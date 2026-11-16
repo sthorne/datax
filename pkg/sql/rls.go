@@ -413,6 +413,7 @@ func (rc *rowCheck) checkUpdate(row map[catalog.ColumnID]types.Datum) error {
 var policyFuncsAllowed = map[string]bool{
 	"current_user": true, "session_user": true, "current_setting": true, "current_database": true, "current_schema": true,
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
+	"current_time": true, "localtime": true,
 }
 
 // validatePolicyExpr checks a policy expression against the table when

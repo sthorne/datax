@@ -86,7 +86,17 @@ func openBackupRecords(path string, dataKey []byte, history bool) (*backupReader
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 	}
-	return &backupReader{path: path, f: f, r: bufio.NewReaderSize(src, 64<<10), history: history}, nil
+	r := bufio.NewReaderSize(src, 64<<10)
+	if dataKey == nil {
+		// A sealed file read without its key would otherwise be parsed
+		// as length-prefixed records, and random ciphertext now and
+		// then parses cleanly.
+		if hdr, _ := r.Peek(enc.SealedStreamHeaderLen); enc.IsSealedStreamHeader(hdr) {
+			_ = f.Close()
+			return nil, fmt.Errorf("%s is a sealed backup file and no key was given", path)
+		}
+	}
+	return &backupReader{path: path, f: f, r: r, history: history}, nil
 }
 
 func (rd *backupReader) Close() { _ = rd.f.Close() }

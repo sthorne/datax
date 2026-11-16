@@ -11,6 +11,29 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
+  extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
+  INDEX`, both supported, but not here): when the table already has a
+  constraint of that name the statement does nothing and sends the NOTICE
+  `constraint "name" for relation "t" already exists, skipping`. Only the
+  name is compared, never the definition.
+- **`UPDATE` may change primary-key columns** (#322). A row whose key
+  changes moves: its old row and index entries are deleted and the new
+  version written at the new key, with its entries, in the statement's
+  transaction; a hash-sharded table files it under the new bucket; a sealed
+  table seals it afresh for the new key, and a per-tenant table under the
+  new tenant's key when the tenant column changes. Foreign keys apply their
+  `ON UPDATE` actions, row security checks `WITH CHECK` on the new row, and
+  `RETURNING` shows it. Unique keys — the primary key and unique indexes —
+  are now checked for the statement as a whole in every `UPDATE`, so
+  `UPDATE t SET id = id + 1` and swaps succeed (PostgreSQL, checking a
+  non-deferrable key row by row, refuses the first); before, a unique index
+  refused `SET u = u - 1` over consecutive values. Where a foreign key
+  references its own table with `ON UPDATE CASCADE` or `SET NULL`, a
+  statement that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`) rather than losing one of the two changes,
+  as it could before. `ON CONFLICT DO UPDATE` still cannot change the key.
+  Before, any update of a key column was refused with `0A000`.
 - **Vector columns and nearest-neighbour search** (#304): `vector(n)` columns
   compatible with pgvector (float4 elements, up to 16,000 dimensions; text
   `'[1,2,3]'` and pgvector's binary format; a fixed type OID found through
@@ -1166,6 +1189,24 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **A unique index takes NULLs, as in PostgreSQL** (#322). A row with a NULL
+  in any column of a unique index has no entry in it and conflicts with no
+  other row (NULLS DISTINCT, PostgreSQL's default), on every path: `INSERT`,
+  `COPY`, `UPDATE` to and from NULL, `ON CONFLICT (col)` (a NULL inserts),
+  the backfill of `CREATE UNIQUE INDEX` and `ADD CONSTRAINT ... UNIQUE` over
+  existing NULLs, and foreign keys referencing a unique column. Before, such
+  a row was refused with `23502`. The planner no longer takes a unique index
+  for a complete row source: like a non-unique one it scans it only where a
+  NULL cannot match (`WHERE col = 'x'` is still a point lookup; `WHERE col
+  IS NULL` reads the table). `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15) is
+  supported on a column, as a table constraint and on `CREATE UNIQUE INDEX
+  ... NULLS NOT DISTINCT`: its index keys each column behind a tag byte so a
+  NULL has a key of its own (`pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show it). Both need cluster
+  version v22: before it is finalized a unique index refuses NULLs as
+  before and `NULLS NOT DISTINCT` is refused, since a v21 planner reads a
+  unique index as holding every row and a v21 node does not know the tag.
+  Existing unique indexes hold no NULLs and need no change.
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
   first `n` (plus `OFFSET`) rows in a heap instead of sorting every row, so it
   runs in bounded memory; `EXPLAIN` shows `top-k heap` (#304).
@@ -1426,6 +1467,86 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A seal job no longer stalls on a lock its own stopped batch left.**
+  Each batch locks the job's record for its transaction. When the node
+  running the job stopped mid-batch, that lock stayed. The job runner's
+  scan and each step's read of the job were done outside a transaction, so
+  they failed on the lock instead of pushing it aside. The job then
+  stood still until some other transaction happened to read the record.
+  Both reads now run in a transaction, which aborts the abandoned batch
+  once its heartbeat has expired, so the job resumes within a few
+  seconds.
+- **psql 17 and 18's describe commands.** psql chooses its catalog
+  queries by its own version as well as the server's, so a newer client
+  sends queries psql 16 did not, though datax reports server version 14:
+  `\d+` reads `pg_constraint.connoinherit` (with `conislocal` and
+  `coninhcount`, now present: every constraint is local and inherits
+  nothing), and psql 18's `\dx` joins `LEFT JOIN
+  pg_available_extensions() ae(name, default_version, comment) ON ...`,
+  which failed with `syntax error: expected ON, found "("`. A
+  set-returning function in `FROM` is now a member like a table: heading
+  the `FROM` or joined (inner, `LEFT`, `RIGHT`, `FULL`, `CROSS`; `ON` or
+  `USING`), with `[AS] alias (column, ...)` renaming its columns (too many
+  names is `42P10`); a call reading another member's columns (`LATERAL`)
+  is still refused. `pg_available_extensions()` and the
+  `pg_available_extensions` view are new and empty: datax packages no
+  installable extension (`CREATE EXTENSION vector` is accepted because the
+  type is built in). `pg_partition_ancestors(...)` in `FROM` returns the
+  relation itself. `TestPsqlCatalogQueries` runs the client named by
+  `DATAX_PSQL` when set, logs `psql --version`, covers eleven more
+  commands, and passes with psql 16, 17 and 18.
+- **`RIGHT` / `FULL JOIN` dropped the joined side's unmatched rows when
+  that side was a `WITH` member, a subquery, a table function or a
+  catalog** (`pg_class c RIGHT JOIN pg_namespace n ON ...` kept only the
+  namespaces that matched). Those rows have no primary key, and unmatched
+  rows were told from matched ones by it; they are now told by their
+  values.
+- **Parameters are counted and typed wherever they stand** (#322). A
+  parameter used only inside a subquery (`WHERE sid IN (SELECT sid FROM s
+  WHERE g = $1)`), or only under `EXPLAIN` (`EXPLAIN SELECT $1::text`), was
+  not counted, so a prepared statement refused its argument ("expected 0
+  arguments"); and a parameter compared with a qualified column of a join
+  inside `OR` (`g.at < $1 OR (g.at = $1 AND ...)`) was described as text,
+  so a client sent a timestamp as text and it failed to parse. One walker
+  (`parser.Walker`) now visits every expression position — subqueries of
+  every kind, WITH members, set members, `JOIN ... ON`, `HAVING`, `ORDER
+  BY`, windows, `LIMIT` / `OFFSET`, `VALUES`, `SET`, `ON CONFLICT`,
+  `RETURNING`, `EXPLAIN` — for counting and for typing. A parameter takes
+  the type of the column it is compared with or assigned to, resolved per
+  query level (aliases, join sides, derived tables, WITH members,
+  correlated references), or the type it is cast to (`$1::int8`); one
+  parameter has one type, and two columns fixing different ones are
+  `42P08`, as in PostgreSQL. `LIMIT '5'` (a client interpolating a
+  parameter) parses.
+- **A single table's alias works in every query shape** (#322). `SELECT
+  count(*) FROM gr AS g WHERE g.at < $1` failed with `column "g.at" does not
+  exist`: the alias was removed only on the plain (ungrouped, unwindowed)
+  path. It is now removed for grouped, windowed and explained queries too,
+  including aggregate arguments, `HAVING` and window clauses.
+- **`now()` and the clock keywords in `RETURNING`** (#322). `UPDATE ...
+  RETURNING now()` (and in `INSERT`, `DELETE`, `UPSERT`, `ON CONFLICT DO
+  UPDATE SET` / `WHERE`) failed with `now() was not resolved before
+  execution`; `RETURNING current_timestamp` with `unknown function`. They
+  are now the statement's start time there as everywhere. `current_time`
+  and `localtime` are new, and `current_timestamp`, `localtimestamp`,
+  `current_time` and `localtime` take a precision (`current_timestamp(3)`).
+- **`EXPLAIN` of a parameterized statement** (#322) describes and binds
+  the statement's parameters; `EXPLAIN ANALYZE` runs with the bound values;
+  and a `SELECT` without `FROM` is explained instead of refused.
+- **`DROP DATABASE ... CASCADE` of a large database failed with `40001`
+  after about a minute** (#322), "write timestamp diverged from read
+  timestamp", with no other load. It reads every table's name and
+  descriptor; past 512 read spans a transaction gave up its read set, so
+  once a drop's commit outlived the closed-timestamp lag (3 s) and was
+  pushed above it, the transaction could not refresh and restarted, every
+  attempt alike, 21 times. A transaction now condenses its read spans past
+  512 into at most 64 covering ones and goes on refreshing; and `DROP
+  DATABASE` no longer reads each table a second time and writes its drops
+  in one batch instead of a round trip per key. A drop that loses to
+  concurrent DDL in the same database still fails with `40001` as a
+  whole. `CREATE TABLE` (and view, sequence) now reads its database in its
+  own transaction: one racing `DROP DATABASE` could commit a table under
+  the dropped database, where nothing would ever find or drop it.
 - **A transaction blocked on another's lock noticed it was released up to
   100 ms late.** It re-asked the lock holder's transaction record every
   100 ms. Now the holder's coordinator wakes it as soon as the holder has
@@ -1490,6 +1611,30 @@ state or the internode protocol does, and an entry below says so.
   to the last row it returned, which is all its result depended on; the
   same queue loses none. (The report's empty `SKIP LOCKED` results with
   rows free were the locks of failed commits, released since #315.)
+- **`FOR UPDATE SKIP LOCKED ... LIMIT` through an index returned too few
+  rows** (#322). Where an index served the filter and the order (a queue's
+  `WHERE queue = $1 AND state = 'pending' ORDER BY visible_at LIMIT 1` over
+  an index on those columns), a row another transaction held still used up
+  the limit, since the lock is on the row and not its index entry: the claim
+  returned no row while others were free, and `LIMIT 2` returned one. The
+  index scan now continues past locked rows until the limit is met, and the
+  index entries of rows it passed over leave the transaction's read set, as
+  the rows themselves did, so the holder's change to one no longer fails
+  the skipper's commit with `40001`. Primary-key scans and in-memory sorts
+  were not affected; `NOWAIT` and plain `FOR UPDATE` behave as before.
+- **A write keyed by a `SKIP LOCKED` subquery waited for the rows it
+  skipped** (#322). `UPDATE jobs SET ... WHERE id = (SELECT id ... LIMIT 1
+  FOR UPDATE SKIP LOCKED)` — and the `IN (...)`, `DELETE` and `WITH` forms
+  — read the whole table when the subquery returned nothing (`id = NULL`)
+  or a list (`IN` had no access path), and a plain read waits for any row
+  another transaction holds: the claim waited for the very lock it was
+  written to avoid, then updated nothing. The subquery itself always
+  honoured the clause. The planner now looks up `WHERE pk IN (constants)`
+  (the other key columns pinned by `=`) by primary-key point lookups, and
+  reads nothing for a clause that cannot be true (`col = NULL`, `IN` over
+  NULLs, a failed `EXISTS`); `EXPLAIN` says `point lookups on primary key
+  (N keys)` and `no rows read (the WHERE clause cannot be true)`. The
+  claim now takes the first free row at once.
 - **A transaction waited for a lock it could not outwait** (#315). Blocked
   on another transaction's uncommitted write to a row it had itself read —
   on the bank workload, a transfer whose account a newer transfer was
@@ -1967,6 +2112,51 @@ state or the internode protocol does, and an entry below says so.
   restore's summary says so. Backups record commit times, and restores
   record bands, at cluster protocol version v22. See docs/user/operations.md,
   "Time-series retention and backups".
+- **`ALTER TABLE ... PURGE` sent its report without a description of its
+  columns over the extended protocol** (#322). Describe answered NoData and
+  Execute then sent rows: pgx read one row of no columns, and psql's `\bind`
+  failed with "server sent data without prior row description". The same
+  held for `SPLIT AT`, `UNSPLIT AT`, `UNSPLIT ALL`, `SHOW DATABASES` and
+  `SHOW PLACEMENT`; `SHOW GRANTS ON ROLE` was described with six columns
+  and returned three, and `SHOW COLUMNS`, `INDEXES`, `USERS` and `ROLES`
+  described their boolean and integer columns as text. Describe now reports
+  the columns of every statement that returns rows, from the same list its
+  executor uses, and Execute refuses a result whose shape Describe did not
+  report rather than send it: with columns Describe said it had none of
+  (`XX000`), or of another width (`0A000` "cached plan must not change
+  result type", as PostgreSQL answers a `SELECT *` prepared before an
+  `ALTER TABLE`). A test walks a statement of every kind the parser knows
+  through Parse, Describe, Bind and Execute, and fails for a new kind
+  without a sample.
+- **`information_schema` listed every database's tables** (#322):
+  `information_schema.tables`, `columns`, `views` and `schemata` listed the
+  objects of every database in the cluster, so a query for the current
+  database's tables (`WHERE table_schema = 'public'`) returned others' too,
+  and `pg_type` and `pg_enum` listed every database's enum types. In
+  PostgreSQL each database has its own catalogs. Every `information_schema`
+  view and every per-database `pg_catalog` table now lists the current
+  database's objects, with `table_catalog` its name; the shared catalogs
+  (`pg_database`, `pg_roles`, `pg_user`, `pg_auth_members`,
+  `pg_tablespace`, `pg_shdescription`) and `pg_stat_activity` list the
+  cluster's. What a role sees is otherwise unchanged (#312). Reading
+  `information_schema.tables`, `columns` and `views` no longer reads every
+  table descriptor in the cluster.
+- **`DROP OWNED BY r` and `DROP ROLE r` hung when `r` held default
+  privileges** (`ALTER DEFAULT PRIVILEGES ... TO r` or `FOR ROLE r`), over
+  pgwire, until the client gave up (#322). Removing the default privileges
+  writes the database's descriptor in the statement's transaction, and the
+  key service then looked up its table in a transaction of its own, which
+  waited on that write. The key service's work inside a statement now reads
+  its table in the statement's transaction.
+- **`ORDER BY n` resolved select item n by its output name** (#322): over an
+  unnamed expression it failed with `42703` (`column "?column?" does not
+  exist`, as in `SELECT table_schema || '.' || table_name FROM
+  information_schema.tables ORDER BY 1`), and over a column that another
+  item's alias also named (`SELECT id AS b, b ... ORDER BY 1`) it sorted by
+  the other column. A position now names the item itself — its column,
+  aggregate or expression — and after a set operation the result's column
+  n, whatever the last member calls it. `SELECT * ... ORDER BY n` works.
+  `GROUP BY n` is accepted for a select item that is a column.
 
 ## 0.57.0 — unreleased
 

@@ -56,7 +56,7 @@ SELECT [DISTINCT] * | col, ... | aggregates | func() OVER ([PARTITION BY ...] [O
     [ORDER BY col | n | expr | agg() [ASC|DESC] [NULLS FIRST|LAST], ...]
     [LIMIT n | ALL] [OFFSET n] [FETCH FIRST n ROWS ONLY] [FOR UPDATE [SKIP LOCKED | NOWAIT]]
 SELECT <literal exprs>                  -- e.g. SELECT 1 (client health checks)
-UPDATE t SET col = value, ... [WHERE conjunction]
+UPDATE t SET col = value, ... [WHERE conjunction]   -- primary-key columns too (see below)
 DELETE FROM t [WHERE conjunction]
 BEGIN / COMMIT / ROLLBACK
 SAVEPOINT name / RELEASE SAVEPOINT name / ROLLBACK TO SAVEPOINT name
@@ -183,7 +183,17 @@ SHOW STATS FOR t
   absence means the structural fallback, byte-identical to the
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
-  format).
+  and binary formats). `parser.Walker` visits every expression position
+  of a statement — subqueries, WITH members, set members, RETURNING, ON
+  CONFLICT, LIMIT / OFFSET, the statement under EXPLAIN — and both the
+  count a Bind must supply (`parser.CountParams`) and the types
+  ParameterDescription reports (`Session.PlanParams`, `pkg/sql/paramtypes.go`)
+  go through it. Typing builds a column scope per query level (a table
+  with its alias, join sides, a derived table's or WITH member's
+  described columns), nested queries falling back to the enclosing
+  scope; a column comparison or assignment fixes a parameter's type, a
+  function argument or arithmetic operand only suggests one, and two
+  fixed types that disagree are `42P08`.
 
 ### Row-level security (v21)
 
@@ -725,7 +735,11 @@ Table descriptors are JSON documents stored in system keys (range 1):
   `ALTER TABLE ... ADD CONSTRAINT` is a multi-transaction statement of
   the `CREATE INDEX` shape: publish (unvalidated), drain lease
   adoption, backfill the index, sweep the existing rows in chunks as of
-  a boundary, mark validated.
+  a boundary, mark validated. `ADD CONSTRAINT IF NOT EXISTS name` (a
+  datax extension, issue #322) checks, in the publish transaction,
+  whether the table has a constraint of that name (`<table>_pkey` or one
+  in `Constraints`) and if so commits nothing and returns a NOTICE; the
+  definitions are not compared.
 
 `TRUNCATE` reuses the re-shard's layout swap: the descriptor moves the
 primary rows and every secondary index to fresh index IDs in one write
@@ -1151,8 +1165,22 @@ key space (`/t/<tableID>/<indexID>/`):
   (SQL equality never matches NULL, so equality lookups stay correct; such
   rows are found by full scans).
 - **Unique**: key = indexed columns only, value = the encoded primary key.
-  NULLs in unique-indexed columns are **rejected** (a deliberate divergence
-  from PostgreSQL's multiple-NULLs-allowed behavior).
+  As in PostgreSQL (NULLS DISTINCT, the default), a row with NULL in any
+  indexed column has **no entry**, like a non-unique index, and so
+  conflicts with no other row: a unique index takes any number of NULLs.
+  Before cluster version v22 is finalized NULLs are refused instead
+  (`23502`), as every earlier binary refuses them — a v21 planner takes a
+  unique index for a complete row source.
+- **Unique, `NULLS NOT DISTINCT`** (PostgreSQL 15; on `CREATE UNIQUE
+  INDEX ... (cols) NULLS NOT DISTINCT`, `UNIQUE NULLS NOT DISTINCT` on a
+  column, and `UNIQUE NULLS NOT DISTINCT (cols)` as a table constraint or
+  in `ADD CONSTRAINT`; cluster version v22): every row has an entry, and
+  two rows whose indexed values are equal or both NULL column by column
+  conflict, `ON CONFLICT` included. Each key column is preceded by a tag
+  byte — `0x00` for NULL, `0x01` before a value — so a NULL has a key no
+  value can have (`IndexDescriptor.NullsNotDistinct`). `NULLS DISTINCT`
+  may be written too and is the default. `pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show the clause.
 
 Maintenance happens inside the writing transaction — index entries ride the
 same write batch as the row, so they commit or roll back atomically, and
@@ -1171,9 +1199,9 @@ explicit transaction block — code 25001):
    union is complete. The backfill transaction deliberately touches only
    row and index data — the descriptor flip to **public** is a separate
    small transaction, so a stream of concurrent writes cannot starve the
-   backfill's commit. Unique violations (including a NULL in a
-   unique-indexed column) abort the build and remove the write-only index
-   again.
+   backfill's commit. Unique violations abort the build and remove the
+   write-only index again; a row with a NULL in an indexed column is
+   skipped, as its writer would skip it (before v22: a violation too).
 3. Drain once more, so every gateway plans with the public index.
 
 The backfill is **bounded and snapshot-planned**: a planning sweep reads
@@ -1214,6 +1242,48 @@ every kind of index (`TestCreateIndexDiscardsEntriesWrittenDuringItsDrain`).
 
 Left for later: a delete-only state for online index drops, and the
 long-lived-transaction descriptor pinning noted under Catalog.
+
+## Updating primary-key columns
+
+`UPDATE` may set primary-key columns (issue #322; `pkg/sql/update_pk.go`).
+A row whose key changes **moves**: in the statement's transaction its
+old row (and a re-shard's shadow copy) and every index entry are
+deleted, and the new version is written at the new key with its
+entries. A hash-sharded table files it under the new key's bucket. A
+sealed table's value is sealed afresh for the new key — the key is in
+its associated data — and on a table sealed per tenant, a new tenant
+column value seals it under the new tenant's key (made on its first
+write, as for an insert). Foreign keys see an ordinary change of the
+referenced columns: `ON UPDATE CASCADE` re-keys the children, `SET
+NULL` nulls them, `RESTRICT` / `NO ACTION` refuse (`23503`, checked per
+row). Where a table's foreign key references the table itself, a
+statement that changes both a referenced row and a row its cascade
+rewrites is refused (`0A000`, `cascadeOverlap`): the cascade rewrote
+that row from the version the statement read, and the statement would
+then write its own version over it. PostgreSQL runs the cascade after
+the statement, on the rows as it left them; here the rows are changed
+in separate statements. Row security checks the new row against
+`WITH CHECK` before any probe of the new key; `RETURNING` shows the new
+row. The hidden key columns (`rowid`, the shard bucket) cannot be set.
+
+**Uniqueness is checked for the statement as a whole**, for the primary
+key and every unique index, in every `UPDATE` (`checkUpdateKeys`): a new
+key conflicts when two of the statement's rows take it, or when a row
+the statement does not move out of it holds it now (`23505`). So `UPDATE
+t SET id = id + 1` succeeds over keys 1, 2, 3, as does a swap. This is
+the SQL standard's rule and PostgreSQL's for a `DEFERRABLE` constraint;
+PostgreSQL checks a non-deferrable key row by row, in the order it
+visits the rows, and so refuses `id = id + 1` over 1, 2, 3 (but not `id =
+id - 1`). Datax accepts what PostgreSQL accepts and some statements it
+refuses; none that leaves the table with a duplicate. Because a row may
+take a key another row of the statement gives up, the statement's own
+row and index writes go through `updateWrites`, which writes each key
+once (the new version wins over the old one's delete).
+
+`ON CONFLICT DO UPDATE` still may not change a primary-key column
+(`0A000`): its arbiter reads see the table as it was before the
+statement, so a key one proposed row's update gave up would still look
+taken to the next row of the same `INSERT`. Use `UPDATE`.
 
 ## Inverted indexes (v21)
 
@@ -1658,6 +1728,19 @@ The executor ranks access paths:
 
 1. WHERE pins every PK column by equality → primary point `Get`.
 2. Every column of a unique index pinned → unique-index point lookup.
+   Then: every PK column pinned by equality but one, which `IN (...)`
+   holds to constants (a list, or an `IN (SELECT ...)` already
+   evaluated) → one primary point lookup per distinct non-NULL value,
+   batched and made in key order (`point lookups on primary key (N
+   keys)`; a list over 4,096 values is a residual filter instead). A
+   clause that cannot be true on its face — a column compared with a
+   NULL constant (`= NULL`, as a scalar subquery that found no row
+   leaves it), `IN` over nothing but NULLs, an `EXISTS` that found
+   nothing — reads no rows at all (`no rows read (the WHERE clause
+   cannot be true)`). Both matter beyond speed: a scan's plain read
+   waits for another transaction's lock on any row it meets, so a write
+   keyed by a subquery must touch only the rows the subquery returned
+   (issue #322; see Locking clauses below).
 3. The best constrained scan of the primary key or an index: equality
    conjuncts pin a leading column prefix, and range conjuncts
    (`> >= < <=`) on the **next** key column become order-preserving scan
@@ -1695,6 +1778,50 @@ and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`. An ORDER BY
 the path does not satisfy, with a LIMIT, keeps a heap of the limit's
 rows while scanning instead of sorting them all (see Vectors above).
+
+**Locking clauses.** `FOR UPDATE`, `FOR UPDATE NOWAIT` and `FOR
+UPDATE SKIP LOCKED` apply to a single-table `SELECT` (not with `GROUP
+BY`, aggregates or `DISTINCT`, which fail with `0A000`; `FOR SHARE`,
+`FOR NO KEY UPDATE` and `OF t` are not parsed), wherever that select
+stands: at the top, as a subquery (scalar, `IN`, `EXISTS`) of a
+`SELECT`, `UPDATE` or `DELETE`, as the source of `INSERT ... SELECT`,
+or as a `WITH` member. Subqueries and `WITH` members run before the
+statement around them, through the same path, so the clause holds for
+their scan and the rows they lock stay locked to the end of the
+transaction. The job-queue claim is
+
+```sql
+UPDATE jobs SET state = 'claimed'
+ WHERE id = (SELECT id FROM jobs WHERE queue = $1 AND state = 'pending'
+              ORDER BY visible_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+RETURNING id
+```
+
+(or `WHERE id IN (...)`, or the same through `WITH c AS (...) ... WHERE
+id IN (SELECT id FROM c)`; `UPDATE ... FROM` is not supported). The
+subquery's result is spliced into the outer WHERE, which then reads by
+primary-key point lookups — or not at all when every candidate was
+locked — so the write neither waits for nor touches the rows the
+subquery skipped (issue #322). An outer clause that must scan (say,
+`WHERE state = 'pending' AND id IN (...)` with `id` not the key) still
+reads every row of its span and, being a plain read, waits for any of
+them another transaction holds.
+
+`LIMIT` (with `OFFSET`) counts the rows a locking select **returns**.
+Under `SKIP LOCKED` a row passed over is not counted wherever the limit
+runs: in the KV scan of the primary key (the server counts only rows it
+returns), in an index scan joined to the primary key (the lock is on the
+primary row, so the join passes it over, and the index scan goes on past
+its last entry for the rows still wanted — before #322 the skipped row
+used up the limit, and the claim above returned no row), and in the
+lock step, which locks candidates in order only until the limit is met.
+`NOWAIT` fails with `55P03` as soon as the rows it reads in order reach
+a locked one before the limit is met, and plain `FOR UPDATE` waits for
+it there, as in PostgreSQL. With an in-memory sort the fetch is not
+limited: every matching row is read, plain `FOR UPDATE` and `NOWAIT`
+lock every matching row and then cut, and `SKIP LOCKED` sorts first and
+locks only as many as it keeps. How skipped rows leave the transaction's read set is in
+docs/transactions.md (Locking reads).
 
 **Panic barrier.** The statement path is a panic barrier (#136): a
 panic anywhere below `Session.Execute` — in the planner, the executor,
@@ -1744,11 +1871,14 @@ by a K-way merge of the per-bucket scans (see docs/timeseries.md); the
 per-bucket scans carry the pushed limit, so `ORDER BY ts DESC LIMIT n`
 reads at most `buckets × n` rows.
 
-A non-unique index has no entry for rows with NULL in any indexed column,
-so the planner only uses one when the schema (`NOT NULL`) or the WHERE
-clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
-match — and `col IS NULL` therefore always reads the primary rows. Unique
-indexes reject NULLs at write time and are always complete.
+An index — unique or not — has no entry for rows with NULL in any
+indexed column, so the planner only scans one when the schema (`NOT
+NULL`) or the WHERE clause (equality/range/`IS NOT NULL` conjuncts)
+proves those rows cannot match — and `col IS NULL` therefore always
+reads the primary rows. A unique-index point lookup pins every column to
+a value, so it is unaffected. (A `NULLS NOT DISTINCT` index does hold
+its NULLs, but is planned by the same rule; its scans start past the
+NULL entries.)
 
 Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops.
 Without statistics they execute **in syntactic order** — the FROM/JOIN
@@ -1951,9 +2081,10 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   The virtual catalogs are read by every role (issue #312):
   `tablePrivAllowed` grants `SELECT` on a `pg_catalog` or
   `information_schema` descriptor to anyone and nothing else, and
-  `virtualEnv` decides what each lists — every table of the scope for
-  `pg_catalog`, the tables `catalog.CanSeeTable` admits (and whose
-  schema the reader may use) for `information_schema` — and gathers
+  `virtualEnv` decides what each lists — every table of the current
+  database for `pg_catalog`, the tables `catalog.CanSeeTable` admits
+  (and whose schema the reader may use) for `information_schema`; no
+  other database's (issue #322) — and gathers
   statistics only for tables `catalog.CanSelectTable` admits and row
   security does not confine, and a sequence's counter only past
   `sequencePrivAllowed`. A sequence read as a relation (`SELECT

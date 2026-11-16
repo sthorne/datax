@@ -462,15 +462,13 @@ const (
 	// envNoTables: the reader wants roles or settings only.
 	envNoTables envTables = iota
 	// envCurrentTables: the session's current database, which is all
-	// that pg_catalog and most of information_schema describe.
+	// that pg_catalog and information_schema describe.
 	envCurrentTables
-	// envAllTables: every database's, for the few views that list them
-	// all (vtable.Table.AllDatabases). This one reads the whole catalog.
-	envAllTables
 )
 
 // virtualEnv gathers what the virtual tables render: every database,
-// the tables within scope, statistics, users and admins. Every role
+// the current database's tables, sequences and types (scope
+// envCurrentTables), statistics, users and admins. Every role
 // reads the catalogs, as in PostgreSQL (issue #312); what each one
 // lists follows PostgreSQL too. pg_catalog lists every table, whatever
 // privileges the reader holds (filtered false); information_schema
@@ -485,11 +483,21 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		return nil, err
 	}
 	env.Databases = dbs
-	if env.Sequences, err = catalog.ListSequences(ctx, txn, 0); err != nil {
-		return nil, err
+	var cur *catalog.DatabaseDescriptor
+	for _, d := range dbs {
+		if d.Name == s.database {
+			cur = d
+		}
 	}
-	if env.Types, err = catalog.ListTypes(ctx, txn, 0); err != nil {
-		return nil, err
+	if scope == envCurrentTables && cur != nil {
+		// The current database's alone (issue #322); without one (it was
+		// dropped under the session) there is nothing to list.
+		if env.Sequences, err = catalog.ListSequences(ctx, txn, cur.ID); err != nil {
+			return nil, err
+		}
+		if env.Types, err = catalog.ListTypes(ctx, txn, cur.ID); err != nil {
+			return nil, err
+		}
 	}
 	set, err := s.currentRoleSet(ctx, txn)
 	if err != nil {
@@ -527,17 +535,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		return !filtered || (canSeeTable(set, d) && !denied[d.DatabaseID])
 	}
 	var all []*catalog.TableDescriptor
-	switch scope {
-	case envAllTables:
-		if all, err = s.cat.List(ctx, txn); err != nil {
-			return nil, err
-		}
-	case envCurrentTables:
-		for _, db := range dbs {
-			if db.Name != s.database {
-				continue
-			}
-			if all, err = s.cat.ListIn(ctx, txn, db); err != nil {
+	if scope == envCurrentTables {
+		if cur != nil {
+			if all, err = s.cat.ListIn(ctx, txn, cur); err != nil {
 				return nil, err
 			}
 		}
@@ -614,11 +614,7 @@ func (s *Session) fetchVirtual(ctx context.Context, txn *kvclient.Txn, desc *cat
 	if !ok {
 		return nil, newErrf(CodeInternal, "virtual table %q vanished", desc.Virtual)
 	}
-	scope := envCurrentTables
-	if vt.AllDatabases() {
-		scope = envAllTables
-	}
-	env, err := s.virtualEnv(ctx, txn, scope, vt.Schema == vtable.InformationSchema)
+	env, err := s.virtualEnv(ctx, txn, envCurrentTables, vt.Schema == vtable.InformationSchema)
 	if err != nil {
 		return nil, err
 	}

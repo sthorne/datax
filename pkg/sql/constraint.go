@@ -53,6 +53,27 @@ func (s *Session) requireV8(what string) error {
 	return nil
 }
 
+// requireNullsNotDistinct gates UNIQUE NULLS NOT DISTINCT: its index
+// keys NULLs with a tag byte (rowenc.TaggedIndexKey) that a v21 node
+// does not know, and would drop the descriptor field that says so.
+func (s *Session) requireNullsNotDistinct() error {
+	if s.db.ClusterVersion() < version.V22 {
+		return newErrf(CodeFeatureNotSupported, "UNIQUE NULLS NOT DISTINCT needs cluster version %s (finalize the upgrade first)", version.V22)
+	}
+	return nil
+}
+
+// hasConstraintNamed reports whether the table has a constraint called
+// name: its primary key's, or one of its CHECK, UNIQUE and FOREIGN KEY
+// constraints. (An index made by CREATE UNIQUE INDEX is not one.)
+func hasConstraintNamed(desc *catalog.TableDescriptor, name string) bool {
+	if name == desc.Name+"_pkey" {
+		return true
+	}
+	_, ok := desc.Constraint(name)
+	return ok
+}
+
 // constraintName picks a constraint's name: the given one (refused when
 // taken), else PostgreSQL's <table>_<col>_<suffix>, numbered when taken.
 func constraintName(desc *catalog.TableDescriptor, given string, cols []string, suffix string) (string, error) {
@@ -152,7 +173,12 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 			}
 			c.Columns = append(c.Columns, col.ID)
 		}
-		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState}
+		if cd.NullsNotDistinct {
+			if err := s.requireNullsNotDistinct(); err != nil {
+				return nil, nil, err
+			}
+		}
+		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState, NullsNotDistinct: cd.NullsNotDistinct}
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
 		c.Name, c.IndexID, c.Validated = name, idx.ID, true
@@ -205,9 +231,15 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err != nil {
 			return nil, nil, err
 		}
-		shared, err := s.lookup(ctx, txn, cd.RefTable)
-		if err != nil {
-			return nil, nil, err
+		// A reference to the table itself is the descriptor in hand: the
+		// table may be one this transaction is creating, whose name a
+		// gateway's lease acquisition (its own transaction) would wait on
+		// for as long as this one runs.
+		shared := desc
+		if q, bare := catalog.SplitTableName(cd.RefTable); bare != desc.Name || (q != "" && q != s.database) {
+			if shared, err = s.lookup(ctx, txn, cd.RefTable); err != nil {
+				return nil, nil, err
+			}
 		}
 		if err := mustBeReal(shared); err != nil {
 			return nil, nil, err
@@ -901,7 +933,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 }
 
 // deleteRow buffers the deletion of a fetched row and its index entries.
-func deleteRow(d *catalog.TableDescriptor, fr fetchedRow, wb *kvclient.WriteBatch) error {
+func deleteRow(d *catalog.TableDescriptor, fr fetchedRow, wb batchWriter) error {
 	wb.Delete(fr.key)
 	if d.Reshard != nil {
 		shadow, err := reshardShadowKey(d, fr.row)
@@ -982,13 +1014,19 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	cd := t.AddConstraint
 	var cID, indexID uint64
 	var parentName string
+	exists := false
 	err := s.db.RunTxn(ctx, "add-constraint-publish", func(ctx context.Context, txn *kvclient.Txn) error {
+		exists = false
 		shared, err := s.lookup(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
 		if err := mustBeReal(shared); err != nil {
 			return err
+		}
+		if t.AddConstraintIfNotExists && hasConstraintNamed(shared, cd.Name) {
+			exists = true
+			return nil
 		}
 		desc := shared.Clone()
 		if desc.Reshard != nil {
@@ -1014,6 +1052,9 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	})
 	if err != nil {
 		return nil, ToSQLError(err)
+	}
+	if exists {
+		return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("constraint %q for relation %q already exists, skipping", cd.Name, t.Table)}}, nil
 	}
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)

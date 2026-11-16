@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -351,7 +352,13 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		t.Log("psql not installed; skipping the end-to-end run")
 		return
 	}
-	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
+	// psql's describe queries change with its version, not the server's:
+	// record which one ran so client drift shows up in the log.
+	if v, verr := exec.CommandContext(ctx, psql, "--version").CombinedOutput(); verr == nil {
+		t.Logf("%s: %s", psql, strings.TrimSpace(string(v)))
+	}
+	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`,
+		`\di+`, `\dn+`, `\du+`, `\df`, `\ds`, `\dm`, `\dP`, `\dX`, `\drg`, `\dRp`, `\conninfo`} {
 		out, err := runPsql(ctx, psql, url, cmd)
 		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
@@ -372,8 +379,15 @@ func TestPsqlCatalogQueries(t *testing.T) {
 	}
 }
 
-// lookPsql finds the psql binary, for end-to-end runs.
-func lookPsql() (string, error) { return exec.LookPath("psql") }
+// lookPsql finds the psql binary, for end-to-end runs: $DATAX_PSQL
+// when set (to run the describe commands against a chosen client
+// version), else psql on the PATH.
+func lookPsql() (string, error) {
+	if p := os.Getenv("DATAX_PSQL"); p != "" {
+		return exec.LookPath(p)
+	}
+	return exec.LookPath("psql")
+}
 
 // runPsql runs one backslash command through psql and returns its output.
 func runPsql(ctx context.Context, psql, url, cmd string) (string, error) {
@@ -444,6 +458,36 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	eq("ON filters", names(execSQL(t, ctx, root, `SELECT t.name FROM t LEFT JOIN u ON (u.tid = t.id AND u.tag IN ('x', 'z')) WHERE u.id IS NULL`)), "bob")
 	eq("comma join", names(execSQL(t, ctx, root, `SELECT u.tag FROM t, u WHERE t.id = u.tid AND t.name = 'carol'`)), "z")
 	eq("unnest", names(execSQL(t, ctx, root, `SELECT x FROM unnest('{b,a,"c d"}') AS s(x) ORDER BY x`)), "a", "b", "c d")
+	// A set-returning function joins like a table: as a member (inner or
+	// LEFT, ON or USING), or heading the join; its alias's column list
+	// renames its leading columns.
+	eq("JOIN unnest", names(execSQL(t, ctx, root, `SELECT t.name FROM t JOIN unnest(ARRAY['carol', 'Alice', 'zed']) s(n) ON s.n = t.name ORDER BY 1`)), "Alice", "carol")
+	eq("LEFT JOIN unnest", names(execSQL(t, ctx, root, `SELECT t.name || ':' || coalesce(s.n, '-') FROM t LEFT JOIN pg_catalog.unnest(ARRAY['bob']) AS s(n) ON s.n = t.name ORDER BY t.id`)), "Alice:-", "bob:bob", "carol:-")
+	eq("unnest heading a join", names(execSQL(t, ctx, root, `SELECT u.tag FROM unnest(ARRAY[3, 1]) AS k(id) JOIN u ON u.tid = k.id ORDER BY 1`)), "x", "y", "z")
+	eq("JOIN unnest USING", names(execSQL(t, ctx, root, `SELECT t.name FROM t JOIN unnest(ARRAY[2]) AS k(id) USING (id)`)), "bob")
+	// RIGHT and FULL keep the joined side's unmatched rows when that side
+	// is a relation (a WITH member, a subquery, a function) or a catalog,
+	// whose rows have no primary key to tell them by.
+	eq("FULL JOIN of functions", names(execSQL(t, ctx, root, `SELECT coalesce(p.x, '-') || coalesce(q.y, '-') FROM unnest(ARRAY['a', 'b']) p(x) FULL JOIN unnest(ARRAY['b', 'c', 'c']) q(y) ON p.x = q.y ORDER BY 1`)), "-c", "-c", "a-", "bb")
+	eq("RIGHT JOIN a WITH member", names(execSQL(t, ctx, root, `WITH w AS (SELECT tag FROM u) SELECT w.tag FROM t RIGHT JOIN w ON w.tag = t.name ORDER BY 1`)), "x", "y", "z")
+	eq("RIGHT JOIN a catalog", names(execSQL(t, ctx, root, `SELECT n.nspname FROM pg_class c RIGHT JOIN pg_namespace n ON n.oid = c.relnamespace AND c.relname = 't' WHERE c.relname IS NULL AND n.nspname = 'information_schema'`)), "information_schema")
+	eq("pg_partition_ancestors in FROM", names(execSQL(t, ctx, root, `SELECT count(*) FROM pg_partition_ancestors('t')`)), "1")
+	if _, serr := trySQL(ctx, root, `SELECT t.name FROM t CROSS JOIN unnest(ARRAY[t.id]) AS k(x)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
+		t.Fatalf("LATERAL table function: %v", serr)
+	}
+	if r := execSQL(t, ctx, root, `SELECT * FROM pg_available_extensions()`); len(r.Rows) != 0 || len(r.Columns) != 3 || r.Columns[0].Name != "name" || r.Columns[2].Name != "comment" {
+		t.Fatalf("pg_available_extensions(): %+v %+v", r.Columns, r.Rows)
+	}
+	if r := execSQL(t, ctx, root, `SELECT name, installed_version FROM pg_available_extensions`); len(r.Rows) != 0 {
+		t.Fatalf("pg_available_extensions: %+v", r.Rows)
+	}
+	if _, serr := trySQL(ctx, root, `SELECT * FROM pg_available_extensions() AS ae(a, b, c, d)`); serr == nil || serr.Code != sql.CodeInvalidColumnReference {
+		t.Fatalf("too many column aliases: %v", serr)
+	}
+	// psql 18's \dx: every installed extension beside its default version.
+	if r := execSQL(t, ctx, root, `SELECT e.extname, ae.default_version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname ORDER BY 1`); len(r.Rows) != 0 || len(r.Columns) != 2 || r.Columns[1].Name != "default_version" {
+		t.Fatalf("\\dx's join: %+v %+v", r.Columns, r.Rows)
+	}
 	eq("CAST", names(execSQL(t, ctx, root, `SELECT CAST(qty AS text) FROM t WHERE id = 1`)), "5")
 	eq("subquery as predicate", names(execSQL(t, ctx, root, `SELECT name FROM t WHERE (SELECT count(*) FROM u WHERE u.tid = t.id) = 2 OR (SELECT true)`)), "Alice", "bob", "carol")
 	if _, serr := trySQL(ctx, root, `SELECT nosuchfn(1)`); serr == nil || serr.Code != sql.CodeUndefinedFunction {

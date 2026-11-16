@@ -197,6 +197,30 @@ type row struct {
 	versions []sealedVersion
 }
 
+// descIn resolves the table in txn, part of the caller's transaction
+// (see sql.ReadKeysTableIn); nil txn is desc(ctx, create). In a
+// transaction the table is neither created nor upgraded: those are
+// statements of their own. A table from before the access columns
+// cannot take an owner or a grant, so a change to one is refused.
+func (s *Store) descIn(ctx context.Context, txn *kvclient.Txn, create bool) (*catalog.TableDescriptor, error) {
+	if txn == nil {
+		return s.desc(ctx, create)
+	}
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	if d == nil {
+		return nil, ErrNotFound
+	}
+	if create {
+		if _, ok := d.Col("privileges"); !ok {
+			return nil, fmt.Errorf("the %s table predates key owners and grants: change a key's access outside a transaction once, to upgrade it", catalog.KeysTableName)
+		}
+	}
+	return d, nil
+}
+
 func (s *Store) desc(ctx context.Context, create bool) (*catalog.TableDescriptor, error) {
 	if create {
 		return sql.EnsureKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
@@ -403,7 +427,7 @@ func (s *Store) preCreate(ctx context.Context, kind Kind, name string) error {
 }
 
 func (s *Store) createIn(ctx context.Context, txn *kvclient.Txn, kind Kind, name, owner string) (Key, error) {
-	d, err := s.desc(ctx, false)
+	d, err := s.descIn(ctx, txn, false)
 	if err != nil {
 		return Key{}, err
 	}
@@ -1104,7 +1128,7 @@ func (s *Store) DestroyMany(ctx context.Context, ids []int64, spare func(ctx con
 // OWNED, REASSIGN OWNED and DROP ROLE list by, on a cluster whose
 // per-tenant tables may have millions of tenant keys.
 func (s *Store) WrappingKeysIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
-	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
 	if err != nil || d == nil {
 		return nil, err
 	}
@@ -1171,7 +1195,7 @@ func (s *Store) WrappingKeysIn(ctx context.Context, txn *kvclient.Txn) ([]Key, e
 
 // ListIn returns every key's metadata, in id order, read in txn.
 func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
-	d, err := sql.LookupKeysTable(ctx, s.cfg.DB, s.cfg.Catalog)
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
 	if err != nil || d == nil {
 		return nil, err
 	}
@@ -1198,7 +1222,7 @@ func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
 // sees it at its next lease check. txn nil runs in a transaction of its
 // own; otherwise the change is part of txn (DROP OWNED, REASSIGN OWNED).
 func (s *Store) SetAccess(ctx context.Context, txn *kvclient.Txn, id int64, change func(k *Key) (bool, error)) (Key, bool, error) {
-	d, err := s.desc(ctx, true)
+	d, err := s.descIn(ctx, txn, true)
 	if err != nil {
 		return Key{}, false, err
 	}

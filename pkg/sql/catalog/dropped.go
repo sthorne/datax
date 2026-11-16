@@ -1,7 +1,6 @@
 package catalog
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 
@@ -63,11 +62,11 @@ func (d *TableDescriptor) HistoryWindowSeconds() int64 {
 	return 0
 }
 
-// recordDroppedTable writes d's record in the dropping transaction. A
+// recordDroppedTable buffers d's record in the dropping transaction's wb. A
 // view holds no rows and leaves none; a table of the cluster's own lives
 // at a reserved id it is created at again, which a reclaim must never
 // reach.
-func recordDroppedTable(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+func recordDroppedTable(txn *kvclient.Txn, d *TableDescriptor, wb *kvclient.WriteBatch) error {
 	if d.IsView() || IsSystemTableID(d.ID) {
 		return nil
 	}
@@ -80,7 +79,8 @@ func recordDroppedTable(ctx context.Context, txn *kvclient.Txn, d *TableDescript
 	if err != nil {
 		return err
 	}
-	return txn.Put(ctx, keys.DroppedTableKey(d.ID), raw)
+	wb.Put(keys.DroppedTableKey(d.ID), raw)
+	return nil
 }
 
 // DecodeDroppedTable reads one record of keys.DroppedTableSpan.

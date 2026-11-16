@@ -267,6 +267,9 @@ func (f *fingerprinter) join(j JoinClause) {
 		f.kw("(")
 		f.selectStmt(j.Derived)
 		f.w(")")
+	} else if j.FuncTable != nil {
+		f.sp()
+		f.expr(*j.FuncTable)
 	}
 	if len(j.Using) > 0 {
 		f.kw("USING (" + strings.ToLower(strings.Join(j.Using, ", ")) + ")")

@@ -85,7 +85,7 @@ func (p *parser) errf(format string, args ...any) error {
 }
 
 // tableFuncs are the set-returning functions accepted in FROM.
-var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true}
+var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true, "pg_available_extensions": true}
 
 // parseFuncTable parses a FROM-clause table function call, if present.
 func (p *parser) parseFuncTable() (*Expr, bool, error) {
@@ -100,6 +100,9 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 	}
 	p.i += 2
 	e := Expr{Func: t.text}
+	if p.consumeOp(")") {
+		return &e, true, nil
+	}
 	for {
 		a, err := p.parseAddExpr()
 		if err != nil {
@@ -114,6 +117,36 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 		return nil, false, err
 	}
 	return &e, true, nil
+}
+
+// parseFuncTableAlias parses what follows a FROM-clause table function
+// call: [WITH ORDINALITY] [[AS] alias [(column, ...)]]. The alias
+// defaults to the function's name.
+func (p *parser) parseFuncTableAlias(fe *Expr) (string, []string, error) {
+	if p.peekIdentSeq("with", "ordinality") {
+		p.i += 2
+	}
+	alias := p.parseOptTableAlias(false)
+	if alias == "" {
+		alias = fe.Func
+	}
+	var cols []string
+	if p.consumeOp("(") {
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return "", nil, err
+			}
+			cols = append(cols, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return "", nil, err
+		}
+	}
+	return alias, cols, nil
 }
 
 // parseColumnRef parses ident['.' ident] into a ColumnRef.
@@ -1191,7 +1224,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			def.PrimaryKey = true
 			def.NotNull = true
 		case p.consumeKeyword("UNIQUE"):
-			def.Constraints = append(def.Constraints, ConstraintDef{Name: cname, Kind: "unique", Columns: []string{def.Name}})
+			nnd, _, err := p.parseNullsDistinct()
+			if err != nil {
+				return def, err
+			}
+			def.Constraints = append(def.Constraints, ConstraintDef{Name: cname, Kind: "unique", Columns: []string{def.Name}, NullsNotDistinct: nnd})
 		case p.peekKeyword("CHECK"):
 			cd, err := p.parseCheckClause(cname)
 			if err != nil {
@@ -1490,16 +1527,33 @@ func (p *parser) parseColumnList() ([]string, error) {
 	return cols, nil
 }
 
+// parseNullsDistinct parses an optional NULLS [NOT] DISTINCT, reporting
+// whether NOT was written and whether the clause was there at all.
+func (p *parser) parseNullsDistinct() (notDistinct, given bool, err error) {
+	if !p.consumeIdentWord("nulls") {
+		return false, false, nil
+	}
+	notDistinct = p.consumeKeyword("NOT")
+	if !p.consumeIdentWord("distinct") && !p.consumeKeyword("DISTINCT") {
+		return false, false, p.errf("expected DISTINCT after NULLS%s, found %q", map[bool]string{true: " NOT"}[notDistinct], p.peek().text)
+	}
+	return notDistinct, true, nil
+}
+
 // parseTableConstraint parses UNIQUE (cols) | CHECK (expr) | FOREIGN KEY
 // (cols) REFERENCES ... after an optional CONSTRAINT name.
 func (p *parser) parseTableConstraint(name string) (ConstraintDef, error) {
 	switch {
 	case p.consumeKeyword("UNIQUE"):
+		nnd, _, err := p.parseNullsDistinct()
+		if err != nil {
+			return ConstraintDef{}, err
+		}
 		cols, err := p.parseColumnList()
 		if err != nil {
 			return ConstraintDef{}, err
 		}
-		return ConstraintDef{Name: name, Kind: "unique", Columns: cols}, nil
+		return ConstraintDef{Name: name, Kind: "unique", Columns: cols, NullsNotDistinct: nnd}, nil
 	case p.peekKeyword("CHECK"):
 		return p.parseCheckClause(name)
 	case p.consumeKeyword("FOREIGN"):
@@ -2096,6 +2150,9 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
 	}
+	if ci.NullsNotDistinct, ci.NullsClause, err = p.parseNullsDistinct(); err != nil {
+		return nil, err
+	}
 	// WITH (name = value, ...): the access method's storage parameters
 	// (an IVF index's lists). The executor decides which it knows.
 	if p.consumeIdentWord("with") {
@@ -2585,33 +2642,21 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 			derived = true
 		}
-		// FROM [pg_catalog.]unnest(...) [AS] alias [(column)] — a
-		// set-returning function as a one-column table.
-		if fe, ok, err := p.parseFuncTable(); err != nil {
-			return nil, err
-		} else if ok {
-			sel.FuncTable = fe
-			if p.peekIdentSeq("with", "ordinality") {
-				p.i += 2
-			}
-			sel.Alias = p.parseOptTableAlias(false)
-			if sel.Alias == "" {
-				sel.Alias = fe.Func
-			}
-			sel.FuncCol = sel.Alias
-			if p.consumeOp("(") {
-				col, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				sel.FuncCol = col
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-			}
-			return p.finishSelect(sel)
-		}
+		// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
+		// set-returning function as a table, joinable like any other.
+		funcTable := false
 		if !derived {
+			if fe, ok, err := p.parseFuncTable(); err != nil {
+				return nil, err
+			} else if ok {
+				sel.FuncTable = fe
+				if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+					return nil, err
+				}
+				funcTable = true
+			}
+		}
+		if !derived && !funcTable {
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
@@ -2634,41 +2679,17 @@ func (p *parser) parseSelect() (Statement, error) {
 			if len(sel.Joins) >= maxJoinTables-1 {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
 			}
+			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
 			if fe, ok, err := p.parseFuncTable(); err != nil {
 				return nil, err
 			} else if ok {
-				// A table function as a join member.
-				if p.peekIdentSeq("with", "ordinality") {
-					p.i += 2
+				// A table function as a join member, named by its alias
+				// (the function's name by default).
+				jc.FuncTable = fe
+				if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+					return nil, err
 				}
-				jc := JoinClause{Left: left, Cross: cross, FuncTable: fe}
-				jc.Alias = p.parseOptTableAlias(false)
-				if jc.Alias == "" {
-					jc.Alias = fe.Func
-				}
-				if p.consumeOp("(") {
-					for {
-						col, err := p.expectIdent()
-						if err != nil {
-							return nil, err
-						}
-						jc.FuncCols = append(jc.FuncCols, col)
-						if !p.consumeOp(",") {
-							break
-						}
-					}
-					if err := p.expectOp(")"); err != nil {
-						return nil, err
-					}
-				}
-				if !cross {
-					return nil, p.errf("a table function can only be cross-joined")
-				}
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
-			if sub, ok, err := p.parseSubquery(); err != nil {
+			} else if sub, ok, err := p.parseSubquery(); err != nil {
 				return nil, err
 			} else if ok {
 				jc.Derived = sub
@@ -2686,6 +2707,9 @@ func (p *parser) parseSelect() (Statement, error) {
 				jc.Alias = p.parseOptTableAlias(false)
 			}
 			jt := jc.Table
+			if jt == "" {
+				jt = jc.Alias
+			}
 			if cross || jk.natural {
 				sel.Joins = append(sel.Joins, jc)
 				continue
@@ -2792,6 +2816,19 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 			return nil, err
 		}
 		for {
+			if t := p.peek(); t.kind == tkNumber {
+				// GROUP BY n: the column select item n reads.
+				name, err := p.groupByPosition(sel.Exprs, t.text)
+				if err != nil {
+					return nil, err
+				}
+				p.i++
+				sel.GroupBy = append(sel.GroupBy, name)
+				if !p.consumeOp(",") {
+					break
+				}
+				continue
+			}
 			// Possibly qualified: GROUP BY c.name over a join.
 			ref, err := p.parseColumnRef()
 			if err != nil {
@@ -3002,15 +3039,25 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 		var oc OrderCol
 		if t := p.peek(); t.kind == tkNumber {
 			n, err := strconv.Atoi(t.text)
-			if err != nil || n < 1 || (exprsKnown && n > len(exprs)) {
+			star := firstStar(exprs)
+			if err != nil || n < 1 || (exprsKnown && star < 0 && n > len(exprs)) {
 				return nil, p.errf("ORDER BY position %s is not in the select list", t.text)
 			}
 			p.i++
-			if exprsKnown {
-				oc = OrderCol{Column: outputName(exprs[n-1])}
-			} else {
+			switch {
+			case !exprsKnown:
 				oc = OrderCol{Position: n}
+			case star < 0 || n <= star:
+				// The items up to the first * are positions as written.
+				oc = orderByItem(exprs, n-1)
+			case len(exprs) == 1:
+				// SELECT * alone: the position of the relation's
+				// columns, which the executor knows.
+				oc = OrderCol{Position: n}
+			default:
+				return nil, p.errf("ORDER BY position %s is at or after a * among other select items; name the column instead", t.text)
 			}
+			oc.Ordinal = n
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
 		} else if ok {
@@ -3050,6 +3097,79 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 	}
 }
 
+// groupByPosition resolves GROUP BY n to the column select item n
+// reads, by the item and never by its output name (an alias may name
+// another column). Grouping takes columns, so an item that is an
+// expression is refused (a syntax error, as GROUP BY of the expression
+// written out is), and so is an aggregate.
+func (p *parser) groupByPosition(exprs []SelectExpr, text string) (string, error) {
+	n, err := strconv.Atoi(text)
+	if star := firstStar(exprs); err != nil || n < 1 || n > len(exprs) || (star >= 0 && n > star) {
+		return "", p.errf("GROUP BY position %s is not in the select list", text)
+	}
+	se := exprs[n-1]
+	switch {
+	case se.Agg != "" || se.Window != nil:
+		return "", p.errf("GROUP BY position %d is an aggregate; aggregate functions are not allowed in GROUP BY", n)
+	case !isPlainColumn(se.Expr):
+		return "", p.errf("GROUP BY position %d is an expression; GROUP BY takes columns (group by the column and compute the expression in the select list)", n)
+	}
+	return se.Expr.Column, nil
+}
+
+// firstStar is the index of a select list's first * (bare or
+// qualified), -1 when it has none.
+func firstStar(exprs []SelectExpr) int {
+	for i, se := range exprs {
+		if se.Star {
+			return i
+		}
+	}
+	return -1
+}
+
+// orderByItem is ORDER BY i+1 for select item exprs[i]: the item
+// itself, never its output name, which may be generated ("?column?",
+// shared by every unnamed expression) or name an input column as well
+// (SELECT id AS b, b ...). A plain column sorts by that column, an
+// aggregate by the aggregate, an expression by the expression; a window
+// function, which is computed after the sort keys are, by its output
+// name. A column that another item's alias also names is written as an
+// expression, which reads the input column: a bare name would resolve
+// to the alias.
+func orderByItem(exprs []SelectExpr, i int) OrderCol {
+	se := exprs[i]
+	switch {
+	case se.Window != nil:
+		return OrderCol{Column: outputName(se)}
+	case se.Agg != "":
+		c := se
+		c.Alias = ""
+		return OrderCol{Agg: &c}
+	case isPlainColumn(se.Expr) && !aliasedElsewhere(exprs, i, se.Expr.Column):
+		return OrderCol{Column: se.Expr.Column}
+	default:
+		e := se.Expr
+		return OrderCol{Expr: &e}
+	}
+}
+
+// aliasedElsewhere reports whether an item other than exprs[i] has an
+// alias that the column reference col (possibly qualified) would
+// resolve to.
+func aliasedElsewhere(exprs []SelectExpr, i int, col string) bool {
+	bare := col
+	if j := strings.LastIndexByte(bare, '.'); j >= 0 {
+		bare = bare[j+1:]
+	}
+	for k, se := range exprs {
+		if k != i && se.Alias != "" && strings.EqualFold(se.Alias, bare) {
+			return true
+		}
+	}
+	return false
+}
+
 // parseCount parses the count of a LIMIT / OFFSET / FETCH clause: a
 // non-negative integer, or a parameter ($n) resolved at execution (the
 // count is then -1 and param names it).
@@ -3063,7 +3183,9 @@ func (p *parser) parseCount(clause string) (n int64, param int, err error) {
 		}
 		return -1, idx, nil
 	}
-	if t.kind != tkNumber {
+	// LIMIT '10': a quoted count, as a client that interpolates its
+	// parameters into the text (the simple protocol) writes one.
+	if t.kind != tkNumber && t.kind != tkString {
 		return 0, 0, p.errf("expected %s count, found %q", clause, t.text)
 	}
 	v, err := strconv.ParseInt(t.text, 10, 64)
@@ -3109,7 +3231,7 @@ func (p *parser) parseSetOps(sel *Select) error {
 		if err != nil {
 			return err
 		}
-		sel.OrderBy, tail.OrderBy = tail.OrderBy, nil
+		sel.OrderBy, tail.OrderBy = byOutputPosition(tail.OrderBy), nil
 		sel.Limit, tail.Limit = tail.Limit, -1
 		sel.Offset, tail.Offset = tail.Offset, 0
 		sel.LimitParam, tail.LimitParam = tail.LimitParam, 0
@@ -3122,6 +3244,18 @@ func (p *parser) parseSetOps(sel *Select) error {
 		// The tail's own list continues from it; nothing more to parse
 		// here unless it stopped at a parenthesized member's boundary.
 	}
+}
+
+// byOutputPosition rewrites the positions of an ORDER BY written after
+// a set operation's last member, which were resolved against that
+// member's select list, back to positions of the operation's result.
+func byOutputPosition(order []OrderCol) []OrderCol {
+	for i, oc := range order {
+		if oc.Ordinal > 0 {
+			order[i] = OrderCol{Position: oc.Ordinal, Ordinal: oc.Ordinal, Desc: oc.Desc, Nulls: oc.Nulls}
+		}
+	}
+	return order
 }
 
 // parseSetMember parses one member of a set operation: SELECT ...,
@@ -3155,6 +3289,10 @@ func (p *parser) parseSetMember() (*Select, error) {
 		head := stmt.(*Select)
 		if err := p.parseOrderLimit(head, true); err != nil {
 			return nil, err
+		}
+		if head.Union != nil {
+			// The rows of a VALUES list are a set operation's members.
+			head.OrderBy = byOutputPosition(head.OrderBy)
 		}
 		if err := p.parseSetOps(head); err != nil {
 			return nil, err
@@ -3587,6 +3725,16 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
+			// IF NOT EXISTS: a datax extension (PostgreSQL has none here).
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("NOT"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				at.AddConstraintIfNotExists = true
+			}
 			n, err := p.expectIdent()
 			if err != nil {
 				return nil, err
@@ -5432,6 +5580,7 @@ func foldBinOp(lhs Expr, op string, rhs Expr) Expr {
 // session before execution; the rest evaluate per row).
 var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"now": 0, "current_database": 0, "current_schema": 0, "current_timestamp": 0, "localtimestamp": 0, "current_date": 0,
+	"current_time": 0, "localtime": 0,
 	"statement_timestamp": 0, "transaction_timestamp": 0,
 	// The catalog functions psql and ORMs call (evaluated by the session's
 	// catalog splice, see pkg/sql/subquery.go).
@@ -5448,7 +5597,12 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 }
 
 // bareFuncs are called without parentheses (SQL keywords in PostgreSQL).
-var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true, "current_timestamp": true, "current_date": true, "localtimestamp": true}
+var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true,
+	"current_timestamp": true, "current_date": true, "localtimestamp": true, "current_time": true, "localtime": true}
+
+// precisionFuncs are the SQL-standard clock keywords that also take a
+// fractional-seconds precision: current_timestamp(3), localtime(0).
+var precisionFuncs = map[string]bool{"current_timestamp": true, "localtimestamp": true, "current_time": true, "localtime": true}
 
 // parsePrimaryExpr parses one operand: a parenthesized expression, a
 // builtin call, a possibly-qualified column reference (with an optional
@@ -5640,6 +5794,16 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			case registered:
 				if !bi.ArityOK(len(e.Args)) {
 					return e, p.errf("%s() takes %s argument(s), got %d", t.text, bi.ArityText(), len(e.Args))
+				}
+			case precisionFuncs[t.text] && len(e.Args) <= 1:
+				if len(e.Args) == 1 {
+					a := e.Args[0]
+					if a.Lit == nil || a.Lit.Fam != types.Int || a.BinOp != "" {
+						return e, p.errf("%s() takes an integer constant precision", t.text)
+					}
+					if a.Lit.I < 0 {
+						return e, p.errf("%s(%d) precision must not be negative", strings.ToUpper(t.text), a.Lit.I)
+					}
 				}
 			case arity == -1 && len(e.Args) == 0:
 				return e, p.errf("%s() requires at least one argument", t.text)

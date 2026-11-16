@@ -154,6 +154,8 @@ func sessionFuncFamily(name string) types.Family {
 		return types.Timestamp
 	case "current_date":
 		return types.Date
+	case "current_time", "localtime":
+		return types.Time
 	case "nextval", "currval", "lastval", "setval", "unique_rowid", "pg_backend_pid", "to_regtype",
 		destroyTenantKeyFunc, rotateTenantKeyFunc, destroyOldKeyVersionsFunc, removeTenantRowsFunc:
 		return types.Int

@@ -263,19 +263,32 @@ syntax error or `0A000` feature not supported):
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
-  change a primary-key column, and there is no `ON CONFLICT ... DO
-  UPDATE` over exclusion constraints (there are none). `UPSERT INTO`
+  change a primary-key column (a plain `UPDATE` can), and there is no `ON
+  CONFLICT ... DO UPDATE` over exclusion constraints (there are none).
+- **Unique keys are checked at the end of an `UPDATE`**, as the SQL
+  standard (and PostgreSQL for a `DEFERRABLE` constraint) has it:
+  `UPDATE t SET id = id + 1` succeeds where PostgreSQL, checking a
+  non-deferrable key row by row, fails with `23505`. Where a foreign
+  key references its own table with `ON UPDATE CASCADE` or `SET NULL`,
+  an `UPDATE` that changes both a referenced row and a row the cascade
+  rewrites is refused (`0A000`); PostgreSQL cascades after the
+  statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
 - **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
   inside a transaction block.
 - **`ORDER BY`** takes output names, positions and expressions, but an
   expression sort never uses an index; NULLs order last ASC / first DESC
-  (PostgreSQL default). Under `GROUP BY` and `UNION`, output names only.
+  (PostgreSQL default). Under `GROUP BY` and `UNION`, output names and
+  positions only. A position after a `*` that is not the whole select
+  list is refused; `GROUP BY` takes columns and positions of columns,
+  not expressions.
 - **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
-  precision on the wire, nanosecond internally.
-- **`EXPLAIN`** returns one plain-text line, not a plan tree; there is no
-  `EXPLAIN ANALYZE`.
+  precision on the wire, nanosecond internally. `current_time` is a
+  `time` (PostgreSQL's is `timetz`), and `localtimestamp` a
+  `timestamptz` like `current_timestamp`.
+- **`EXPLAIN`** returns one plain-text line, not a plan tree (`EXPLAIN
+  ANALYZE` adds a line per stage), and explains `SELECT` only.
 - **`ANALYZE`** exists but is admin-only (PostgreSQL allows table
   owners), takes no column list or options, and stores row counts +
   distinct estimates only — no histograms, no `pg_statistic`. `SHOW
@@ -376,6 +389,22 @@ are the differences ([reference](sql.md#large-objects)):
   after the GC window — but objects orphaned by deleting the row that
   named them are still yours to unlink, exactly as in PostgreSQL.
 
+## Things datax accepts that PostgreSQL does not
+
+- **`ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS name ...`**: when the
+  table already has a constraint called `name` (its `<table>_pkey`, or a
+  `CHECK`, `UNIQUE` or `FOREIGN KEY` constraint), the statement does
+  nothing and says so in a NOTICE (`constraint "name" for relation "t"
+  already exists, skipping`); otherwise it adds the constraint as `ADD
+  CONSTRAINT` would. Only the name is compared, never the definition: a
+  constraint of that name that checks something else is left as it is.
+  An index made by `CREATE UNIQUE INDEX` is not a constraint, so its name
+  is still refused (`42710`). PostgreSQL has `IF NOT EXISTS` on `ADD
+  COLUMN` and `CREATE INDEX` (both supported here) but not on `ADD
+  CONSTRAINT`; migration tools that want an idempotent constraint can
+  use it, at the price of a schema PostgreSQL will not load.
+- `UPSERT INTO` (CockroachDB syntax), above.
+
 ## Errors you should know
 
 | SQLSTATE | Meaning | What to do |
@@ -424,6 +453,17 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
+- **Which database.** The current one, as in PostgreSQL, where each
+  database has catalogs of its own: `information_schema` (with
+  `table_catalog` the current database's name) and the per-database
+  `pg_catalog` tables (`pg_class`, `pg_attribute`, `pg_type`'s enum
+  types, `pg_sequences`, ...) list its objects only; another
+  database's are reachable by qualified name (`db.t`) but not listed.
+  The shared catalogs — `pg_database`, `pg_roles` / `pg_user`,
+  `pg_auth_members`, `pg_tablespace`, `pg_shdescription` — and
+  `pg_stat_activity` are the cluster's. Before 0.58.0
+  `information_schema.tables`, `.columns`, `.views` and `.schemata`,
+  and `pg_type` / `pg_enum`, listed every database's.
 - **Who may read them.** Every role, as in PostgreSQL: `pg_catalog`
   lists every table of the current database to any reader, and
   `information_schema` the tables the reader holds some privilege on.
@@ -432,10 +472,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   shows them to everyone, and `pg_largeobject_metadata` lists the
   reader's own large objects only.
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
-- **How many tables.** The `pg_catalog` views, `SHOW TABLES` and name
+- **How many tables.** The catalogs, `SHOW TABLES` and name
   resolution cost in proportion to the current database, not to the
-  cluster; `information_schema.tables`, `.columns` and `.views` list
-  every database and read every table descriptor. See [Capacity
+  cluster. See [Capacity
   planning](operations.md#capacity-planning) for what was measured (up
   to 5,000 tables) and what still grows with the table count.
 

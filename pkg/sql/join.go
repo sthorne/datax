@@ -674,7 +674,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				next = append(next, ext)
 				matched++
 				if matchedKeys != nil {
-					matchedKeys[string(ifr.key)] = true
+					matchedKeys[joinRowID(sides[k].desc, ifr)] = true
 				}
 			}
 			if matched == 0 && sides[k].left {
@@ -689,7 +689,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				return nil, err
 			}
 			for _, fr := range all {
-				if matchedKeys[string(fr.key)] {
+				if matchedKeys[joinRowID(sides[k].desc, fr)] {
 					continue
 				}
 				ext := joinedRow{rows: make([]map[catalog.ColumnID]types.Datum, k+1)}
@@ -891,6 +891,8 @@ func innerPathDesc(plan accessPlan) string {
 	switch plan.kind {
 	case planPKPoint:
 		return "point lookup on primary key"
+	case planPKPoints:
+		return plan.String()
 	case planUniquePoint:
 		return fmt.Sprintf("point lookup via unique index %q", plan.idx.Name)
 	case planPKScan:
@@ -1098,4 +1100,25 @@ func expandUsing(sides []joinSide, t *parser.Select) (*parser.Select, error) {
 		return t, nil
 	}
 	return out, nil
+}
+
+// joinRowID identifies a RIGHT or FULL joined side's row, to tell the
+// rows that found a partner from those that did not: its primary key,
+// or, for a row fetched without one (a bound relation — WITH member,
+// joined subquery or table function — or a catalog), its values, which
+// for a relation include the hidden ordinal. Rows equal in every value
+// match alike, so sharing an identity loses nothing.
+func joinRowID(desc *catalog.TableDescriptor, fr fetchedRow) string {
+	if len(fr.key) > 0 {
+		return string(fr.key)
+	}
+	vals := make([]types.Datum, len(desc.Columns))
+	for i, c := range desc.Columns {
+		d, ok := fr.row[c.ID]
+		if !ok {
+			d = types.DNull
+		}
+		vals[i] = d
+	}
+	return "\x00" + encodeGroupKey(vals)
 }

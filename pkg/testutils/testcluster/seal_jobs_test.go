@@ -39,17 +39,26 @@ func startSealJobCluster(t *testing.T, ctx context.Context) *ckCluster {
 }
 
 // sealJob reads a table's seal job record (nil: none), through any node
-// that answers.
+// that answers. It reads in a transaction, as the job runner does: a
+// batch whose node was stopped leaves its lock on the record, which a
+// transaction's read clears once the batch has expired and a plain read
+// only fails on.
 func sealJob(t *testing.T, ctx context.Context, c *ckCluster, id uint64) *catalog.SealJob {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		for _, n := range c.tc.Nodes {
+		for i := range c.tc.Nodes {
+			n := c.tc.Node(i)
 			if n == nil {
 				continue
 			}
 			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			raw, err := n.DB().Get(rctx, keys.SealJobKey(id))
+			var raw []byte
+			err := n.DB().RunTxn(rctx, "test-seal-job", func(ctx context.Context, txn *kvclient.Txn) error {
+				var err error
+				raw, err = txn.Get(ctx, keys.SealJobKey(id))
+				return err
+			})
 			cancel()
 			if err != nil {
 				continue
@@ -245,20 +254,43 @@ func TestSealJobs(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		leader := c.tc.LeaderIndex(1)
+		// Restarted with a SQL listener, so that it serves SQL again; the
+		// connections to it are made anew. Should this subtest fail
+		// before the restart, its cleanup restarts the node, so that the
+		// subtests after it run on a whole cluster.
+		restarted := false
+		restart := func(t *testing.T) {
+			t.Helper()
+			restarted = true
+			pglis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.tc.RestartNodeErr(leader, nil, func(cfg *server.Config) {
+				cfg.CertsDir = c.certsDir
+				c.config(leader, cfg)
+				cfg.PGListener = pglis
+			}); err != nil {
+				t.Fatalf("restarting n%d: %v", leader+1, err)
+			}
+			// The restarted node may still be fetching the cluster key:
+			// use another's key store from here on.
+			alive = (leader + 1) % 3
+			ks = c.keyStore(alive)
+			conns[leader] = sealedConn(outer, ctx, c, leader, nil)
+			if leader == 0 {
+				conn = sealedConn(outer, ctx, c, 0, &notices)
+				conns[0] = conn
+			}
+		}
+		t.Cleanup(func() {
+			if !restarted {
+				restart(t)
+			}
+		})
 		c.tc.StopNode(leader)
 		before := sealJob(t, ctx, c, d.ID)
-		// Restarted with a SQL listener, so that it serves SQL again.
-		pglis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.tc.RestartNodeErr(leader, nil, func(cfg *server.Config) {
-			cfg.CertsDir = c.certsDir
-			c.config(leader, cfg)
-			cfg.PGListener = pglis
-		}); err != nil {
-			t.Fatalf("restarting n%d: %v", leader+1, err)
-		}
+		restart(t)
 		waitSealJobDone(t, ctx, c, d.ID)
 		if got := valueVersions(t, ctx, c, d.ID); got[2] != 400 || len(got) != 1 {
 			t.Fatalf("after the restart: %v", got)
@@ -269,14 +301,43 @@ func TestSealJobs(t *testing.T) {
 		t.Logf("cut short at %d rows rewritten (pass %d); finished after the restart of n%d", before.Rewritten, before.Pass, leader+1)
 		other := conns[(leader+1)%3]
 		sameStrings(t, "rows", queryStrings(t, ctx, other, `SELECT count(*), max(body) FROM big`), "400|SEKRIT-99")
-		// The restarted node may still be fetching the cluster key: use
-		// another's key store from here on.
-		alive = (leader + 1) % 3
-		ks = c.keyStore(alive)
-		conns[leader] = sealedConn(outer, ctx, c, leader, nil)
-		if leader == 0 {
-			conn = sealedConn(outer, ctx, c, 0, &notices)
-			conns[0] = conn
+	})
+
+	// A batch whose node stops mid-transaction leaves its lock on the
+	// job's record (the restart above stops the node gracefully, which
+	// mostly lets the batch roll back). The runner reads the record in a
+	// transaction, which clears the lock once the batch has expired; it
+	// read it plainly before, failed on the lock every turn, and the job
+	// stood still until another transaction came to read the record.
+	t.Run("a lock left by a stopped batch does not hold the job up", func(t *testing.T) {
+		sealExec(t, ctx, conn, `CREATE TABLE stuck (id INT8 PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto')`)
+		var rows []string
+		for i := 1; i <= 100; i++ {
+			rows = append(rows, fmt.Sprintf(`(%d, 'SEKRIT-%d')`, i, i))
+		}
+		insertRows(t, ctx, conn, "stuck", rows)
+		d := tableDesc(t, ctx, c, "stuck")
+		sealExec(t, ctx, conn, `ALTER TABLE stuck ROTATE ENCRYPTION KEY`)
+		db := c.node(t, alive).DB()
+		batch := db.NewTxn("test-stopped-batch")
+		if _, err := batch.GetForUpdate(ctx, keys.SealJobKey(d.ID)); err != nil {
+			t.Fatal(err)
+		}
+		batch.AbandonForTesting()
+		// Plain reads, which do not clear the lock themselves.
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			raw, err := db.Get(ctx, keys.SealJobKey(d.ID))
+			if err == nil && raw == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the job is not done a minute after its record was left locked: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := valueVersions(t, ctx, c, d.ID); got[2] != 100 || len(got) != 1 {
+			t.Fatalf("after the job: %v", got)
 		}
 	})
 
@@ -523,19 +584,25 @@ func TestSealJobs(t *testing.T) {
 		if raceEnabled {
 			tenants = 2000
 		}
+		// 25 to a transaction: eight of them at once contend on the keys
+		// table's ranges, and a restart of a short one loses little. With
+		// 100 to a transaction, after the subtests above, making them
+		// under the race detector took minutes of restarts, long enough
+		// for a purge of the keys' history to refuse one past its retries.
+		const per = 25
 		start := time.Now()
-		db := c.tc.Nodes[alive].DB()
+		db := c.node(t, alive).DB()
 		var wg sync.WaitGroup
-		errs := make(chan error, tenants/100)
+		errs := make(chan error, tenants/per)
 		sem := make(chan struct{}, 8)
-		for at := 0; at < tenants; at += 100 {
+		for at := 0; at < tenants; at += per {
 			wg.Add(1)
 			go func(at int) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				errs <- db.RunTxn(ctx, "test-tenant-keys", func(ctx context.Context, txn *kvclient.Txn) error {
-					for i := at; i < at+100; i++ {
+					for i := at; i < at+per; i++ {
 						name := rowseal.TenantKeyName(999999, []byte(hex.EncodeToString([]byte(strconv.Itoa(i)))))
 						if _, err := ks.CreateIn(ctx, txn, keystore.KindTenant, name); err != nil {
 							return err

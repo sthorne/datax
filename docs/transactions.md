@@ -127,8 +127,22 @@ still equals `readTS`. Events that force the write timestamp above
 - `WriteTooOld`: a committed version exists above our write timestamp,
 - an uncertainty restart.
 
-The coordinator tracks every span the transaction has read (up to a cap;
-beyond it refresh is disabled). On any of the conflicts above it attempts a
+The coordinator tracks every span the transaction has read. Past 512
+spans it **condenses** them (issue #322): the spans recorded so far are
+merged with the earlier condensed ones into at most 64 spans covering
+every key read — closing first the gaps between keys that share the
+longest prefix, so a merged span stays within the keyspace its reads
+were in (one table's rows, the descriptors) instead of reaching across
+one others write all the time (the descriptor leases). A condensed span
+can only make a refresh fail that would have passed, never pass one
+that should fail. Before, the transaction gave its read set up there,
+and every later push of its timestamp was a restart: `DROP DATABASE` of
+a database of a few hundred tables, which reads each table's name and
+descriptor, failed every attempt whose commit came after the
+closed-timestamp lag (3 s) — the commit is pushed above the closed
+timestamp — and an implicit statement gave up after 21 attempts with
+`40001` ("write timestamp diverged from read timestamp"). On any of the
+conflicts above the coordinator attempts a
 **read refresh**: for each read span it sends a `Refresh` request verifying
 no other transaction wrote into the span within `(readTS, newTS]` — any
 committed version there, or any foreign intent (which could commit inside
@@ -303,12 +317,16 @@ statements of the transaction are never touched: a row the transaction
 really read keeps its protection even if a later `SKIP LOCKED` passes
 it over. What is given up is exactly what the clause gives up in
 PostgreSQL — the result is not a serializable read of the skipped rows.
-Two limits: an index scan's entries for skipped rows stay in the read
-set (the fetch forgets primary keys), so a queue ordered by a secondary
-index can still fail a refresh when a skipped row's entry is deleted;
-and a statement that skips more keys than the read set holds spans for
-(512) loses refresh for the transaction, as overflowing it with plain
-reads does.
+An index scan joined to the primary key forgets the entry of each row
+the join passed over as well (issue #322): the row's holder typically
+moves or deletes that entry (a queue's `state` changes), and left in the
+read set it failed the skipper's refresh just the same. Two limits: a
+row the fetch returned but the lock step then refused leaves only its
+primary key, not its index entry (it was free when the fetch read it,
+so this takes a race), and neither does an inverted scan's; and a
+statement that skips more keys than the read set holds spans for (512)
+loses refresh for the transaction: the spans a skipping statement splits
+are not condensed, unlike plain reads past the limit, which are.
 
 **LIMIT.** Plain `FOR UPDATE` locks what the fetch returned, and the
 fetch stops at the limit only when the access path delivers the order —
@@ -316,8 +334,13 @@ with an in-memory sort it locks every matching row and then cuts.
 `SKIP LOCKED` sorts first when it must, then locks candidates in order,
 only as many as are still wanted, and stops when the limit is met: a row
 locked and then cut would be hidden from every other skipping reader for
-nothing. If a limit-bounded fetch comes back full and the lock step
-still leaves the limit unmet (rows taken between fetch and lock), the
+nothing. The fetch's own limit counts only rows it returns: an index
+join passes over the rows behind entries it scanned, so under `SKIP
+LOCKED` its scan continues past its last entry, in pages growing
+fourfold up to 256, until the limit is met or the span ends (issue
+#322: the skipped row used to consume the limit, and a short fetch read
+as the end of the table). If a limit-bounded fetch comes back full and
+the lock step still leaves the limit unmet (rows taken between fetch and lock), the
 fetch is repeated at four times the size, unbounded after three rounds;
 rows fetched beyond the limit in an ordered scan are forgotten like
 skipped ones, since a fetch that could stop exactly at the limit would

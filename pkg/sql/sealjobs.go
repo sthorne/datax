@@ -509,7 +509,14 @@ func (s *Session) SealJobStep(ctx context.Context, id uint64, batch int, now fun
 		batch = 100
 	}
 	var res SealJobStepResult
-	raw, err := s.db.Get(ctx, keys.SealJobKey(id))
+	// In a transaction, which pushes a lock left on the record by a batch
+	// whose node stopped (RunSealJobsOnce).
+	var raw []byte
+	err := s.db.RunTxn(ctx, "seal-job-read", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		raw, err = txn.Get(ctx, keys.SealJobKey(id))
+		return err
+	})
 	if err != nil {
 		return res, err
 	}

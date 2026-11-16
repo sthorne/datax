@@ -53,22 +53,23 @@ const (
 // and the session's identity.
 type Env struct {
 	Databases []*catalog.DatabaseDescriptor
-	// Tables holds the tables the catalog lists (every one for
-	// pg_catalog, those the reader holds a privilege on for
-	// information_schema): those of its current database, or of every
-	// database for a table that lists them all
-	// (Table.AllDatabases). A generator that ranges over Tables directly
-	// rather than through currentTables must be one of the latter.
+	// Tables holds the tables of the current database the catalog lists
+	// (every one for pg_catalog, those the reader holds a privilege on
+	// for information_schema). Every virtual table describes the current
+	// database only, as PostgreSQL's catalogs do (issue #322), so its Env
+	// is built from that database alone and reading it costs the same
+	// however many tables the rest of the cluster holds (issue #311).
+	// Generators read it through currentTables.
 	Tables []*catalog.TableDescriptor
 	// ReadTable resolves a table that Tables does not hold — the
 	// referenced table of a foreign key into another database — as the
-	// session may see it (nil when it may not, or there is none). Nil
-	// when Tables already holds every database's.
+	// session may see it (nil when it may not, or there is none).
 	ReadTable func(id uint64) *catalog.TableDescriptor
-	// Sequences holds every sequence, in every database.
+	// Sequences holds the sequences, Types the user-defined types (enums)
+	// of the current database (generators read them through
+	// currentSequences and currentTypes).
 	Sequences []*catalog.SequenceDescriptor
-	// Types holds every user-defined type (enum), in every database.
-	Types []*catalog.TypeDescriptor
+	Types     []*catalog.TypeDescriptor
 	// SequenceValue reads a sequence's last value (called reports whether
 	// nextval has run); nil when the caller cannot read counters.
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)
@@ -207,21 +208,6 @@ type Table struct {
 	Columns []catalog.Column
 	Rows    func(ctx context.Context, env *Env) ([]Row, error)
 }
-
-// allDatabaseTables are the virtual tables that list the tables of
-// every database rather than the session's current one.
-var allDatabaseTables = map[string]bool{
-	InformationSchema + ".tables":  true,
-	InformationSchema + ".views":   true,
-	InformationSchema + ".columns": true,
-}
-
-// AllDatabases reports whether the table's rows describe the tables of
-// every database. Every other virtual table renders the current
-// database's, so its Env is built from that database alone and reading
-// it costs the same however many tables the rest of the cluster holds
-// (issue #311).
-func (t *Table) AllDatabases() bool { return allDatabaseTables[t.Schema+"."+t.Name] }
 
 // Descriptor renders the table as a catalog descriptor the planner and
 // executor understand: a table with a primary key on a hidden ordinal
@@ -657,7 +643,11 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 		// and lists is the storage parameter.
 		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", idx.Name, d.Name, v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "))
+	nulls := ""
+	if idx.Unique && idx.NullsNotDistinct {
+		nulls = " NULLS NOT DISTINCT"
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "), nulls)
 }
 
 // Access method OIDs, as PostgreSQL numbers them.
@@ -704,7 +694,16 @@ func UniqueDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string 
 	for _, id := range idx.ColumnIDs {
 		cols = append(cols, columnName(d, id))
 	}
-	return "UNIQUE (" + strings.Join(cols, ", ") + ")"
+	return uniqueKeyword(idx) + " (" + strings.Join(cols, ", ") + ")"
+}
+
+// uniqueKeyword is UNIQUE, with PostgreSQL's NULLS NOT DISTINCT when the
+// index was declared so.
+func uniqueKeyword(idx *catalog.IndexDescriptor) string {
+	if idx != nil && idx.NullsNotDistinct {
+		return "UNIQUE NULLS NOT DISTINCT"
+	}
+	return "UNIQUE"
 }
 
 // ConstraintOID is a constraint's pg_constraint OID (a bit above the
@@ -728,7 +727,8 @@ func ConstraintDef(d *catalog.TableDescriptor, c *catalog.Constraint, byID func(
 	case catalog.ConstraintCheck:
 		return "CHECK (" + c.Expr + ")"
 	case catalog.ConstraintUnique:
-		return "UNIQUE (" + names(d, c.Columns) + ")"
+		idx, _ := d.IndexByID(c.IndexID)
+		return uniqueKeyword(idx) + " (" + names(d, c.Columns) + ")"
 	case catalog.ConstraintForeign:
 		ref := d
 		if c.RefTable != d.ID {
@@ -835,7 +835,11 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		for _, id := range idx.ColumnIDs {
 			cols = append(cols, columnName(d, id))
 		}
-		items = append(items, fmt.Sprintf("%sINDEX %s (%s)", unique, idx.Name, strings.Join(cols, ", ")))
+		nulls := ""
+		if idx.Unique && idx.NullsNotDistinct {
+			nulls = " NULLS NOT DISTINCT"
+		}
+		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s", unique, idx.Name, strings.Join(cols, ", "), nulls))
 	}
 	for i := range d.Constraints {
 		c := &d.Constraints[i]

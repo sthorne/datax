@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -662,7 +663,7 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 			return nil, err
 		}
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	res := &Result{Tag: "ALTER TABLE", Columns: splitColumns()}
 	for _, tuple := range t.SplitAt {
 		key, err := splitKey(desc, "SPLIT AT", tuple, params)
 		if err != nil {
@@ -702,7 +703,7 @@ func (s *Session) execUnsplit(ctx context.Context, t *parser.AlterTable, params 
 	if !s.db.StickyBitsOK() {
 		return nil, newErrf(CodeFeatureNotSupported, "UNSPLIT needs cluster version %s (finalize the upgrade first)", version.V20)
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	res := &Result{Tag: "ALTER TABLE", Columns: splitColumns()}
 	var unsplit []keys.Key
 	if t.UnsplitAll {
 		// Every range that starts strictly inside the table's primary
@@ -1696,6 +1697,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		noteIndexRows(desc, desc.LivePrimaryIndex(), len(rows))
 		return rows, err
 
+	case planPKPoints:
+		return s.fetchPKPoints(ctx, txn, desc, plan, where, params, limit)
+
 	case planUniquePoint:
 		key, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
@@ -1742,76 +1746,121 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		// Index entries are 1:1 with rows, so with no residual filter every
 		// scanned entry yields a result row: the limit pushes into the scan.
+		// Under SKIP LOCKED it does not quite: the lock is on the primary
+		// row, not on the entry, so the join passes over the row behind an
+		// entry it scanned (issue #322). The scan then goes on past its
+		// last entry for the rows still wanted, until the limit is met or
+		// the span runs out — the limit counts rows returned, and a short
+		// result means there was no more to return (fetchSkipLocked
+		// relies on that to stop).
 		var scanLimit int64
 		if len(plan.residual) == 0 {
 			scanLimit = limit
 		}
+		skip := kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip
 		noteIndexScan(desc, plan.idx.ID)
 		mark := txn.ReadMark()
-		kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
-		if err != nil {
-			return nil, err
-		}
-		metrics.SQLRowsScanned.Add(float64(len(kvs)))
-		s.AddScanned(int64(len(kvs)))
-		noteIndexRows(desc, plan.idx.ID, len(kvs))
-		// The primary rows behind the entries come back in pages of
-		// primaryFetchPage, each page one routed batch, in the index's
-		// order (issue #103): a lookup matching 1,000 entries is four
-		// round trips instead of 1,000.
-		pks := make([]keys.Key, len(kvs))
-		for i, kv := range kvs {
-			pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
+		var (
+			out              []fetchedRow
+			passed           []keys.Key // entries of rows passed over as locked
+			fetched, batches int
+			met              bool
+		)
+		lo, hi := start, end
+		for {
+			kvs, err := spanScan(ctx, txn, lo, hi, scanLimit, plan.reverse)
 			if err != nil {
-				return nil, newErrf(CodeInternal, "%v", err)
+				return nil, err
 			}
-			pks[i] = pk
-		}
-		var out []fetchedRow
-		batches := 0
-		err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
-			batches++
-			for i, raw := range raws {
-				pk := pks[first+i]
-				if raw == nil {
-					if kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip {
-						continue // locked by another transaction: passed over
-					}
-					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
-				}
-				row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+			metrics.SQLRowsScanned.Add(float64(len(kvs)))
+			s.AddScanned(int64(len(kvs)))
+			noteIndexRows(desc, plan.idx.ID, len(kvs))
+			// The primary rows behind the entries come back in pages of
+			// primaryFetchPage, each page one routed batch, in the index's
+			// order (issue #103): a lookup matching 1,000 entries is four
+			// round trips instead of 1,000.
+			pks := make([]keys.Key, len(kvs))
+			for i, kv := range kvs {
+				pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
 				if err != nil {
-					return false, err
+					return nil, newErrf(CodeInternal, "%v", err)
 				}
-				match, err := matchesWhere(where, desc, row, params)
-				if err != nil {
-					return false, err
-				}
-				if !match {
-					continue
-				}
-				if err := s.chargeRow(row); err != nil {
-					return false, err
-				}
-				out = append(out, fetchedRow{key: pk, row: row})
-				if limit > 0 && int64(len(out)) == limit {
-					// The entries after this one, and the primary rows
-					// of this page behind them, cannot change the
-					// result (see forgetScanTail).
-					if at := first + i; at+1 < len(kvs) {
-						forgetScanTail(txn, mark, start, end, kvs[at].Key, plan.reverse)
-						txn.ForgetReads(mark, pks[at+1:first+len(raws)])
-					}
-					return false, nil
-				}
+				pks[i] = pk
 			}
-			return true, nil
-		})
-		if err != nil {
-			return nil, err
+			fetched += len(pks)
+			err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+				batches++
+				for i, raw := range raws {
+					pk := pks[first+i]
+					if raw == nil {
+						if skip {
+							// Locked by another transaction: passed over.
+							passed = append(passed, kvs[first+i].Key)
+							continue
+						}
+						return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
+					}
+					row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+					if err != nil {
+						return false, err
+					}
+					match, err := matchesWhere(where, desc, row, params)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						continue
+					}
+					if err := s.chargeRow(row); err != nil {
+						return false, err
+					}
+					out = append(out, fetchedRow{key: pk, row: row})
+					if limit > 0 && int64(len(out)) == limit {
+						// The entries after this one, and the primary rows
+						// of this page behind them, cannot change the
+						// result (see forgetScanTail).
+						met = true
+						if at := first + i; at+1 < len(kvs) {
+							forgetScanTail(txn, mark, start, end, kvs[at].Key, plan.reverse)
+							txn.ForgetReads(mark, pks[at+1:first+len(raws)])
+						}
+						return false, nil
+					}
+				}
+				return true, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if met || !skip || scanLimit == 0 || int64(len(kvs)) < scanLimit {
+				break
+			}
+			// A full page, short of the limit by the rows passed over:
+			// the next page starts past its last entry, sized for the
+			// rows still wanted, and grows while rows keep being passed
+			// over so a long locked run costs few round trips.
+			last := kvs[len(kvs)-1].Key
+			if plan.reverse {
+				hi = last
+			} else {
+				lo = last.Next()
+			}
+			want := limit - int64(len(out))
+			if scanLimit *= skipLockedGrowth; scanLimit < want {
+				scanLimit = want
+			}
+			if scanLimit > primaryFetchPage {
+				scanLimit = max(want, primaryFetchPage)
+			}
 		}
-		if s.explain != nil && len(pks) > 0 {
-			s.note("index join: %d primary rows fetched in %d batches of up to %d", len(pks), batches, primaryFetchPage)
+		// A row passed over is no part of the result, and the transaction
+		// holding it is likely to change it, moving or deleting this
+		// entry: its entry leaves the read set as the row itself did
+		// (see Txn.ForgetReads), or that change would fail this
+		// transaction's next refresh over a row it never returned.
+		txn.ForgetReads(mark, passed)
+		if s.explain != nil && fetched > 0 {
+			s.note("index join: %d primary rows fetched in %d batches of up to %d", fetched, batches, primaryFetchPage)
 		}
 		return out, nil
 
@@ -1858,6 +1907,71 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 
 	start, end := rowenc.PrimarySpanFor(desc)
 	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+}
+
+// fetchPKPoints runs a planPKPoints plan: the rows at its primary keys,
+// looked up in key order (descending for a reverse plan) in pages of
+// primaryFetchPage, filtered by the WHERE clause, up to limit. A key
+// with no row — or, under SKIP LOCKED, a row another transaction holds
+// — yields nothing. Once the limit is met the keys after the last row
+// kept leave the read set, as the tail of a limited scan does.
+func (s *Session) fetchPKPoints(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if len(plan.pkPoints) == 0 {
+		return nil, nil
+	}
+	pks := make([]keys.Key, 0, len(plan.pkPoints))
+	for _, vals := range plan.pkPoints {
+		key, err := rowenc.EncodePK(desc, vals)
+		if err != nil {
+			return nil, err
+		}
+		pks = append(pks, key)
+	}
+	slices.SortFunc(pks, func(a, b keys.Key) int {
+		if plan.reverse {
+			return bytes.Compare(b, a)
+		}
+		return bytes.Compare(a, b)
+	})
+	pks = slices.CompactFunc(pks, func(a, b keys.Key) bool { return a.Equal(b) })
+	noteIndexScan(desc, desc.LivePrimaryIndex())
+	mark := txn.ReadMark()
+	var out []fetchedRow
+	err := fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+		for i, raw := range raws {
+			if raw == nil {
+				continue // no such row, or one passed over as locked
+			}
+			pk := pks[first+i]
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+			if err != nil {
+				return false, err
+			}
+			match, err := matchesWhere(where, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if !match {
+				continue
+			}
+			if err := s.chargeRow(row); err != nil {
+				return false, err
+			}
+			out = append(out, fetchedRow{key: pk, row: row})
+			if limit > 0 && int64(len(out)) == limit {
+				txn.ForgetReads(mark, pks[first+i+1:first+len(raws)])
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	metrics.SQLRowsScanned.Add(float64(len(out)))
+	s.AddScanned(int64(len(out)))
+	noteIndexRows(desc, desc.LivePrimaryIndex(), len(out))
+	return out, nil
 }
 
 // spanScan runs one KV scan in the plan's direction.
@@ -2064,7 +2178,7 @@ func (s *Session) cachePlan(stmt parser.Statement, desc *catalog.TableDescriptor
 // re-shard's shadow key when there is one, each sealed for its own key
 // when the table is sealed (pkg/sql/rowseal). Every write of a row value
 // goes through here.
-func putRowValue(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, wb *kvclient.WriteBatch, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
+func putRowValue(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, wb batchWriter, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
 	value, err := rowenc.EncodeValue(desc, row)
 	if err != nil {
 		return err
@@ -2183,6 +2297,10 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			return nil, err
 		}
 	}
+	// A single table's columns are addressed by bare name from here on,
+	// whatever the select's shape (grouped, windowed, plain): t.c and
+	// alias.c become c.
+	stripTableAlias(t)
 	if hasWindows(t.Exprs) {
 		return s.execWindowed(ctx, txn, t, params)
 	}
@@ -2566,15 +2684,20 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
 		return nil, err
 	}
+	pkSet := false // the statement sets a primary-key column: rows may move
 	for _, set := range t.Set {
 		col, ok := desc.Col(set.Column)
 		if !ok {
 			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", set.Column)
 		}
 		if desc.IsPKCol(col.ID) {
-			return nil, newErrf(CodeFeatureNotSupported, "updating primary key column %q is not supported", set.Column)
+			if col.Hidden {
+				return nil, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", set.Column)
+			}
+			pkSet = true
 		}
 	}
+
 	var planKeyStmt parser.Statement
 	if t == orig {
 		planKeyStmt = t
@@ -2624,7 +2747,6 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	}
 	res := &Result{}
 	var wb kvclient.WriteBatch
-	seen := map[string]bool{}
 	defaults, err := s.prepareDefaults(ctx, txn, desc, params)
 	if err != nil {
 		return nil, err
@@ -2673,10 +2795,35 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			fr.row[col.ID] = d
 		}
 	}
+	// The rows' keys after the update: a row whose primary key changes
+	// moves (update_pk.go).
+	oldKeys := make([]keys.Key, len(rows))
+	newKeys := make([]keys.Key, len(rows))
+	newRows := make([]map[catalog.ColumnID]types.Datum, len(rows))
+	for i, fr := range rows {
+		oldKeys[i], newKeys[i], newRows[i] = fr.key, fr.key, fr.row
+		if !pkSet {
+			continue
+		}
+		for _, id := range desc.PrimaryKey {
+			if col, _ := desc.ColByID(id); rowVal(fr.row, id).Null {
+				return nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+			}
+		}
+		if _, err := withShardBucket(desc, fr.row); err != nil {
+			return nil, newErrf(CodeInternal, "shard bucket: %v", err)
+		}
+		if newKeys[i], err = pkKey(desc, fr.row); err != nil {
+			return nil, err
+		}
+	}
 	var ps *probeSet
 	if len(rows) > 1 {
 		var probeKeys []keys.Key
 		for i, fr := range rows {
+			if !newKeys[i].Equal(oldKeys[i]) {
+				probeKeys = append(probeKeys, newKeys[i])
+			}
 			probeKeys = appendMovedUniqueIndexKeys(probeKeys, desc, oldRows[i], fr.row)
 			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, oldRows[i], fr.row)
 		}
@@ -2687,20 +2834,45 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			guard.setProbe(ps)
 		}
 	}
-	for i, fr := range rows {
-		oldRow := oldRows[i]
+	// The policy check comes before any probe of the table: a row the
+	// role may not write is refused as such, whether or not its new key
+	// is taken.
+	for _, fr := range rows {
 		if err := rowSec.checkUpdate(fr.row); err != nil {
 			return nil, err
 		}
+	}
+	// The statement's unique keys are checked together, so a row may
+	// take a key another row of the statement gives up.
+	if err := checkUpdateKeys(ctx, txn, desc, oldRows, newRows, oldKeys, newKeys, ps); err != nil {
+		return nil, err
+	}
+	writes := newUpdateWrites()
+	for i, fr := range rows {
+		oldRow := oldRows[i]
 		if err := guard.checkUpdate(ctx, txn, oldRow, fr.row, &wb); err != nil {
 			return nil, err
 		}
-		// PK updates are unsupported, so a re-shard's shadow key is stable.
-		if err := putRowValue(ctx, s.rowSealer(), desc, &wb, fr.key, fr.row); err != nil {
-			return nil, err
-		}
-		if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, &wb, seen, ps); err != nil {
-			return nil, err
+		if newKeys[i].Equal(fr.key) {
+			if err := putRowValue(ctx, s.rowSealer(), desc, writes, fr.key, fr.row); err != nil {
+				return nil, err
+			}
+			if err := updateIndexEntries(ctx, txn, desc, oldRow, fr.row, writes, nil, ps); err != nil {
+				return nil, err
+			}
+		} else {
+			// The row moves: its old version and entries go (a re-shard's
+			// shadow copy too), the new one is written at its new key —
+			// sealed for that key on a sealed table.
+			if err := deleteRow(desc, fetchedRow{key: fr.key, row: oldRow}, writes); err != nil {
+				return nil, err
+			}
+			if err := putRowValue(ctx, s.rowSealer(), desc, writes, newKeys[i], fr.row); err != nil {
+				return nil, err
+			}
+			if err := addIndexEntries(ctx, txn, desc, fr.row, writes, nil, ps); err != nil {
+				return nil, err
+			}
 		}
 		if ret != nil {
 			out, err := ret.project(desc, fr.row, params)
@@ -2710,6 +2882,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			res.Rows = append(res.Rows, out)
 		}
 	}
+	if err := guard.cascadeOverlap(desc, oldKeys, newKeys); err != nil {
+		return nil, err
+	}
+	writes.flush(&wb)
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
@@ -3021,6 +3197,19 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 // execExplain describes the access plan of a SELECT without executing it.
 func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.Explain, params []types.Datum) (*Result, error) {
 	sel, ok := t.Stmt.(*parser.Select)
+	if ok && sel.Table == "" && sel.Derived == nil && sel.FuncTable == nil && sel.Union == nil && len(sel.Joins) == 0 && len(sel.With) == 0 {
+		// SELECT without FROM (SELECT $1::text, SELECT now()): one row
+		// computed from its expressions, no table read. ANALYZE runs it
+		// with the bound parameters.
+		if t.Analyze {
+			return s.execExplainAnalyze(ctx, txn, sel, params)
+		}
+		return &Result{
+			Columns: []ResultColumn{{Name: "plan", Type: types.String}},
+			Rows:    [][]types.Datum{{types.NewString("result: one row computed without reading a table")}},
+			Tag:     "EXPLAIN",
+		}, nil
+	}
 	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
 	}
@@ -3052,6 +3241,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		defer restore()
 		sel = bound
 	}
+	// The plan reads a single table's columns by bare name, as
+	// execution does.
+	stripTableAlias(sel)
 	windowed := ""
 	if hasWindows(sel.Exprs) {
 		wp, err := windowPlanFor(sel)
@@ -3214,7 +3406,7 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 		return nil, err
 	}
 	denied := catalog.SchemaUsageDenied([]*catalog.DatabaseDescriptor{db}, set)
-	res := &Result{Columns: []ResultColumn{{Name: "table_name", Type: types.String}}}
+	res := &Result{Columns: showTablesColumns()}
 	for _, d := range descs {
 		if d.IsView() {
 			continue // SHOW VIEWS
@@ -3246,68 +3438,54 @@ func stripTableAlias(t *parser.Select) {
 	if t.Alias != "" {
 		prefixes[t.Alias+"."] = true
 	}
-	strip := func(name string) string {
+	// strip rewrites a name in place only when it changes: a statement
+	// already stripped (a prepared one, run again) is only read.
+	strip := func(name *string) {
 		for pre := range prefixes {
-			if strings.HasPrefix(name, pre) && !strings.Contains(name[len(pre):], ".") {
-				return name[len(pre):]
+			if strings.HasPrefix(*name, pre) && !strings.Contains((*name)[len(pre):], ".") {
+				*name = (*name)[len(pre):]
+				return
 			}
 		}
-		return name
 	}
-	var walk func(e *parser.Expr)
-	walk = func(e *parser.Expr) {
-		if e == nil {
-			return
-		}
-		if e.Column != "" {
-			e.Column = strip(e.Column)
-		}
-		walk(e.Left)
-		walk(e.Right)
-		for i := range e.Args {
-			walk(&e.Args[i])
-		}
-		if e.Case != nil {
-			walk(e.Case.Operand)
-			for i := range e.Case.Whens {
-				walk(e.Case.Whens[i].Value)
-				walk(&e.Case.Whens[i].Result)
-				stripConds(e.Case.Whens[i].Cond, strip, walk)
+	// Every expression position of this select (select list, aggregate
+	// arguments and filters, WHERE, HAVING, ORDER BY, windows); not its
+	// subqueries, whose qualified names may be correlated references
+	// to this very alias, nor its WITH members or set members.
+	self := *t
+	self.With, self.Union, self.Derived = nil, nil, nil
+	w := parser.Walker{
+		OnSelect: func(s *parser.Select) bool { return s == &self },
+		OnExpr: func(e *parser.Expr) bool {
+			if e.Column != "" {
+				strip(&e.Column)
 			}
-			walk(e.Case.Else)
-		}
-		if e.Cmp != nil {
-			c := *e.Cmp
-			stripConds([]parser.Comparison{c}, strip, walk)
-			e.Cmp = &c
-		}
+			return true
+		},
+		OnCond: func(c *parser.Comparison) bool {
+			if c.Column != "" {
+				strip(&c.Column)
+			}
+			return true
+		},
+		OnSelectExpr: func(se *parser.SelectExpr) {
+			if se.AggCol != "" {
+				strip(&se.AggCol)
+			}
+		},
+		OnOrderCol: func(oc *parser.OrderCol) {
+			if oc.Column != "" {
+				strip(&oc.Column)
+			}
+		},
 	}
-	for i := range t.Exprs {
-		walk(&t.Exprs[i].Expr)
-	}
-	stripConds(t.Where, strip, walk)
-	for i := range t.OrderBy {
-		t.OrderBy[i].Column = strip(t.OrderBy[i].Column)
-		walk(t.OrderBy[i].Expr)
-	}
+	w.SelectStmt(&self)
 	for i := range t.GroupBy {
-		t.GroupBy[i] = strip(t.GroupBy[i])
+		strip(&t.GroupBy[i])
 	}
-}
-
-func stripConds(conds []parser.Comparison, strip func(string) string, walk func(*parser.Expr)) {
-	for i := range conds {
-		c := &conds[i]
-		if c.Column != "" {
-			c.Column = strip(c.Column)
-		}
-		walk(c.Expr)
-		walk(&c.Value)
-		for j := range c.Values {
-			walk(&c.Values[j])
-		}
-		for j := range c.Or {
-			stripConds(c.Or[j], strip, walk)
+	for i := range t.Having {
+		if t.Having[i].Column != "" {
+			strip(&t.Having[i].Column)
 		}
 	}
 }
@@ -3435,12 +3613,8 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 // CREATE TABLE / USERS / GRANTS / ALL).
 func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Show) (*Result, error) {
 	str := types.NewString
-	res := &Result{Tag: "SHOW"}
-	cols := func(names ...string) {
-		for _, n := range names {
-			res.Columns = append(res.Columns, ResultColumn{Name: n, Type: types.String})
-		}
-	}
+	// The shape is showColumns', which Describe reports too.
+	res := &Result{Tag: "SHOW", Columns: showColumns(t)}
 	switch t.Kind {
 	case "columns":
 		desc, err := s.lookup(ctx, txn, t.Table)
@@ -3450,8 +3624,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
 		}
-		cols("column_name", "data_type", "is_nullable", "column_default", "indices")
-		res.Columns[2].Type = types.Bool
 		for i := range desc.Columns {
 			c := &desc.Columns[i]
 			if c.Hidden {
@@ -3482,8 +3654,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
 		}
-		cols("table_name", "index_name", "non_unique", "seq_in_index", "column_name")
-		res.Columns[2].Type, res.Columns[3].Type = types.Bool, types.Int
 		seq := int64(0)
 		for _, id := range desc.PrimaryKey {
 			if c, ok := desc.ColByID(id); ok && !c.Hidden {
@@ -3507,7 +3677,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err != nil {
 			return nil, err
 		}
-		cols("view_name", "definition")
 		for _, d := range descs {
 			if d.IsView() {
 				res.Rows = append(res.Rows, []types.Datum{str(d.Name), str(d.ViewQuery)})
@@ -3522,14 +3691,12 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return nil, err
 		}
 		if desc.IsView() {
-			cols("table_name", "create_statement")
 			res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(CreateViewDef(desc))})
 			break
 		}
 		if err := mustBeReal(desc); err != nil {
 			return nil, err
 		}
-		cols("table_name", "create_statement")
 		byID := func(id uint64) *catalog.TableDescriptor {
 			d, err := catalog.ReadTable(ctx, txn, id)
 			if err != nil {
@@ -3550,12 +3717,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return nil, err
 		}
 		graph := catalog.NewRoleGraph(env.Roles)
-		if t.Kind == "users" {
-			cols("username", "is_admin", "member_of")
-		} else {
-			cols("role_name", "can_login", "is_admin", "member_of")
-			res.Columns[1].Type = types.Bool
-		}
 		for _, r := range env.Roles {
 			if t.Kind == "users" && !r.Login {
 				continue
@@ -3570,16 +3731,13 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			memberOf := strings.Join(members, ",")
 			if t.Kind == "users" {
-				res.Columns[1].Type = types.Bool
 				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(set.IsAdmin()), str(memberOf)})
 			} else {
-				res.Columns[2].Type = types.Bool
 				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(r.Login), types.NewBool(set.IsAdmin()), str(memberOf)})
 			}
 		}
 	case "grants":
 		if t.OnRole {
-			cols("role_name", "member", "is_admin")
 			rows, err := s.roleGrantRows(ctx, txn, t)
 			if err != nil {
 				return nil, err
@@ -3589,7 +3747,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			break
 		}
-		cols("database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable")
 		rows, err := s.grantRows(ctx, txn, t)
 		if err != nil {
 			return nil, err
@@ -3606,17 +3763,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			res.Rows = append(res.Rows, row)
 		}
 	case "all":
-		cols("name", "setting")
 		for _, kv := range s.settings() {
 			res.Rows = append(res.Rows, []types.Datum{str(kv[0]), str(kv[1])})
 		}
 	case "sessions":
 		// This node's sessions (each node keeps its own registry).
-		cols("pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start")
-		res.Columns[0].Type = types.Int
-		for i := 7; i < 10; i++ {
-			res.Columns[i].Type = types.Timestamp
-		}
 		admin, err := s.isAdmin(ctx, txn)
 		if err != nil {
 			return nil, err

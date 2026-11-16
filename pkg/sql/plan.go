@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
-	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -94,294 +93,6 @@ func (s *Session) lookupForPlan(ctx context.Context, name string) (*catalog.Tabl
 	return desc, err
 }
 
-// PlanParams infers the type of each $N parameter from its column context
-// (WHERE col = $1, SET col = $1, INSERT VALUES ($1)). Unknown stays Unknown
-// and is treated as TEXT on the wire.
-func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]types.Family, *Error) {
-	n := parser.CountParams(stmt)
-	if n == 0 {
-		return nil, nil
-	}
-	fams := make([]types.Family, n)
-	if expanded, err := s.expandViews(ctx, nil, stmt); err != nil {
-		return nil, ToSQLError(err)
-	} else {
-		stmt = expanded
-	}
-	if with := stmtWith(stmt); len(with) > 0 {
-		// The members bind (columns only) so lookups resolve, and each
-		// member's own parameters type as in its query once it and the
-		// members before it are visible.
-		merge := func(cte parser.CTE) error {
-			sub, err := s.PlanParams(ctx, cte.Query)
-			if err != nil {
-				return err
-			}
-			for i := range sub {
-				if i < len(fams) && fams[i] == types.Unknown {
-					fams[i] = sub[i]
-				}
-			}
-			return nil
-		}
-		restore, err := s.bindWith(ctx, nil, with, nil, true, merge)
-		if err != nil {
-			return nil, ToSQLError(err)
-		}
-		defer restore()
-		stmt = stmtWithout(stmt)
-	}
-	if ins, ok := stmt.(*parser.Insert); ok && ins.Select != nil {
-		sub, err := s.PlanParams(ctx, ins.Select)
-		if err != nil {
-			return nil, err
-		}
-		for i := range sub {
-			if i < len(fams) && fams[i] == types.Unknown {
-				fams[i] = sub[i]
-			}
-		}
-	}
-	var assign func(e parser.Expr, fam types.Family)
-	assign = func(e parser.Expr, fam types.Family) {
-		if e.Param > 0 && fams[e.Param-1] == types.Unknown {
-			fams[e.Param-1] = fam
-		}
-		if e.Left != nil {
-			assign(*e.Left, fam)
-		}
-		if e.Right != nil {
-			assign(*e.Right, fam)
-		}
-		for _, a := range e.Args {
-			assign(a, fam)
-		}
-	}
-	var fromWhere func(desc *catalog.TableDescriptor, where []parser.Comparison)
-	fromWhere = func(desc *catalog.TableDescriptor, where []parser.Comparison) {
-		for _, cmp := range where {
-			if col, ok := desc.Col(cmp.Column); ok {
-				typ := col.Type
-				if len(cmp.Path) > 0 {
-					typ = pathResultType(cmp.Path)
-				}
-				if strings.Contains(cmp.Op, " ANY") || strings.Contains(cmp.Op, " ALL") || cmp.Op == "@>" || cmp.Op == "NOT @>" || cmp.Op == "&&" || cmp.Op == "NOT &&" {
-					// = ANY($1), @> $1: the parameter is an array of the
-					// column's type (of the column's array type for @>).
-					if !typ.IsArray() && typ != types.Jsonb {
-						typ = types.ArrayOf(typ)
-					}
-				}
-				if cmp.Op == "@@" || cmp.Op == "NOT @@" {
-					// vector @@ $1: the parameter is the other of the
-					// two text-search types.
-					switch typ {
-					case types.Tsvector:
-						typ = types.Tsquery
-					case types.Tsquery:
-						typ = types.Tsvector
-					}
-				}
-				assign(cmp.Value, typ)
-				for _, v := range cmp.Values {
-					assign(v, typ)
-				}
-			}
-			for _, d := range cmp.Or {
-				fromWhere(desc, d)
-			}
-		}
-	}
-	switch t := stmt.(type) {
-	case *parser.Insert:
-		desc, err := s.lookupForPlan(ctx, t.Table)
-		if err != nil {
-			return nil, ToSQLError(err)
-		}
-		target := desc.VisibleColumns()
-		if len(t.Columns) > 0 {
-			target = nil
-			for _, name := range t.Columns {
-				if col, ok := desc.Col(name); ok {
-					target = append(target, col)
-				} else {
-					target = append(target, catalog.Column{})
-				}
-			}
-		}
-		for _, row := range t.Rows {
-			for i, e := range row {
-				if i < len(target) {
-					assign(e, target[i].Type)
-				}
-			}
-		}
-		if oc := t.OnConflict; oc != nil {
-			for _, set := range oc.Set {
-				if col, ok := desc.Col(set.Column); ok {
-					assign(set.Value, col.Type)
-				}
-			}
-			fromWhere(desc, oc.Where)
-		}
-	case *parser.Select:
-		for _, idx := range []int{t.LimitParam, t.OffsetParam} {
-			if idx > 0 && fams[idx-1] == types.Unknown {
-				fams[idx-1] = types.Int
-			}
-		}
-		// A parameter that is a function's argument takes the declared
-		// family (pg_cancel_backend($1) binds an integer).
-		var fromCalls func(e parser.Expr)
-		fromCalls = func(e parser.Expr) {
-			if e.Func != "" {
-				for i, a := range e.Args {
-					fam := types.Unknown
-					switch e.Func {
-					case "pg_cancel_backend", "pg_terminate_backend":
-						fam = types.Int
-					case "pg_sleep":
-						fam = types.Float
-					case destroyTenantKeyFunc, rotateTenantKeyFunc, destroyOldKeyVersionsFunc, removeTenantRowsFunc:
-						// (table text, tenant [, keep_old bool]): the
-						// tenant is coerced to the table's tenant column,
-						// so it binds as text.
-						fam = types.String
-						if i == 2 {
-							fam = types.Bool
-						}
-					case "datax_key_wrap", "datax_key_unwrap", "datax_encrypt", "datax_decrypt":
-						// (name text, data bytea, context bytea)
-						fam = types.Bytes
-						if i == 0 {
-							fam = types.String
-						}
-					default:
-						if b, ok := builtins.Lookup(e.Func); ok {
-							if f := b.ArgFamily(i); f != builtins.Any {
-								fam = f
-							}
-						}
-					}
-					if fam != types.Unknown && a.Param > 0 && fams[a.Param-1] == types.Unknown {
-						fams[a.Param-1] = fam
-					}
-					fromCalls(a)
-				}
-			}
-			if e.Left != nil {
-				fromCalls(*e.Left)
-			}
-			if e.Right != nil {
-				fromCalls(*e.Right)
-			}
-		}
-		for _, se := range t.Exprs {
-			fromCalls(se.Expr)
-		}
-		// A parameter that is an operand of a vector distance is a
-		// vector (ORDER BY embedding <-> $1), wherever the distance is
-		// written: a client that knows the type then sends it in binary.
-		var fromDistances func(e parser.Expr)
-		fromDistances = func(e parser.Expr) {
-			if builtins.IsVectorOp(e.BinOp) && e.Right != nil {
-				for _, operand := range []int{e.Param, e.Right.Param} {
-					if operand > 0 && fams[operand-1] == types.Unknown {
-						fams[operand-1] = types.Vector
-					}
-				}
-			}
-			for _, sub := range []*parser.Expr{e.Left, e.Right} {
-				if sub != nil {
-					fromDistances(*sub)
-				}
-			}
-			for _, a := range e.Args {
-				fromDistances(a)
-			}
-		}
-		for m := t; m != nil; m = m.Union {
-			for _, se := range m.Exprs {
-				fromDistances(se.Expr)
-			}
-			for _, oc := range m.OrderBy {
-				if oc.Expr != nil {
-					fromDistances(*oc.Expr)
-				}
-			}
-			for _, cmp := range m.Where {
-				if cmp.Expr != nil {
-					fromDistances(*cmp.Expr)
-				}
-				fromDistances(cmp.Value)
-			}
-		}
-		// Every set-operation member types its own WHERE; a derived table
-		// types as a statement of its own.
-		if hasDerivedJoin(t) {
-			bound, restore, err := s.bindJoinedDerived(ctx, nil, t, nil, true)
-			if err != nil {
-				return nil, ToSQLError(err)
-			}
-			defer restore()
-			t = bound
-		}
-		for m := t; m != nil; m = m.Union {
-			if m.Derived != nil {
-				sub, err := s.PlanParams(ctx, m.Derived)
-				if err != nil {
-					return nil, err
-				}
-				for i := range sub {
-					if i < len(fams) && fams[i] == types.Unknown {
-						fams[i] = sub[i]
-					}
-				}
-			}
-			if m.Table == "" {
-				continue
-			}
-			desc, err := s.lookupForPlan(ctx, m.Table)
-			if err != nil {
-				return nil, ToSQLError(err)
-			}
-			fromWhere(desc, m.Where)
-			if len(m.Joins) > 0 {
-				// Qualified references resolve against any join side.
-				if sides, jerr := s.planJoinSides(ctx, desc, m); jerr == nil {
-					for _, cmp := range m.Where {
-						if ref, rerr := resolveJoinRef(sides, cmp.Column); rerr == nil {
-							typ := ref.col.Type
-							if len(cmp.Path) > 0 {
-								typ = pathResultType(cmp.Path)
-							}
-							assign(cmp.Value, typ)
-						}
-					}
-				}
-			}
-		}
-	case *parser.Update:
-		desc, err := s.lookupForPlan(ctx, t.Table)
-		if err != nil {
-			return nil, ToSQLError(err)
-		}
-		for _, set := range t.Set {
-			if col, ok := desc.Col(set.Column); ok {
-				assign(set.Value, col.Type)
-			}
-		}
-		fromWhere(desc, t.Where)
-	case *parser.Delete:
-		desc, err := s.lookupForPlan(ctx, t.Table)
-		if err != nil {
-			return nil, ToSQLError(err)
-		}
-		fromWhere(desc, t.Where)
-	}
-	return fams, nil
-}
-
 // PlanColumns returns the output columns a statement will produce, without
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
@@ -409,6 +120,8 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			defer restore()
 			t = bound
 		}
+		// Execution addresses a single table's columns by bare name.
+		stripTableAlias(t)
 		if hasWindows(t.Exprs) {
 			wp, err := windowPlanFor(t)
 			if err != nil {
@@ -474,7 +187,11 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		if t.Derived != nil || t.FuncTable != nil {
 			var desc *catalog.TableDescriptor
 			if t.FuncTable != nil {
-				desc = funcTableDesc(t)
+				d, err := funcTableDesc(t)
+				if err != nil {
+					return nil, ToSQLError(err)
+				}
+				desc = d
 			} else {
 				innerCols, err := s.PlanColumns(ctx, t.Derived)
 				if err != nil {
@@ -575,8 +292,6 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			return cols, nil
 		}
-		// Execution addresses a single table's columns by bare name.
-		stripTableAlias(t)
 		proj, perr := resolveProjection(desc, maskSubqueryExprs(t).Exprs)
 		if perr != nil {
 			return nil, ToSQLError(perr)
@@ -598,50 +313,22 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		return []ResultColumn{{Name: "plan", Type: types.String}}, nil
 
 	case *parser.ShowTables:
-		return []ResultColumn{{Name: "table_name", Type: types.String}}, nil
-
+		return showTablesColumns(), nil
 	case *parser.Show:
-		names := map[string][]string{
-			"columns":  {"column_name", "data_type", "is_nullable", "column_default", "indices"},
-			"indexes":  {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
-			"create":   {"table_name", "create_statement"},
-			"views":    {"view_name", "definition"},
-			"users":    {"username", "is_admin", "member_of"},
-			"roles":    {"role_name", "can_login", "is_admin", "member_of"},
-			"grants":   {"database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable"},
-			"all":      {"name", "setting"},
-			"sessions": {"pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start"},
-		}[t.Kind]
-		cols := make([]ResultColumn, len(names))
-		for i, n := range names {
-			cols[i] = ResultColumn{Name: n, Type: types.String}
-		}
-		if t.Kind == "sessions" {
-			cols[0].Type = types.Int
-			for i := 7; i < 10; i++ {
-				cols[i].Type = types.Timestamp
-			}
-		}
-		return cols, nil
+		return showColumns(t), nil
+	case *parser.ShowDatabases:
+		return showDatabasesColumns(), nil
+	case *parser.ShowPlacement:
+		return showPlacementColumns(), nil
+	case *parser.AlterTable:
+		return alterTableColumns(t), nil
 
 	case *parser.ShowFunctions:
 		return execShowFunctions().Columns, nil
 	case *parser.ShowSequences:
-		return []ResultColumn{
-			{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},
-			{Name: "min_value", Type: types.Int}, {Name: "max_value", Type: types.Int}, {Name: "cycle", Type: types.Bool},
-			{Name: "cache", Type: types.Int}, {Name: "last_value", Type: types.Int}, {Name: "owned_by", Type: types.String},
-		}, nil
-
+		return showSequencesColumns(), nil
 	case *parser.ShowStats:
-		return []ResultColumn{
-			{Name: "table_name", Type: types.String},
-			{Name: "row_count", Type: types.Int},
-			{Name: "collected_at", Type: types.Timestamp},
-			{Name: "column_name", Type: types.String},
-			{Name: "distinct_count", Type: types.Int},
-			{Name: "null_count", Type: types.Int},
-		}, nil
+		return showStatsColumns(), nil
 
 	case *parser.Analyze:
 		return nil, nil

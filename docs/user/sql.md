@@ -531,6 +531,7 @@ ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100);            -- val
 ALTER TABLE orders ADD CONSTRAINT qty_small CHECK (qty < 100) NOT VALID;  -- new writes only, for now
 ALTER TABLE orders VALIDATE CONSTRAINT qty_small;
 ALTER TABLE orders ADD UNIQUE (code);                                     -- an online unique index build
+ALTER TABLE orders ADD CONSTRAINT IF NOT EXISTS qty_small CHECK (qty < 100); -- datax: a no-op (NOTICE) if the name exists
 ALTER TABLE orders ADD FOREIGN KEY (cust) REFERENCES customers;
 ALTER TABLE orders DROP CONSTRAINT [IF EXISTS] qty_small;
 ALTER TABLE orders RENAME CONSTRAINT qty_small TO qty_bounded;
@@ -539,6 +540,12 @@ ALTER TABLE orders ALTER COLUMN region DROP NOT NULL;
 DROP TABLE customers CASCADE;                    -- also drops the foreign keys that reference it
 SET foreign_key_cascade_limit = 50000;           -- per statement; default 10000
 ```
+
+`ADD CONSTRAINT IF NOT EXISTS name` is a datax extension (PostgreSQL has
+none): when the table has a constraint called `name` it does nothing but
+send a NOTICE, without comparing the definitions — a constraint of that
+name that says something else stays as it is. The name of an index made
+by `CREATE UNIQUE INDEX` is not a constraint's and is still refused.
 
 Names default to PostgreSQL's (`orders_qty_check`, `orders_code_key`,
 `orders_cust_fkey`, numbered when taken); `\d`, `pg_constraint`,
@@ -556,7 +563,15 @@ a cascade rewrites.
 name (`23505` on a duplicate); `ON CONFLICT ON CONSTRAINT name` and
 `ON CONFLICT (cols)` resolve through them. Adding one to a table with
 rows is the online index build: it cannot run inside a transaction
-block, and duplicates fail it with nothing left behind.
+block, and duplicates fail it with nothing left behind. As in
+PostgreSQL, NULLs are distinct: a row with a NULL in any of the unique
+columns conflicts with no other row, so a unique column takes any
+number of NULLs (and `ON CONFLICT (col)` with a NULL inserts). `UNIQUE
+NULLS NOT DISTINCT` (PostgreSQL 15) makes NULLs equal for the
+constraint: on a column, as a table constraint `UNIQUE NULLS NOT
+DISTINCT (a, b)`, or on an index `CREATE UNIQUE INDEX ... (cols) NULLS
+NOT DISTINCT`. Both need cluster version v22; before it a unique index
+refuses NULLs (`23502`).
 
 **FOREIGN KEY**s reference the parent's primary key or a unique
 constraint / index (`42P10` otherwise), column types must match, and
@@ -737,7 +752,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
-  [GROUP BY cols] [HAVING ...]
+  [GROUP BY col | position, ...] [HAVING ...]
   [WINDOW name AS (...), ...]
   [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
   [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
@@ -794,8 +809,11 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   `quote_literal`), math (`abs`,
   `ceil`, `floor`, `round`, `trunc`, `mod`, `div`, `power`, `sqrt`,
   `cbrt`, `exp`, `ln`, `log`, `sign`, `pi`, `random`, the
-  trigonometric functions, ...), date and time (`now()`,
-  `current_timestamp`, `current_date`, `date_trunc`, `date_part` /
+  trigonometric functions, ...), date and time (`now()`, the SQL
+  keywords `current_timestamp`, `current_date`, `current_time`,
+  `localtimestamp` and `localtime` — no parentheses, an optional
+  precision as in `current_timestamp(3)`, the statement's start time
+  wherever an expression goes, `RETURNING` included — `date_trunc`, `date_part` /
   `extract(field FROM x)`, `to_char`, `to_timestamp`, `to_date`,
   `make_date`, `make_timestamp`, `make_time`, `make_interval`, `age`,
   `extract` over intervals and times, `justify_hours`, `justify_days`,
@@ -891,8 +909,12 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
-  the base or as a join member — and table functions `FROM
-  unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
+  the base or as a join member — and table functions (`unnest(array)`,
+  `pg_available_extensions()`, `pg_partition_ancestors(rel)`), which
+  join like tables too: `FROM unnest(array) [AS] s(x)`, `LEFT JOIN
+  pg_available_extensions() ae(name, default_version, comment) ON ...`
+  (not laterally: their arguments cannot read another member's
+  columns). Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,
@@ -924,6 +946,14 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   `LIMIT` over a single table's scan keeps only the limit's rows while
   it reads (`top-k heap` in `EXPLAIN`): every matching row is still
   read, but memory is the limit's rows, not the table's.
+  `ORDER BY n` sorts by select item n itself — its column, aggregate or
+  expression — never by what its output name would resolve to, so an
+  unnamed expression (`ORDER BY 1` over `a || b`) and a column another
+  item's alias also names sort as written; after a set operation it is
+  the result's column n. A position at or after a `*` is accepted only
+  when the `*` is the whole select list. `GROUP BY n` groups by the
+  column select item n reads; a position that is an expression or an
+  aggregate is refused (`42601`), as grouping takes columns.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when
@@ -933,7 +963,7 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 
 Check the plan with `EXPLAIN SELECT ...` — one line naming the access
 path — or run it with `EXPLAIN ANALYZE SELECT ...`, which executes the
-statement and reports the plan line followed by every stage with its
+statement (with the bound values, when it has parameters) and reports the plan line followed by every stage with its
 actual rows and time (each scan and its path, each join level, the
 group / window / set-operation and sort stages), then the output row
 count and the total time:
@@ -997,6 +1027,7 @@ DELETE FROM t WHERE a = 1;
 
 INSERT INTO t (a, b) VALUES (3, 'q') RETURNING a, b;            -- any expression over the written row, or *
 UPDATE t SET c = c + 1 WHERE a = 1 RETURNING *;
+UPDATE t SET a = a + 100 WHERE a < 10;              -- the primary key too: the rows move
 DELETE FROM t WHERE a = 1 RETURNING a;
 
 INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT DO NOTHING;    -- any unique key; the tag counts inserted rows
@@ -1014,7 +1045,19 @@ unique index — by columns or by constraint name (`<table>_pkey`, the
 index name) — else SQLSTATE `42P10`; a conflict on some other unique key
 is still the usual `23505`. `ON CONFLICT DO NOTHING` without a target
 accepts a conflict on any unique key. `DO UPDATE` cannot change primary
-key columns, and the same key twice in one statement is `21000`. The
+key columns (an `UPDATE` can), and the same key twice in one statement is `21000`.
+
+An `UPDATE` may change primary-key columns: the row moves to its new key
+with its index entries, foreign keys referencing it apply their `ON
+UPDATE` action, and a sealed table seals it for its new key (and tenant).
+Unique keys — the primary key and unique indexes — are checked for the
+statement as a whole, so `UPDATE t SET id = id + 1` and swaps work
+whatever order the rows are visited in; PostgreSQL checks a
+non-deferrable key row by row and refuses the first of these. When a
+foreign key references its own table with `ON UPDATE CASCADE` or `SET
+NULL`, a statement that changes both a referenced row and a row the
+cascade then rewrites is refused (`0A000`): change them in separate
+statements. The
 whole statement is one transaction: the read of the existing row and the
 write are serializable, so two sessions upserting the same key never lose
 an update — one of them restarts with `40001` and retries.
@@ -1821,9 +1864,31 @@ query. A replica with zeros in `garbage_versions`, `tombstones` and
 ## Parameters
 
 `$1, $2, ...` work through the extended protocol in text and binary
-formats — every driver's normal parameterized-query path. Parameter types
-are inferred from column context; when a driver asks, unknown parameters
-describe as text.
+formats — every driver's normal parameterized-query path. A parameter
+counts wherever it is written: the select list, `WHERE`, `JOIN ... ON`,
+`HAVING`, `ORDER BY`, `LIMIT` / `OFFSET`, `CASE`, any subquery (`IN`,
+`EXISTS`, scalar, derived or joined), a `WITH` member, `VALUES`, `SET`,
+`ON CONFLICT`, `RETURNING`, and the statement under `EXPLAIN [ANALYZE]`.
+
+Its type, which the server reports when a driver describes the statement
+(and which decides how the driver encodes the value), is inferred as in
+PostgreSQL: a parameter compared with a column — bare, qualified by its
+table or alias, or by a join side (`g.at < $1`), inside `OR`, in a
+subquery — or assigned to one (`SET`, `VALUES`, `INSERT ... SELECT $1`)
+takes the column's type; `$1::int8` takes the cast's; `LIMIT` and
+`OFFSET` take `int8`. A parameter used more than once has one type; two
+columns that fix different ones (`WHERE a.at = $1 OR b.name = $1`) are
+an error, `42P08`, as in PostgreSQL. Columns of different numeric widths
+(or a date and a timestamp) agree on the first. A parameter nothing
+types describes as text.
+
+Describe answers with the result's columns for every
+statement that returns rows — queries, `RETURNING`, `EXPLAIN`, every
+`SHOW`, `ALTER TABLE ... PURGE`, `SPLIT AT` and `UNSPLIT` — and with
+NoData for the rest; a prepared statement whose result changes width
+before it runs (`SELECT *` over a table altered since) is refused with
+`0A000`, as PostgreSQL refuses it (pgx then drops the cached statement
+and prepares it afresh on the next run).
 
 ## EXPLAIN-driven checklist
 
@@ -1871,6 +1936,9 @@ publications, extensions, functions, triggers, ...), plus
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
+They describe the current database, as each PostgreSQL database's own
+catalogs do (`table_catalog` is its name); `pg_database`, `pg_roles`,
+`pg_auth_members` and `pg_tablespace` are the cluster's.
 Every role may read them; `pg_catalog` lists every table and
 `information_schema` the tables the reader holds a privilege on, as in
 PostgreSQL ([security guide](security.md#roles-and-privileges)).
@@ -1977,6 +2045,10 @@ unqualified table name resolves in the session's current database;
 VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
 database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
+`DROP DATABASE ... CASCADE` is one transaction, however many tables it
+drops: it retries itself like any single statement, and if it still
+loses to DDL running in the same database it fails with `40001` having
+dropped nothing.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
 bob`. `CREATE` lets a non-admin create tables there (admins and the

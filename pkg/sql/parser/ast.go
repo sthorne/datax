@@ -166,6 +166,10 @@ type ConstraintDef struct {
 	// NotValid is ALTER TABLE ... ADD CONSTRAINT ... NOT VALID: existing
 	// rows are not checked.
 	NotValid bool
+	// NullsNotDistinct is UNIQUE NULLS NOT DISTINCT (PostgreSQL 15): NULLs
+	// in the unique columns conflict with each other. NULLS DISTINCT, the
+	// default, may be written too.
+	NullsNotDistinct bool
 }
 
 type CreateTable struct {
@@ -342,6 +346,11 @@ type CreateIndex struct {
 	// With holds the WITH (name = value) storage parameters, names
 	// lower-cased (USING ivfflat ... WITH (lists = 100)).
 	With map[string]string
+	// NullsNotDistinct is CREATE UNIQUE INDEX ... NULLS NOT DISTINCT
+	// (PostgreSQL 15); NullsClause says a NULLS [NOT] DISTINCT clause was
+	// written at all (only a unique index takes one).
+	NullsNotDistinct bool
+	NullsClause      bool
 }
 
 // CreateExtension is CREATE EXTENSION [IF NOT EXISTS] name. There are
@@ -532,9 +541,15 @@ type OrderCol struct {
 	// descending).
 	Nulls string
 	// Position is a 1-based output position, kept when the select list
-	// is not known at parse time (ORDER BY after a parenthesized query);
-	// otherwise positions are rewritten to output names.
+	// is not known at parse time (ORDER BY after a parenthesized query,
+	// a set operation, or a select list with a *); otherwise a position
+	// is rewritten to the select item it names (the column, aggregate or
+	// expression, never its output name).
 	Position int
+	// Ordinal is the position as written (ORDER BY 2), 0 for any other
+	// term; it survives the rewrite so that the ORDER BY of a set
+	// operation can be taken back to positions of the result.
+	Ordinal int
 	// Agg is an aggregate call (ORDER BY count(*) DESC) in a grouped
 	// query: sorted by, and computed when no select item is the same.
 	Agg *SelectExpr
@@ -582,8 +597,11 @@ type JoinClause struct {
 	// ON ...); Table is empty then and Alias names it.
 	Derived *Select
 	// FuncTable is a table function joined in (FROM t, f(x) [WITH
-	// ORDINALITY] AS a(c1, c2)), with its column names; Table is empty
-	// then. Parsed for the catalog queries tools send; not executable.
+	// ORDINALITY] AS a(c1, c2), or LEFT JOIN f() a(c1, c2) ON ...), with
+	// the names of its leading columns; Table is empty then. A call
+	// whose arguments use no column runs once and joins as a relation;
+	// one reading an earlier member's columns (LATERAL) is parsed for
+	// the catalog queries tools send but does not execute.
 	FuncTable *Expr
 	FuncCols  []string
 	On        []JoinCond
@@ -621,11 +639,11 @@ type Select struct {
 	Table    string  // empty for FROM-less and derived-table selects
 	Alias    string  // optional alias for Table (or the derived table's alias)
 	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
-	// FuncTable is FROM unnest(array) [AS] alias [(column)]: a
-	// set-returning call materialized as a one-column table named Alias
-	// with column FuncCol.
+	// FuncTable is FROM f(...) [AS] alias [(column, ...)]: a
+	// set-returning call materialized as a table named Alias, its
+	// leading columns renamed by FuncCols.
 	FuncTable *Expr
-	FuncCol   string
+	FuncCols  []string
 	// Joins are the JOIN clauses in syntactic order; execution joins
 	// left-deep in exactly this order.
 	Joins []JoinClause
@@ -731,10 +749,14 @@ type AlterTable struct {
 	// AddConstraint is ADD [CONSTRAINT name] ...; DropConstraint is DROP
 	// CONSTRAINT [IF EXISTS] name; ValidateConstraint is VALIDATE
 	// CONSTRAINT name.
-	AddConstraint          *ConstraintDef
-	DropConstraint         string
-	DropConstraintIfExists bool
-	ValidateConstraint     string
+	AddConstraint *ConstraintDef
+	// AddConstraintIfNotExists is ADD CONSTRAINT IF NOT EXISTS name ...,
+	// a datax extension: nothing happens (with a NOTICE) when the table
+	// has a constraint of that name, whatever its definition.
+	AddConstraintIfNotExists bool
+	DropConstraint           string
+	DropConstraintIfExists   bool
+	ValidateConstraint       string
 	// SetNotNull / DropNotNull are ALTER [COLUMN] c SET NOT NULL / DROP
 	// NOT NULL (the column name).
 	SetNotNull  string
