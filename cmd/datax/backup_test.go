@@ -162,6 +162,36 @@ func TestRestoreSelectionFlags(t *testing.T) {
 	full, inc := filepath.Join(work, "full"), filepath.Join(work, "inc")
 	args := func(a ...string) []string { return append([]string{"--addr", n.Addr()}, a...) }
 
+	// The node makes its audit table when it first writes an audit record,
+	// in the background. Made between the full and the incremental backup
+	// below, it would be a table created inside the chain, and a restore
+	// of everything to a moment in between is refused for it before the
+	// cluster-in-use check this test expects. A backup is an audited admin
+	// operation: take one elsewhere, flush the audit buffer and wait for
+	// the table, so it predates the chain.
+	if err := runBackupCmd(args("--dest", filepath.Join(work, "warmup"))); err != nil {
+		t.Fatal(err)
+	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s := sql.NewSession(n.DB(), catalog.NewAccessor())
+		stmt, err := parser.Parse(`SELECT count(*) FROM ` + catalog.AuditTableName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			n.AuditFlush(ctx)
+			_, serr := s.Execute(ctx, stmt[0], nil)
+			if serr == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("the audit table was never made: %v", serr)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		cancel()
+	}
 	if err := runBackupCmd(args("--dest", full, "--revision-history")); err == nil || !strings.Contains(err.Error(), "a full backup has no base") {
 		t.Fatalf("a full backup with --revision-history: %v", err)
 	}
