@@ -220,9 +220,15 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err != nil {
 			return nil, nil, err
 		}
-		shared, err := s.lookup(ctx, txn, cd.RefTable)
-		if err != nil {
-			return nil, nil, err
+		// A reference to the table itself is the descriptor in hand: the
+		// table may be one this transaction is creating, whose name a
+		// gateway's lease acquisition (its own transaction) would wait on
+		// for as long as this one runs.
+		shared := desc
+		if q, bare := catalog.SplitTableName(cd.RefTable); bare != desc.Name || (q != "" && q != s.database) {
+			if shared, err = s.lookup(ctx, txn, cd.RefTable); err != nil {
+				return nil, nil, err
+			}
 		}
 		if err := mustBeReal(shared); err != nil {
 			return nil, nil, err
