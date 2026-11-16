@@ -319,8 +319,9 @@ func (n *Node) standInIterations(ctx context.Context, user string) int {
 	n.standIn.mu.Lock()
 	counts, at, refreshing := n.standIn.counts, n.standIn.at, n.standIn.refreshing
 	if counts != nil && time.Since(at) >= standInRefreshAfter && !refreshing {
-		n.standIn.refreshing = true
-		go n.refreshStandInCounts(n.stopper.Ctx())
+		// A worker, not a bare goroutine: it reads through the store,
+		// so the engine must not close under it (issue #324).
+		n.standIn.refreshing = n.stopper.RunWorker(n.refreshStandInCounts) == nil
 	}
 	n.standIn.mu.Unlock()
 	if counts == nil {

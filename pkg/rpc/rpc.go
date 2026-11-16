@@ -24,6 +24,7 @@ import (
 	"github.com/sthorne/datax/pkg/rpc/rpcpb"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
+	"github.com/sthorne/datax/pkg/util/stop"
 )
 
 // PayloadHandler serves a JSON request payload and returns a JSON response.
@@ -49,6 +50,14 @@ type ServerHandlers struct {
 	// NodeHealth learns a peer's storage-health snapshot from its Raft
 	// envelopes (see rpcpb.StorageHealth).
 	NodeHealth func(id base.NodeID, h *rpcpb.StorageHealth)
+	// Stopper, when set, is the node's: every dispatch into a handler
+	// runs as one of its tasks (a unary call whole, a stream message by
+	// message, a snapshot stream whole), with a context canceled when
+	// the node begins to stop. Once it has, a call is answered
+	// Unavailable without reaching a handler, and the node's closers —
+	// the storage engine's among them — wait for the handlers already
+	// running (issue #324).
+	Stopper *stop.Stopper
 }
 
 // Server implements rpcpb.InternodeServer.
@@ -64,6 +73,42 @@ type Server struct {
 	sealed bool
 }
 
+// stoppingMessage answers a call that arrives once the node has begun to
+// stop.
+const stoppingMessage = "this node is shutting down"
+
+// errStopping is what a call that arrives once the node has begun to
+// stop is answered: Unavailable, as from a node that is down.
+func errStopping(method string) error {
+	return status.Errorf(codes.Unavailable, "%s: %s", method, stoppingMessage)
+}
+
+// runTask runs f as a task of the node's stopper (see
+// ServerHandlers.Stopper), or directly when there is none.
+func (s *Server) runTask(ctx context.Context, method string, f func(ctx context.Context)) error {
+	if s.handlers.Stopper == nil {
+		f(ctx)
+		return nil
+	}
+	if err := s.handlers.Stopper.RunTask(ctx, method, f); err != nil {
+		return errStopping(method)
+	}
+	return nil
+}
+
+// taskInterceptor runs every unary call as a task of st: a method added
+// later is covered without anyone remembering to.
+func taskInterceptor(st *stop.Stopper) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+		if terr := st.RunTask(ctx, info.FullMethod, func(ctx context.Context) {
+			resp, err = handler(ctx, req)
+		}); terr != nil {
+			return nil, errStopping(info.FullMethod)
+		}
+		return resp, err
+	}
+}
+
 // MaxMessageBytes bounds one internode message in either direction:
 // gRPC's default (4 MiB) is smaller than a page of scan rows or a
 // snapshot chunk. Scan responses are paged well below it
@@ -77,6 +122,9 @@ func NewServer(clock *hlc.Clock, handlers ServerHandlers, tlsCfg *tls.Config) *g
 	opts := []grpc.ServerOption{grpc.MaxRecvMsgSize(MaxMessageBytes)}
 	if tlsCfg != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	if handlers.Stopper != nil {
+		opts = append(opts, grpc.UnaryInterceptor(taskInterceptor(handlers.Stopper)))
 	}
 	gs := grpc.NewServer(opts...)
 	rpcpb.RegisterInternodeServer(gs, &Server{clock: clock, handlers: handlers, secure: tlsCfg != nil})
@@ -196,27 +244,39 @@ func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
 		if err != nil {
 			return err
 		}
-		s.updateClock(env.Now)
-		if s.handlers.NodeInfo != nil && env.FromNode != 0 && env.FromAddr != "" {
-			s.handlers.NodeInfo(base.NodeID(env.FromNode), env.FromAddr)
+		// The stream lives as long as the connection, so each message,
+		// not the stream, is the task: a stop waits for the message in
+		// hand, not for the peer to hang up.
+		if err := s.runTask(stream.Context(), "RaftMessages", func(ctx context.Context) {
+			s.raftEnvelope(ctx, env)
+		}); err != nil {
+			return err
 		}
-		if s.handlers.NodeHealth != nil && env.FromNode != 0 && env.Health != nil {
-			s.handlers.NodeHealth(base.NodeID(env.FromNode), env.Health)
-		}
-		if len(env.Heartbeats) > 0 || len(env.HeartbeatResponses) > 0 || len(env.ClosedTimestamps) > 0 {
-			if s.handlers.RaftHeartbeats != nil {
-				s.handlers.RaftHeartbeats(stream.Context(), base.NodeID(env.FromNode),
-					heartbeatsOf(env.Heartbeats), heartbeatsOf(env.HeartbeatResponses), heartbeatsOf(env.ClosedTimestamps))
-			}
-			continue
-		}
-		var m raftpb.Message
-		if err := m.Unmarshal(env.Message); err != nil {
-			log.Warnf("dropping undecodable raft message: %v", err)
-			continue
-		}
-		s.handlers.Raft(stream.Context(), base.RangeID(env.RangeId), m)
 	}
+}
+
+// raftEnvelope dispatches one envelope of a RaftMessages stream.
+func (s *Server) raftEnvelope(ctx context.Context, env *rpcpb.RaftEnvelope) {
+	s.updateClock(env.Now)
+	if s.handlers.NodeInfo != nil && env.FromNode != 0 && env.FromAddr != "" {
+		s.handlers.NodeInfo(base.NodeID(env.FromNode), env.FromAddr)
+	}
+	if s.handlers.NodeHealth != nil && env.FromNode != 0 && env.Health != nil {
+		s.handlers.NodeHealth(base.NodeID(env.FromNode), env.Health)
+	}
+	if len(env.Heartbeats) > 0 || len(env.HeartbeatResponses) > 0 || len(env.ClosedTimestamps) > 0 {
+		if s.handlers.RaftHeartbeats != nil {
+			s.handlers.RaftHeartbeats(ctx, base.NodeID(env.FromNode),
+				heartbeatsOf(env.Heartbeats), heartbeatsOf(env.HeartbeatResponses), heartbeatsOf(env.ClosedTimestamps))
+		}
+		return
+	}
+	var m raftpb.Message
+	if err := m.Unmarshal(env.Message); err != nil {
+		log.Warnf("dropping undecodable raft message: %v", err)
+		return
+	}
+	s.handlers.Raft(ctx, base.RangeID(env.RangeId), m)
 }
 
 // heartbeatsOf converts a coalesced envelope's heartbeats.
@@ -320,7 +380,14 @@ func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
 		return err
 	}
 	s.updateClock(first.Now)
+	// The whole stream is one task: the snapshot is applied through one
+	// engine batch as it arrives. A stop cancels ctx, and the next chunk
+	// asked for ends it.
+	var ctx context.Context
 	next := func() ([]kvserver.SnapshotKV, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "Snapshot: %s", stoppingMessage)
+		}
 		chunk, err := stream.Recv()
 		if err == io.EOF {
 			return nil, nil
@@ -335,8 +402,15 @@ func (s *Server) Snapshot(stream rpcpb.Internode_SnapshotServer) error {
 		}
 		return out, nil
 	}
-	if err := s.handlers.Snapshot(first.HeaderJson, next); err != nil {
+	var herr error
+	if err := s.runTask(stream.Context(), "Snapshot", func(tctx context.Context) {
+		ctx = tctx
+		herr = s.handlers.Snapshot(first.HeaderJson, next)
+	}); err != nil {
 		return err
+	}
+	if herr != nil {
+		return herr
 	}
 	return stream.SendAndClose(&rpcpb.SnapshotAck{})
 }
