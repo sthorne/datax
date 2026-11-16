@@ -39,17 +39,26 @@ func startSealJobCluster(t *testing.T, ctx context.Context) *ckCluster {
 }
 
 // sealJob reads a table's seal job record (nil: none), through any node
-// that answers.
+// that answers. It reads in a transaction, as the job runner does: a
+// batch whose node was stopped leaves its lock on the record, which a
+// transaction's read clears once the batch has expired and a plain read
+// only fails on.
 func sealJob(t *testing.T, ctx context.Context, c *ckCluster, id uint64) *catalog.SealJob {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		for _, n := range c.tc.Nodes {
+		for i := range c.tc.Nodes {
+			n := c.tc.Node(i)
 			if n == nil {
 				continue
 			}
 			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			raw, err := n.DB().Get(rctx, keys.SealJobKey(id))
+			var raw []byte
+			err := n.DB().RunTxn(rctx, "test-seal-job", func(ctx context.Context, txn *kvclient.Txn) error {
+				var err error
+				raw, err = txn.Get(ctx, keys.SealJobKey(id))
+				return err
+			})
 			cancel()
 			if err != nil {
 				continue
@@ -292,6 +301,44 @@ func TestSealJobs(t *testing.T) {
 		t.Logf("cut short at %d rows rewritten (pass %d); finished after the restart of n%d", before.Rewritten, before.Pass, leader+1)
 		other := conns[(leader+1)%3]
 		sameStrings(t, "rows", queryStrings(t, ctx, other, `SELECT count(*), max(body) FROM big`), "400|SEKRIT-99")
+	})
+
+	// A batch whose node stops mid-transaction leaves its lock on the
+	// job's record (the restart above stops the node gracefully, which
+	// mostly lets the batch roll back). The runner reads the record in a
+	// transaction, which clears the lock once the batch has expired; it
+	// read it plainly before, failed on the lock every turn, and the job
+	// stood still until another transaction came to read the record.
+	t.Run("a lock left by a stopped batch does not hold the job up", func(t *testing.T) {
+		sealExec(t, ctx, conn, `CREATE TABLE stuck (id INT8 PRIMARY KEY, body TEXT) WITH (encryption_key = 'auto')`)
+		var rows []string
+		for i := 1; i <= 100; i++ {
+			rows = append(rows, fmt.Sprintf(`(%d, 'SEKRIT-%d')`, i, i))
+		}
+		insertRows(t, ctx, conn, "stuck", rows)
+		d := tableDesc(t, ctx, c, "stuck")
+		sealExec(t, ctx, conn, `ALTER TABLE stuck ROTATE ENCRYPTION KEY`)
+		db := c.node(t, alive).DB()
+		batch := db.NewTxn("test-stopped-batch")
+		if _, err := batch.GetForUpdate(ctx, keys.SealJobKey(d.ID)); err != nil {
+			t.Fatal(err)
+		}
+		batch.AbandonForTesting()
+		// Plain reads, which do not clear the lock themselves.
+		deadline := time.Now().Add(60 * time.Second)
+		for {
+			raw, err := db.Get(ctx, keys.SealJobKey(d.ID))
+			if err == nil && raw == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the job is not done a minute after its record was left locked: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if got := valueVersions(t, ctx, c, d.ID); got[2] != 100 || len(got) != 1 {
+			t.Fatalf("after the job: %v", got)
+		}
 	})
 
 	t.Run("rotate one tenant", func(t *testing.T) {

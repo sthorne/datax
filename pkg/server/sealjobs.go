@@ -6,6 +6,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -81,7 +82,16 @@ type SealJobRun struct {
 // tests, which drive runs instead of waiting on the loop.
 func (n *Node) RunSealJobsOnce(ctx context.Context) []SealJobRun {
 	lo, hi := keys.SealJobSpan()
-	kvs, err := n.db.Scan(ctx, lo, hi, 0)
+	// Read in a transaction, which pushes the holder of a conflicting
+	// lock: a batch whose node stopped mid-transaction leaves its lock on
+	// the job's record, and a plain read would fail on it until someone
+	// else's transaction happened to clear it.
+	var kvs []kvpb.KeyValue
+	err := n.db.RunTxn(ctx, "seal-jobs", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		kvs, err = txn.Scan(ctx, lo, hi, 0)
+		return err
+	})
 	if err != nil {
 		log.Debugf("seal jobs: %v", err)
 		return nil
