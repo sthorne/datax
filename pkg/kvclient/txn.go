@@ -228,6 +228,11 @@ func (t *Txn) ReadTimestamp() hlc.Timestamp {
 	return t.mu.txn.ReadTimestamp
 }
 
+// ClusterVersion is the finalized cluster version as the transaction's
+// DB observes it (DB.ClusterVersion), for the version-gated decisions
+// of code that holds a transaction and nothing else.
+func (t *Txn) ClusterVersion() version.Version { return t.db.ClusterVersion() }
+
 // Historical reports whether this is a read-only transaction pinned at a
 // fixed past timestamp (NewHistoricalTxn). Catalog lookups key off it:
 // a historical transaction reads the descriptor version current AT its

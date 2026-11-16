@@ -404,6 +404,16 @@ type IndexDescriptor struct {
 	// value, which has no key encoding. The value is never changed once
 	// the index is published, so clones of a descriptor share it.
 	Vector *VectorIndex `json:"vector,omitempty"`
+	// NullsNotDistinct marks a unique index declared NULLS NOT DISTINCT
+	// (PostgreSQL 15): two rows whose indexed values are equal or both
+	// NULL column by column conflict. Without it (NULLS DISTINCT, the
+	// default) a row with a NULL in any indexed column has no entry and
+	// conflicts with nothing. Such an index keys every column with a tag
+	// byte first — rowenc.IndexKeyNullTag for NULL, IndexKeyValueTag
+	// before a value — so a NULL has a key of its own. The field is
+	// omitempty and set only at creation. Cluster version v22: a node
+	// that does not know the field would key the entries untagged.
+	NullsNotDistinct bool `json:"nulls_not_distinct,omitempty"`
 }
 
 // VectorIndex describes an IVF ("inverted file") index: the vectors of

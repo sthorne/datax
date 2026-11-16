@@ -1151,8 +1151,22 @@ key space (`/t/<tableID>/<indexID>/`):
   (SQL equality never matches NULL, so equality lookups stay correct; such
   rows are found by full scans).
 - **Unique**: key = indexed columns only, value = the encoded primary key.
-  NULLs in unique-indexed columns are **rejected** (a deliberate divergence
-  from PostgreSQL's multiple-NULLs-allowed behavior).
+  As in PostgreSQL (NULLS DISTINCT, the default), a row with NULL in any
+  indexed column has **no entry**, like a non-unique index, and so
+  conflicts with no other row: a unique index takes any number of NULLs.
+  Before cluster version v22 is finalized NULLs are refused instead
+  (`23502`), as every earlier binary refuses them — a v21 planner takes a
+  unique index for a complete row source.
+- **Unique, `NULLS NOT DISTINCT`** (PostgreSQL 15; on `CREATE UNIQUE
+  INDEX ... (cols) NULLS NOT DISTINCT`, `UNIQUE NULLS NOT DISTINCT` on a
+  column, and `UNIQUE NULLS NOT DISTINCT (cols)` as a table constraint or
+  in `ADD CONSTRAINT`; cluster version v22): every row has an entry, and
+  two rows whose indexed values are equal or both NULL column by column
+  conflict, `ON CONFLICT` included. Each key column is preceded by a tag
+  byte — `0x00` for NULL, `0x01` before a value — so a NULL has a key no
+  value can have (`IndexDescriptor.NullsNotDistinct`). `NULLS DISTINCT`
+  may be written too and is the default. `pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show the clause.
 
 Maintenance happens inside the writing transaction — index entries ride the
 same write batch as the row, so they commit or roll back atomically, and
@@ -1171,9 +1185,9 @@ explicit transaction block — code 25001):
    union is complete. The backfill transaction deliberately touches only
    row and index data — the descriptor flip to **public** is a separate
    small transaction, so a stream of concurrent writes cannot starve the
-   backfill's commit. Unique violations (including a NULL in a
-   unique-indexed column) abort the build and remove the write-only index
-   again.
+   backfill's commit. Unique violations abort the build and remove the
+   write-only index again; a row with a NULL in an indexed column is
+   skipped, as its writer would skip it (before v22: a violation too).
 3. Drain once more, so every gateway plans with the public index.
 
 The backfill is **bounded and snapshot-planned**: a planning sweep reads
@@ -1744,11 +1758,14 @@ by a K-way merge of the per-bucket scans (see docs/timeseries.md); the
 per-bucket scans carry the pushed limit, so `ORDER BY ts DESC LIMIT n`
 reads at most `buckets × n` rows.
 
-A non-unique index has no entry for rows with NULL in any indexed column,
-so the planner only uses one when the schema (`NOT NULL`) or the WHERE
-clause (equality/range/`IS NOT NULL` conjuncts) proves those rows cannot
-match — and `col IS NULL` therefore always reads the primary rows. Unique
-indexes reject NULLs at write time and are always complete.
+An index — unique or not — has no entry for rows with NULL in any
+indexed column, so the planner only scans one when the schema (`NOT
+NULL`) or the WHERE clause (equality/range/`IS NOT NULL` conjuncts)
+proves those rows cannot match — and `col IS NULL` therefore always
+reads the primary rows. A unique-index point lookup pins every column to
+a value, so it is unaffected. (A `NULLS NOT DISTINCT` index does hold
+its NULLs, but is planned by the same rule; its scans start past the
+NULL entries.)
 
 Joins (INNER and LEFT OUTER, up to 8 tables) are left-deep nested loops.
 Without statistics they execute **in syntactic order** — the FROM/JOIN

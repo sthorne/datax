@@ -556,7 +556,15 @@ a cascade rewrites.
 name (`23505` on a duplicate); `ON CONFLICT ON CONSTRAINT name` and
 `ON CONFLICT (cols)` resolve through them. Adding one to a table with
 rows is the online index build: it cannot run inside a transaction
-block, and duplicates fail it with nothing left behind.
+block, and duplicates fail it with nothing left behind. As in
+PostgreSQL, NULLs are distinct: a row with a NULL in any of the unique
+columns conflicts with no other row, so a unique column takes any
+number of NULLs (and `ON CONFLICT (col)` with a NULL inserts). `UNIQUE
+NULLS NOT DISTINCT` (PostgreSQL 15) makes NULLs equal for the
+constraint: on a column, as a table constraint `UNIQUE NULLS NOT
+DISTINCT (a, b)`, or on an index `CREATE UNIQUE INDEX ... (cols) NULLS
+NOT DISTINCT`. Both need cluster version v22; before it a unique index
+refuses NULLs (`23502`).
 
 **FOREIGN KEY**s reference the parent's primary key or a unique
 constraint / index (`42P10` otherwise), column types must match, and

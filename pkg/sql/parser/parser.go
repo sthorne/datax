@@ -1191,7 +1191,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			def.PrimaryKey = true
 			def.NotNull = true
 		case p.consumeKeyword("UNIQUE"):
-			def.Constraints = append(def.Constraints, ConstraintDef{Name: cname, Kind: "unique", Columns: []string{def.Name}})
+			nnd, _, err := p.parseNullsDistinct()
+			if err != nil {
+				return def, err
+			}
+			def.Constraints = append(def.Constraints, ConstraintDef{Name: cname, Kind: "unique", Columns: []string{def.Name}, NullsNotDistinct: nnd})
 		case p.peekKeyword("CHECK"):
 			cd, err := p.parseCheckClause(cname)
 			if err != nil {
@@ -1490,16 +1494,33 @@ func (p *parser) parseColumnList() ([]string, error) {
 	return cols, nil
 }
 
+// parseNullsDistinct parses an optional NULLS [NOT] DISTINCT, reporting
+// whether NOT was written and whether the clause was there at all.
+func (p *parser) parseNullsDistinct() (notDistinct, given bool, err error) {
+	if !p.consumeIdentWord("nulls") {
+		return false, false, nil
+	}
+	notDistinct = p.consumeKeyword("NOT")
+	if !p.consumeIdentWord("distinct") && !p.consumeKeyword("DISTINCT") {
+		return false, false, p.errf("expected DISTINCT after NULLS%s, found %q", map[bool]string{true: " NOT"}[notDistinct], p.peek().text)
+	}
+	return notDistinct, true, nil
+}
+
 // parseTableConstraint parses UNIQUE (cols) | CHECK (expr) | FOREIGN KEY
 // (cols) REFERENCES ... after an optional CONSTRAINT name.
 func (p *parser) parseTableConstraint(name string) (ConstraintDef, error) {
 	switch {
 	case p.consumeKeyword("UNIQUE"):
+		nnd, _, err := p.parseNullsDistinct()
+		if err != nil {
+			return ConstraintDef{}, err
+		}
 		cols, err := p.parseColumnList()
 		if err != nil {
 			return ConstraintDef{}, err
 		}
-		return ConstraintDef{Name: name, Kind: "unique", Columns: cols}, nil
+		return ConstraintDef{Name: name, Kind: "unique", Columns: cols, NullsNotDistinct: nnd}, nil
 	case p.peekKeyword("CHECK"):
 		return p.parseCheckClause(name)
 	case p.consumeKeyword("FOREIGN"):
@@ -2094,6 +2115,9 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		ci.OpClasses = nil
 	}
 	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if ci.NullsNotDistinct, ci.NullsClause, err = p.parseNullsDistinct(); err != nil {
 		return nil, err
 	}
 	// WITH (name = value, ...): the access method's storage parameters

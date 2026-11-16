@@ -657,7 +657,11 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 		// and lists is the storage parameter.
 		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", idx.Name, d.Name, v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "))
+	nulls := ""
+	if idx.Unique && idx.NullsNotDistinct {
+		nulls = " NULLS NOT DISTINCT"
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "), nulls)
 }
 
 // Access method OIDs, as PostgreSQL numbers them.
@@ -704,7 +708,16 @@ func UniqueDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string 
 	for _, id := range idx.ColumnIDs {
 		cols = append(cols, columnName(d, id))
 	}
-	return "UNIQUE (" + strings.Join(cols, ", ") + ")"
+	return uniqueKeyword(idx) + " (" + strings.Join(cols, ", ") + ")"
+}
+
+// uniqueKeyword is UNIQUE, with PostgreSQL's NULLS NOT DISTINCT when the
+// index was declared so.
+func uniqueKeyword(idx *catalog.IndexDescriptor) string {
+	if idx != nil && idx.NullsNotDistinct {
+		return "UNIQUE NULLS NOT DISTINCT"
+	}
+	return "UNIQUE"
 }
 
 // ConstraintOID is a constraint's pg_constraint OID (a bit above the
@@ -728,7 +741,8 @@ func ConstraintDef(d *catalog.TableDescriptor, c *catalog.Constraint, byID func(
 	case catalog.ConstraintCheck:
 		return "CHECK (" + c.Expr + ")"
 	case catalog.ConstraintUnique:
-		return "UNIQUE (" + names(d, c.Columns) + ")"
+		idx, _ := d.IndexByID(c.IndexID)
+		return uniqueKeyword(idx) + " (" + names(d, c.Columns) + ")"
 	case catalog.ConstraintForeign:
 		ref := d
 		if c.RefTable != d.ID {
@@ -835,7 +849,11 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 		for _, id := range idx.ColumnIDs {
 			cols = append(cols, columnName(d, id))
 		}
-		items = append(items, fmt.Sprintf("%sINDEX %s (%s)", unique, idx.Name, strings.Join(cols, ", ")))
+		nulls := ""
+		if idx.Unique && idx.NullsNotDistinct {
+			nulls = " NULLS NOT DISTINCT"
+		}
+		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s", unique, idx.Name, strings.Join(cols, ", "), nulls))
 	}
 	for i := range d.Constraints {
 		c := &d.Constraints[i]

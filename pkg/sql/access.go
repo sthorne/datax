@@ -13,6 +13,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // colBound is one end of a range constraint on a key column.
@@ -517,12 +518,12 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			// (pickVectorIndex), never a WHERE clause.
 			continue
 		}
-		if !idx.Unique {
-			// A non-unique index has no entry for rows with a NULL in ANY
-			// indexed column: it is a complete row source only when every
-			// indexed column is null-safe under this WHERE clause. (Unique
-			// indexes reject NULLs at write time, so they are always
-			// complete.)
+		{
+			// An index has no entry for rows with a NULL in ANY indexed
+			// column — a unique one included, since NULLs are distinct
+			// (and one declared NULLS NOT DISTINCT is held to the same
+			// rule for simplicity): it is a complete row source only when
+			// every indexed column is null-safe under this WHERE clause.
 			complete := true
 			for _, colID := range idx.ColumnIDs {
 				col, _ := desc.ColByID(colID)
@@ -619,11 +620,18 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 
 // spanBounds builds the KV scan span for a constrained scan: the pinned
 // prefix (already encoded into prefix by the caller), narrowed by the
-// range bounds on the next key column of family fam.
+// range bounds on the next key column of family fam. On an index that
+// keys NULLs (NULLS NOT DISTINCT) the span starts after the next
+// column's NULL entries even without a lower bound: the planner only
+// scans an index where a NULL cannot match, and a NULL entry inside the
+// span would use up a pushed-down limit.
 func (p accessPlan) spanBounds(prefix keys.Key, fam types.Family) (start, end keys.Key, err error) {
 	start = prefix.Clone()
+	if p.lo == nil && rowenc.TaggedIndexKey(p.idx) && len(p.idxVals) < len(p.idx.ColumnIDs) {
+		start = append(start, rowenc.IndexKeyValueTag)
+	}
 	if p.lo != nil {
-		start, err = rowenc.AppendKeyDatum(start, fam, p.lo.val)
+		start, err = rowenc.AppendIndexKeyDatum(start, p.idx, fam, p.lo.val)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -635,7 +643,7 @@ func (p accessPlan) spanBounds(prefix keys.Key, fam types.Family) (start, end ke
 	}
 	end = prefix.Clone()
 	if p.hi != nil {
-		end, err = rowenc.AppendKeyDatum(end, fam, p.hi.val)
+		end, err = rowenc.AppendIndexKeyDatum(end, p.idx, fam, p.hi.val)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -729,6 +737,21 @@ func entryDiff(old, new []rowenc.IndexEntry) (removed, added []rowenc.IndexEntry
 	return removed, added
 }
 
+// uniqueNullsDistinct reports whether a unique index takes rows with a
+// NULL in an indexed column (PostgreSQL's NULLS DISTINCT: such a row has
+// no entry and conflicts with nothing). Before cluster version v22 they
+// are refused, as every earlier binary refuses them: a v21 planner takes
+// a unique index for a complete row source and would miss such rows.
+func uniqueNullsDistinct(txn *kvclient.Txn) bool {
+	return txn == nil || txn.ClusterVersion() >= version.V22
+}
+
+// nullInUniqueIndex is the error for a NULL a unique index cannot take
+// yet (uniqueNullsDistinct).
+func nullInUniqueIndex(idx *catalog.IndexDescriptor) error {
+	return newErrf(CodeNotNullViolation, "null value in column of unique index %q (NULLs in a unique index need cluster version %s: finalize the upgrade first)", idx.Name, version.V22)
+}
+
 // addIndexEntries buffers the row's entries in every secondary index.
 // Unique conflicts are detected through the transaction (a racing insert's
 // intent makes the conflict visible); seen catches duplicates within one
@@ -745,8 +768,8 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			return invertedEntryErr(idx, err)
 		}
 		if len(entries) == 0 {
-			if idx.Unique {
-				return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
+			if idx.Unique && !uniqueNullsDistinct(txn) {
+				return nullInUniqueIndex(idx)
 			}
 			continue
 		}
@@ -837,8 +860,8 @@ func updateIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Ta
 		if err != nil {
 			return invertedEntryErr(idx, err)
 		}
-		if len(newEntries) == 0 && idx.Unique {
-			return newErrf(CodeNotNullViolation, "null value in column of unique index %q", idx.Name)
+		if len(newEntries) == 0 && idx.Unique && !uniqueNullsDistinct(txn) {
+			return nullInUniqueIndex(idx)
 		}
 		removed, added := entryDiff(oldEntries, newEntries)
 		if len(removed) == 0 && len(added) == 0 {

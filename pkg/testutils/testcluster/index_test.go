@@ -39,10 +39,10 @@ func TestSecondaryIndexes(t *testing.T) {
 	if _, serr := trySQL(ctx, s, `CREATE INDEX by_city ON users (age)`); serr == nil {
 		t.Fatal("duplicate index name accepted")
 	}
-	// A row with NULL in the indexed column makes a UNIQUE backfill fail.
-	if _, serr := trySQL(ctx, s, `CREATE UNIQUE INDEX by_email ON users (email)`); serr == nil {
-		t.Fatal("unique backfill over a NULL row succeeded")
-	}
+	// A row with NULL in the indexed column has no entry in a UNIQUE
+	// index either: NULLs are distinct (issue #322).
+	execSQL(t, ctx, s, `CREATE UNIQUE INDEX by_email ON users (email)`)
+	execSQL(t, ctx, s, `DROP INDEX by_email`)
 
 	// Plan selection.
 	if p := explainPlan(t, ctx, s, `SELECT id FROM users WHERE id = 1`); p != "point lookup on primary key" {
@@ -111,9 +111,9 @@ func TestUniqueIndex(t *testing.T) {
 	if res := execSQL(t, ctx, s, `SELECT id FROM users WHERE email = 'bob@x.com'`); len(res.Rows) != 0 {
 		t.Fatalf("stale entry: %+v", res.Rows)
 	}
-	// NULL into a unique-indexed column is rejected (documented divergence).
-	if _, serr := trySQL(ctx, s, `INSERT INTO users (id, email) VALUES (9, NULL)`); serr == nil {
-		t.Fatal("NULL accepted into unique index")
+	// The column is NOT NULL.
+	if _, serr := trySQL(ctx, s, `INSERT INTO users (id, email) VALUES (9, NULL)`); serr == nil || serr.Code != sql.CodeNotNullViolation {
+		t.Fatalf("NULL accepted into a NOT NULL column: %v", serr)
 	}
 
 	// Unique backfill rejects duplicates.

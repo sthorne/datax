@@ -1166,6 +1166,24 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **A unique index takes NULLs, as in PostgreSQL** (#322). A row with a NULL
+  in any column of a unique index has no entry in it and conflicts with no
+  other row (NULLS DISTINCT, PostgreSQL's default), on every path: `INSERT`,
+  `COPY`, `UPDATE` to and from NULL, `ON CONFLICT (col)` (a NULL inserts),
+  the backfill of `CREATE UNIQUE INDEX` and `ADD CONSTRAINT ... UNIQUE` over
+  existing NULLs, and foreign keys referencing a unique column. Before, such
+  a row was refused with `23502`. The planner no longer takes a unique index
+  for a complete row source: like a non-unique one it scans it only where a
+  NULL cannot match (`WHERE col = 'x'` is still a point lookup; `WHERE col
+  IS NULL` reads the table). `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15) is
+  supported on a column, as a table constraint and on `CREATE UNIQUE INDEX
+  ... NULLS NOT DISTINCT`: its index keys each column behind a tag byte so a
+  NULL has a key of its own (`pg_index.indnullsnotdistinct`,
+  `pg_get_indexdef` and `pg_get_constraintdef` show it). Both need cluster
+  version v22: before it is finalized a unique index refuses NULLs as
+  before and `NULLS NOT DISTINCT` is refused, since a v21 planner reads a
+  unique index as holding every row and a v21 node does not know the tag.
+  Existing unique indexes hold no NULLs and need no change.
 - `ORDER BY ... LIMIT n` over one table's primary-index scan keeps only the
   first `n` (plus `OFFSET`) rows in a heap instead of sorting every row, so it
   runs in bounded memory; `EXPLAIN` shows `top-k heap` (#304).

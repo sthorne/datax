@@ -166,6 +166,10 @@ type ConstraintDef struct {
 	// NotValid is ALTER TABLE ... ADD CONSTRAINT ... NOT VALID: existing
 	// rows are not checked.
 	NotValid bool
+	// NullsNotDistinct is UNIQUE NULLS NOT DISTINCT (PostgreSQL 15): NULLs
+	// in the unique columns conflict with each other. NULLS DISTINCT, the
+	// default, may be written too.
+	NullsNotDistinct bool
 }
 
 type CreateTable struct {
@@ -342,6 +346,11 @@ type CreateIndex struct {
 	// With holds the WITH (name = value) storage parameters, names
 	// lower-cased (USING ivfflat ... WITH (lists = 100)).
 	With map[string]string
+	// NullsNotDistinct is CREATE UNIQUE INDEX ... NULLS NOT DISTINCT
+	// (PostgreSQL 15); NullsClause says a NULLS [NOT] DISTINCT clause was
+	// written at all (only a unique index takes one).
+	NullsNotDistinct bool
+	NullsClause      bool
 }
 
 // CreateExtension is CREATE EXTENSION [IF NOT EXISTS] name. There are
