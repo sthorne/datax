@@ -146,7 +146,14 @@ func TestPurgeRemovesDeletedRowsFromDisk(t *testing.T) {
 	// The search must be able to find the marker while the rows exist,
 	// or finding nothing afterwards would prove nothing.
 	for i, n := range tc.Nodes {
-		if !engineHolds(t, n.Store().Engine(), []byte(gone)) {
+		// A write commits on a quorum; the third replica may still be
+		// applying it, so wait for each engine to hold the marker.
+		held := engineHolds(t, n.Store().Engine(), []byte(gone))
+		for wait := time.Now().Add(30 * time.Second); !held && time.Now().Before(wait); {
+			time.Sleep(50 * time.Millisecond)
+			held = engineHolds(t, n.Store().Engine(), []byte(gone))
+		}
+		if !held {
 			t.Fatalf("n%d: the marker is not in the engine before the delete", i+1)
 		}
 		if err := n.Store().Engine().Flush(); err != nil {
