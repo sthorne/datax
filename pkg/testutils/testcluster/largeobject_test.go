@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/server"
 	"github.com/sthorne/datax/pkg/sql"
+	"github.com/sthorne/datax/pkg/sql/parser"
 )
 
 // loTestGrace is the upload grace period these tests run under: long
@@ -125,6 +127,26 @@ func loFetch(t testing.TB, ctx context.Context, conn *pgx.Conn, oid uint32, step
 		}
 	}
 	return out.Bytes()
+}
+
+// loReadFull fills p from obj, failing with the first error a read
+// meets. Not io.ReadFull: pgx's LargeObject.Read reports the whole
+// buffer as read when its loread fails (it counts the preallocated scan
+// target), and io.ReadFull drops an error that comes with a full count.
+// The statement's error — a 40001 on a transaction a conflict aborted —
+// would be lost, and the client's next call would meet 25P02 instead.
+func loReadFull(obj *pgx.LargeObject, p []byte) error {
+	for n := 0; n < len(p); {
+		m, err := obj.Read(p[n:])
+		if errors.Is(err, io.EOF) {
+			return io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			return err
+		}
+		n += m
+	}
+	return nil
 }
 
 // loCounts is what the large-object tables hold, read as root.
@@ -238,7 +260,7 @@ func TestLargeObjectDescriptorSemantics(t *testing.T) {
 			t.Fatal(err)
 		}
 		own := make([]byte, len(patch))
-		if _, err := io.ReadFull(obj, own); err != nil || !bytes.Equal(own, patch) {
+		if err := loReadFull(obj, own); err != nil || !bytes.Equal(own, patch) {
 			t.Fatalf("the writer does not read its own write: %v", err)
 		}
 		if commit {
@@ -859,7 +881,7 @@ func TestLargeObjectConcurrent(t *testing.T) {
 			return err
 		}
 		cur := make([]byte, len(base))
-		if _, err := io.ReadFull(obj, cur); err != nil {
+		if err := loReadFull(obj, cur); err != nil {
 			return err
 		}
 		for i := range cur {
@@ -898,5 +920,76 @@ func TestLargeObjectConcurrent(t *testing.T) {
 		if b != want {
 			t.Fatalf("byte %d is %d after concurrent writers; want %d (a lost update)", i, b, want)
 		}
+	}
+}
+
+// TestLargeObjectReadErrorReported: an error on loread reaches the
+// client as that read's error, and only the block's later statements
+// meet 25P02. TestLargeObjectConcurrent once failed with 25P02 as a
+// writer's first error: the conflict that aborted its transaction
+// surfaced as a 40001 on loread, which the server sent, but pgx's
+// LargeObject.Read reported a full read alongside it and io.ReadFull
+// dropped the error. Here the loread fails deterministically (a panic
+// injected before it executes: XX000).
+func TestLargeObjectReadErrorReported(t *testing.T) {
+	var armed atomic.Bool
+	// Set before the cluster starts and cleared after it stops, so no
+	// session reads the variable while it changes.
+	sql.TestingPanicBeforeExec = func(stmt parser.Statement) {
+		if sel, ok := stmt.(*parser.Select); ok && len(sel.Exprs) == 1 && sel.Exprs[0].Expr.Func == "loread" && armed.CompareAndSwap(true, false) {
+			panic("injected: loread fails")
+		}
+	}
+	t.Cleanup(func() { sql.TestingPanicBeforeExec = nil })
+	tc := startLOCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn := pgConn(t, ctx, tc, 0)
+	data := randomBytes(t, sql.LargeObjectPageSize+100)
+	oid := loStore(t, ctx, conn, data, 1<<20)
+
+	// read runs one transaction block: open, a failing read through
+	// readFull, then a seek. It returns the read's error and the seek's.
+	read := func(readFull func(*pgx.LargeObject, []byte) error) (rerr, serr error) {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		obj, err := loOf(tx).Open(ctx, oid, pgx.LargeObjectModeRead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		armed.Store(true)
+		rerr = readFull(obj, make([]byte, len(data)))
+		if armed.Load() {
+			t.Fatal("the injected loread failure did not fire")
+		}
+		_, serr = obj.Seek(0, io.SeekStart)
+		return rerr, serr
+	}
+
+	rerr, serr := read(loReadFull)
+	if pgErrCode(rerr) != sql.CodeInternal || !strings.Contains(rerr.Error(), "injected") {
+		t.Fatalf("the failing loread returned %v; want its XX000", rerr)
+	}
+	if pgErrCode(serr) != sql.CodeInFailedTransaction {
+		t.Fatalf("the statement after the failed loread: %v; want 25P02", serr)
+	}
+
+	// The trap the helper avoids, as the CI failure met it (as long as
+	// pgx's Read still reports a full count with the error).
+	rerr, serr = read(func(obj *pgx.LargeObject, p []byte) error {
+		_, err := io.ReadFull(obj, p)
+		return err
+	})
+	if rerr == nil && pgErrCode(serr) != sql.CodeInFailedTransaction {
+		t.Fatalf("io.ReadFull lost the loread's error and the next statement got %v; want 25P02", serr)
+	}
+	if rerr != nil && pgErrCode(rerr) != sql.CodeInternal {
+		t.Fatalf("the failing loread through io.ReadFull returned %v; want its XX000", rerr)
+	}
+	if rerr == nil {
+		t.Logf("io.ReadFull over pgx's LargeObject dropped the loread's error; the next statement got %v", serr)
 	}
 }
