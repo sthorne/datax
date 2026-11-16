@@ -245,20 +245,43 @@ func TestSealJobs(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		leader := c.tc.LeaderIndex(1)
+		// Restarted with a SQL listener, so that it serves SQL again; the
+		// connections to it are made anew. Should this subtest fail
+		// before the restart, its cleanup restarts the node, so that the
+		// subtests after it run on a whole cluster.
+		restarted := false
+		restart := func(t *testing.T) {
+			t.Helper()
+			restarted = true
+			pglis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.tc.RestartNodeErr(leader, nil, func(cfg *server.Config) {
+				cfg.CertsDir = c.certsDir
+				c.config(leader, cfg)
+				cfg.PGListener = pglis
+			}); err != nil {
+				t.Fatalf("restarting n%d: %v", leader+1, err)
+			}
+			// The restarted node may still be fetching the cluster key:
+			// use another's key store from here on.
+			alive = (leader + 1) % 3
+			ks = c.keyStore(alive)
+			conns[leader] = sealedConn(outer, ctx, c, leader, nil)
+			if leader == 0 {
+				conn = sealedConn(outer, ctx, c, 0, &notices)
+				conns[0] = conn
+			}
+		}
+		t.Cleanup(func() {
+			if !restarted {
+				restart(t)
+			}
+		})
 		c.tc.StopNode(leader)
 		before := sealJob(t, ctx, c, d.ID)
-		// Restarted with a SQL listener, so that it serves SQL again.
-		pglis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.tc.RestartNodeErr(leader, nil, func(cfg *server.Config) {
-			cfg.CertsDir = c.certsDir
-			c.config(leader, cfg)
-			cfg.PGListener = pglis
-		}); err != nil {
-			t.Fatalf("restarting n%d: %v", leader+1, err)
-		}
+		restart(t)
 		waitSealJobDone(t, ctx, c, d.ID)
 		if got := valueVersions(t, ctx, c, d.ID); got[2] != 400 || len(got) != 1 {
 			t.Fatalf("after the restart: %v", got)
@@ -269,15 +292,6 @@ func TestSealJobs(t *testing.T) {
 		t.Logf("cut short at %d rows rewritten (pass %d); finished after the restart of n%d", before.Rewritten, before.Pass, leader+1)
 		other := conns[(leader+1)%3]
 		sameStrings(t, "rows", queryStrings(t, ctx, other, `SELECT count(*), max(body) FROM big`), "400|SEKRIT-99")
-		// The restarted node may still be fetching the cluster key: use
-		// another's key store from here on.
-		alive = (leader + 1) % 3
-		ks = c.keyStore(alive)
-		conns[leader] = sealedConn(outer, ctx, c, leader, nil)
-		if leader == 0 {
-			conn = sealedConn(outer, ctx, c, 0, &notices)
-			conns[0] = conn
-		}
 	})
 
 	t.Run("rotate one tenant", func(t *testing.T) {

@@ -197,9 +197,30 @@ func (c *ckCluster) fileRefs(i int) []string {
 	return out
 }
 
+// node is node i, failing t with a message that says so when it is not
+// running (a step stopped it and did not restart it) rather than with a
+// nil dereference further on.
+func (c *ckCluster) node(t testing.TB, i int) *server.Node {
+	t.Helper()
+	if i < 0 || i >= len(c.tc.Nodes) {
+		t.Fatalf("there is no n%d: the cluster has %d nodes", i+1, len(c.tc.Nodes))
+	}
+	n := c.tc.Node(i)
+	if n == nil {
+		t.Fatalf("n%d is not running: a step stopped it and did not restart it", i+1)
+	}
+	return n
+}
+
+// sqlAddr is node i's SQL address (see node).
+func (c *ckCluster) sqlAddr(t testing.TB, i int) string {
+	t.Helper()
+	return c.node(t, i).SQLAddr()
+}
+
 func (c *ckCluster) keyStore(i int) *keystore.Store {
 	c.t.Helper()
-	ks, err := c.tc.Nodes[i].KeyStore()
+	ks, err := c.node(c.t, i).KeyStore()
 	if err != nil {
 		c.t.Fatal(err)
 	}

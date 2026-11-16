@@ -28,7 +28,7 @@ const keyLease = time.Second
 func ksConn(t *testing.T, ctx context.Context, c *ckCluster, i int, user, password string) *pgx.Conn {
 	t.Helper()
 	url := fmt.Sprintf("postgres://%s:%s@%s/datax?sslmode=verify-ca&sslrootcert=%s",
-		user, password, c.tc.Nodes[i].SQLAddr(), filepath.Join(c.certsDir, "ca.crt"))
+		user, password, c.sqlAddr(t, i), filepath.Join(c.certsDir, "ca.crt"))
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		conn, err := pgx.Connect(ctx, url)
