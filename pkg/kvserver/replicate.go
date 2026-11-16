@@ -259,13 +259,16 @@ func (r *Replica) streamSnapshot(ctx context.Context, target base.NodeID, newDes
 		return snapshotHeader{}, err
 	}
 
-	// The range's replicated content: its MVCC data span and its
-	// range-local addressed keys (transaction records).
+	// The range's replicated content: its MVCC data span, its
+	// range-local addressed keys (transaction records), and its abort
+	// span (issue #320; keyed by the range ID, which the receiver keeps).
 	type span struct{ lower, upper []byte }
 	loLocal, hiLocal := keys.RangeLocalAddressedSpan(newDesc.StartKey, newDesc.EndKey)
+	abortPre := keys.AbortSpanPrefix(newDesc.RangeID)
 	spans := []span{
 		{[]byte(loLocal), []byte(hiLocal)},
 		{storage.EncodeMVCCKey(newDesc.StartKey, hlc.Timestamp{}), storage.EncodeMVCCKey(newDesc.EndKey, hlc.Timestamp{})},
+		{[]byte(abortPre), []byte(abortPre.PrefixEnd())},
 	}
 	spanIdx := 0
 	var it storage.Iterator
@@ -340,6 +343,14 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 		s.destroyStaleReplica(r)
 	}
 	b := s.cfg.Engine.NewBatch()
+	// Nothing of an earlier replica of this range survives its removal,
+	// but the abort span is the one piece of its state keyed by the range
+	// alone; clear it so only the stream's entries are there.
+	abortPre := keys.AbortSpanPrefix(h.Desc.RangeID)
+	if err := b.DeleteRange(abortPre, abortPre.PrefixEnd()); err != nil {
+		_ = b.Close()
+		return err
+	}
 	count := 0
 	for {
 		kvs, err := next()

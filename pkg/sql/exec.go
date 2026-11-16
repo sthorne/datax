@@ -1747,6 +1747,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			scanLimit = limit
 		}
 		noteIndexScan(desc, plan.idx.ID)
+		mark := txn.ReadMark()
 		kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 		if err != nil {
 			return nil, err
@@ -1794,6 +1795,13 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 				}
 				out = append(out, fetchedRow{key: pk, row: row})
 				if limit > 0 && int64(len(out)) == limit {
+					// The entries after this one, and the primary rows
+					// of this page behind them, cannot change the
+					// result (see forgetScanTail).
+					if at := first + i; at+1 < len(kvs) {
+						forgetScanTail(txn, mark, start, end, kvs[at].Key, plan.reverse)
+						txn.ForgetReads(mark, pks[at+1:first+len(raws)])
+					}
 					return false, nil
 				}
 			}
@@ -1903,6 +1911,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 		scanLimit = limit
 	}
 	noteIndexScan(desc, desc.LivePrimaryIndex())
+	mark := txn.ReadMark()
 	kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
 	if err != nil {
 		return nil, err
@@ -1911,7 +1920,7 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 	s.AddScanned(int64(len(kvs)))
 	noteIndexRows(desc, desc.LivePrimaryIndex(), len(kvs))
 	var out []fetchedRow
-	for _, kv := range kvs {
+	for i, kv := range kvs {
 		row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 		if err != nil {
 			return nil, err
@@ -1928,10 +1937,31 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 		}
 		out = append(out, fetchedRow{key: kv.Key, row: row})
 		if limit > 0 && int64(len(out)) == limit {
+			if i+1 < len(kvs) {
+				forgetScanTail(txn, mark, start, end, kv.Key, plan.reverse)
+			}
 			break
 		}
 	}
 	return out, nil
+}
+
+// forgetScanTail takes the part of a scan of [start, end) beyond last —
+// the last row a limited statement kept — out of the transaction's read
+// set (issue #320). With a residual filter the limit cannot be pushed
+// into the KV scan, which reads the whole span; but the rows after the
+// limit-th match cannot change the statement's result, any more than
+// they would have had the scan stopped there, and left in the read set
+// every change another transaction commits among them fails this one's
+// next refresh. A SKIP LOCKED queue (WHERE runnable ORDER BY id LIMIT 1)
+// read every row of the queue that way and failed two thirds of its
+// commits.
+func forgetScanTail(txn *kvclient.Txn, mark int, start, end, last keys.Key, reverse bool) {
+	if reverse {
+		txn.ForgetSpan(mark, start, last)
+		return
+	}
+	txn.ForgetSpan(mark, last.Next(), end)
 }
 
 // pkPointValues extracts PK datums when the WHERE clause pins every PK

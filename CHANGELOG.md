@@ -1463,6 +1463,33 @@ state or the internode protocol does, and an entry below says so.
   who met one of its rows waited for the record to expire. The failed
   commit now aborts the record and resolves its intents before it
   returns.
+- **An aborted transaction kept answering and missed its own writes**
+  (#320). A stronger transaction that aborted another removed the writes it
+  ran into, and the aborted one learned of it only at its next heartbeat
+  or its `COMMIT`: an `INSERT` reported `INSERT 0 1`, the `SELECT` of the
+  same key in the same transaction found nothing, and only the `COMMIT`
+  failed — a client that acted on the empty read and rolled back never saw
+  an error. Nothing such a transaction did could commit. Now the range
+  records the abort where the writes were removed (its abort span,
+  replicated with the range: snapshots, splits, merges, the consistency
+  checker), so the transaction's next statement there fails with `40001`;
+  and once its coordinator knows it was aborted (its heartbeat, every
+  second, or a refused statement) every further statement fails with
+  `40001` and its remaining writes are released at once. Four
+  transactions at a time writing one new key and reading it back
+  (`INSERT ... ON CONFLICT DO NOTHING`, `UPSERT`, plain `INSERT`) missed
+  their own write 51 times in 6,000 on 26250af and never now. Cluster
+  protocol version v22 for the range's part; below it, the coordinator's.
+- **`FOR UPDATE SKIP LOCKED ... LIMIT` with a filter failed most commits**
+  (#320). With a condition the scan could not use (`WHERE runnable ORDER BY
+  id LIMIT 1`), the statement read the whole table and kept all of it in
+  the transaction's read set, so another worker's commit on any row made
+  this one's commit fail with `40001` ("write timestamp diverged from read
+  timestamp"): four workers on a 200-row queue lost a third of their
+  attempts. A limited scan now keeps in its read set only what it read up
+  to the last row it returned, which is all its result depended on; the
+  same queue loses none. (The report's empty `SKIP LOCKED` results with
+  rows free were the locks of failed commits, released since #315.)
 - **A transaction waited for a lock it could not outwait** (#315). Blocked
   on another transaction's uncommitted write to a row it had itself read —
   on the bank workload, a transfer whose account a newer transfer was

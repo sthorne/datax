@@ -926,45 +926,53 @@ func MVCCCheckForWrites(r Reader, start, end keys.Key, fromTS, toTS hlc.Timestam
 // invoke it with the status recorded in the transaction's record (or ABORTED
 // for an expired record they pushed). See docs/transactions.md.
 func MVCCResolveIntent(b *Batch, key keys.Key, txnID uuid.UUID, status enginepb.TxnStatus, commitTS hlc.Timestamp) error {
+	_, err := MVCCResolveIntentFound(b, key, txnID, status, commitTS)
+	return err
+}
+
+// MVCCResolveIntentFound is MVCCResolveIntent reporting whether key held
+// an intent of txnID that the call resolved (issue #320: an ABORTED
+// resolution that removed one records the abort on the range).
+func MVCCResolveIntentFound(b *Batch, key keys.Key, txnID uuid.UUID, status enginepb.TxnStatus, commitTS hlc.Timestamp) (bool, error) {
 	if status == enginepb.PENDING {
-		return fmt.Errorf("cannot resolve intent with PENDING status")
+		return false, fmt.Errorf("cannot resolve intent with PENDING status")
 	}
 	metaKey, _ := mvccKeyBounds(key)
 	rawMeta, err := b.Get(metaKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if rawMeta == nil {
-		return nil
+		return false, nil
 	}
 	meta, err := decodeMeta(rawMeta)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if meta.Txn.ID != txnID {
-		return nil // someone else's intent now
+		return false, nil // someone else's intent now
 	}
 	if err := b.Delete(metaKey); err != nil {
-		return err
+		return false, err
 	}
 	provKey := EncodeMVCCKey(key, meta.Timestamp)
 	if status == enginepb.ABORTED {
-		return b.Delete(provKey)
+		return true, b.Delete(provKey)
 	}
 	// COMMITTED: the provisional value becomes a committed version at the
 	// commit timestamp (rewrite it if the transaction's timestamp moved).
 	if commitTS.IsEmpty() || commitTS.Equal(meta.Timestamp) {
-		return nil
+		return true, nil
 	}
 	raw, err := b.Get(provKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if raw == nil {
-		return fmt.Errorf("intent on %s has no provisional value at %s", key, meta.Timestamp)
+		return false, fmt.Errorf("intent on %s has no provisional value at %s", key, meta.Timestamp)
 	}
 	if err := b.Delete(provKey); err != nil {
-		return err
+		return false, err
 	}
-	return b.Put(EncodeMVCCKey(key, commitTS), raw)
+	return true, b.Put(EncodeMVCCKey(key, commitTS), raw)
 }

@@ -143,6 +143,17 @@ type Txn struct {
 		// walk wait chains and detect deadlock cycles.
 		waitingFor    uuid.UUID
 		waitingForKey keys.Key
+		// aborted: the coordinator has learned that its transaction was
+		// aborted by another (a heartbeat found the record ABORTED, or a
+		// request failed with a TxnAbortedError). Every later request
+		// fails at once (issue #320): the record can never commit, and a
+		// pusher may already have removed some of the transaction's
+		// writes, so whatever it read now could miss them.
+		aborted bool
+		// abortCleaned: the transaction's own intents have been (or are
+		// being) resolved as aborted after it gave up, which also removes
+		// the abort-span entries pushers left for it.
+		abortCleaned bool
 	}
 	heartbeatCancel context.CancelFunc
 }
@@ -750,6 +761,10 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 	var cw conflictWait
 	refreshes := 0
 	for attempt := 1; ; attempt++ {
+		if err := t.failIfAborted(); err != nil {
+			t.publishWait(ctx, nil)
+			return nil, err
+		}
 		if err := t.checkDeadline(ba); err != nil {
 			t.publishWait(ctx, nil)
 			return nil, err
@@ -823,8 +838,11 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 				return nil, err
 			}
 		case kerr.TxnAborted != nil:
-			t.markFinished()
-			t.wakeWaiters()
+			t.publishWait(ctx, nil)
+			if !batchCommits(ba) {
+				// A failed commit settles itself (abortFailedCommit).
+				t.giveUpAborted()
+			}
 			return nil, &RetryableError{Cause: kerr}
 		case kerr.Ambiguous != nil && !batchHasEndTxn(ba):
 			// The proposal's fate is unknown: leadership was interrupted
@@ -1085,8 +1103,7 @@ func (t *Txn) detectDeadlock(ctx context.Context, pending *storage.Intent) error
 		if _, kerr := t.db.Send(ctx, aba); kerr != nil {
 			log.Debugf("txn %s: self-abort as deadlock victim: %v", self.ID, kerr)
 		}
-		t.markFinished()
-		t.db.waits.finished(self.ID)
+		t.giveUpAborted()
 		e := kvpb.NewErrorf("deadlock detected: transaction %s chosen as victim", self.ID)
 		e.TxnAborted = &kvpb.TxnAbortedError{}
 		return &RetryableError{Cause: e}
@@ -1229,6 +1246,7 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 			TxnID:         intent.Txn.ID,
 			Status:        v.status,
 			CommitTS:      v.commitTS,
+			Poison:        t.db.poisonsAborted(v.status),
 		})
 	}
 	if len(rba.Requests) > 0 {
@@ -1318,6 +1336,8 @@ func (t *Txn) abortFailedCommit(ctx context.Context) {
 	t.mu.Lock()
 	anchored := t.mu.anchored
 	txn := t.mu.txn
+	cleaned := t.mu.abortCleaned
+	t.mu.abortCleaned = true
 	t.mu.Unlock()
 	t.markFinished()
 	defer t.wakeWaiters()
@@ -1334,7 +1354,11 @@ func (t *Txn) abortFailedCommit(ctx context.Context) {
 		return
 	}
 	metrics.TxnAborts.Inc()
-	t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+	if !cleaned {
+		// (A part of the commit that found the transaction aborted by
+		// another has resolved its intents already: giveUpAborted.)
+		t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+	}
 }
 
 // commit1PC attempts the one-phase fast path: when the deferred write
@@ -1762,6 +1786,43 @@ func (t *Txn) Restart(cause error) {
 	t.mu.deadline = hlc.Timestamp{} // the new epoch re-plans and re-pins
 }
 
+// failIfAborted refuses any further request of a transaction the
+// coordinator knows was aborted by another (issue #320), cleaning up its
+// intents the first time.
+func (t *Txn) failIfAborted() error {
+	t.mu.Lock()
+	aborted, id := t.mu.aborted, t.mu.txn.ID
+	t.mu.Unlock()
+	if !aborted {
+		return nil
+	}
+	t.giveUpAborted()
+	e := kvpb.NewErrorf("transaction %s was aborted by a conflicting transaction", id)
+	e.TxnAborted = &kvpb.TxnAbortedError{}
+	return &RetryableError{Cause: e}
+}
+
+// giveUpAborted settles a transaction that was aborted by another (or by
+// itself, as a deadlock victim): it is finished, every later request
+// fails at once, and its intents are resolved as aborted now, once. The
+// SQL session forgets a transaction once a statement of it has failed,
+// and its ROLLBACK then finds it finished, so without this the intents
+// would wait for pushers, and the abort-span entries pushers left for it
+// (which its own resolution removes) for GC.
+func (t *Txn) giveUpAborted() {
+	t.mu.Lock()
+	t.mu.aborted = true
+	cleaned := t.mu.abortCleaned
+	t.mu.abortCleaned = true
+	txn := t.mu.txn
+	t.mu.Unlock()
+	t.markFinished()
+	if !cleaned {
+		t.resolveAll(enginepb.ABORTED, txn.WriteTimestamp)
+	}
+	t.wakeWaiters()
+}
+
 func (t *Txn) markFinished() {
 	t.mu.Lock()
 	t.mu.finished = true
@@ -1836,7 +1897,13 @@ func (t *Txn) startHeartbeat() {
 				continue
 			}
 			if br.Responses[0].HeartbeatTxn.Status == enginepb.ABORTED {
-				return // a pusher won; the next operation will discover it
+				// A pusher won. The next operation fails at once rather
+				// than reading past writes the pusher may have removed
+				// (issue #320).
+				t.mu.Lock()
+				t.mu.aborted = true
+				t.mu.Unlock()
+				return
 			}
 		}
 	}()

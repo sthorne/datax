@@ -289,6 +289,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 			TxnId:    uuidToProto(r.TxnID),
 			Status:   int32(r.Status),
 			CommitTs: tsToProto(r.CommitTS),
+			Poison:   r.Poison,
 		}}
 	case *RollbackIntentRequest:
 		out.Value = &rpcpb.RequestUnion_RollbackIntent{RollbackIntent: &rpcpb.RollbackIntentRequest{
@@ -305,7 +306,7 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 	case *RefreshRequest:
 		out.Value = &rpcpb.RequestUnion_Refresh{Refresh: &rpcpb.RefreshRequest{Header: reqHeaderToProto(r.RequestHeader), FromTs: tsToProto(r.FromTS)}}
 	case *GCRequest:
-		pb := &rpcpb.GcRequest{Header: reqHeaderToProto(r.RequestHeader), Threshold: tsToProto(r.Threshold)}
+		pb := &rpcpb.GcRequest{Header: reqHeaderToProto(r.RequestHeader), Threshold: tsToProto(r.Threshold), AbortSpanCutoff: tsToProto(r.AbortSpanCutoff)}
 		for _, v := range r.Versions {
 			pb.Versions = append(pb.Versions, &rpcpb.GcVersion{Key: v.Key, Ts: tsToProto(v.TS), BytesSize: v.Bytes})
 		}
@@ -420,6 +421,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 			TxnID:         id,
 			Status:        enginepb.TxnStatus(v.ResolveIntent.Status),
 			CommitTS:      tsFromProto(v.ResolveIntent.CommitTs),
+			Poison:        v.ResolveIntent.Poison,
 		}
 	case *rpcpb.RequestUnion_RollbackIntent:
 		id, err := uuidFromProto(v.RollbackIntent.TxnId)
@@ -444,7 +446,7 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 	case *rpcpb.RequestUnion_Refresh:
 		u.Refresh = &RefreshRequest{RequestHeader: reqHeaderFromProto(v.Refresh.Header), FromTS: tsFromProto(v.Refresh.FromTs)}
 	case *rpcpb.RequestUnion_Gc:
-		r := &GCRequest{RequestHeader: reqHeaderFromProto(v.Gc.Header), Threshold: tsFromProto(v.Gc.Threshold)}
+		r := &GCRequest{RequestHeader: reqHeaderFromProto(v.Gc.Header), Threshold: tsFromProto(v.Gc.Threshold), AbortSpanCutoff: tsFromProto(v.Gc.AbortSpanCutoff)}
 		for _, ver := range v.Gc.Versions {
 			r.Versions = append(r.Versions, GCVersion{Key: ver.Key, TS: tsFromProto(ver.Ts), Bytes: ver.BytesSize})
 		}
