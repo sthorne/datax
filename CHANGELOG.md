@@ -1467,6 +1467,20 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`DROP DATABASE ... CASCADE` of a large database failed with `40001`
+  after about a minute** (#322), "write timestamp diverged from read
+  timestamp", with no other load. It reads every table's name and
+  descriptor; past 512 read spans a transaction gave up its read set, so
+  once a drop's commit outlived the closed-timestamp lag (3 s) and was
+  pushed above it, the transaction could not refresh and restarted, every
+  attempt alike, 21 times. A transaction now condenses its read spans past
+  512 into at most 64 covering ones and goes on refreshing; and `DROP
+  DATABASE` no longer reads each table a second time and writes its drops
+  in one batch instead of a round trip per key. A drop that loses to
+  concurrent DDL in the same database still fails with `40001` as a
+  whole. `CREATE TABLE` (and view, sequence) now reads its database in its
+  own transaction: one racing `DROP DATABASE` could commit a table under
+  the dropped database, where nothing would ever find or drop it.
 - **A transaction blocked on another's lock noticed it was released up to
   100 ms late.** It re-asked the lock holder's transaction record every
   100 ms. Now the holder's coordinator wakes it as soon as the holder has

@@ -103,13 +103,19 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 	if len(tables) > 0 && !t.Cascade {
 		return nil, newErrf(CodeDependentObjectsExist, "database %q holds %d table(s); DROP DATABASE ... CASCADE drops them too", t.Name, len(tables))
 	}
+	// ListIn read every descriptor in this transaction: the drops need
+	// not read each name and descriptor again (reads the transaction
+	// would carry to its commit), and go out in one batch rather than a
+	// round trip per key.
+	var wb kvclient.WriteBatch
 	for _, d := range tables {
-		if _, err := s.cat.DropIn(ctx, txn, t.Name, d.Name); err != nil {
+		if err := s.cat.DropDescriptor(txn, d, &wb); err != nil {
 			return nil, err
 		}
-		if err := txn.Delete(ctx, keys.TableStatsKey(d.ID)); err != nil {
-			return nil, err
-		}
+		wb.Delete(keys.TableStatsKey(d.ID))
+	}
+	if err := txn.RunBatch(ctx, &wb); err != nil {
+		return nil, err
 	}
 	// The sealed tables' keys go once every table is dropped, so that two
 	// tables sharing a key (a table and its restored copy) both count.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -119,6 +120,13 @@ type Txn struct {
 		// readSpans are the spans this transaction has observed; refresh
 		// verifies them when moving the read timestamp forward.
 		readSpans []readSpan
+		// condensed holds the reads that overflowed readSpans, merged
+		// into at most maxCondensedSpans spans covering them (and the
+		// keys between them): refresh verifies these too. Covering more
+		// than was read can only fail a refresh that would have passed,
+		// never pass one that should fail. Marks and savepoints index
+		// readSpans alone; condensed is never forgotten.
+		condensed []readSpan
 		// refreshUnusable: too many spans (or tracking disabled) — fall
 		// back to v1's restart behavior.
 		refreshUnusable bool
@@ -162,9 +170,18 @@ type readSpan struct {
 	start, end keys.Key // end nil = point read
 }
 
-// maxReadSpans bounds refresh bookkeeping; beyond it, conflicts surface as
-// restarts (v1 behavior).
+// maxReadSpans bounds the read spans kept as they were read. Beyond it
+// they are condensed (maxCondensedSpans), so that a transaction that
+// reads many keys — DROP DATABASE of a database of hundreds of tables
+// reads each one's name and descriptor — can still refresh when its
+// timestamp is pushed rather than restart (issue #322); before, it gave
+// up its read set and every push ended in a restart, which an implicit
+// transaction retried until it gave up with 40001.
 const maxReadSpans = 512
+
+// maxCondensedSpans bounds the condensed read spans, and so the refresh
+// requests a transaction's commit can need.
+const maxCondensedSpans = 64
 
 func (t *Txn) recordRead(start, end keys.Key) {
 	t.mu.Lock()
@@ -173,11 +190,65 @@ func (t *Txn) recordRead(start, end keys.Key) {
 		return
 	}
 	if len(t.mu.readSpans) >= maxReadSpans {
-		t.mu.refreshUnusable = true
+		t.mu.condensed = condenseSpans(append(t.mu.condensed, t.mu.readSpans...), maxCondensedSpans)
 		t.mu.readSpans = nil
-		return
 	}
 	t.mu.readSpans = append(t.mu.readSpans, readSpan{start: start.Clone(), end: end.Clone()})
+}
+
+// condenseSpans merges spans into at most max spans that cover them:
+// overlapping and touching spans first, then the neighbours in key order
+// that are closest — whose keys share the longest prefix — so a merged
+// span stays inside the keyspace its reads were in (one table's rows,
+// the descriptors) rather than reaching across another that others
+// write all the time (the descriptor leases).
+func condenseSpans(spans []readSpan, max int) []readSpan {
+	norm := make([]readSpan, 0, len(spans))
+	for _, sp := range spans {
+		end := sp.end
+		if len(end) == 0 {
+			end = sp.start.Next()
+		}
+		norm = append(norm, readSpan{start: sp.start, end: end})
+	}
+	sort.Slice(norm, func(i, j int) bool { return norm[i].start.Less(norm[j].start) })
+	var out []readSpan
+	for _, sp := range norm {
+		if n := len(out); n > 0 && !out[n-1].end.Less(sp.start) {
+			if out[n-1].end.Less(sp.end) {
+				out[n-1].end = sp.end
+			}
+			continue
+		}
+		out = append(out, sp)
+	}
+	if len(out) <= max {
+		return out
+	}
+	// Close the len(out)-max gaps whose sides share the longest prefix.
+	gaps := make([]int, len(out)-1)
+	shared := make([]int, len(out)-1)
+	for i := range gaps {
+		gaps[i] = i
+		a, b := out[i].end, out[i+1].start
+		for shared[i] < len(a) && shared[i] < len(b) && a[shared[i]] == b[shared[i]] {
+			shared[i]++
+		}
+	}
+	sort.SliceStable(gaps, func(x, y int) bool { return shared[gaps[x]] > shared[gaps[y]] })
+	closed := make([]bool, len(out)-1)
+	for _, g := range gaps[:len(out)-max] {
+		closed[g] = true
+	}
+	merged := out[:0:0]
+	for i, sp := range out {
+		if i > 0 && closed[i-1] {
+			merged[len(merged)-1].end = sp.end
+			continue
+		}
+		merged = append(merged, sp)
+	}
+	return merged
 }
 
 // NewTxn begins a transaction at the current clock reading.
@@ -940,7 +1011,7 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 		return false
 	}
 	oldRead := t.mu.txn.ReadTimestamp
-	spans := append([]readSpan(nil), t.mu.readSpans...)
+	spans := append(append([]readSpan(nil), t.mu.condensed...), t.mu.readSpans...)
 	provisional := t.mu.txn
 	t.mu.Unlock()
 
@@ -1164,7 +1235,7 @@ func (t *Txn) cannotOutwait(live []storage.Intent) error {
 		if !readTS.Less(in.Txn.WriteTimestamp) {
 			continue
 		}
-		if !t.mu.refreshUnusable && !readSpansCover(t.mu.readSpans, in.Key) {
+		if !t.mu.refreshUnusable && !readSpansCover(t.mu.readSpans, in.Key) && !readSpansCover(t.mu.condensed, in.Key) {
 			continue
 		}
 		e := kvpb.NewErrorf("transaction %s must restart: transaction %s is writing key %s at %s, above the read timestamp %s at which it was read",

@@ -2005,6 +2005,10 @@ unqualified table name resolves in the session's current database;
 VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
 database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.
+`DROP DATABASE ... CASCADE` is one transaction, however many tables it
+drops: it retries itself like any single statement, and if it still
+loses to DDL running in the same database it fails with `40001` having
+dropped nothing.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
 bob`. `CREATE` lets a non-admin create tables there (admins and the

@@ -127,8 +127,22 @@ still equals `readTS`. Events that force the write timestamp above
 - `WriteTooOld`: a committed version exists above our write timestamp,
 - an uncertainty restart.
 
-The coordinator tracks every span the transaction has read (up to a cap;
-beyond it refresh is disabled). On any of the conflicts above it attempts a
+The coordinator tracks every span the transaction has read. Past 512
+spans it **condenses** them (issue #322): the spans recorded so far are
+merged with the earlier condensed ones into at most 64 spans covering
+every key read — closing first the gaps between keys that share the
+longest prefix, so a merged span stays within the keyspace its reads
+were in (one table's rows, the descriptors) instead of reaching across
+one others write all the time (the descriptor leases). A condensed span
+can only make a refresh fail that would have passed, never pass one
+that should fail. Before, the transaction gave its read set up there,
+and every later push of its timestamp was a restart: `DROP DATABASE` of
+a database of a few hundred tables, which reads each table's name and
+descriptor, failed every attempt whose commit came after the
+closed-timestamp lag (3 s) — the commit is pushed above the closed
+timestamp — and an implicit statement gave up after 21 attempts with
+`40001` ("write timestamp diverged from read timestamp"). On any of the
+conflicts above the coordinator attempts a
 **read refresh**: for each read span it sends a `Refresh` request verifying
 no other transaction wrote into the span within `(readTS, newTS]` — any
 committed version there, or any foreign intent (which could commit inside
@@ -307,8 +321,8 @@ Two limits: an index scan's entries for skipped rows stay in the read
 set (the fetch forgets primary keys), so a queue ordered by a secondary
 index can still fail a refresh when a skipped row's entry is deleted;
 and a statement that skips more keys than the read set holds spans for
-(512) loses refresh for the transaction, as overflowing it with plain
-reads does.
+(512) loses refresh for the transaction: the spans it splits are not
+condensed.
 
 **LIMIT.** Plain `FOR UPDATE` locks what the fetch returned, and the
 fetch stops at the limit only when the access path delivers the order —
