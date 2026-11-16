@@ -1467,6 +1467,19 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A comma or `CROSS` join keyed in `WHERE` no longer runs as a cross
+  product.** psql's `\d <index>` joins `pg_index`, `pg_class` twice and
+  `pg_am` with commas, equated in `WHERE`. Such a join had no `ON` keys,
+  so each level fetched every row of its table for every partial row,
+  and only the final `WHERE` filtered the product. On a node started with
+  `datax init`, whose catalogs list the system tables, that was 177,504
+  joined rows and about 60,000 catalog scans: `\d <index>` took 20–36 s. A
+  `WHERE` equality of a later side's column with an earlier side's
+  column, or with a constant, is now that side's lookup key, as an `ON`
+  equality is. The same `\d` takes 0.07 s, and `EXPLAIN` shows an inner
+  join with a point or index lookup where a key allows one. The full
+  `WHERE` still filters the result. A `LEFT` side, and any chain with a
+  `RIGHT` or `FULL` join, are unchanged.
 - **40001 errors say "restart transaction:" once.** A retryable error's
   own text already starts with that prefix, and the conversion to a SQL
   error added it again. Every 40001 from a transaction restart read

@@ -869,7 +869,12 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   share; a cross join when none) equate the named columns, show each
   once in `*`, resolve it unqualified without ambiguity, and read it as
   `COALESCE` across an outer join. `CROSS JOIN` and the comma form
-  `FROM a, b WHERE a.x = b.y` are cross products filtered by `WHERE`.
+  `FROM a, b WHERE a.x = b.y` are cross products filtered by `WHERE`;
+  a `WHERE` equality of a later side's column with an earlier side's
+  column, or with a constant, becomes that side's lookup key as an `ON`
+  equality would, so `EXPLAIN` shows an inner join with a point or
+  index lookup rather than a scan per row (not for a `LEFT` side, or
+  with a `RIGHT` / `FULL` join in the chain).
   Join select lists take columns, `*`, expressions, `->`/`->>` paths
   and subqueries; under `GROUP BY` they narrow to plain columns and
   aggregates.
