@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -351,7 +352,13 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		t.Log("psql not installed; skipping the end-to-end run")
 		return
 	}
-	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`} {
+	// psql's describe queries change with its version, not the server's:
+	// record which one ran so client drift shows up in the log.
+	if v, verr := exec.CommandContext(ctx, psql, "--version").CombinedOutput(); verr == nil {
+		t.Logf("%s: %s", psql, strings.TrimSpace(string(v)))
+	}
+	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`,
+		`\di+`, `\dn+`, `\du+`, `\df`, `\ds`, `\dm`, `\dP`, `\dX`, `\drg`, `\dRp`, `\conninfo`} {
 		out, err := runPsql(ctx, psql, url, cmd)
 		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
@@ -372,8 +379,15 @@ func TestPsqlCatalogQueries(t *testing.T) {
 	}
 }
 
-// lookPsql finds the psql binary, for end-to-end runs.
-func lookPsql() (string, error) { return exec.LookPath("psql") }
+// lookPsql finds the psql binary, for end-to-end runs: $DATAX_PSQL
+// when set (to run the describe commands against a chosen client
+// version), else psql on the PATH.
+func lookPsql() (string, error) {
+	if p := os.Getenv("DATAX_PSQL"); p != "" {
+		return exec.LookPath(p)
+	}
+	return exec.LookPath("psql")
+}
 
 // runPsql runs one backslash command through psql and returns its output.
 func runPsql(ctx context.Context, psql, url, cmd string) (string, error) {
