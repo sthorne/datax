@@ -154,7 +154,7 @@ func (c *ckCluster) waitFor(what string, d time.Duration, cond func() bool) {
 }
 
 // waitReported waits until every running node has written its holder
-// record.
+// record, and then until every member is live (waitLive).
 func (c *ckCluster) waitReported(n int) {
 	c.t.Helper()
 	c.waitFor("every node to report its root", 30*time.Second, func() bool {
@@ -166,6 +166,26 @@ func (c *ckCluster) waitReported(n int) {
 			}
 		}
 		return got >= n
+	})
+	c.waitLive(0)
+}
+
+// waitLive waits until node i's status shows every member live. The
+// cluster key's operations refuse while a member's last heartbeat is
+// older than the liveness grace (4 s here, against a beat every 3 s),
+// and under the race detector a member's beats can lag that much while
+// a fresh cluster forms or a restarted node rejoins: an operation that
+// expects some other refusal, or none, waits for this first.
+func (c *ckCluster) waitLive(i int) {
+	c.t.Helper()
+	c.waitFor("every member to be live", 30*time.Second, func() bool {
+		st := c.status(i)
+		for _, nd := range st.Nodes {
+			if !nd.Live {
+				return false
+			}
+		}
+		return len(st.Nodes) == len(c.tc.Nodes)
 	})
 }
 
@@ -197,9 +217,30 @@ func (c *ckCluster) fileRefs(i int) []string {
 	return out
 }
 
+// node is node i, failing t with a message that says so when it is not
+// running (a step stopped it and did not restart it) rather than with a
+// nil dereference further on.
+func (c *ckCluster) node(t testing.TB, i int) *server.Node {
+	t.Helper()
+	if i < 0 || i >= len(c.tc.Nodes) {
+		t.Fatalf("there is no n%d: the cluster has %d nodes", i+1, len(c.tc.Nodes))
+	}
+	n := c.tc.Node(i)
+	if n == nil {
+		t.Fatalf("n%d is not running: a step stopped it and did not restart it", i+1)
+	}
+	return n
+}
+
+// sqlAddr is node i's SQL address (see node).
+func (c *ckCluster) sqlAddr(t testing.TB, i int) string {
+	t.Helper()
+	return c.node(t, i).SQLAddr()
+}
+
 func (c *ckCluster) keyStore(i int) *keystore.Store {
 	c.t.Helper()
-	ks, err := c.tc.Nodes[i].KeyStore()
+	ks, err := c.node(c.t, i).KeyStore()
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -261,6 +302,7 @@ func TestClusterKeyRefusals(t *testing.T) {
 			}
 			return got == 3
 		})
+		c.waitLive(0)
 		errText, _ := c.op(0, "init")
 		wantErr(t, "init with a key-file node", errText, "n3 keeps its store key in a key file")
 		wantErr(t, "init with a key-file node", errText, "datax debug enc-root adopt")
@@ -433,6 +475,7 @@ func TestClusterKeyLifecycle(t *testing.T) {
 		t.Fatalf("n2 after a restart: %v", err)
 	}
 	m2b.Release()
+	c.waitLive(2)
 
 	// A rotation of the named key keeps the old version opening.
 	rot, err := ks1.Rotate(ctx, billing.ID)

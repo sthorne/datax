@@ -109,6 +109,26 @@ func LookupKeysTableIn(ctx context.Context, txn *kvclient.Txn, cat *catalog.Acce
 	return d, nil
 }
 
+// ReadKeysTableIn is LookupKeysTableIn for the key service's work inside
+// a caller's transaction: it reads the committed descriptor in txn and
+// takes no lease. A leased lookup pins txn's commit deadline to the
+// lease's expiry, and the key service's transactions can outlast one —
+// a statement's first writes may make a tenant key per row, and the
+// listings of DROP OWNED and DROP ROLE read every key — which then
+// could never commit. Read in txn, a change to the table's descriptor
+// orders against txn as any other write to what it read does.
+func ReadKeysTableIn(ctx context.Context, txn *kvclient.Txn, cat *catalog.Accessor) (*catalog.TableDescriptor, error) {
+	d, err := cat.LookupFreshIn(ctx, txn, catalog.DefaultDatabase, catalog.KeysTableName)
+	if err != nil {
+		var nf *catalog.ErrTableNotFound
+		if errors.As(err, &nf) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return d, nil
+}
+
 // EnsureKeysTable creates the named-keys table if it is not there and
 // returns its descriptor. Refused before v22 (rule 4): a v21 node would
 // treat the table as an ordinary one.

@@ -198,7 +198,7 @@ type row struct {
 }
 
 // descIn resolves the table in txn, part of the caller's transaction
-// (see sql.LookupKeysTableIn); nil txn is desc(ctx, create). In a
+// (see sql.ReadKeysTableIn); nil txn is desc(ctx, create). In a
 // transaction the table is neither created nor upgraded: those are
 // statements of their own. A table from before the access columns
 // cannot take an owner or a grant, so a change to one is refused.
@@ -206,7 +206,7 @@ func (s *Store) descIn(ctx context.Context, txn *kvclient.Txn, create bool) (*ca
 	if txn == nil {
 		return s.desc(ctx, create)
 	}
-	d, err := sql.LookupKeysTableIn(ctx, txn, s.cfg.Catalog)
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -1128,7 +1128,7 @@ func (s *Store) DestroyMany(ctx context.Context, ids []int64, spare func(ctx con
 // OWNED, REASSIGN OWNED and DROP ROLE list by, on a cluster whose
 // per-tenant tables may have millions of tenant keys.
 func (s *Store) WrappingKeysIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
-	d, err := sql.LookupKeysTableIn(ctx, txn, s.cfg.Catalog)
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
 	if err != nil || d == nil {
 		return nil, err
 	}
@@ -1195,7 +1195,7 @@ func (s *Store) WrappingKeysIn(ctx context.Context, txn *kvclient.Txn) ([]Key, e
 
 // ListIn returns every key's metadata, in id order, read in txn.
 func (s *Store) ListIn(ctx context.Context, txn *kvclient.Txn) ([]Key, error) {
-	d, err := sql.LookupKeysTableIn(ctx, txn, s.cfg.Catalog)
+	d, err := sql.ReadKeysTableIn(ctx, txn, s.cfg.Catalog)
 	if err != nil || d == nil {
 		return nil, err
 	}

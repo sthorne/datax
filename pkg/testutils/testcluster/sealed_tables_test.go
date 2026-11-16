@@ -45,7 +45,7 @@ func (l *noticeLog) take() []string {
 func sealedConn(t *testing.T, ctx context.Context, c *ckCluster, i int, log *noticeLog) *pgx.Conn {
 	t.Helper()
 	url := fmt.Sprintf("postgres://root:topsecret@%s/datax?sslmode=verify-ca&sslrootcert=%s",
-		c.tc.Nodes[i].SQLAddr(), filepath.Join(c.certsDir, "ca.crt"))
+		c.sqlAddr(t, i), filepath.Join(c.certsDir, "ca.crt"))
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		cfg, err := pgx.ParseConfig(url)

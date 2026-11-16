@@ -215,6 +215,12 @@ func (n *Node) clusterKeyPreflight(ctx context.Context) ([]kvpb.NodeDescriptor, 
 	if err != nil {
 		return nil, fmt.Errorf("reading the nodes' reports: %w", err)
 	}
+	// The rows as they are now, not as of this node's last beat: the
+	// in-memory copy can be a beat behind, and a peer that beat a moment
+	// ago would otherwise be refused as not live under a short grace.
+	if err := n.refreshRegistry(ctx); err != nil {
+		log.Debugf("cluster key: reading the registry: %v (using the copy from the last beat)", err)
+	}
 	now, grace := n.clock.Now().WallTime, n.livenessGrace()
 	all := n.registry.All()
 	sort.Slice(all, func(i, j int) bool { return all[i].NodeID < all[j].NodeID })

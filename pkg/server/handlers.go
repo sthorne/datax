@@ -157,14 +157,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			}
 		}
 		n.publishLiveness(hctx)
-		start, end := keys.NodeRegistrySpan()
-		if rows, err := n.db.Scan(hctx, start, end, 0); err == nil {
-			for _, kv := range rows {
-				var other kvpb.NodeDescriptor
-				if json.Unmarshal(kv.Value, &other) == nil {
-					n.registry.Upsert(other)
-				}
-			}
+		if err := n.refreshRegistry(hctx); err == nil {
 			if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 				log.Debugf("persisting registry: %v", err)
 			}
@@ -178,6 +171,25 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		n.auditEncryptionCutover(hctx)
 		cancel()
 	}
+}
+
+// refreshRegistry reads every member's registry row into the in-memory
+// registry. The heartbeat loop does it every beat; a check that holds a
+// peer's liveness against a grace shorter than two beats does it first,
+// since between beats the copy is up to a beat older than the rows.
+func (n *Node) refreshRegistry(ctx context.Context) error {
+	start, end := keys.NodeRegistrySpan()
+	rows, err := n.db.Scan(ctx, start, end, 0)
+	if err != nil {
+		return err
+	}
+	for _, kv := range rows {
+		var other kvpb.NodeDescriptor
+		if json.Unmarshal(kv.Value, &other) == nil {
+			n.registry.Upsert(other)
+		}
+	}
+	return nil
 }
 
 // publishLiveness writes this node's registry row: its address, the
