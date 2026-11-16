@@ -107,17 +107,36 @@ func (n *Node) exportMetadata(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	// On an encrypted store the backup holds the same data the sstables do
-	// (descriptors, user verifiers) — seal it with the store key (the
-	// CURRENT one: online rotation swaps it).
+	n.writeMetadataBackup(raw)
+}
+
+// testingMetadataBackupSealed, when set, runs after writeMetadataBackup
+// has read the key and sealed, before it writes: tests park an export
+// there to race it against a rotation.
+var testingMetadataBackupSealed func()
+
+// writeMetadataBackup seals raw, on an encrypted store, and replaces the
+// backup file with it. The backup holds the same data the sstables do
+// (descriptors, user verifiers), so it is sealed with the store key: the
+// CURRENT one, which online rotation swaps. The key is read, and the
+// file written, under exportMu. A rotation swaps the key and then
+// exports, so its export waits out one that took the old key and writes
+// last.
+func (n *Node) writeMetadataBackup(raw []byte) {
+	n.exportMu.Lock()
+	defer n.exportMu.Unlock()
 	n.encKeyMu.Lock()
 	encKey := n.encKey
 	n.encKeyMu.Unlock()
 	if encKey != nil {
+		var err error
 		if raw, err = enc.Seal(MetadataBackupMagic, encKey, raw); err != nil {
 			log.Debugf("metadata export: sealing: %v", err)
 			return
 		}
+	}
+	if testingMetadataBackupSealed != nil {
+		testingMetadataBackupSealed()
 	}
 	tmp := filepath.Join(n.cfg.Dir, MetadataBackupFile+".tmp")
 	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)

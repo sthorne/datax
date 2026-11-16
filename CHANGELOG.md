@@ -1467,6 +1467,14 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **After an online store-key rotation, the metadata backup is always
+  under the new key.** Each heartbeat rewrites the backup, and a
+  rotation reseals it right after swapping the key. A heartbeat's write
+  that had read the old key just before the swap could land after the
+  reseal. The backup then stayed sealed under the retired key until the
+  next heartbeat, about 3 s later. A crash in that window left a
+  recovery backup no current key could open. The seal and the write are
+  now serialized, so the rotation's reseal always writes last.
 - **A seal job no longer stalls on a lock its own stopped batch left.**
   Each batch locks the job's record for its transaction. When the node
   running the job stopped mid-batch, that lock stayed. The job runner's
