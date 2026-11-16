@@ -187,7 +187,11 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		if t.Derived != nil || t.FuncTable != nil {
 			var desc *catalog.TableDescriptor
 			if t.FuncTable != nil {
-				desc = funcTableDesc(t)
+				d, err := funcTableDesc(t)
+				if err != nil {
+					return nil, ToSQLError(err)
+				}
+				desc = d
 			} else {
 				innerCols, err := s.PlanColumns(ctx, t.Derived)
 				if err != nil {

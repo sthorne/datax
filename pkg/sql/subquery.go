@@ -985,13 +985,101 @@ func (s *Session) execDerivedSelect(ctx context.Context, txn *kvclient.Txn, t *p
 	return s.execMaterialized(ctx, txn, derivedDesc(t.Alias, inner.Columns), inner.Rows, t, params)
 }
 
-// funcTableDesc is the one-column descriptor of a FROM table function.
-func funcTableDesc(t *parser.Select) *catalog.TableDescriptor {
-	return funcTableDescOf(t, funcTableElem(*t.FuncTable))
+// tableFuncColumns are the columns of a FROM-clause table function
+// call named alias, the leading ones renamed by rename. A function
+// returning a single scalar column (unnest) names it by the alias, as
+// in PostgreSQL.
+func tableFuncColumns(e parser.Expr, alias string, rename []string) ([]ResultColumn, error) {
+	var cols []ResultColumn
+	switch e.Func {
+	case "unnest":
+		cols = []ResultColumn{{Name: alias, Type: funcTableElem(e)}}
+	case "pg_partition_ancestors":
+		cols = []ResultColumn{{Name: alias, Type: types.Int}}
+	default:
+		return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
+	}
+	if len(rename) > len(cols) {
+		return nil, newErrf(CodeInvalidColumnReference, "table \"%s\" has %d columns available but %d columns specified", alias, len(cols), len(rename))
+	}
+	for i, n := range rename {
+		cols[i].Name = n
+	}
+	for i := range cols {
+		cols[i].Name = strings.ToLower(cols[i].Name)
+	}
+	return cols, nil
 }
 
-func funcTableDescOf(t *parser.Select, elem types.Family) *catalog.TableDescriptor {
-	return &catalog.TableDescriptor{Name: t.Alias, Columns: []catalog.Column{{ID: 1, Name: strings.ToLower(t.FuncCol), Type: elem}}}
+// funcTableDesc is the descriptor of a select's FROM table function.
+func funcTableDesc(t *parser.Select) (*catalog.TableDescriptor, error) {
+	cols, err := tableFuncColumns(*t.FuncTable, t.Alias, t.FuncCols)
+	if err != nil {
+		return nil, err
+	}
+	return derivedDesc(t.Alias, cols), nil
+}
+
+// isLateralFunc reports whether a table function call's arguments read
+// a column, which can only be an earlier FROM member's (LATERAL).
+func isLateralFunc(e parser.Expr) bool {
+	lateral := false
+	exprColumns(e, func(string) { lateral = true })
+	return lateral
+}
+
+// execTableFunc runs a FROM-clause table function call: its columns
+// (named as tableFuncColumns says) and rows.
+func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parser.Expr, alias string, rename []string, params []types.Datum) ([]ResultColumn, [][]types.Datum, error) {
+	cols, err := tableFuncColumns(fe, alias, rename)
+	if err != nil {
+		return nil, nil, err
+	}
+	if isLateralFunc(fe) {
+		return nil, nil, newErrf(CodeFeatureNotSupported, "table function %s cannot read columns of other FROM items (LATERAL)", fe.Func)
+	}
+	var rows [][]types.Datum
+	switch fe.Func {
+	case "unnest":
+		e, err := s.resolveValueExpr(ctx, txn, fe, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(e.Args) != 1 {
+			return nil, nil, newErrf(CodeUndefinedFunction, "unnest takes one array argument")
+		}
+		arg, err := evalExpr(e.Args[0], nil, nil, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case arg.Null:
+		case arg.Fam.IsArray():
+			for _, d := range arg.A {
+				rows = append(rows, []types.Datum{d})
+			}
+		default:
+			for _, el := range arrayElems(arg.Text()) {
+				d := types.NewString(el)
+				if el == "NULL" {
+					d = types.DNull
+				}
+				rows = append(rows, []types.Datum{d})
+			}
+		}
+	case "pg_partition_ancestors":
+		// No partitions: a relation's only ancestor is itself (the
+		// scalar rewrite resolves it to the relation's OID).
+		e, err := s.resolveValueExpr(ctx, txn, fe, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		if e.Lit == nil {
+			return nil, nil, newErrf(CodeFeatureNotSupported, "pg_partition_ancestors takes a relation OID or name")
+		}
+		rows = append(rows, []types.Datum{*e.Lit})
+	}
+	return cols, rows, nil
 }
 
 // funcTableElem is the element family FROM unnest(array) produces, from
@@ -1005,39 +1093,15 @@ func funcTableElem(e parser.Expr) types.Family {
 	return types.String
 }
 
-// execFuncTableSelect materializes FROM unnest(array): one text row per
-// array element (NULL when the array is NULL), then runs the select's
-// pipeline over them.
+// execFuncTableSelect materializes FROM f(...) — unnest(array): one row
+// per array element (none when the array is NULL) — then runs the
+// select's pipeline over the rows.
 func (s *Session) execFuncTableSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
-	e, err := s.resolveValueExpr(ctx, txn, *t.FuncTable, params)
+	cols, rows, err := s.execTableFunc(ctx, txn, *t.FuncTable, t.Alias, t.FuncCols, params)
 	if err != nil {
 		return nil, err
 	}
-	if e.Func != "unnest" || len(e.Args) != 1 {
-		return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
-	}
-	arg, err := evalExpr(e.Args[0], nil, nil, params)
-	if err != nil {
-		return nil, err
-	}
-	elem := funcTableElem(*t.FuncTable)
-	var rows [][]types.Datum
-	switch {
-	case arg.Null:
-	case arg.Fam.IsArray():
-		for _, d := range arg.A {
-			rows = append(rows, []types.Datum{d})
-		}
-	default:
-		for _, el := range arrayElems(arg.Text()) {
-			d := types.NewString(el)
-			if el == "NULL" {
-				d = types.DNull
-			}
-			rows = append(rows, []types.Datum{d})
-		}
-	}
-	return s.execMaterialized(ctx, txn, funcTableDescOf(t, elem), rows, t, params)
+	return s.execMaterialized(ctx, txn, derivedDesc(t.Alias, cols), rows, t, params)
 }
 
 // execMaterialized runs a select's pipeline (WHERE filter, grouping or

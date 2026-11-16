@@ -458,6 +458,17 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	eq("ON filters", names(execSQL(t, ctx, root, `SELECT t.name FROM t LEFT JOIN u ON (u.tid = t.id AND u.tag IN ('x', 'z')) WHERE u.id IS NULL`)), "bob")
 	eq("comma join", names(execSQL(t, ctx, root, `SELECT u.tag FROM t, u WHERE t.id = u.tid AND t.name = 'carol'`)), "z")
 	eq("unnest", names(execSQL(t, ctx, root, `SELECT x FROM unnest('{b,a,"c d"}') AS s(x) ORDER BY x`)), "a", "b", "c d")
+	// A set-returning function joins like a table: as a member (inner or
+	// LEFT, ON or USING), or heading the join; its alias's column list
+	// renames its leading columns.
+	eq("JOIN unnest", names(execSQL(t, ctx, root, `SELECT t.name FROM t JOIN unnest(ARRAY['carol', 'Alice', 'zed']) s(n) ON s.n = t.name ORDER BY 1`)), "Alice", "carol")
+	eq("LEFT JOIN unnest", names(execSQL(t, ctx, root, `SELECT t.name || ':' || coalesce(s.n, '-') FROM t LEFT JOIN pg_catalog.unnest(ARRAY['bob']) AS s(n) ON s.n = t.name ORDER BY t.id`)), "Alice:-", "bob:bob", "carol:-")
+	eq("unnest heading a join", names(execSQL(t, ctx, root, `SELECT u.tag FROM unnest(ARRAY[3, 1]) AS k(id) JOIN u ON u.tid = k.id ORDER BY 1`)), "x", "y", "z")
+	eq("JOIN unnest USING", names(execSQL(t, ctx, root, `SELECT t.name FROM t JOIN unnest(ARRAY[2]) AS k(id) USING (id)`)), "bob")
+	eq("pg_partition_ancestors in FROM", names(execSQL(t, ctx, root, `SELECT count(*) FROM pg_partition_ancestors('t')`)), "1")
+	if _, serr := trySQL(ctx, root, `SELECT t.name FROM t CROSS JOIN unnest(ARRAY[t.id]) AS k(x)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
+		t.Fatalf("LATERAL table function: %v", serr)
+	}
 	eq("CAST", names(execSQL(t, ctx, root, `SELECT CAST(qty AS text) FROM t WHERE id = 1`)), "5")
 	eq("subquery as predicate", names(execSQL(t, ctx, root, `SELECT name FROM t WHERE (SELECT count(*) FROM u WHERE u.tid = t.id) = 2 OR (SELECT true)`)), "Alice", "bob", "carol")
 	if _, serr := trySQL(ctx, root, `SELECT nosuchfn(1)`); serr == nil || serr.Code != sql.CodeUndefinedFunction {
