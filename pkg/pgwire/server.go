@@ -197,17 +197,32 @@ func (s *Server) acceptLoop() {
 			}()
 			s.act.connOpened(c, nc.RemoteAddr().String(), c.pid)
 			defer s.act.connClosed(c)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			go func() { // tear the connection down on server shutdown
-				select {
-				case <-s.stopper.ShouldQuiesce():
-					_ = nc.Close()
-				case <-ctx.Done():
+			// The connection is a stopper task: its statements read and
+			// write through the node's store, so the node's closers (the
+			// engine's among them) wait for it, and its context is
+			// canceled when the node begins to stop (issue #324). One
+			// accepted after that is closed unserved: run sees the closed
+			// socket at once and still releases what the connection holds
+			// (its pre-authentication slot above all), before any session
+			// work.
+			if err := s.stopper.RunTask(context.Background(), "sql connection", func(ctx context.Context) {
+				ran := make(chan struct{})
+				defer close(ran)
+				go func() { // tear the connection down on server shutdown
+					select {
+					case <-ctx.Done():
+						_ = nc.Close()
+					case <-ran:
+					}
+				}()
+				if err := c.run(ctx); err != nil {
+					log.Debugf("pgwire conn %s: %v", nc.RemoteAddr(), err)
 				}
-			}()
-			if err := c.run(ctx); err != nil {
-				log.Debugf("pgwire conn %s: %v", nc.RemoteAddr(), err)
+			}); err != nil {
+				_ = nc.Close()
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				_ = c.run(ctx)
 			}
 		}()
 	}

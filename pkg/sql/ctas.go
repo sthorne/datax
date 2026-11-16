@@ -312,7 +312,33 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 	return nil
 }
 
-// execCommentOn is COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS text.
+// setConstraintComment sets the comment of desc's constraint name: its
+// primary key (<table>_pkey), a CHECK or FOREIGN KEY constraint, or a
+// UNIQUE one (a unique index, as pg_constraint lists it).
+func setConstraintComment(desc *catalog.TableDescriptor, name, text string) error {
+	if !desc.IsView() && name == desc.Name+"_pkey" {
+		desc.PKComment = text
+		return nil
+	}
+	for i := range desc.Constraints {
+		c := &desc.Constraints[i]
+		if c.Name == name && (c.Kind == catalog.ConstraintCheck || c.Kind == catalog.ConstraintForeign) {
+			c.Comment = text
+			return nil
+		}
+	}
+	for i := range desc.Indexes {
+		idx := &desc.Indexes[i]
+		if idx.Name == name && idx.Unique {
+			idx.ConstraintComment = text
+			return nil
+		}
+	}
+	return newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", name, desc.Name)
+}
+
+// execCommentOn is COMMENT ON TABLE | VIEW | INDEX | COLUMN | CONSTRAINT
+// ... IS text.
 func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parser.CommentOn) (*Result, error) {
 	text := ""
 	if t.Text != nil {
@@ -342,7 +368,11 @@ func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parse
 			return nil, err
 		}
 		desc = shared.Clone()
-		if t.Kind == "column" {
+		if t.Kind == "constraint" {
+			if err := setConstraintComment(desc, t.Column, text); err != nil {
+				return nil, err
+			}
+		} else if t.Kind == "column" {
 			found := false
 			for i := range desc.Columns {
 				if desc.Columns[i].Name == t.Column && !desc.Columns[i].Hidden {

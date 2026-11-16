@@ -211,6 +211,19 @@ func (s *Session) settings() [][2]string {
 	return out
 }
 
+// settingDefaults maps each setting to the value a new session has:
+// what this one reports with its own variables reset.
+func (s *Session) settingDefaults() map[string]string {
+	saved := s.vars
+	s.vars = defaultVars()
+	defer func() { s.vars = saved }()
+	out := make(map[string]string, len(varNames))
+	for _, kv := range s.settings() {
+		out[kv[0]] = kv[1]
+	}
+	return out
+}
+
 // setting resolves a SHOW name to the setting's canonical name and value.
 func (s *Session) setting(name string) (string, string, bool) {
 	if isCustomVar(name) {

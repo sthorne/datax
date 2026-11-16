@@ -2,12 +2,13 @@ package vtable
 
 import (
 	"context"
-	"github.com/sthorne/datax/pkg/sql/builtins"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -31,7 +32,55 @@ func pg(name string, cols []catalog.Column, rows func(ctx context.Context, env *
 	if hasOID && !hasDesc {
 		cols = append(append([]catalog.Column(nil), cols...), hidden("__obj_description"))
 	}
+	cols, rows = withTableOID(name, cols, rows)
 	pgCatalogTables[name] = &Table{Schema: PgCatalog, Name: name, Columns: cols, Rows: rows}
+}
+
+// catalogRelOIDs are PostgreSQL's own OIDs of the system catalogs whose
+// rows carry an OID: each catalog's tableoid, which is also the classoid
+// of a pg_description row commenting on one of its objects (psql's \dd
+// joins the two).
+var catalogRelOIDs = map[string]int64{
+	"pg_type": 1247, "pg_attribute": 1249, "pg_proc": 1255, "pg_class": OIDPgClass, "pg_database": 1262,
+	"pg_tablespace": 1213, "pg_am": 2601, "pg_amop": 2602, "pg_amproc": 2603, "pg_attrdef": 2604, "pg_cast": 2605,
+	"pg_constraint": OIDPgConstraint, "pg_conversion": 2607, "pg_namespace": 2615, "pg_opclass": 2616,
+	"pg_operator": 2617, "pg_rewrite": 2618, "pg_trigger": 2620, "pg_opfamily": 2753, "pg_extension": 3079,
+	"pg_policy": 3256, "pg_collation": 3456, "pg_event_trigger": 3466, "pg_enum": 3501,
+}
+
+// withTableOID gives a catalog listed in catalogRelOIDs PostgreSQL's
+// tableoid system column: hidden (SELECT * leaves it out, as it does a
+// system column), the catalog's own OID on every row.
+func withTableOID(name string, cols []catalog.Column, rows func(context.Context, *Env) ([]Row, error)) ([]catalog.Column, func(context.Context, *Env) ([]Row, error)) {
+	oid, ok := catalogRelOIDs[name]
+	if !ok {
+		return cols, rows
+	}
+	for _, c := range cols {
+		if c.Name == "tableoid" {
+			return cols, rows
+		}
+	}
+	at := len(cols)
+	cols = append(append([]catalog.Column(nil), cols...), catalog.Column{Name: "tableoid", Type: types.Int, Hidden: true})
+	if reflect.ValueOf(rows).Pointer() == reflect.ValueOf(empty).Pointer() {
+		return cols, rows // no rows to stamp; IsAlwaysEmpty still sees empty
+	}
+	return cols, func(ctx context.Context, env *Env) ([]Row, error) {
+		rs, err := rows(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+		for i, r := range rs {
+			out := make(Row, at, at+1)
+			copy(out, r)
+			for j := len(r); j < at; j++ {
+				out[j] = null()
+			}
+			rs[i] = append(out, i64(oid))
+		}
+		return rs, nil
+	}
 }
 
 func is(name string, cols []catalog.Column, rows func(ctx context.Context, env *Env) ([]Row, error)) {
@@ -427,6 +476,20 @@ func init() {
 					rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(OIDPgClass), i64(0), str(idx.Comment)})
 				}
 			}
+			// Constraint comments, under pg_constraint's OIDs (psql's \dd).
+			if t.PKComment != "" {
+				rows = append(rows, Row{i64(IndexOID(t, 1)), i64(OIDPgConstraint), i64(0), str(t.PKComment)})
+			}
+			for _, idx := range t.Indexes {
+				if idx.Unique && idx.ConstraintComment != "" {
+					rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(OIDPgConstraint), i64(0), str(idx.ConstraintComment)})
+				}
+			}
+			for i := range t.Constraints {
+				if c := &t.Constraints[i]; c.Comment != "" {
+					rows = append(rows, Row{i64(ConstraintOID(t, c)), i64(OIDPgConstraint), i64(0), str(c.Comment)})
+				}
+			}
 		}
 		return rows, nil
 	})
@@ -572,6 +635,12 @@ func init() {
 	pg("pg_conversion", []catalog.Column{col("oid", types.Int), col("conname", types.String), col("connamespace", types.Int), col("conowner", types.Int), col("conforencoding", types.Int), col("contoencoding", types.Int), col("conproc", types.Int), col("condefault", types.Bool)}, empty)
 	pg("pg_opclass", []catalog.Column{col("oid", types.Int), col("opcmethod", types.Int), col("opcname", types.String), col("opcnamespace", types.Int), col("opcowner", types.Int), col("opcfamily", types.Int), col("opcintype", types.Int), col("opcdefault", types.Bool), col("opckeytype", types.Int)}, empty)
 	pg("pg_opfamily", []catalog.Column{col("oid", types.Int), col("opfmethod", types.Int), col("opfname", types.String), col("opfnamespace", types.Int), col("opfowner", types.Int)}, empty)
+	// pg_amop and pg_amproc: an access method's operators and support
+	// functions, by operator family. datax's index methods are built in
+	// and have no operator families (pg_opfamily is empty), so neither
+	// has rows; psql's \dAo and \dAp read them.
+	pg("pg_amop", []catalog.Column{col("oid", types.Int), col("amopfamily", types.Int), col("amoplefttype", types.Int), col("amoprighttype", types.Int), col("amopstrategy", types.Int), col("amoppurpose", types.String), col("amopopr", types.Int), col("amopmethod", types.Int), col("amopsortfamily", types.Int)}, empty)
+	pg("pg_amproc", []catalog.Column{col("oid", types.Int), col("amprocfamily", types.Int), col("amproclefttype", types.Int), col("amprocrighttype", types.Int), col("amprocnum", types.Int), col("amproc", types.Int)}, empty)
 	pg("pg_trigger", []catalog.Column{col("oid", types.Int), col("tgrelid", types.Int), col("tgname", types.String), col("tgfoid", types.Int), col("tgtype", types.Int), col("tgenabled", types.String), col("tgisinternal", types.Bool), col("tgconstraint", types.Int), col("tgdeferrable", types.Bool), col("tginitdeferred", types.Bool)}, empty)
 	pg("pg_rewrite", []catalog.Column{col("oid", types.Int), col("rulename", types.String), col("ev_class", types.Int), col("ev_type", types.String), col("ev_enabled", types.String), col("is_instead", types.Bool)}, empty)
 	pg("pg_event_trigger", []catalog.Column{col("oid", types.Int), col("evtname", types.String), col("evtevent", types.String), col("evtowner", types.Int), col("evtfoid", types.Int), col("evtenabled", types.String), col("evttags", types.String)}, empty)
@@ -650,7 +719,7 @@ func init() {
 		// Inheritance: datax has none, so every constraint is local, inherited
 		// by nothing and from nothing. psql's \d+ reads these.
 		col("conislocal", types.Bool), col("coninhcount", types.Int), col("connoinherit", types.Bool),
-		hidden("__condef"),
+		hidden("__condef"), hidden("__obj_description"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		fkAction := func(a string) string {
@@ -664,14 +733,14 @@ func init() {
 		}
 		for _, t := range env.currentTables() {
 			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
-				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t))})
+				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t)), textOrNull(t.PKComment)})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				if !idx.Unique {
 					continue
 				}
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), str("u"), boolean(false), boolean(false), boolean(true),
-					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(UniqueDef(t, idx))})
+					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(UniqueDef(t, idx)), textOrNull(idx.ConstraintComment)})
 			}
 			for i := range t.Constraints {
 				c := &t.Constraints[i]
@@ -679,7 +748,7 @@ func init() {
 				switch c.Kind {
 				case catalog.ConstraintCheck:
 					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("c"), boolean(false), boolean(false), boolean(c.Validated),
-						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(def)})
+						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(def), textOrNull(c.Comment)})
 				case catalog.ConstraintForeign:
 					ref := t
 					if c.RefTable != t.ID {
@@ -690,7 +759,7 @@ func init() {
 						confkey = str(intArray(attnums(ref, c.RefColumns)))
 					}
 					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("f"), boolean(false), boolean(false), boolean(c.Validated),
-						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), boolean(true), i64(0), boolean(false), str(def)})
+						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), boolean(true), i64(0), boolean(false), str(def), textOrNull(c.Comment)})
 				}
 			}
 		}
@@ -773,7 +842,15 @@ func init() {
 				case "default_transaction_read_only", "transaction_read_only", "integer_datetimes", "standard_conforming_strings":
 					vartype = "bool"
 				}
-				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str("default"), str(kv[1]), str(kv[1])})
+				// source and boot_val: a setting this session changed
+				// (SET, or a connection parameter) reads 'session'
+				// beside the value a new session starts with, as psql's
+				// \dconfig lists the non-default ones.
+				source, boot := "default", kv[1]
+				if d, ok := env.SettingDefaults[kv[0]]; ok && d != kv[1] {
+					source, boot = "session", d
+				}
+				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str(source), str(boot), str(kv[1])})
 			}
 			return rows, nil
 		})

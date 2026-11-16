@@ -248,6 +248,35 @@ func TestClearRangeReplicaCaughtUpBySnapshot(t *testing.T) {
 	if !ok || len(desc.Replicas) != 3 {
 		t.Fatalf("the table's range: %+v", desc)
 	}
+	// Bound the table's range at its end now, with every replica holding
+	// the bound. The last table's range runs to /Max; a table created
+	// while the node is down (a system table made in the background)
+	// would split it there, and a replica that missed a split is refused
+	// a catch-up snapshot by design (it must be removed and re-added),
+	// which is not what this test is about.
+	if !desc.EndKey.Equal(end) {
+		if _, err := n.DB().AdminSplit(ctx, end); err != nil {
+			if d, ok := rangeAt(n, start); !ok || !d.EndKey.Equal(end) {
+				t.Fatalf("splitting at the table's end: %v", err)
+			}
+		}
+	}
+	bounded := time.Now().Add(30 * time.Second)
+	for {
+		desc, _ = rangeAt(n, start)
+		all := desc.EndKey.Equal(end)
+		for i := range tc.Nodes {
+			r, ok := tc.Nodes[i].Store().GetReplica(desc.RangeID)
+			all = all && ok && r.Desc().EndKey.Equal(end)
+		}
+		if all {
+			break
+		}
+		if time.Now().After(bounded) {
+			t.Fatalf("the table's range is not bounded at its end on every replica: %+v", desc)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	// Stop a node that is neither the table range's leader nor n1.
 	down := 1
 	if tc.LeaderIndex(desc.RangeID) == down {

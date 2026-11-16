@@ -386,6 +386,10 @@ type IndexDescriptor struct {
 	ColumnIDs []ColumnID `json:"column_ids"`
 	// Comment is COMMENT ON INDEX's text ("" = none).
 	Comment string `json:"comment,omitempty"`
+	// ConstraintComment is COMMENT ON CONSTRAINT's text for the UNIQUE
+	// constraint a unique index is ("" = none): a comment of its own,
+	// as PostgreSQL keeps the constraint's apart from the index's.
+	ConstraintComment string `json:"constraint_comment,omitempty"`
 	// State is the index's lifecycle state: "" or "public" = readable;
 	// "write-only" = maintained by writers but invisible to the planner
 	// (the CREATE INDEX backfill window). See IndexStateWriteOnly.
@@ -503,6 +507,10 @@ type Constraint struct {
 	// still being validated): new writes are checked, existing rows
 	// were not.
 	Validated bool `json:"validated"`
+	// Comment is COMMENT ON CONSTRAINT's text for a CHECK or FOREIGN
+	// KEY constraint ("" = none); a UNIQUE constraint's is its index's
+	// ConstraintComment.
+	Comment string `json:"comment,omitempty"`
 }
 
 // ForeignKeyRef points from a referenced table to a foreign key on one
@@ -557,6 +565,9 @@ type TableDescriptor struct {
 	NextColumnID ColumnID `json:"next_column_id,omitempty"`
 	// Comment is COMMENT ON TABLE / VIEW's text ("" = none).
 	Comment string `json:"comment,omitempty"`
+	// PKComment is COMMENT ON CONSTRAINT's text for the primary key
+	// constraint (<table>_pkey; "" = none).
+	PKComment string `json:"pk_comment,omitempty"`
 	// ViewQuery is the SELECT a view stands for, as SQL text; a
 	// descriptor carrying one is a view (cluster version v9): it owns no
 	// rows and no primary key, Columns describe the query's output, and

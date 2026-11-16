@@ -481,6 +481,113 @@ func exprHasColumn(e parser.Expr) bool {
 	return found
 }
 
+// levelKeys is what the WHERE clause adds to one join level's per-row
+// lookup: equalities between that side's column and an earlier side's
+// (pairs, used exactly like ON pairs), and equalities between that
+// side's column and a constant (consts, bare column names, values bound).
+type levelKeys struct {
+	pairs  []onPair
+	consts []parser.Comparison
+}
+
+// whereJoinKeys lifts the WHERE clause's equalities into the join levels
+// they constrain (index k-1 for side k). A comma or CROSS join has no ON
+// clause, so without this the nested loop fetches every row of every
+// side for every partial row and only the final WHERE filters the
+// product: psql's \d <index> joins pg_index, pg_class twice and pg_am by
+// commas, which on a node with a real catalog is ~180k joined rows and
+// tens of thousands of catalog scans. Lifted, each level fetches only
+// the rows matching the partial row, and an index on the key is used.
+//
+// Lifting only narrows what a level fetches; the full WHERE still
+// filters the complete rows, so it is enough that no lifted equality
+// rejects a partial row whose completions the WHERE would keep. That
+// holds for an INNER or CROSS side (a rejected partial row cannot
+// survive to the end, and equality is never true against NULL), and not
+// for a LEFT side (a miss NULL-extends instead of dropping) nor anywhere
+// in a chain with a RIGHT or FULL join (its unmatched rows are decided
+// by what earlier levels matched).
+func whereJoinKeys(sides []joinSide, where []parser.Comparison, params []types.Datum) []levelKeys {
+	keys := make([]levelKeys, len(sides)-1)
+	if anyRightSide(sides) {
+		return keys
+	}
+	for _, cmp := range where {
+		if cmp.Op != "=" || cmp.Column == "" || len(cmp.Path) > 0 || cmp.Expr != nil {
+			continue
+		}
+		l, err := resolveJoinRef(sides, cmp.Column)
+		if err != nil || l.alt != nil {
+			continue
+		}
+		v := cmp.Value
+		if !plainExpr(v) {
+			continue
+		}
+		if v.Column != "" {
+			r, err := resolveJoinRef(sides, v.Column)
+			if err != nil || r.alt != nil || r.side == l.side {
+				continue
+			}
+			if l.side < r.side {
+				l, r = r, l // l: the later side, the one looked up
+			}
+			if l.side == 0 || sides[l.side].left {
+				continue
+			}
+			k := &keys[l.side-1]
+			k.pairs = append(k.pairs, onPair{leftSide: r.side, leftCol: r.col, rightCol: l.col})
+			continue
+		}
+		if l.side == 0 || sides[l.side].left {
+			continue // side 0's constants are baseOnlyWhere's
+		}
+		var lit types.Datum
+		switch {
+		case v.Lit != nil:
+			lit = *v.Lit
+		case v.Param > 0 && v.Param <= len(params):
+			lit = params[v.Param-1]
+		default:
+			continue
+		}
+		if lit.Null {
+			continue
+		}
+		k := &keys[l.side-1]
+		k.consts = append(k.consts, parser.Comparison{Column: l.col.Name, Op: "=", Value: parser.Expr{Lit: &lit}})
+	}
+	return keys
+}
+
+// plainExpr reports whether e is a bare column, literal or parameter,
+// with no path, cast, call, operator or subquery around it.
+func plainExpr(e parser.Expr) bool {
+	n := 0
+	if e.Column != "" {
+		n++
+	}
+	if e.Lit != nil {
+		n++
+	}
+	if e.Param > 0 {
+		n++
+	}
+	return n == 1 && len(e.Path) == 0 && e.Sub == nil && e.Func == "" && e.BinOp == "" &&
+		e.Left == nil && e.Right == nil && e.Case == nil && e.Cmp == nil && !e.IsDefault && e.Cast == ""
+}
+
+// levelKindName names join level k for EXPLAIN and the ANALYZE notes: a
+// comma or CROSS join whose WHERE supplies its keys runs as an inner
+// join.
+func levelKindName(sides []joinSide, t *parser.Select, keys []levelKeys, k int) string {
+	kind := joinKindName(sides[k], t.Joins[k-1])
+	if kind == "cross" && (len(keys[k-1].pairs) > 0 || len(keys[k-1].consts) > 0) {
+		return "inner"
+	}
+	return kind
+}
+
 // makeJoinSides pairs every descriptor with its alias and checks for
 // duplicates across all sides.
 func makeJoinSides(baseDesc *catalog.TableDescriptor, innerDescs []*catalog.TableDescriptor, t *parser.Select) ([]joinSide, error) {
@@ -607,6 +714,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		// prune the base first.
 		baseWhere = nil
 	}
+	keys := whereJoinKeys(sides, t.Where, params)
 
 	baseRows, _, err := s.fetchRows(ctx, txn, sides[0].desc, baseWhere, params, 0)
 	if err != nil {
@@ -630,8 +738,9 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 			// keys. A NULL key (including a NULL-extended earlier side)
 			// matches nothing (SQL equality).
 			nullKey := false
-			synth := make([]parser.Comparison, 0, len(ons[k-1]))
-			for _, p := range ons[k-1] {
+			synth := make([]parser.Comparison, 0, len(ons[k-1])+len(keys[k-1].pairs)+len(keys[k-1].consts))
+			synth = append(synth, keys[k-1].consts...)
+			for _, p := range append(ons[k-1][:len(ons[k-1]):len(ons[k-1])], keys[k-1].pairs...) {
 				d := jr.datum(joinRef{side: p.leftSide, col: p.leftCol})
 				if d.Null {
 					nullKey = true
@@ -698,7 +807,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 			}
 		}
 		joined = next
-		s.note("join level %d (%s, %s): %d rows", k, sides[k].alias, joinKindName(sides[k], t.Joins[k-1]), len(joined))
+		s.note("join level %d (%s, %s): %d rows", k, sides[k].alias, levelKindName(sides, t, keys, k), len(joined))
 	}
 
 	// The full WHERE filters complete rows only (LEFT JOIN semantics:
@@ -956,14 +1065,16 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		}
 		return ""
 	}
-	kind := joinKindName(sides[1], t.Joins[0])
+	keys := whereJoinKeys(sides, t.Where, params)
+	kind := levelKindName(sides, t, keys, 1)
 	var b strings.Builder
 	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s%s", kind, sides[0].alias, basePlan.String(), estimate(basePlan))
 	for k := 1; k < len(sides); k++ {
 		// Placeholder non-NULL datums of the join-key columns' own types
 		// give the planner the same shape the per-row lookups will use.
-		synth := make([]parser.Comparison, 0, len(ons[k-1]))
-		for _, p := range ons[k-1] {
+		synth := make([]parser.Comparison, 0, len(ons[k-1])+len(keys[k-1].pairs)+len(keys[k-1].consts))
+		synth = append(synth, keys[k-1].consts...)
+		for _, p := range append(ons[k-1][:len(ons[k-1]):len(ons[k-1])], keys[k-1].pairs...) {
 			lit := types.Datum{Fam: p.rightCol.Type}
 			synth = append(synth, parser.Comparison{
 				Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
@@ -985,7 +1096,7 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 			}
 			continue
 		}
-		lk := joinKindName(sides[k], t.Joins[k-1])
+		lk := levelKindName(sides, t, keys, k)
 		fmt.Fprintf(&b, "; then %s (%s) per row: %s%s", lk, sides[k].alias, innerPathDesc(plan), estimate(plan))
 		if sides[k].right {
 			fmt.Fprintf(&b, " + unmatched %s rows appended", sides[k].alias)

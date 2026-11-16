@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
@@ -122,7 +123,7 @@ func ToSQLError(err error) *Error {
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}
 	}
 	if kvclient.IsRetryable(err) {
-		return &Error{Code: CodeSerializationFailure, Msg: "restart transaction: " + err.Error()}
+		return &Error{Code: CodeSerializationFailure, Msg: restartMessage(err)}
 	}
 	var kerr *kvpb.Error
 	if errors.As(err, &kerr) && kerr.IsBelowGCThreshold() {
@@ -166,4 +167,19 @@ func ToSQLError(err error) *Error {
 		return &Error{Code: CodeDuplicateTable, Msg: ex.Error()}
 	}
 	return &Error{Code: CodeInternal, Msg: err.Error()}
+}
+
+// restartMessage is a retryable error's 40001 text: "restart
+// transaction: " once, in front. kvclient.RetryableError already
+// carries the prefix in its own text, so prefixing it again doubled it
+// ("restart transaction: restart transaction: ..."); a wrapped one
+// ("loread: restart transaction: ...") has the prefix moved to the
+// front.
+func restartMessage(err error) string {
+	const prefix = "restart transaction: "
+	msg := err.Error()
+	if strings.HasPrefix(msg, prefix) {
+		return msg
+	}
+	return prefix + strings.Replace(msg, prefix, "", 1)
 }

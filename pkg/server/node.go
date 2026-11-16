@@ -306,6 +306,14 @@ type Config struct {
 
 	// Test hooks.
 	TestingKnobs kvserver.TestingKnobs
+	// TestingAdminHook runs at the start of every admin RPC this node
+	// serves, with its op; the func it returns, if any, runs when the
+	// handler returns. Lets a test hold a handler inside the node while
+	// it stops (issue #324).
+	TestingAdminHook func(ctx context.Context, op string) (done func())
+	// TestingBeforeEngineClose runs in the shutdown closer just before
+	// the node closes the engines it opened (issue #324).
+	TestingBeforeEngineClose func()
 	// RequireLockedKeys refuses to start an encrypted node whose key
 	// memory could not be locked and kept out of core dumps (issue
 	// #309); without it that is a warning.
@@ -651,6 +659,9 @@ func (n *Node) start() error {
 				_ = n.raftEngine.Close()
 			}
 		})
+		if k := n.cfg.TestingBeforeEngineClose; k != nil {
+			n.stopper.AddCloser(k) // closers run in reverse: before both
+		}
 	}
 	if n.raftEngine != nil {
 		log.Infof("store layout: split (raft log on its own engine; state engine without a WAL)")
@@ -899,15 +910,31 @@ func (n *Node) start() error {
 		NodeHealth: func(id base.NodeID, h *rpcpb.StorageHealth) {
 			n.store.UpdateNodeHealth(id, h.Overloaded, h.Reason)
 		},
+		// Every handler runs as a stopper task, so the engine closer
+		// below cannot run under one (issue #324).
+		Stopper: n.stopper,
 	}, serverTLS)
-	// Not a stopper worker: Serve exits when the closer calls Stop, and
-	// closers run after workers — a worker here would deadlock shutdown.
+	// Not a stopper worker: Serve exits when the server is stopped,
+	// which a worker waiting on Serve would hold up.
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Debugf("grpc server stopped: %v", err)
 		}
 	}()
-	n.stopper.AddCloser(grpcServer.Stop)
+	// The server stops as soon as the node begins to: its connections
+	// close, which cancels the running calls and fails a snapshot stream
+	// waiting for its next chunk, so the handlers the stopper then waits
+	// for (as tasks, before any closer) finish promptly. Stop does not
+	// wait for handlers itself, and GracefulStop would wait for the
+	// peers' raft streams, which only end with the connection (issue
+	// #324).
+	if err := n.stopper.RunWorker(func(ctx context.Context) {
+		<-ctx.Done()
+		grpcServer.Stop()
+	}); err != nil {
+		grpcServer.Stop()
+		return err
+	}
 	// What a sealed restart of this node will need before its store is
 	// open; the heartbeat keeps it in step with the registry after this.
 	n.writeSealIdentity()

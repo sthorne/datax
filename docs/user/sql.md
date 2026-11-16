@@ -369,10 +369,13 @@ view uses, and columns drawing from a sequence are otherwise refused
 (`25001`); cluster version v9.
 
 **`COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL`**
-stores the text in the descriptor; `obj_description`,
-`col_description` and `pg_description` render it, so `psql`'s `\d+`,
-`\dt+` and `\dv+` show the descriptions. Comments survive renames,
-default changes and type rewrites.
+and **`COMMENT ON CONSTRAINT name ON table IS ...`** store the text in
+the descriptor; `obj_description`, `col_description` and
+`pg_description` render it, so `psql`'s `\d+`, `\dt+` and `\dv+` show
+the descriptions, and `\dd` the constraints' (a primary key, `UNIQUE`,
+`CHECK` or foreign key; a constraint's comment is its own, apart from
+its index's, and is dropped with it). Comments survive renames, default
+changes and type rewrites.
 
 **DDL in transaction blocks.** A statement that is one descriptor
 write runs inside `BEGIN ... COMMIT` like any other and commits or rolls
@@ -747,7 +750,7 @@ gets a fresh key. One tenant's key is rotated with
 
 ```sql
 [WITH [RECURSIVE] name [(cols)] AS (query | INSERT/UPDATE/DELETE ... RETURNING ...), ...]
-SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
+SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
   FROM t [AS a] | (query) AS d
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
@@ -869,7 +872,12 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
   share; a cross join when none) equate the named columns, show each
   once in `*`, resolve it unqualified without ambiguity, and read it as
   `COALESCE` across an outer join. `CROSS JOIN` and the comma form
-  `FROM a, b WHERE a.x = b.y` are cross products filtered by `WHERE`.
+  `FROM a, b WHERE a.x = b.y` are cross products filtered by `WHERE`;
+  a `WHERE` equality of a later side's column with an earlier side's
+  column, or with a constant, becomes that side's lookup key as an `ON`
+  equality would, so `EXPLAIN` shows an inner join with a point or
+  index lookup rather than a scan per row (not for a `LEFT` side, or
+  with a `RIGHT` / `FULL` join in the chain).
   Join select lists take columns, `*`, expressions, `->`/`->>` paths
   and subqueries; under `GROUP BY` they narrow to plain columns and
   aggregates.
@@ -1566,7 +1574,7 @@ SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / 
 SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
-SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;
+SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;   -- source 'session' where this session changed it (psql's \dconfig)
 SET app.tenant = 'acme';                      -- a custom setting: any class.name
 SELECT set_config('app.tenant', $1, false);   -- the same, with the value as a parameter
 SELECT current_setting('app.tenant');         -- 42704 if never set; current_setting(name, true) gives NULL
@@ -1928,13 +1936,15 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
 `pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
 `pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`,
-`pg_policy`, `pg_policies`
+`pg_policy`, `pg_policies`, `pg_description`
 (and empty stand-ins for the catalogs of features datax lacks —
-publications, extensions, functions, triggers, ...), plus
+publications, extensions, functions, triggers, operator classes and
+families, `pg_amop`, `pg_amproc`, ...), plus
 `information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
-descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
+descriptor ID; `'t'::regclass` gives it); a catalog whose rows have OIDs
+also has PostgreSQL's `tableoid` system column (not in `*`). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
 They describe the current database, as each PostgreSQL database's own
 catalogs do (`table_catalog` is its name); `pg_database`, `pg_roles`,

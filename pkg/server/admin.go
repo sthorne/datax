@@ -29,6 +29,11 @@ func (n *Node) handleAdmin(ctx context.Context, data []byte) ([]byte, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return nil, err
 	}
+	if h := n.cfg.TestingAdminHook; h != nil {
+		if done := h(ctx, req.Op); done != nil {
+			defer done()
+		}
+	}
 	resp := n.serveAdmin(ctx, req)
 	return json.Marshal(resp)
 }
