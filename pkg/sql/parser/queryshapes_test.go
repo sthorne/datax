@@ -137,3 +137,30 @@ func TestParseExplainAnalyze(t *testing.T) {
 		t.Fatalf("EXPLAIN of ANALYZE: %+v", ex)
 	}
 }
+
+// TestParseBareColumnAlias: a select-list item takes its alias without
+// AS too (count(*) n, (SELECT ...) "Applicable types" in psql's \dAf),
+// while the words that end the list or continue the item are never
+// taken for one.
+func TestParseBareColumnAlias(t *testing.T) {
+	sel := parseOne(t, `SELECT id ident, count(*) n, (SELECT 1) "Applicable types", qty + 1 AS q FROM t GROUP BY id`).(*Select)
+	var got []string
+	for _, e := range sel.Exprs {
+		got = append(got, e.Alias)
+	}
+	if strings.Join(got, ",") != "ident,n,Applicable types,q" || len(sel.GroupBy) != 1 {
+		t.Fatalf("aliases: %q, group by %v", got, sel.GroupBy)
+	}
+	// A clause word after an item is the clause, not an alias.
+	if u := parseOne(t, `SELECT id FROM t UNION SELECT 2`).(*Select); u.Union == nil || u.Exprs[0].Alias != "" {
+		t.Fatalf("union: %+v", u)
+	}
+	if o := parseOne(t, `SELECT id FROM t OFFSET 1`).(*Select); o.Exprs[0].Alias != "" || o.Offset != 1 {
+		t.Fatalf("offset: %+v", o)
+	}
+	// An operator word the parser does not take stays an error rather
+	// than reading as an alias.
+	if _, err := Parse(`SELECT id isnull FROM t`); err == nil {
+		t.Fatal("id isnull parsed as an alias")
+	}
+}
