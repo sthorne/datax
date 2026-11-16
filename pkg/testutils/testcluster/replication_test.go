@@ -2,10 +2,13 @@ package testcluster
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 )
 
 func testKey(s string) keys.Key {
@@ -144,7 +147,7 @@ func TestFullClusterRestart(t *testing.T) {
 	if err := tc.waitForReplication(ctx, 3, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := n1.DB().Put(ctx, testKey("survives"), []byte("restart")); err != nil {
+	if err := putRetryAmbiguous(ctx, n1.DB(), testKey("survives"), []byte("restart")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 
@@ -167,7 +170,28 @@ func TestFullClusterRestart(t *testing.T) {
 	if string(v) != "restart" {
 		t.Fatalf("got %q", v)
 	}
-	if err := tc.Nodes[4].DB().Put(ctx, testKey("post-restart"), []byte("ok")); err != nil {
+	if err := putRetryAmbiguous(ctx, tc.Nodes[4].DB(), testKey("post-restart"), []byte("ok")); err != nil {
 		t.Fatalf("write after full restart: %v", err)
+	}
+}
+
+// putRetryAmbiguous writes key=value, sending it again while the result
+// is ambiguous. A leadership change with the proposal in flight (here,
+// during the conf change that adds the third replica, or while the
+// restarted cluster elects) leaves the client not knowing whether the
+// write applied; the server is right to say so. A blind put of a fixed
+// value is idempotent, so resending it is safe.
+func putRetryAmbiguous(ctx context.Context, db *kvclient.DB, key keys.Key, value []byte) error {
+	for {
+		err := db.Put(ctx, key, value)
+		var kerr *kvpb.Error
+		if err == nil || !errors.As(err, &kerr) || kerr.Ambiguous == nil || ctx.Err() != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
