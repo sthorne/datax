@@ -407,6 +407,11 @@ type Node struct {
 	// Guarded by encKeyMu: online rotation (rotate-store-key) swaps it.
 	encKeyMu sync.Mutex
 	encKey   []byte
+	// exportMu serializes the metadata backup's seal and write. Without
+	// it, a heartbeat's export that read the old key just before a
+	// rotation's swap could write after the rotation's reseal, leaving
+	// the backup under a key the rotation retired until the next beat.
+	exportMu sync.Mutex
 	// encKeyPaths are the key files EncKeyPath named (the one that opened
 	// the store first), consulted after an online rotation to tell the
 	// operator whether a restart would find the new key.
