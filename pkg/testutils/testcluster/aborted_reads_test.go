@@ -248,6 +248,19 @@ func TestTxnAbortedLearnedFromHeartbeat(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	// Once it knows, the operations that check for a finished transaction
+	// say it was aborted, retryably (40001), not "already finished" (which
+	// SQL reported as XX000: TestLargeObjectConcurrent hit it through a
+	// savepoint).
+	if err := victim.Savepoint("sp"); !kvclient.IsRetryable(err) {
+		t.Fatalf("savepoint of an aborted transaction: %v, want a retryable abort", err)
+	}
+	if err := victim.RollbackToSavepoint(ctx, "sp"); !kvclient.IsRetryable(err) {
+		t.Fatalf("rollback to savepoint of an aborted transaction: %v, want a retryable abort", err)
+	}
+	if err := victim.Commit(ctx); !kvclient.IsRetryable(err) {
+		t.Fatalf("commit of an aborted transaction: %v, want a retryable abort", err)
+	}
 }
 
 // TestTxnAbortSpanAcrossSplitAndMerge (issue #320): the abort-span entry

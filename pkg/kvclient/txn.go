@@ -287,7 +287,7 @@ func (t *Txn) Savepoint(name string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.mu.finished {
-		return fmt.Errorf("transaction already finished")
+		return t.finishedErrLocked()
 	}
 	if t.mu.savepoints == nil {
 		t.mu.savepoints = make(map[string]*savepoint)
@@ -334,8 +334,9 @@ func (t *Txn) ReleaseSavepoint(name string) error {
 func (t *Txn) RollbackToSavepoint(ctx context.Context, name string) error {
 	t.mu.Lock()
 	if t.mu.finished {
+		err := t.finishedErrLocked()
 		t.mu.Unlock()
-		return fmt.Errorf("transaction already finished")
+		return err
 	}
 	sp, ok := t.mu.savepoints[name]
 	if !ok {
@@ -1270,8 +1271,9 @@ func (t *Txn) pushIntents(ctx context.Context, intents []storage.Intent, pushAbo
 func (t *Txn) Commit(ctx context.Context) error {
 	t.mu.Lock()
 	if t.mu.finished {
+		err := t.finishedErrLocked()
 		t.mu.Unlock()
-		return fmt.Errorf("transaction already finished")
+		return err
 	}
 	wb := t.mu.deferred
 	t.mu.deferred = nil
@@ -1800,6 +1802,20 @@ func (t *Txn) failIfAborted() error {
 	e := kvpb.NewErrorf("transaction %s was aborted by a conflicting transaction", id)
 	e.TxnAborted = &kvpb.TxnAbortedError{}
 	return &RetryableError{Cause: e}
+}
+
+// finishedErrLocked is the error for an operation on a finished
+// transaction; t.mu must be held. A transaction that finished because
+// another aborted it (issue #320) answers with the same retryable abort
+// every other request of it gets, so the client sees 40001 and retries,
+// rather than a generic "already finished" that surfaces as XX000.
+func (t *Txn) finishedErrLocked() error {
+	if t.mu.aborted {
+		e := kvpb.NewErrorf("transaction %s was aborted by a conflicting transaction", t.mu.txn.ID)
+		e.TxnAborted = &kvpb.TxnAbortedError{}
+		return &RetryableError{Cause: e}
+	}
+	return fmt.Errorf("transaction already finished")
 }
 
 // giveUpAborted settles a transaction that was aborted by another (or by
