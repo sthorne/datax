@@ -3063,7 +3063,9 @@ func (p *parser) parseCount(clause string) (n int64, param int, err error) {
 		}
 		return -1, idx, nil
 	}
-	if t.kind != tkNumber {
+	// LIMIT '10': a quoted count, as a client that interpolates its
+	// parameters into the text (the simple protocol) writes one.
+	if t.kind != tkNumber && t.kind != tkString {
 		return 0, 0, p.errf("expected %s count, found %q", clause, t.text)
 	}
 	v, err := strconv.ParseInt(t.text, 10, 64)
