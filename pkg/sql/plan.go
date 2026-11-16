@@ -120,6 +120,8 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			defer restore()
 			t = bound
 		}
+		// Execution addresses a single table's columns by bare name.
+		stripTableAlias(t)
 		if hasWindows(t.Exprs) {
 			wp, err := windowPlanFor(t)
 			if err != nil {
@@ -286,8 +288,6 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			return cols, nil
 		}
-		// Execution addresses a single table's columns by bare name.
-		stripTableAlias(t)
 		proj, perr := resolveProjection(desc, maskSubqueryExprs(t).Exprs)
 		if perr != nil {
 			return nil, ToSQLError(perr)

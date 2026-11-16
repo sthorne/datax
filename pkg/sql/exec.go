@@ -2183,6 +2183,10 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			return nil, err
 		}
 	}
+	// A single table's columns are addressed by bare name from here on,
+	// whatever the select's shape (grouped, windowed, plain): t.c and
+	// alias.c become c.
+	stripTableAlias(t)
 	if hasWindows(t.Exprs) {
 		return s.execWindowed(ctx, txn, t, params)
 	}
@@ -3052,6 +3056,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		defer restore()
 		sel = bound
 	}
+	// The plan reads a single table's columns by bare name, as
+	// execution does.
+	stripTableAlias(sel)
 	windowed := ""
 	if hasWindows(sel.Exprs) {
 		wp, err := windowPlanFor(sel)
@@ -3246,68 +3253,54 @@ func stripTableAlias(t *parser.Select) {
 	if t.Alias != "" {
 		prefixes[t.Alias+"."] = true
 	}
-	strip := func(name string) string {
+	// strip rewrites a name in place only when it changes: a statement
+	// already stripped (a prepared one, run again) is only read.
+	strip := func(name *string) {
 		for pre := range prefixes {
-			if strings.HasPrefix(name, pre) && !strings.Contains(name[len(pre):], ".") {
-				return name[len(pre):]
+			if strings.HasPrefix(*name, pre) && !strings.Contains((*name)[len(pre):], ".") {
+				*name = (*name)[len(pre):]
+				return
 			}
 		}
-		return name
 	}
-	var walk func(e *parser.Expr)
-	walk = func(e *parser.Expr) {
-		if e == nil {
-			return
-		}
-		if e.Column != "" {
-			e.Column = strip(e.Column)
-		}
-		walk(e.Left)
-		walk(e.Right)
-		for i := range e.Args {
-			walk(&e.Args[i])
-		}
-		if e.Case != nil {
-			walk(e.Case.Operand)
-			for i := range e.Case.Whens {
-				walk(e.Case.Whens[i].Value)
-				walk(&e.Case.Whens[i].Result)
-				stripConds(e.Case.Whens[i].Cond, strip, walk)
+	// Every expression position of this select (select list, aggregate
+	// arguments and filters, WHERE, HAVING, ORDER BY, windows); not its
+	// subqueries, whose qualified names may be correlated references
+	// to this very alias, nor its WITH members or set members.
+	self := *t
+	self.With, self.Union, self.Derived = nil, nil, nil
+	w := parser.Walker{
+		OnSelect: func(s *parser.Select) bool { return s == &self },
+		OnExpr: func(e *parser.Expr) bool {
+			if e.Column != "" {
+				strip(&e.Column)
 			}
-			walk(e.Case.Else)
-		}
-		if e.Cmp != nil {
-			c := *e.Cmp
-			stripConds([]parser.Comparison{c}, strip, walk)
-			e.Cmp = &c
-		}
+			return true
+		},
+		OnCond: func(c *parser.Comparison) bool {
+			if c.Column != "" {
+				strip(&c.Column)
+			}
+			return true
+		},
+		OnSelectExpr: func(se *parser.SelectExpr) {
+			if se.AggCol != "" {
+				strip(&se.AggCol)
+			}
+		},
+		OnOrderCol: func(oc *parser.OrderCol) {
+			if oc.Column != "" {
+				strip(&oc.Column)
+			}
+		},
 	}
-	for i := range t.Exprs {
-		walk(&t.Exprs[i].Expr)
-	}
-	stripConds(t.Where, strip, walk)
-	for i := range t.OrderBy {
-		t.OrderBy[i].Column = strip(t.OrderBy[i].Column)
-		walk(t.OrderBy[i].Expr)
-	}
+	w.SelectStmt(&self)
 	for i := range t.GroupBy {
-		t.GroupBy[i] = strip(t.GroupBy[i])
+		strip(&t.GroupBy[i])
 	}
-}
-
-func stripConds(conds []parser.Comparison, strip func(string) string, walk func(*parser.Expr)) {
-	for i := range conds {
-		c := &conds[i]
-		if c.Column != "" {
-			c.Column = strip(c.Column)
-		}
-		walk(c.Expr)
-		walk(&c.Value)
-		for j := range c.Values {
-			walk(&c.Values[j])
-		}
-		for j := range c.Or {
-			stripConds(c.Or[j], strip, walk)
+	for i := range t.Having {
+		if t.Having[i].Column != "" {
+			strip(&t.Having[i].Column)
 		}
 	}
 }
