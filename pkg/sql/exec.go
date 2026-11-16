@@ -3025,6 +3025,19 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 // execExplain describes the access plan of a SELECT without executing it.
 func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.Explain, params []types.Datum) (*Result, error) {
 	sel, ok := t.Stmt.(*parser.Select)
+	if ok && sel.Table == "" && sel.Derived == nil && sel.FuncTable == nil && sel.Union == nil && len(sel.Joins) == 0 && len(sel.With) == 0 {
+		// SELECT without FROM (SELECT $1::text, SELECT now()): one row
+		// computed from its expressions, no table read. ANALYZE runs it
+		// with the bound parameters.
+		if t.Analyze {
+			return s.execExplainAnalyze(ctx, txn, sel, params)
+		}
+		return &Result{
+			Columns: []ResultColumn{{Name: "plan", Type: types.String}},
+			Rows:    [][]types.Datum{{types.NewString("result: one row computed without reading a table")}},
+			Tag:     "EXPLAIN",
+		}, nil
+	}
 	if !ok || (sel.Table == "" && sel.Derived == nil) {
 		return nil, newErrf(CodeFeatureNotSupported, "EXPLAIN supports table SELECT statements only")
 	}
