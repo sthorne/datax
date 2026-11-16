@@ -161,6 +161,19 @@ type StreamReader struct {
 	err   error
 }
 
+// SealedStreamHeaderLen is how many leading bytes IsSealedStreamHeader
+// needs to look at.
+const SealedStreamHeaderLen = headerLenV2
+
+// IsSealedStreamHeader reports whether b begins with the header of a
+// stream sealed by NewStreamWriter: the file magic and the stream flags.
+// A reader that expects plaintext uses it to refuse a sealed file for
+// what it is, rather than parse ciphertext as records.
+func IsSealedStreamHeader(b []byte) bool {
+	return len(b) >= headerLenV2 && string(b[0:4]) == fileMagicV2 &&
+		binary.BigEndian.Uint32(b[8:12]) == flagBound|flagStream
+}
+
 // NewStreamReader reads the header from r and prepares to open the stream
 // sealed under key for name. A wrong key or name is reported by the first
 // Read, as a chunk that does not authenticate.
