@@ -1467,6 +1467,31 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **psql 17 and 18's describe commands.** psql chooses its catalog
+  queries by its own version as well as the server's, so a newer client
+  sends queries psql 16 did not, though datax reports server version 14:
+  `\d+` reads `pg_constraint.connoinherit` (with `conislocal` and
+  `coninhcount`, now present: every constraint is local and inherits
+  nothing), and psql 18's `\dx` joins `LEFT JOIN
+  pg_available_extensions() ae(name, default_version, comment) ON ...`,
+  which failed with `syntax error: expected ON, found "("`. A
+  set-returning function in `FROM` is now a member like a table: heading
+  the `FROM` or joined (inner, `LEFT`, `RIGHT`, `FULL`, `CROSS`; `ON` or
+  `USING`), with `[AS] alias (column, ...)` renaming its columns (too many
+  names is `42P10`); a call reading another member's columns (`LATERAL`)
+  is still refused. `pg_available_extensions()` and the
+  `pg_available_extensions` view are new and empty: datax packages no
+  installable extension (`CREATE EXTENSION vector` is accepted because the
+  type is built in). `pg_partition_ancestors(...)` in `FROM` returns the
+  relation itself. `TestPsqlCatalogQueries` runs the client named by
+  `DATAX_PSQL` when set, logs `psql --version`, covers eleven more
+  commands, and passes with psql 16, 17 and 18.
+- **`RIGHT` / `FULL JOIN` dropped the joined side's unmatched rows when
+  that side was a `WITH` member, a subquery, a table function or a
+  catalog** (`pg_class c RIGHT JOIN pg_namespace n ON ...` kept only the
+  namespaces that matched). Those rows have no primary key, and unmatched
+  rows were told from matched ones by it; they are now told by their
+  values.
 - **Parameters are counted and typed wherever they stand** (#322). A
   parameter used only inside a subquery (`WHERE sid IN (SELECT sid FROM s
   WHERE g = $1)`), or only under `EXPLAIN` (`EXPLAIN SELECT $1::text`), was

@@ -597,8 +597,11 @@ type JoinClause struct {
 	// ON ...); Table is empty then and Alias names it.
 	Derived *Select
 	// FuncTable is a table function joined in (FROM t, f(x) [WITH
-	// ORDINALITY] AS a(c1, c2)), with its column names; Table is empty
-	// then. Parsed for the catalog queries tools send; not executable.
+	// ORDINALITY] AS a(c1, c2), or LEFT JOIN f() a(c1, c2) ON ...), with
+	// the names of its leading columns; Table is empty then. A call
+	// whose arguments use no column runs once and joins as a relation;
+	// one reading an earlier member's columns (LATERAL) is parsed for
+	// the catalog queries tools send but does not execute.
 	FuncTable *Expr
 	FuncCols  []string
 	On        []JoinCond
@@ -636,11 +639,11 @@ type Select struct {
 	Table    string  // empty for FROM-less and derived-table selects
 	Alias    string  // optional alias for Table (or the derived table's alias)
 	Derived  *Select // FROM (SELECT ...) AS alias — materialized subquery
-	// FuncTable is FROM unnest(array) [AS] alias [(column)]: a
-	// set-returning call materialized as a one-column table named Alias
-	// with column FuncCol.
+	// FuncTable is FROM f(...) [AS] alias [(column, ...)]: a
+	// set-returning call materialized as a table named Alias, its
+	// leading columns renamed by FuncCols.
 	FuncTable *Expr
-	FuncCol   string
+	FuncCols  []string
 	// Joins are the JOIN clauses in syntactic order; execution joins
 	// left-deep in exactly this order.
 	Joins []JoinClause

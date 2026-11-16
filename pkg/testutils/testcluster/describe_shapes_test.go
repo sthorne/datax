@@ -58,6 +58,8 @@ var describeSamples = []struct {
 		{sql: `SELECT * FROM shapes ORDER BY id`, rows: true},
 		{sql: `SELECT 1, now(), 'x'::text`, rows: true},
 		{sql: `SELECT * FROM unnest(ARRAY[1, 2, 3]) AS u(x)`, rows: true},
+		{sql: `SELECT s.id, u.x FROM shapes s LEFT JOIN unnest(ARRAY[1, 2]) AS u(x) ON u.x = s.id ORDER BY s.id`, rows: true},
+		{sql: `SELECT ae.name, ae.default_version FROM pg_available_extensions() AS ae`},
 		{sql: `SELECT count(*) FROM information_schema.tables`, rows: true},
 		{sql: `SELECT relname FROM pg_class LIMIT 1`, rows: true},
 	}},

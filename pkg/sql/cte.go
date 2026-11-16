@@ -364,46 +364,20 @@ func stmtReferences(stmt parser.Statement, name string) bool {
 	return false
 }
 
-// bindJoinedDerived binds every JOIN (SELECT ...) AS d member of t as a
-// relation named by its alias (rows when executing, columns only when
-// describing), returning t with the members referring to the relations
-// by name and a function restoring the shadowed bindings.
+// bindJoinedDerived binds every JOIN (SELECT ...) AS d member of t,
+// every joined table function call whose arguments read no column, and
+// a table function heading a join, as a relation named by its alias
+// (rows when executing, columns only when describing), returning t
+// with the members referring to the relations by name and a function
+// restoring the shadowed bindings.
 func (s *Session) bindJoinedDerived(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum, describeOnly bool) (*parser.Select, func(), error) {
 	saved := map[string]*relation{}
 	restore := func() { s.restoreRelations(saved) }
 	var out *parser.Select
-	for i := range t.Joins {
-		jc := t.Joins[i]
-		if jc.Derived == nil {
-			continue
-		}
-		if out == nil {
-			c := *t
-			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
-			out = &c
-		}
-		name := strings.ToLower(jc.Alias)
-		var cols []ResultColumn
-		var rows [][]types.Datum
-		if describeOnly {
-			c, serr := s.PlanColumns(ctx, jc.Derived)
-			if serr != nil {
-				restore()
-				return nil, nil, serr
-			}
-			cols = c
-		} else {
-			res, err := s.execSubSelect(ctx, txn, jc.Derived, params)
-			if err != nil {
-				restore()
-				return nil, nil, err
-			}
-			cols, rows = res.Columns, res.Rows
-		}
+	bind := func(name string, cols []ResultColumn, rows [][]types.Datum) error {
 		desc, err := relationDesc(name, cols, nil)
 		if err != nil {
-			restore()
-			return nil, nil, err
+			return err
 		}
 		if prev, had := s.bindRelation(name, &relation{desc: desc, rows: rows}); had {
 			if _, seen := saved[name]; !seen {
@@ -412,7 +386,67 @@ func (s *Session) bindJoinedDerived(ctx context.Context, txn *kvclient.Txn, t *p
 		} else if _, seen := saved[name]; !seen {
 			saved[name] = nil
 		}
-		out.Joins[i].Derived, out.Joins[i].Table = nil, name
+		return nil
+	}
+	funcRelation := func(fe parser.Expr, alias string, rename []string) ([]ResultColumn, [][]types.Datum, error) {
+		if describeOnly {
+			cols, err := tableFuncColumns(fe, alias, rename)
+			return cols, nil, err
+		}
+		return s.execTableFunc(ctx, txn, fe, alias, rename, params)
+	}
+	clone := func() {
+		if out == nil {
+			c := *t
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+			out = &c
+		}
+	}
+	if t.FuncTable != nil && len(t.Joins) > 0 && !isLateralFunc(*t.FuncTable) {
+		clone()
+		name := strings.ToLower(t.Alias)
+		cols, rows, err := funcRelation(*t.FuncTable, t.Alias, t.FuncCols)
+		if err == nil {
+			err = bind(name, cols, rows)
+		}
+		if err != nil {
+			restore()
+			return nil, nil, err
+		}
+		out.FuncTable, out.FuncCols, out.Table = nil, nil, name
+	}
+	for i := range t.Joins {
+		jc := t.Joins[i]
+		if jc.Derived == nil && (jc.FuncTable == nil || isLateralFunc(*jc.FuncTable)) {
+			continue
+		}
+		clone()
+		name := strings.ToLower(jc.Alias)
+		var cols []ResultColumn
+		var rows [][]types.Datum
+		var err error
+		switch {
+		case jc.FuncTable != nil:
+			cols, rows, err = funcRelation(*jc.FuncTable, jc.Alias, jc.FuncCols)
+		case describeOnly:
+			var serr *Error
+			if cols, serr = s.PlanColumns(ctx, jc.Derived); serr != nil {
+				err = serr
+			}
+		default:
+			var res *Result
+			if res, err = s.execSubSelect(ctx, txn, jc.Derived, params); err == nil {
+				cols, rows = res.Columns, res.Rows
+			}
+		}
+		if err == nil {
+			err = bind(name, cols, rows)
+		}
+		if err != nil {
+			restore()
+			return nil, nil, err
+		}
+		out.Joins[i].Derived, out.Joins[i].FuncTable, out.Joins[i].FuncCols, out.Joins[i].Table = nil, nil, nil, name
 	}
 	if out == nil {
 		return t, restore, nil
@@ -420,10 +454,15 @@ func (s *Session) bindJoinedDerived(ctx context.Context, txn *kvclient.Txn, t *p
 	return out, restore, nil
 }
 
-// hasDerivedJoin reports whether any join member is a subquery.
+// hasDerivedJoin reports whether any join member is a subquery or a
+// table function call bindJoinedDerived binds as a relation, or a
+// table function heads a join.
 func hasDerivedJoin(t *parser.Select) bool {
+	if t.FuncTable != nil && len(t.Joins) > 0 && !isLateralFunc(*t.FuncTable) {
+		return true
+	}
 	for _, jc := range t.Joins {
-		if jc.Derived != nil {
+		if jc.Derived != nil || jc.FuncTable != nil && !isLateralFunc(*jc.FuncTable) {
 			return true
 		}
 	}

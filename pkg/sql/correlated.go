@@ -298,7 +298,10 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	var innerDesc *catalog.TableDescriptor
 	switch {
 	case sub.FuncTable != nil:
-		innerDesc = funcTableDesc(sub)
+		var err error
+		if innerDesc, err = funcTableDesc(sub); err != nil {
+			return nil, nil, err
+		}
 	case sub.Table == "":
 		// FROM-less: no columns of its own; every name is an outer's.
 		innerDesc = &catalog.TableDescriptor{}

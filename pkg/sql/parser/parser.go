@@ -85,7 +85,7 @@ func (p *parser) errf(format string, args ...any) error {
 }
 
 // tableFuncs are the set-returning functions accepted in FROM.
-var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true}
+var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true, "pg_available_extensions": true}
 
 // parseFuncTable parses a FROM-clause table function call, if present.
 func (p *parser) parseFuncTable() (*Expr, bool, error) {
@@ -100,6 +100,9 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 	}
 	p.i += 2
 	e := Expr{Func: t.text}
+	if p.consumeOp(")") {
+		return &e, true, nil
+	}
 	for {
 		a, err := p.parseAddExpr()
 		if err != nil {
@@ -114,6 +117,36 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 		return nil, false, err
 	}
 	return &e, true, nil
+}
+
+// parseFuncTableAlias parses what follows a FROM-clause table function
+// call: [WITH ORDINALITY] [[AS] alias [(column, ...)]]. The alias
+// defaults to the function's name.
+func (p *parser) parseFuncTableAlias(fe *Expr) (string, []string, error) {
+	if p.peekIdentSeq("with", "ordinality") {
+		p.i += 2
+	}
+	alias := p.parseOptTableAlias(false)
+	if alias == "" {
+		alias = fe.Func
+	}
+	var cols []string
+	if p.consumeOp("(") {
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return "", nil, err
+			}
+			cols = append(cols, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return "", nil, err
+		}
+	}
+	return alias, cols, nil
 }
 
 // parseColumnRef parses ident['.' ident] into a ColumnRef.
@@ -2609,33 +2642,21 @@ func (p *parser) parseSelect() (Statement, error) {
 			}
 			derived = true
 		}
-		// FROM [pg_catalog.]unnest(...) [AS] alias [(column)] — a
-		// set-returning function as a one-column table.
-		if fe, ok, err := p.parseFuncTable(); err != nil {
-			return nil, err
-		} else if ok {
-			sel.FuncTable = fe
-			if p.peekIdentSeq("with", "ordinality") {
-				p.i += 2
-			}
-			sel.Alias = p.parseOptTableAlias(false)
-			if sel.Alias == "" {
-				sel.Alias = fe.Func
-			}
-			sel.FuncCol = sel.Alias
-			if p.consumeOp("(") {
-				col, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				sel.FuncCol = col
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-			}
-			return p.finishSelect(sel)
-		}
+		// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
+		// set-returning function as a table, joinable like any other.
+		funcTable := false
 		if !derived {
+			if fe, ok, err := p.parseFuncTable(); err != nil {
+				return nil, err
+			} else if ok {
+				sel.FuncTable = fe
+				if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+					return nil, err
+				}
+				funcTable = true
+			}
+		}
+		if !derived && !funcTable {
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
@@ -2658,41 +2679,17 @@ func (p *parser) parseSelect() (Statement, error) {
 			if len(sel.Joins) >= maxJoinTables-1 {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
 			}
+			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
 			if fe, ok, err := p.parseFuncTable(); err != nil {
 				return nil, err
 			} else if ok {
-				// A table function as a join member.
-				if p.peekIdentSeq("with", "ordinality") {
-					p.i += 2
+				// A table function as a join member, named by its alias
+				// (the function's name by default).
+				jc.FuncTable = fe
+				if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+					return nil, err
 				}
-				jc := JoinClause{Left: left, Cross: cross, FuncTable: fe}
-				jc.Alias = p.parseOptTableAlias(false)
-				if jc.Alias == "" {
-					jc.Alias = fe.Func
-				}
-				if p.consumeOp("(") {
-					for {
-						col, err := p.expectIdent()
-						if err != nil {
-							return nil, err
-						}
-						jc.FuncCols = append(jc.FuncCols, col)
-						if !p.consumeOp(",") {
-							break
-						}
-					}
-					if err := p.expectOp(")"); err != nil {
-						return nil, err
-					}
-				}
-				if !cross {
-					return nil, p.errf("a table function can only be cross-joined")
-				}
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
-			if sub, ok, err := p.parseSubquery(); err != nil {
+			} else if sub, ok, err := p.parseSubquery(); err != nil {
 				return nil, err
 			} else if ok {
 				jc.Derived = sub
@@ -2710,6 +2707,9 @@ func (p *parser) parseSelect() (Statement, error) {
 				jc.Alias = p.parseOptTableAlias(false)
 			}
 			jt := jc.Table
+			if jt == "" {
+				jt = jc.Alias
+			}
 			if cross || jk.natural {
 				sel.Joins = append(sel.Joins, jc)
 				continue

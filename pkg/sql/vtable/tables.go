@@ -398,6 +398,12 @@ func init() {
 		col("oid", types.Int), col("extname", types.String), col("extowner", types.Int), col("extnamespace", types.Int),
 		col("extrelocatable", types.Bool), col("extversion", types.String), col("extconfig", types.String), col("extcondition", types.String),
 	}, empty)
+	// pg_available_extensions: none. datax packages no installable
+	// extension (CREATE EXTENSION vector is accepted only because the
+	// type is built in), as pg_available_extensions() also answers.
+	pg("pg_available_extensions", []catalog.Column{
+		col("name", types.String), col("default_version", types.String), col("installed_version", types.String), col("comment", types.String),
+	}, empty)
 	pg("pg_description", []catalog.Column{
 		col("objoid", types.Int), col("classoid", types.Int), col("objsubid", types.Int), col("description", types.String),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {

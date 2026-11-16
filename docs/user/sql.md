@@ -909,8 +909,12 @@ SELECT * | expr [AS alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY term
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
-  the base or as a join member — and table functions `FROM
-  unnest(array) [AS] s(x)`. Correlated subqueries — ones that reference
+  the base or as a join member — and table functions (`unnest(array)`,
+  `pg_available_extensions()`, `pg_partition_ancestors(rel)`), which
+  join like tables too: `FROM unnest(array) [AS] s(x)`, `LEFT JOIN
+  pg_available_extensions() ae(name, default_version, comment) ON ...`
+  (not laterally: their arguments cannot read another member's
+  columns). Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,
