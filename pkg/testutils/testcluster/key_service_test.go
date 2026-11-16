@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sthorne/datax/pkg/keystore"
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/sql/rowseal"
 )
 
 // keyLease is the key cache lease the key-service cluster runs with: short,
@@ -410,5 +413,33 @@ func TestKeyService(t *testing.T) {
 		mustExec(t, ctx, root, `DROP ENCRYPTION KEY IF EXISTS nosuch`)
 		_, err := root.Exec(ctx, `CREATE ENCRYPTION KEY docs`)
 		wantState(t, "reusing a dropped key's name", err, "42710", "keeps its name")
+	})
+
+	// The key service's work in a caller's transaction reads the keys
+	// table's descriptor there and takes no lease on it: a leased lookup
+	// would pin the transaction's commit deadline to the lease's expiry,
+	// and a transaction that makes many tenant keys (first writes) or
+	// lists every key (DROP OWNED) could outlast it and never commit.
+	t.Run("key work in a transaction leaves it no deadline", func(t *testing.T) {
+		ks := c.keyStore(1)
+		if err := c.tc.Nodes[1].DB().RunTxn(ctx, "test-key-work", func(ctx context.Context, txn *kvclient.Txn) error {
+			for i := 0; i < 3; i++ {
+				if _, err := ks.CreateIn(ctx, txn, keystore.KindTenant, rowseal.TenantKeyName(888888, []byte(fmt.Sprint(i)))); err != nil {
+					return err
+				}
+			}
+			if _, err := ks.ListIn(ctx, txn); err != nil {
+				return err
+			}
+			if _, err := ks.WrappingKeysIn(ctx, txn); err != nil {
+				return err
+			}
+			if d := txn.Deadline(); !d.IsEmpty() {
+				t.Errorf("the transaction has the deadline %s", d)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	})
 }
