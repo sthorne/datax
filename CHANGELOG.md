@@ -1467,6 +1467,15 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A seal job no longer stalls on a lock its own stopped batch left.**
+  Each batch locks the job's record for its transaction. When the node
+  running the job stopped mid-batch, that lock stayed. The job runner's
+  scan and each step's read of the job were done outside a transaction, so
+  they failed on the lock instead of pushing it aside. The job then
+  stood still until some other transaction happened to read the record.
+  Both reads now run in a transaction, which aborts the abandoned batch
+  once its heartbeat has expired, so the job resumes within a few
+  seconds.
 - **psql 17 and 18's describe commands.** psql chooses its catalog
   queries by its own version as well as the server's, so a newer client
   sends queries psql 16 did not, though datax reports server version 14:
