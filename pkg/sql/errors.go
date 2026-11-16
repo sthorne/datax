@@ -83,6 +83,10 @@ const (
 	CodeConfigLimitExceeded  = "53400"
 	CodeExternalRoutine      = "39000"
 	CodeInvalidAuthorization = "28000"
+
+	// CodeAmbiguousParameter is PostgreSQL's ambiguous_parameter: one
+	// parameter deduced as two incompatible types.
+	CodeAmbiguousParameter = "42P08"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.

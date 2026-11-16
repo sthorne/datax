@@ -183,7 +183,17 @@ SHOW STATS FOR t
   absence means the structural fallback, byte-identical to the
   pre-statistics planner.
 - Parameters (`$1 …`) are supported through the extended protocol (text
-  format).
+  and binary formats). `parser.Walker` visits every expression position
+  of a statement — subqueries, WITH members, set members, RETURNING, ON
+  CONFLICT, LIMIT / OFFSET, the statement under EXPLAIN — and both the
+  count a Bind must supply (`parser.CountParams`) and the types
+  ParameterDescription reports (`Session.PlanParams`, `pkg/sql/paramtypes.go`)
+  go through it. Typing builds a column scope per query level (a table
+  with its alias, join sides, a derived table's or WITH member's
+  described columns), nested queries falling back to the enclosing
+  scope; a column comparison or assignment fixes a parameter's type, a
+  function argument or arithmetic operand only suggests one, and two
+  fixed types that disagree are `42P08`.
 
 ### Row-level security (v21)
 

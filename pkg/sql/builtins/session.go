@@ -18,6 +18,8 @@ func init() {
 		{Name: "now", Ret: types.Timestamp, Vol: Stable, Doc: "The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()).",
 			Aliases: []string{"current_timestamp", "localtimestamp", "statement_timestamp", "transaction_timestamp"}},
 		{Name: "current_date", Ret: types.Date, Vol: Stable, Doc: "Today's date, from the statement's start time."},
+		{Name: "current_time", Ret: types.Time, Vol: Stable, Doc: "The time of day of the statement's start time, in the session's time zone. current_time, current_timestamp, localtime and localtimestamp are written without parentheses, as in PostgreSQL, and take an optional fractional-seconds precision: current_timestamp(3).",
+			Aliases: []string{"localtime"}},
 		{Name: "current_user", Ret: types.String, Vol: Stable, Doc: "The current role: the session user, or the role SET ROLE selected."},
 		{Name: "session_user", Ret: types.String, Vol: Stable, Doc: "The authenticated session user (unchanged by SET ROLE)."},
 		{Name: "current_database", Ret: types.String, Vol: Stable, Doc: "The session's database."},
