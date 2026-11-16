@@ -465,6 +465,12 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	eq("LEFT JOIN unnest", names(execSQL(t, ctx, root, `SELECT t.name || ':' || coalesce(s.n, '-') FROM t LEFT JOIN pg_catalog.unnest(ARRAY['bob']) AS s(n) ON s.n = t.name ORDER BY t.id`)), "Alice:-", "bob:bob", "carol:-")
 	eq("unnest heading a join", names(execSQL(t, ctx, root, `SELECT u.tag FROM unnest(ARRAY[3, 1]) AS k(id) JOIN u ON u.tid = k.id ORDER BY 1`)), "x", "y", "z")
 	eq("JOIN unnest USING", names(execSQL(t, ctx, root, `SELECT t.name FROM t JOIN unnest(ARRAY[2]) AS k(id) USING (id)`)), "bob")
+	// RIGHT and FULL keep the joined side's unmatched rows when that side
+	// is a relation (a WITH member, a subquery, a function) or a catalog,
+	// whose rows have no primary key to tell them by.
+	eq("FULL JOIN of functions", names(execSQL(t, ctx, root, `SELECT coalesce(p.x, '-') || coalesce(q.y, '-') FROM unnest(ARRAY['a', 'b']) p(x) FULL JOIN unnest(ARRAY['b', 'c', 'c']) q(y) ON p.x = q.y ORDER BY 1`)), "-c", "-c", "a-", "bb")
+	eq("RIGHT JOIN a WITH member", names(execSQL(t, ctx, root, `WITH w AS (SELECT tag FROM u) SELECT w.tag FROM t RIGHT JOIN w ON w.tag = t.name ORDER BY 1`)), "x", "y", "z")
+	eq("RIGHT JOIN a catalog", names(execSQL(t, ctx, root, `SELECT n.nspname FROM pg_class c RIGHT JOIN pg_namespace n ON n.oid = c.relnamespace AND c.relname = 't' WHERE c.relname IS NULL AND n.nspname = 'information_schema'`)), "information_schema")
 	eq("pg_partition_ancestors in FROM", names(execSQL(t, ctx, root, `SELECT count(*) FROM pg_partition_ancestors('t')`)), "1")
 	if _, serr := trySQL(ctx, root, `SELECT t.name FROM t CROSS JOIN unnest(ARRAY[t.id]) AS k(x)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
 		t.Fatalf("LATERAL table function: %v", serr)
