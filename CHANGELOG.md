@@ -1490,6 +1490,30 @@ state or the internode protocol does, and an entry below says so.
   to the last row it returned, which is all its result depended on; the
   same queue loses none. (The report's empty `SKIP LOCKED` results with
   rows free were the locks of failed commits, released since #315.)
+- **`FOR UPDATE SKIP LOCKED ... LIMIT` through an index returned too few
+  rows** (#322). Where an index served the filter and the order (a queue's
+  `WHERE queue = $1 AND state = 'pending' ORDER BY visible_at LIMIT 1` over
+  an index on those columns), a row another transaction held still used up
+  the limit, since the lock is on the row and not its index entry: the claim
+  returned no row while others were free, and `LIMIT 2` returned one. The
+  index scan now continues past locked rows until the limit is met, and the
+  index entries of rows it passed over leave the transaction's read set, as
+  the rows themselves did, so the holder's change to one no longer fails
+  the skipper's commit with `40001`. Primary-key scans and in-memory sorts
+  were not affected; `NOWAIT` and plain `FOR UPDATE` behave as before.
+- **A write keyed by a `SKIP LOCKED` subquery waited for the rows it
+  skipped** (#322). `UPDATE jobs SET ... WHERE id = (SELECT id ... LIMIT 1
+  FOR UPDATE SKIP LOCKED)` — and the `IN (...)`, `DELETE` and `WITH` forms
+  — read the whole table when the subquery returned nothing (`id = NULL`)
+  or a list (`IN` had no access path), and a plain read waits for any row
+  another transaction holds: the claim waited for the very lock it was
+  written to avoid, then updated nothing. The subquery itself always
+  honoured the clause. The planner now looks up `WHERE pk IN (constants)`
+  (the other key columns pinned by `=`) by primary-key point lookups, and
+  reads nothing for a clause that cannot be true (`col = NULL`, `IN` over
+  NULLs, a failed `EXISTS`); `EXPLAIN` says `point lookups on primary key
+  (N keys)` and `no rows read (the WHERE clause cannot be true)`. The
+  claim now takes the first free row at once.
 - **A transaction waited for a lock it could not outwait** (#315). Blocked
   on another transaction's uncommitted write to a row it had itself read —
   on the bank workload, a transfer whose account a newer transfer was
