@@ -345,6 +345,10 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		}
 	}
 
+	// A constraint comment, for \dd (which lists the comments on
+	// constraints, not on tables or columns).
+	execSQL(t, ctx, root, `COMMENT ON CONSTRAINT t_pkey ON t IS 'the row key'`)
+
 	// psql itself, when available: every describe command renders
 	// without an error on stderr.
 	psql, err := lookPsql()
@@ -358,7 +362,8 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		t.Logf("%s: %s", psql, strings.TrimSpace(string(v)))
 	}
 	for _, cmd := range []string{`\l`, `\dt`, `\dv`, `\di`, `\du`, `\dn`, `\d`, `\d t`, `\d+ t`, `\d t_qty`, `\d tv`, `\d+ tv`, `\dp`, `\dT`, `\db`, `\dx`, `\dt+`, `\l+`,
-		`\di+`, `\dn+`, `\du+`, `\df`, `\ds`, `\dm`, `\dP`, `\dX`, `\drg`, `\dRp`, `\conninfo`} {
+		`\di+`, `\dn+`, `\du+`, `\df`, `\ds`, `\dm`, `\dP`, `\dX`, `\drg`, `\dRp`, `\conninfo`,
+		`\dd`, `\dAf`, `\dAo`, `\dAp`, `\dconfig`} {
 		out, err := runPsql(ctx, psql, url, cmd)
 		if err != nil || strings.Contains(out, "ERROR") {
 			t.Fatalf("psql %s: %v\n%s", cmd, err, out)
@@ -368,6 +373,19 @@ func TestPsqlCatalogQueries(t *testing.T) {
 		}
 		if cmd == `\d+ tv` && !strings.Contains(out, "SELECT id, name FROM t WHERE qty > 0") {
 			t.Fatalf("psql \\d+ tv lacks the definition:\n%s", out)
+		}
+		// \dd: the constraint's comment. \dAf, \dAo, \dAp: empty
+		// (datax's index methods have no operator families).
+		// \dconfig: the settings this session changed — psql
+		// connects with application_name psql.
+		if cmd == `\dd` && !strings.Contains(out, "t_pkey | table constraint | the row key") {
+			t.Fatalf("psql \\dd lacks the constraint comment:\n%s", out)
+		}
+		if strings.HasPrefix(cmd, `\dA`) && !strings.Contains(out, "(0 rows)") {
+			t.Fatalf("psql %s: expected no rows:\n%s", cmd, out)
+		}
+		if cmd == `\dconfig` && !strings.Contains(out, "application_name | psql") {
+			t.Fatalf("psql \\dconfig lacks application_name:\n%s", out)
 		}
 		if cmd == `\d t` {
 			for _, s := range []string{`"t_pkey" PRIMARY KEY, btree (id)`, `"t_name" UNIQUE CONSTRAINT, btree (name)`, `"t_qty" btree (qty)`, `qty    | bigint |           |          | 0`} {

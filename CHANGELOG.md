@@ -1467,6 +1467,42 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **psql's `\dd`, `\dAf`, `\dAo`, `\dAp` and `\dconfig` work** (psql 16,
+  17 and 18). Each failed with an error. `\dd` read the `tableoid` system
+  column, which the catalogs lacked; each catalog with OIDs now has it,
+  hidden from `*`. `\dd` lists comments on constraints, and the new
+  `COMMENT ON CONSTRAINT name ON table IS ...` sets one on a primary
+  key, `UNIQUE`, `CHECK` or foreign-key constraint. `\dAf` failed on a
+  select-list alias written without `AS` (`(SELECT ...) "Applicable
+  types"`), which the select list now takes, as PostgreSQL does.
+  `\dAo` and `\dAp` read `pg_amop` and `pg_amproc`, now present and
+  empty: datax's index methods have no operator families. `\dconfig`
+  called `current_setting()` on a column, which worked only on a
+  constant; it now works per row. `pg_settings` now reports `source =
+  'session'` and the new-session value as `boot_val` for a setting the
+  session changed, so `\dconfig` lists those settings, as it does on
+  PostgreSQL. Before, every setting read `default` and the list was
+  always empty.
+- **A comma or `CROSS` join keyed in `WHERE` no longer runs as a cross
+  product.** psql's `\d <index>` joins `pg_index`, `pg_class` twice and
+  `pg_am` with commas, equated in `WHERE`. Such a join had no `ON` keys,
+  so each level fetched every row of its table for every partial row,
+  and only the final `WHERE` filtered the product. On a node started with
+  `datax init`, whose catalogs list the system tables, that was 177,504
+  joined rows and about 60,000 catalog scans: `\d <index>` took 20–36 s. A
+  `WHERE` equality of a later side's column with an earlier side's
+  column, or with a constant, is now that side's lookup key, as an `ON`
+  equality is. The same `\d` takes 0.07 s, and `EXPLAIN` shows an inner
+  join with a point or index lookup where a key allows one. The full
+  `WHERE` still filters the result. A `LEFT` side, and any chain with a
+  `RIGHT` or `FULL` join, are unchanged.
+- **40001 errors say "restart transaction:" once.** A retryable error's
+  own text already starts with that prefix, and the conversion to a SQL
+  error added it again. Every 40001 from a transaction restart read
+  "restart transaction: restart transaction: ...", for example a large
+  object's `loread` failing with `TransactionAbortedError`. The prefix
+  is now added only when missing, and a wrapped error has it moved to
+  the front.
 - **After an online store-key rotation, the metadata backup is always
   under the new key.** Each heartbeat rewrites the backup, and a
   rotation reseals it right after swapping the key. A heartbeat's write

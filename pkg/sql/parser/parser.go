@@ -2590,20 +2590,18 @@ func (p *parser) parseSelect() (Statement, error) {
 				return nil, err
 			}
 			item := SelectExpr{Expr: e}
-			if p.consumeKeyword("AS") {
-				alias, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				item.Alias = alias
+			alias, err := p.parseOptColumnAlias()
+			if err != nil {
+				return nil, err
 			}
+			item.Alias = alias
 			sel.Exprs = append(sel.Exprs, item)
 		} else if ok {
-			if p.consumeKeyword("AS") {
-				alias, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
+			alias, err := p.parseOptColumnAlias()
+			if err != nil {
+				return nil, err
+			}
+			if alias != "" {
 				se.Alias = alias
 			}
 			sel.Exprs = append(sel.Exprs, se)
@@ -2613,13 +2611,11 @@ func (p *parser) parseSelect() (Statement, error) {
 				return nil, err
 			}
 			se := SelectExpr{Expr: e}
-			if p.consumeKeyword("AS") {
-				alias, err := p.expectIdent()
-				if err != nil {
-					return nil, err
-				}
-				se.Alias = alias
+			alias, err := p.parseOptColumnAlias()
+			if err != nil {
+				return nil, err
 			}
+			se.Alias = alias
 			sel.Exprs = append(sel.Exprs, se)
 		}
 		if !p.consumeOp(",") {
@@ -3387,6 +3383,38 @@ func (p *parser) peekIdentSeq(words ...string) bool {
 		}
 	}
 	return true
+}
+
+// notBareColumnLabel lists the identifiers that may follow a select-list
+// item without being its alias: the clauses that end the list and the
+// postfix operators PostgreSQL also refuses as a bare label (so an
+// unsupported "x isnull" stays a syntax error rather than reading as
+// x AS isnull).
+var notBareColumnLabel = map[string]bool{
+	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
+	"window": true, "with": true, "returning": true, "is": true, "isnull": true, "notnull": true, "between": true, "like": true, "ilike": true,
+	"similar": true, "in": true, "at": true, "collate": true, "over": true, "filter": true, "within": true, "escape": true,
+}
+
+// parseOptColumnAlias consumes a select-list item's optional alias:
+// AS name, or a bare name (SELECT count(*) n, (SELECT ...) "Applicable
+// types"). A bare alias is a quoted identifier or one that cannot
+// continue the statement instead (notBareColumnLabel); keywords never
+// are.
+func (p *parser) parseOptColumnAlias() (string, error) {
+	if p.consumeKeyword("AS") {
+		return p.expectIdent()
+	}
+	t := p.peek()
+	if t.kind != tkIdent {
+		return "", nil
+	}
+	quoted := t.pos < len(p.src) && p.src[t.pos] == '"'
+	if !quoted && notBareColumnLabel[t.text] {
+		return "", nil
+	}
+	p.i++
+	return t.text, nil
 }
 
 // parseOptTableAlias consumes an optional [AS] alias after a table name.
@@ -4170,10 +4198,31 @@ func (p *parser) parseCommentOn() (Statement, error) {
 		co.Kind = "index"
 	case p.consumeKeyword("COLUMN"):
 		co.Kind = "column"
+	case p.consumeKeyword("CONSTRAINT"):
+		co.Kind = "constraint"
 	default:
-		return nil, p.errf("COMMENT ON supports TABLE, VIEW, INDEX and COLUMN, found %q", p.peek().text)
+		return nil, p.errf("COMMENT ON supports TABLE, VIEW, INDEX, COLUMN and CONSTRAINT, found %q", p.peek().text)
 	}
-	if co.Kind == "column" {
+	if co.Kind == "constraint" {
+		// CONSTRAINT name ON table (a domain's constraints: datax has
+		// no domains).
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		co.Column = name
+		if err := p.expectKeyword("ON"); err != nil {
+			return nil, err
+		}
+		if p.consumeIdentWord("domain") {
+			return nil, p.errf("COMMENT ON CONSTRAINT ... ON DOMAIN is not supported (datax has no domains)")
+		}
+		tbl, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		co.Name = tbl
+	} else if co.Kind == "column" {
 		// table.column, db.table.column or db.public.table.column: the
 		// last part is the column, the rest a table name.
 		first, err := p.expectIdent()

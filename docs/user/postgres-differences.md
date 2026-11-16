@@ -434,9 +434,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
 - **psql**: `\l`, `\dt`, `\di`, `\d t`, `\d+ t`, `\d index`, `\du`,
   `\dn`, `\dp` / `\z`, `\dT`, `\db`, `\dx`, `\df`, `\dS`, tab completion
   and the `+` variants render; the list commands for features datax lacks
-  (`\dv`, `\ds`, `\dy`, `\dRp`, `\dew`, ...) render empty. `\dd` (object
-  comments, a `UNION` inside a derived table joined to `pg_description`)
-  is the known holdout. Sizes (`\dt+`, `\l+`) show blank: `pg_table_size`
+  (`\dv`, `\ds`, `\dy`, `\dRp`, `\dew`, `\dAf`, `\dAo`, `\dAp`, ...)
+  render empty. `\dd` lists constraint comments (`COMMENT ON CONSTRAINT`)
+  and `\dconfig` the settings the session changed. Sizes (`\dt+`, `\l+`) show blank: `pg_table_size`
   and `pg_database_size` are `NULL`.
 - **Drivers**: pgx's, psycopg's and lib/pq's startup queries
   (`pg_type` lookups, `SHOW standard_conforming_strings`, `SET

@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -132,6 +133,36 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		// unknown name is 42704 unless missing_ok, then NULL.
 		if len(e.Args) < 1 || len(e.Args) > 2 {
 			return e, newErrf(CodeSyntaxError, "current_setting() takes a name and an optional missing_ok")
+		}
+		if exprHasColumn(e.Args[0]) {
+			// A name read from the row (current_setting(s.name) over
+			// pg_settings, psql's \dconfig): a CASE over every setting
+			// the session has, matched case-insensitively as SHOW
+			// matches. A name that is none of them is NULL, as with
+			// missing_ok.
+			arg, err := s.resolveValueExprOpts(ctx, txn, e.Args[0], params, keepVolatile)
+			if err != nil {
+				return e, err
+			}
+			ce := &parser.CaseExpr{Operand: &parser.Expr{Func: "lower", Args: []parser.Expr{arg}}}
+			add := func(name, value string) {
+				n, v := types.NewString(strings.ToLower(name)), types.NewString(value)
+				ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &n}, Result: parser.Expr{Lit: &v}})
+			}
+			for _, kv := range s.settings() {
+				add(kv[0], kv[1])
+			}
+			custom := make([]string, 0, len(s.vars.custom))
+			for name := range s.vars.custom {
+				custom = append(custom, name)
+			}
+			sort.Strings(custom)
+			for _, name := range custom {
+				add(name, s.vars.custom[name])
+			}
+			null := types.DNull
+			ce.Else = &parser.Expr{Lit: &null}
+			return parser.Expr{Case: ce}, nil
 		}
 		nameArg, err := evalExpr(e.Args[0], nil, nil, params)
 		if err != nil {
@@ -1227,6 +1258,27 @@ func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int6
 	}
 	desc, err := catalog.ReadTable(ctx, txn, tableID)
 	if err != nil || desc == nil {
+		return ""
+	}
+	if e.Func == "obj_description" && len(e.Args) > 1 && e.Args[1].Lit != nil && e.Args[1].Lit.Text() == "pg_constraint" {
+		// A constraint's comment: its primary key, a UNIQUE index, or a
+		// CHECK / FOREIGN KEY constraint (pg_constraint's OIDs).
+		switch {
+		case indexID == 1:
+			return desc.PKComment
+		case indexID&(1<<15) != 0:
+			for i := range desc.Constraints {
+				if c := &desc.Constraints[i]; vtable.ConstraintOID(desc, c) == oid {
+					return c.Comment
+				}
+			}
+		default:
+			for _, idx := range desc.Indexes {
+				if idx.ID == indexID && idx.Unique {
+					return idx.ConstraintComment
+				}
+			}
+		}
 		return ""
 	}
 	if indexID != 0 {

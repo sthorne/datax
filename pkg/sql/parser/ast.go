@@ -215,8 +215,10 @@ type LikeClause struct {
 }
 
 // CommentOn is COMMENT ON TABLE | VIEW | INDEX | COLUMN name IS 'text'
-// | NULL. Kind is "table" (views too), "index" or "column"; Column is
-// the column name for Kind "column" (Name then names the table).
+// | NULL, or COMMENT ON CONSTRAINT name ON table IS .... Kind is "table"
+// (views too), "index", "column" or "constraint"; Column is the column
+// name for Kind "column", the constraint's for "constraint" (Name then
+// names the table).
 type CommentOn struct {
 	Kind   string
 	Name   string

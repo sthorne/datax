@@ -152,6 +152,28 @@ func TestCreateTableAsLikeComments(t *testing.T) {
 	if r := execSQL(t, ctx, s, `SHOW CREATE TABLE orders`); !strings.Contains(r.Rows[0][1].S, "CREATE TABLE orders") {
 		t.Fatalf("SHOW CREATE TABLE: %s", r.Rows[0][1].S)
 	}
+
+	// ---- COMMENT ON CONSTRAINT ----
+	// Each kind keeps its own comment under pg_constraint's OIDs (a
+	// UNIQUE constraint's apart from its index's), joined to
+	// pg_description by tableoid as psql's \dd joins them.
+	execSQL(t, ctx, s, `CREATE TABLE lines (id INT8 PRIMARY KEY, ord INT8, n INT8 CONSTRAINT n_pos CHECK (n > 0), sku TEXT)`)
+	execSQL(t, ctx, s, `ALTER TABLE lines ADD CONSTRAINT lines_order FOREIGN KEY (ord) REFERENCES orders (id)`)
+	execSQL(t, ctx, s, `CREATE UNIQUE INDEX lines_sku ON lines (sku)`)
+	execSQL(t, ctx, s, `COMMENT ON CONSTRAINT lines_pkey ON lines IS 'the line'`)
+	execSQL(t, ctx, s, `COMMENT ON CONSTRAINT lines_order ON public.lines IS 'ships an order'`)
+	execSQL(t, ctx, s, `COMMENT ON CONSTRAINT n_pos ON lines IS 'positive'`)
+	execSQL(t, ctx, s, `COMMENT ON CONSTRAINT lines_sku ON lines IS 'one per sku'`)
+	const described = `SELECT c.conname, d.description FROM pg_constraint c JOIN pg_description d ON d.objoid = c.oid AND d.classoid = c.tableoid WHERE c.conrelid = 'lines'::regclass ORDER BY 1`
+	expect(described, "lines_order|ships an order;lines_pkey|the line;lines_sku|one per sku;n_pos|positive")
+	expect(`SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conname = 'n_pos'`, "positive")
+	expect(`SELECT obj_description(c.oid, 'pg_class') FROM pg_class c WHERE c.relname = 'lines_sku'`, "NULL")
+	execSQL(t, ctx, s, `COMMENT ON CONSTRAINT lines_pkey ON lines IS NULL`)
+	execSQL(t, ctx, s, `ALTER TABLE lines DROP CONSTRAINT n_pos`)
+	expect(described, "lines_order|ships an order;lines_sku|one per sku")
+	expectCode(`COMMENT ON CONSTRAINT nope ON lines IS 'x'`, sql.CodeUndefinedObject)
+	expectCode(`COMMENT ON CONSTRAINT lines_pkey ON nope IS 'x'`, sql.CodeUndefinedTable)
+	expectCode(`COMMENT ON CONSTRAINT pg_class_pkey ON pg_class IS 'x'`, sql.CodeInsufficientPriv)
 }
 
 // TestAlterColumnType: the online rewrite — widening and text
