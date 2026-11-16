@@ -260,11 +260,7 @@ func (s *Session) execShowSequences(ctx context.Context, txn *kvclient.Txn) (*Re
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Columns: []ResultColumn{
-		{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},
-		{Name: "min_value", Type: types.Int}, {Name: "max_value", Type: types.Int}, {Name: "cycle", Type: types.Bool},
-		{Name: "cache", Type: types.Int}, {Name: "last_value", Type: types.Int}, {Name: "owned_by", Type: types.String},
-	}}
+	res := &Result{Columns: showSequencesColumns()}
 	for _, d := range seqs {
 		last := types.DNull
 		if v, called, err := s.sequenceValue(ctx, d); err == nil && called {

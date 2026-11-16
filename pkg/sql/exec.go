@@ -662,7 +662,7 @@ func (s *Session) execSplitAt(ctx context.Context, t *parser.AlterTable, params 
 			return nil, err
 		}
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	res := &Result{Tag: "ALTER TABLE", Columns: splitColumns()}
 	for _, tuple := range t.SplitAt {
 		key, err := splitKey(desc, "SPLIT AT", tuple, params)
 		if err != nil {
@@ -702,7 +702,7 @@ func (s *Session) execUnsplit(ctx context.Context, t *parser.AlterTable, params 
 	if !s.db.StickyBitsOK() {
 		return nil, newErrf(CodeFeatureNotSupported, "UNSPLIT needs cluster version %s (finalize the upgrade first)", version.V20)
 	}
-	res := &Result{Tag: "ALTER TABLE", Columns: []ResultColumn{{Name: "key", Type: types.String}}}
+	res := &Result{Tag: "ALTER TABLE", Columns: splitColumns()}
 	var unsplit []keys.Key
 	if t.UnsplitAll {
 		// Every range that starts strictly inside the table's primary
@@ -3214,7 +3214,7 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 		return nil, err
 	}
 	denied := catalog.SchemaUsageDenied([]*catalog.DatabaseDescriptor{db}, set)
-	res := &Result{Columns: []ResultColumn{{Name: "table_name", Type: types.String}}}
+	res := &Result{Columns: showTablesColumns()}
 	for _, d := range descs {
 		if d.IsView() {
 			continue // SHOW VIEWS
@@ -3435,12 +3435,8 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 // CREATE TABLE / USERS / GRANTS / ALL).
 func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Show) (*Result, error) {
 	str := types.NewString
-	res := &Result{Tag: "SHOW"}
-	cols := func(names ...string) {
-		for _, n := range names {
-			res.Columns = append(res.Columns, ResultColumn{Name: n, Type: types.String})
-		}
-	}
+	// The shape is showColumns', which Describe reports too.
+	res := &Result{Tag: "SHOW", Columns: showColumns(t)}
 	switch t.Kind {
 	case "columns":
 		desc, err := s.lookup(ctx, txn, t.Table)
@@ -3450,8 +3446,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
 		}
-		cols("column_name", "data_type", "is_nullable", "column_default", "indices")
-		res.Columns[2].Type = types.Bool
 		for i := range desc.Columns {
 			c := &desc.Columns[i]
 			if c.Hidden {
@@ -3482,8 +3476,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 			return nil, err
 		}
-		cols("table_name", "index_name", "non_unique", "seq_in_index", "column_name")
-		res.Columns[2].Type, res.Columns[3].Type = types.Bool, types.Int
 		seq := int64(0)
 		for _, id := range desc.PrimaryKey {
 			if c, ok := desc.ColByID(id); ok && !c.Hidden {
@@ -3507,7 +3499,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err != nil {
 			return nil, err
 		}
-		cols("view_name", "definition")
 		for _, d := range descs {
 			if d.IsView() {
 				res.Rows = append(res.Rows, []types.Datum{str(d.Name), str(d.ViewQuery)})
@@ -3522,14 +3513,12 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return nil, err
 		}
 		if desc.IsView() {
-			cols("table_name", "create_statement")
 			res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(CreateViewDef(desc))})
 			break
 		}
 		if err := mustBeReal(desc); err != nil {
 			return nil, err
 		}
-		cols("table_name", "create_statement")
 		byID := func(id uint64) *catalog.TableDescriptor {
 			d, err := catalog.ReadTable(ctx, txn, id)
 			if err != nil {
@@ -3550,12 +3539,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			return nil, err
 		}
 		graph := catalog.NewRoleGraph(env.Roles)
-		if t.Kind == "users" {
-			cols("username", "is_admin", "member_of")
-		} else {
-			cols("role_name", "can_login", "is_admin", "member_of")
-			res.Columns[1].Type = types.Bool
-		}
 		for _, r := range env.Roles {
 			if t.Kind == "users" && !r.Login {
 				continue
@@ -3570,16 +3553,13 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			memberOf := strings.Join(members, ",")
 			if t.Kind == "users" {
-				res.Columns[1].Type = types.Bool
 				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(set.IsAdmin()), str(memberOf)})
 			} else {
-				res.Columns[2].Type = types.Bool
 				res.Rows = append(res.Rows, []types.Datum{str(r.Name), types.NewBool(r.Login), types.NewBool(set.IsAdmin()), str(memberOf)})
 			}
 		}
 	case "grants":
 		if t.OnRole {
-			cols("role_name", "member", "is_admin")
 			rows, err := s.roleGrantRows(ctx, txn, t)
 			if err != nil {
 				return nil, err
@@ -3589,7 +3569,6 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			}
 			break
 		}
-		cols("database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable")
 		rows, err := s.grantRows(ctx, txn, t)
 		if err != nil {
 			return nil, err
@@ -3606,17 +3585,11 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 			res.Rows = append(res.Rows, row)
 		}
 	case "all":
-		cols("name", "setting")
 		for _, kv := range s.settings() {
 			res.Rows = append(res.Rows, []types.Datum{str(kv[0]), str(kv[1])})
 		}
 	case "sessions":
 		// This node's sessions (each node keeps its own registry).
-		cols("pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start")
-		res.Columns[0].Type = types.Int
-		for i := 7; i < 10; i++ {
-			res.Columns[i].Type = types.Timestamp
-		}
 		admin, err := s.isAdmin(ctx, txn)
 		if err != nil {
 			return nil, err

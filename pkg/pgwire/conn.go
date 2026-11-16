@@ -1341,6 +1341,11 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		var suspended bool
 		_, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			pt.res = res
+			if serr := resultMatchesDescribe(pt.stmt.cols, res); serr != nil {
+				pt.done = true
+				pt.close(context.Background())
+				return 0, serr
+			}
 			if res.Stream == nil {
 				return int64(len(res.Rows)), nil
 			}
@@ -1398,6 +1403,26 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	}
 	pt.done = true
 	c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+}
+
+// resultMatchesDescribe checks a result against the columns Describe
+// reported for its statement: a client told NoData has no
+// RowDescription to read rows with, and one told n columns cannot read
+// rows of another width. PostgreSQL refuses the second case with the
+// same error; the first is a statement whose result shape PlanColumns
+// does not know, refused here rather than sent as rows the client
+// cannot interpret.
+func resultMatchesDescribe(described []sql.ResultColumn, res *sql.Result) *sql.Error {
+	switch {
+	case res.Columns == nil:
+		// No rows: CommandComplete only, whatever Describe said.
+		return nil
+	case described == nil:
+		return &sql.Error{Code: sql.CodeInternal, Msg: "statement returned rows but was described as returning none"}
+	case len(described) != len(res.Columns):
+		return &sql.Error{Code: sql.CodeFeatureNotSupported, Msg: "cached plan must not change result type"}
+	}
+	return nil
 }
 
 // finishStreamExecute ends one Execute on a streamed portal: an error

@@ -598,50 +598,22 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		return []ResultColumn{{Name: "plan", Type: types.String}}, nil
 
 	case *parser.ShowTables:
-		return []ResultColumn{{Name: "table_name", Type: types.String}}, nil
-
+		return showTablesColumns(), nil
 	case *parser.Show:
-		names := map[string][]string{
-			"columns":  {"column_name", "data_type", "is_nullable", "column_default", "indices"},
-			"indexes":  {"table_name", "index_name", "non_unique", "seq_in_index", "column_name"},
-			"create":   {"table_name", "create_statement"},
-			"views":    {"view_name", "definition"},
-			"users":    {"username", "is_admin", "member_of"},
-			"roles":    {"role_name", "can_login", "is_admin", "member_of"},
-			"grants":   {"database_name", "schema_name", "relation_name", "grantee", "privilege_type", "is_grantable"},
-			"all":      {"name", "setting"},
-			"sessions": {"pid", "user_name", "database", "application_name", "client_addr", "state", "query", "backend_start", "query_start", "xact_start"},
-		}[t.Kind]
-		cols := make([]ResultColumn, len(names))
-		for i, n := range names {
-			cols[i] = ResultColumn{Name: n, Type: types.String}
-		}
-		if t.Kind == "sessions" {
-			cols[0].Type = types.Int
-			for i := 7; i < 10; i++ {
-				cols[i].Type = types.Timestamp
-			}
-		}
-		return cols, nil
+		return showColumns(t), nil
+	case *parser.ShowDatabases:
+		return showDatabasesColumns(), nil
+	case *parser.ShowPlacement:
+		return showPlacementColumns(), nil
+	case *parser.AlterTable:
+		return alterTableColumns(t), nil
 
 	case *parser.ShowFunctions:
 		return execShowFunctions().Columns, nil
 	case *parser.ShowSequences:
-		return []ResultColumn{
-			{Name: "sequence_name", Type: types.String}, {Name: "start", Type: types.Int}, {Name: "increment", Type: types.Int},
-			{Name: "min_value", Type: types.Int}, {Name: "max_value", Type: types.Int}, {Name: "cycle", Type: types.Bool},
-			{Name: "cache", Type: types.Int}, {Name: "last_value", Type: types.Int}, {Name: "owned_by", Type: types.String},
-		}, nil
-
+		return showSequencesColumns(), nil
 	case *parser.ShowStats:
-		return []ResultColumn{
-			{Name: "table_name", Type: types.String},
-			{Name: "row_count", Type: types.Int},
-			{Name: "collected_at", Type: types.Timestamp},
-			{Name: "column_name", Type: types.String},
-			{Name: "distinct_count", Type: types.Int},
-			{Name: "null_count", Type: types.Int},
-		}, nil
+		return showStatsColumns(), nil
 
 	case *parser.Analyze:
 		return nil, nil
