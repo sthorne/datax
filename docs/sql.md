@@ -1658,6 +1658,19 @@ The executor ranks access paths:
 
 1. WHERE pins every PK column by equality → primary point `Get`.
 2. Every column of a unique index pinned → unique-index point lookup.
+   Then: every PK column pinned by equality but one, which `IN (...)`
+   holds to constants (a list, or an `IN (SELECT ...)` already
+   evaluated) → one primary point lookup per distinct non-NULL value,
+   batched and made in key order (`point lookups on primary key (N
+   keys)`; a list over 4,096 values is a residual filter instead). A
+   clause that cannot be true on its face — a column compared with a
+   NULL constant (`= NULL`, as a scalar subquery that found no row
+   leaves it), `IN` over nothing but NULLs, an `EXISTS` that found
+   nothing — reads no rows at all (`no rows read (the WHERE clause
+   cannot be true)`). Both matter beyond speed: a scan's plain read
+   waits for another transaction's lock on any row it meets, so a write
+   keyed by a subquery must touch only the rows the subquery returned
+   (issue #322; see Locking clauses below).
 3. The best constrained scan of the primary key or an index: equality
    conjuncts pin a leading column prefix, and range conjuncts
    (`> >= < <=`) on the **next** key column become order-preserving scan
@@ -1695,6 +1708,50 @@ and any ORDER BY is already satisfied by the access path; scanned-row
 counts are observable via `datax_sql_rows_scanned_total`. An ORDER BY
 the path does not satisfy, with a LIMIT, keeps a heap of the limit's
 rows while scanning instead of sorting them all (see Vectors above).
+
+**Locking clauses.** `FOR UPDATE`, `FOR UPDATE NOWAIT` and `FOR
+UPDATE SKIP LOCKED` apply to a single-table `SELECT` (not with `GROUP
+BY`, aggregates or `DISTINCT`, which fail with `0A000`; `FOR SHARE`,
+`FOR NO KEY UPDATE` and `OF t` are not parsed), wherever that select
+stands: at the top, as a subquery (scalar, `IN`, `EXISTS`) of a
+`SELECT`, `UPDATE` or `DELETE`, as the source of `INSERT ... SELECT`,
+or as a `WITH` member. Subqueries and `WITH` members run before the
+statement around them, through the same path, so the clause holds for
+their scan and the rows they lock stay locked to the end of the
+transaction. The job-queue claim is
+
+```sql
+UPDATE jobs SET state = 'claimed'
+ WHERE id = (SELECT id FROM jobs WHERE queue = $1 AND state = 'pending'
+              ORDER BY visible_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+RETURNING id
+```
+
+(or `WHERE id IN (...)`, or the same through `WITH c AS (...) ... WHERE
+id IN (SELECT id FROM c)`; `UPDATE ... FROM` is not supported). The
+subquery's result is spliced into the outer WHERE, which then reads by
+primary-key point lookups — or not at all when every candidate was
+locked — so the write neither waits for nor touches the rows the
+subquery skipped (issue #322). An outer clause that must scan (say,
+`WHERE state = 'pending' AND id IN (...)` with `id` not the key) still
+reads every row of its span and, being a plain read, waits for any of
+them another transaction holds.
+
+`LIMIT` (with `OFFSET`) counts the rows a locking select **returns**.
+Under `SKIP LOCKED` a row passed over is not counted wherever the limit
+runs: in the KV scan of the primary key (the server counts only rows it
+returns), in an index scan joined to the primary key (the lock is on the
+primary row, so the join passes it over, and the index scan goes on past
+its last entry for the rows still wanted — before #322 the skipped row
+used up the limit, and the claim above returned no row), and in the
+lock step, which locks candidates in order only until the limit is met.
+`NOWAIT` fails with `55P03` as soon as the rows it reads in order reach
+a locked one before the limit is met, and plain `FOR UPDATE` waits for
+it there, as in PostgreSQL. With an in-memory sort the fetch is not
+limited: every matching row is read, plain `FOR UPDATE` and `NOWAIT`
+lock every matching row and then cut, and `SKIP LOCKED` sorts first and
+locks only as many as it keeps. How skipped rows leave the transaction's read set is in
+docs/transactions.md (Locking reads).
 
 **Panic barrier.** The statement path is a panic barrier (#136): a
 panic anywhere below `Session.Execute` — in the planner, the executor,

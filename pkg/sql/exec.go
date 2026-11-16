@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1696,6 +1697,9 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		noteIndexRows(desc, desc.LivePrimaryIndex(), len(rows))
 		return rows, err
 
+	case planPKPoints:
+		return s.fetchPKPoints(ctx, txn, desc, plan, where, params, limit)
+
 	case planUniquePoint:
 		key, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
 		if err != nil {
@@ -1742,76 +1746,121 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		// Index entries are 1:1 with rows, so with no residual filter every
 		// scanned entry yields a result row: the limit pushes into the scan.
+		// Under SKIP LOCKED it does not quite: the lock is on the primary
+		// row, not on the entry, so the join passes over the row behind an
+		// entry it scanned (issue #322). The scan then goes on past its
+		// last entry for the rows still wanted, until the limit is met or
+		// the span runs out — the limit counts rows returned, and a short
+		// result means there was no more to return (fetchSkipLocked
+		// relies on that to stop).
 		var scanLimit int64
 		if len(plan.residual) == 0 {
 			scanLimit = limit
 		}
+		skip := kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip
 		noteIndexScan(desc, plan.idx.ID)
 		mark := txn.ReadMark()
-		kvs, err := spanScan(ctx, txn, start, end, scanLimit, plan.reverse)
-		if err != nil {
-			return nil, err
-		}
-		metrics.SQLRowsScanned.Add(float64(len(kvs)))
-		s.AddScanned(int64(len(kvs)))
-		noteIndexRows(desc, plan.idx.ID, len(kvs))
-		// The primary rows behind the entries come back in pages of
-		// primaryFetchPage, each page one routed batch, in the index's
-		// order (issue #103): a lookup matching 1,000 entries is four
-		// round trips instead of 1,000.
-		pks := make([]keys.Key, len(kvs))
-		for i, kv := range kvs {
-			pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
+		var (
+			out              []fetchedRow
+			passed           []keys.Key // entries of rows passed over as locked
+			fetched, batches int
+			met              bool
+		)
+		lo, hi := start, end
+		for {
+			kvs, err := spanScan(ctx, txn, lo, hi, scanLimit, plan.reverse)
 			if err != nil {
-				return nil, newErrf(CodeInternal, "%v", err)
+				return nil, err
 			}
-			pks[i] = pk
-		}
-		var out []fetchedRow
-		batches := 0
-		err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
-			batches++
-			for i, raw := range raws {
-				pk := pks[first+i]
-				if raw == nil {
-					if kvclient.LockWaitFrom(ctx) == kvclient.LockWaitSkip {
-						continue // locked by another transaction: passed over
-					}
-					return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
-				}
-				row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+			metrics.SQLRowsScanned.Add(float64(len(kvs)))
+			s.AddScanned(int64(len(kvs)))
+			noteIndexRows(desc, plan.idx.ID, len(kvs))
+			// The primary rows behind the entries come back in pages of
+			// primaryFetchPage, each page one routed batch, in the index's
+			// order (issue #103): a lookup matching 1,000 entries is four
+			// round trips instead of 1,000.
+			pks := make([]keys.Key, len(kvs))
+			for i, kv := range kvs {
+				pk, err := rowenc.IndexEntryPrimaryKey(desc, plan.idx, kv.Key, kv.Value)
 				if err != nil {
-					return false, err
+					return nil, newErrf(CodeInternal, "%v", err)
 				}
-				match, err := matchesWhere(where, desc, row, params)
-				if err != nil {
-					return false, err
-				}
-				if !match {
-					continue
-				}
-				if err := s.chargeRow(row); err != nil {
-					return false, err
-				}
-				out = append(out, fetchedRow{key: pk, row: row})
-				if limit > 0 && int64(len(out)) == limit {
-					// The entries after this one, and the primary rows
-					// of this page behind them, cannot change the
-					// result (see forgetScanTail).
-					if at := first + i; at+1 < len(kvs) {
-						forgetScanTail(txn, mark, start, end, kvs[at].Key, plan.reverse)
-						txn.ForgetReads(mark, pks[at+1:first+len(raws)])
-					}
-					return false, nil
-				}
+				pks[i] = pk
 			}
-			return true, nil
-		})
-		if err != nil {
-			return nil, err
+			fetched += len(pks)
+			err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+				batches++
+				for i, raw := range raws {
+					pk := pks[first+i]
+					if raw == nil {
+						if skip {
+							// Locked by another transaction: passed over.
+							passed = append(passed, kvs[first+i].Key)
+							continue
+						}
+						return false, newErrf(CodeInternal, "index %q entry points at a missing row", plan.idx.Name)
+					}
+					row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+					if err != nil {
+						return false, err
+					}
+					match, err := matchesWhere(where, desc, row, params)
+					if err != nil {
+						return false, err
+					}
+					if !match {
+						continue
+					}
+					if err := s.chargeRow(row); err != nil {
+						return false, err
+					}
+					out = append(out, fetchedRow{key: pk, row: row})
+					if limit > 0 && int64(len(out)) == limit {
+						// The entries after this one, and the primary rows
+						// of this page behind them, cannot change the
+						// result (see forgetScanTail).
+						met = true
+						if at := first + i; at+1 < len(kvs) {
+							forgetScanTail(txn, mark, start, end, kvs[at].Key, plan.reverse)
+							txn.ForgetReads(mark, pks[at+1:first+len(raws)])
+						}
+						return false, nil
+					}
+				}
+				return true, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if met || !skip || scanLimit == 0 || int64(len(kvs)) < scanLimit {
+				break
+			}
+			// A full page, short of the limit by the rows passed over:
+			// the next page starts past its last entry, sized for the
+			// rows still wanted, and grows while rows keep being passed
+			// over so a long locked run costs few round trips.
+			last := kvs[len(kvs)-1].Key
+			if plan.reverse {
+				hi = last
+			} else {
+				lo = last.Next()
+			}
+			want := limit - int64(len(out))
+			if scanLimit *= skipLockedGrowth; scanLimit < want {
+				scanLimit = want
+			}
+			if scanLimit > primaryFetchPage {
+				scanLimit = max(want, primaryFetchPage)
+			}
 		}
-		if s.explain != nil && len(pks) > 0 {
-			s.note("index join: %d primary rows fetched in %d batches of up to %d", len(pks), batches, primaryFetchPage)
+		// A row passed over is no part of the result, and the transaction
+		// holding it is likely to change it, moving or deleting this
+		// entry: its entry leaves the read set as the row itself did
+		// (see Txn.ForgetReads), or that change would fail this
+		// transaction's next refresh over a row it never returned.
+		txn.ForgetReads(mark, passed)
+		if s.explain != nil && fetched > 0 {
+			s.note("index join: %d primary rows fetched in %d batches of up to %d", fetched, batches, primaryFetchPage)
 		}
 		return out, nil
 
@@ -1858,6 +1907,71 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 
 	start, end := rowenc.PrimarySpanFor(desc)
 	return s.scanPrimarySpan(ctx, txn, desc, plan, start, end, where, params, limit)
+}
+
+// fetchPKPoints runs a planPKPoints plan: the rows at its primary keys,
+// looked up in key order (descending for a reverse plan) in pages of
+// primaryFetchPage, filtered by the WHERE clause, up to limit. A key
+// with no row — or, under SKIP LOCKED, a row another transaction holds
+// — yields nothing. Once the limit is met the keys after the last row
+// kept leave the read set, as the tail of a limited scan does.
+func (s *Session) fetchPKPoints(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, where []parser.Comparison, params []types.Datum, limit int64) ([]fetchedRow, error) {
+	if len(plan.pkPoints) == 0 {
+		return nil, nil
+	}
+	pks := make([]keys.Key, 0, len(plan.pkPoints))
+	for _, vals := range plan.pkPoints {
+		key, err := rowenc.EncodePK(desc, vals)
+		if err != nil {
+			return nil, err
+		}
+		pks = append(pks, key)
+	}
+	slices.SortFunc(pks, func(a, b keys.Key) int {
+		if plan.reverse {
+			return bytes.Compare(b, a)
+		}
+		return bytes.Compare(a, b)
+	})
+	pks = slices.CompactFunc(pks, func(a, b keys.Key) bool { return a.Equal(b) })
+	noteIndexScan(desc, desc.LivePrimaryIndex())
+	mark := txn.ReadMark()
+	var out []fetchedRow
+	err := fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
+		for i, raw := range raws {
+			if raw == nil {
+				continue // no such row, or one passed over as locked
+			}
+			pk := pks[first+i]
+			row, err := decodeFullRow(ctx, s.rowSealer(), desc, pk, raw)
+			if err != nil {
+				return false, err
+			}
+			match, err := matchesWhere(where, desc, row, params)
+			if err != nil {
+				return false, err
+			}
+			if !match {
+				continue
+			}
+			if err := s.chargeRow(row); err != nil {
+				return false, err
+			}
+			out = append(out, fetchedRow{key: pk, row: row})
+			if limit > 0 && int64(len(out)) == limit {
+				txn.ForgetReads(mark, pks[first+i+1:first+len(raws)])
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	metrics.SQLRowsScanned.Add(float64(len(out)))
+	s.AddScanned(int64(len(out)))
+	noteIndexRows(desc, desc.LivePrimaryIndex(), len(out))
+	return out, nil
 }
 
 // spanScan runs one KV scan in the plan's direction.

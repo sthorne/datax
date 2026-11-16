@@ -891,6 +891,8 @@ func innerPathDesc(plan accessPlan) string {
 	switch plan.kind {
 	case planPKPoint:
 		return "point lookup on primary key"
+	case planPKPoints:
+		return plan.String()
 	case planUniquePoint:
 		return fmt.Sprintf("point lookup via unique index %q", plan.idx.Name)
 	case planPKScan:
