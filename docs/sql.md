@@ -1951,9 +1951,10 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   The virtual catalogs are read by every role (issue #312):
   `tablePrivAllowed` grants `SELECT` on a `pg_catalog` or
   `information_schema` descriptor to anyone and nothing else, and
-  `virtualEnv` decides what each lists — every table of the scope for
-  `pg_catalog`, the tables `catalog.CanSeeTable` admits (and whose
-  schema the reader may use) for `information_schema` — and gathers
+  `virtualEnv` decides what each lists — every table of the current
+  database for `pg_catalog`, the tables `catalog.CanSeeTable` admits
+  (and whose schema the reader may use) for `information_schema`; no
+  other database's (issue #322) — and gathers
   statistics only for tables `catalog.CanSelectTable` admits and row
   security does not confine, and a sequence's counter only past
   `sequencePrivAllowed`. A sequence read as a relation (`SELECT

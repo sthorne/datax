@@ -320,12 +320,7 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	res := &Result{Columns: []ResultColumn{
-		{Name: "range_id", Type: types.Int}, {Name: "node_id", Type: types.Int},
-		{Name: "live_keys", Type: types.Int}, {Name: "garbage_versions", Type: types.Int},
-		{Name: "tombstones", Type: types.Int}, {Name: "intents", Type: types.Int},
-		{Name: "compacted", Type: types.Bool}, {Name: "status", Type: types.String},
-	}}
+	res := &Result{Columns: purgeColumns()}
 	sort.Slice(rep.Replicas, func(i, j int) bool {
 		a, b := rep.Replicas[i], rep.Replicas[j]
 		if a.RangeID != b.RangeID {

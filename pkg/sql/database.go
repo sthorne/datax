@@ -161,7 +161,7 @@ func (s *Session) execShowDatabases(ctx context.Context, txn *kvclient.Txn) (*Re
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Columns: []ResultColumn{{Name: "database_name", Type: types.String}, {Name: "owner", Type: types.String}}}
+	res := &Result{Columns: showDatabasesColumns()}
 	for _, d := range dbs {
 		owner := d.Owner
 		if owner == "" {
@@ -340,12 +340,7 @@ func (s *Session) execShowPlacement(ctx context.Context, txn *kvclient.Txn, t *p
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	res := &Result{Columns: []ResultColumn{
-		{Name: "database_name", Type: types.String},
-		{Name: "replicas", Type: types.Int},
-		{Name: "constraints", Type: types.String},
-		{Name: "source", Type: types.String},
-	}}
+	res := &Result{Columns: showPlacementColumns()}
 	source := "cluster default"
 	if !db.Placement.IsZero() {
 		source = "database policy"

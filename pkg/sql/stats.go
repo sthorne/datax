@@ -294,14 +294,7 @@ func (s *Session) execShowStats(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
 		return nil, err
 	}
-	res := &Result{Columns: []ResultColumn{
-		{Name: "table_name", Type: types.String},
-		{Name: "row_count", Type: types.Int},
-		{Name: "collected_at", Type: types.Timestamp},
-		{Name: "column_name", Type: types.String},
-		{Name: "distinct_count", Type: types.Int},
-		{Name: "null_count", Type: types.Int},
-	}}
+	res := &Result{Columns: showStatsColumns()}
 	// A role confined by the table's row-security policies is shown no
 	// statistics: row, distinct and null counts describe every row.
 	confined, err := s.rowSecurityActive(ctx, txn, desc)

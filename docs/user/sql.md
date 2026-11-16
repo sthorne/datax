@@ -1823,7 +1823,13 @@ query. A replica with zeros in `garbage_versions`, `tombstones` and
 `$1, $2, ...` work through the extended protocol in text and binary
 formats — every driver's normal parameterized-query path. Parameter types
 are inferred from column context; when a driver asks, unknown parameters
-describe as text.
+describe as text. Describe answers with the result's columns for every
+statement that returns rows — queries, `RETURNING`, `EXPLAIN`, every
+`SHOW`, `ALTER TABLE ... PURGE`, `SPLIT AT` and `UNSPLIT` — and with
+NoData for the rest; a prepared statement whose result changes width
+before it runs (`SELECT *` over a table altered since) is refused with
+`0A000`, as PostgreSQL refuses it (pgx then drops the cached statement
+and prepares it afresh on the next run).
 
 ## EXPLAIN-driven checklist
 
@@ -1871,6 +1877,9 @@ publications, extensions, functions, triggers, ...), plus
 `role_table_grants`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
+They describe the current database, as each PostgreSQL database's own
+catalogs do (`table_catalog` is its name); `pg_database`, `pg_roles`,
+`pg_auth_members` and `pg_tablespace` are the cluster's.
 Every role may read them; `pg_catalog` lists every table and
 `information_schema` the tables the reader holds a privilege on, as in
 PostgreSQL ([security guide](security.md#roles-and-privileges)).
