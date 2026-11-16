@@ -349,7 +349,7 @@ func (n *Node) startHTTP() error {
 	// headers slowly, or never, is closed at it rather than holding the
 	// connection. Bodies and responses are not bounded by it — the
 	// console's long polls are unaffected.
-	srv := &http.Server{Handler: n.httpAuth(mux), ReadHeaderTimeout: n.authTimeout()}
+	srv := &http.Server{Handler: n.httpTask(n.httpAuth(mux)), ReadHeaderTimeout: n.authTimeout()}
 	if n.tlsCfgs != nil {
 		srv.TLSConfig = n.tlsCfgs.PGServer.Clone()
 		go func() {
@@ -367,6 +367,21 @@ func (n *Node) startHTTP() error {
 	n.stopper.AddCloser(func() { _ = srv.Close() })
 	log.Infof("node %s serving the dashboard, /metrics, /status and /api/cluster at %s", n.ident.NodeID, n.httpAddr)
 	return nil
+}
+
+// httpTask runs every request, its authentication included, as a stopper
+// task: the request's context is canceled when the node begins to stop
+// (the console's long polls return), the engine closer waits for the
+// requests already running, and one that arrives once the node is
+// stopping is answered 503 without reaching a handler (issue #324).
+func (n *Node) httpTask(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if err := n.stopper.RunTask(req.Context(), "http "+req.URL.Path, func(ctx context.Context) {
+			next.ServeHTTP(w, req.WithContext(ctx))
+		}); err != nil {
+			http.Error(w, "this node is shutting down", http.StatusServiceUnavailable)
+		}
+	})
 }
 
 // httpPrincipal identifies the authenticated caller of an HTTP request:

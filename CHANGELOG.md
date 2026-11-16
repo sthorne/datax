@@ -1503,6 +1503,18 @@ state or the internode protocol does, and an entry below says so.
   object's `loread` failing with `TransactionAbortedError`. The prefix
   is now added only when missing, and a wrapped error has it moved to
   the front.
+- **Stopping a node no longer closes its store under a running request**
+  (#324). The internode gRPC server's stop, one of the shutdown steps,
+  did not wait for calls already in progress, so an admin, KV, raft or
+  snapshot handler could still be reading the storage engine when the
+  next step closed it: a data race, then a crash (seen in `TestSealJobs`
+  teardown, from a purge step reading intents). Every gRPC call, every
+  HTTP request and every SQL connection now runs as a task of the node's
+  stopper. Once a stop begins no new one is admitted (gRPC answers
+  `Unavailable`, HTTP 503), the running ones have their context canceled
+  and the gRPC server's connections are closed, and nothing is closed
+  until they have returned. The wait is bounded: a task still running
+  after a minute is logged by name and the shutdown goes on.
 - **After an online store-key rotation, the metadata backup is always
   under the new key.** Each heartbeat rewrites the backup, and a
   rotation reseals it right after swapping the key. A heartbeat's write
