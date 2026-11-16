@@ -1491,7 +1491,7 @@ Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
   one gateway pays two point reads per statement for the overflow. The
   schema page costs one build per five seconds while somebody has it
   open — 51 ms and 1 MB of descriptors at 5,000 tables — and it, the
-  catalog-wide `information_schema` views, the per-table gauges and a
+  per-table gauges and a
   few background passes (statistics refresh, retention, backup) are
   what still read every descriptor. Small tables do not get a range
   each: ranges split by size, and 5,000 one-row tables shared nine

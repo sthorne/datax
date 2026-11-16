@@ -1967,6 +1967,35 @@ state or the internode protocol does, and an entry below says so.
   restore's summary says so. Backups record commit times, and restores
   record bands, at cluster protocol version v22. See docs/user/operations.md,
   "Time-series retention and backups".
+- **`ALTER TABLE ... PURGE` sent its report without a description of its
+  columns over the extended protocol** (#322). Describe answered NoData and
+  Execute then sent rows: pgx read one row of no columns, and psql's `\bind`
+  failed with "server sent data without prior row description". The same
+  held for `SPLIT AT`, `UNSPLIT AT`, `UNSPLIT ALL`, `SHOW DATABASES` and
+  `SHOW PLACEMENT`; `SHOW GRANTS ON ROLE` was described with six columns
+  and returned three, and `SHOW COLUMNS`, `INDEXES`, `USERS` and `ROLES`
+  described their boolean and integer columns as text. Describe now reports
+  the columns of every statement that returns rows, from the same list its
+  executor uses, and Execute refuses a result whose shape Describe did not
+  report rather than send it: with columns Describe said it had none of
+  (`XX000`), or of another width (`0A000` "cached plan must not change
+  result type", as PostgreSQL answers a `SELECT *` prepared before an
+  `ALTER TABLE`). A test walks a statement of every kind the parser knows
+  through Parse, Describe, Bind and Execute, and fails for a new kind
+  without a sample.
+- **`information_schema` listed every database's tables** (#322):
+  `information_schema.tables`, `columns`, `views` and `schemata` listed the
+  objects of every database in the cluster, so a query for the current
+  database's tables (`WHERE table_schema = 'public'`) returned others' too,
+  and `pg_type` and `pg_enum` listed every database's enum types. In
+  PostgreSQL each database has its own catalogs. Every `information_schema`
+  view and every per-database `pg_catalog` table now lists the current
+  database's objects, with `table_catalog` its name; the shared catalogs
+  (`pg_database`, `pg_roles`, `pg_user`, `pg_auth_members`,
+  `pg_tablespace`, `pg_shdescription`) and `pg_stat_activity` list the
+  cluster's. What a role sees is otherwise unchanged (#312). Reading
+  `information_schema.tables`, `columns` and `views` no longer reads every
+  table descriptor in the cluster.
 
 ## 0.57.0 — unreleased
 

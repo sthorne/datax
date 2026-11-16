@@ -166,8 +166,7 @@ cluster (issue #311):
   13,200 rows and writes about 370.
 
 What still reads every table descriptor: `catalog.Accessor.List`, used
-by `information_schema.tables`, `.columns` and `.views` (which list
-every database), role DDL that must find everything a role owns or is
+by role DDL that must find everything a role owns or is
 granted (`DROP ROLE`, `REASSIGN OWNED`, `DROP OWNED`),
 `ALTER TYPE ... ADD VALUE` and `DROP TYPE`,
 `regclass` name resolution, a build of the schema document, and the
