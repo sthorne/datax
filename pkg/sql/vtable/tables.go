@@ -38,20 +38,43 @@ func is(name string, cols []catalog.Column, rows func(ctx context.Context, env *
 	informationSchemaTables[name] = &Table{Schema: InformationSchema, Name: name, Columns: cols, Rows: rows}
 }
 
-// visibleTables are the session's tables in its current database, the
-// ones psql lists; every database's tables are reachable qualified.
-// currentSequences lists the sequences of the session's database.
-func (env *Env) currentSequences() []*catalog.SequenceDescriptor {
-	dbID := uint64(0)
+// The catalogs describe the session's current database only, as each
+// PostgreSQL database has catalogs of its own (issue #322): pg_class,
+// pg_attribute, pg_type's user types, information_schema's views and
+// the rest list its objects, and another database's are reachable only
+// by qualified name. The shared catalogs (pg_database, pg_roles,
+// pg_auth_members, pg_tablespace, pg_shdescription) are cluster-wide.
+
+// inCurrent reports whether an object of database dbID belongs to the
+// session's current database. An object from before databases existed
+// (dbID 0) belongs to the default one; with no current database (it was
+// dropped under the session) nothing does.
+func (env *Env) inCurrent(dbID uint64) bool {
 	for _, d := range env.Databases {
 		if d.Name == env.Database {
-			dbID = d.ID
+			return dbID == d.ID || (dbID == 0 && d.Name == catalog.DefaultDatabase)
 		}
 	}
+	return false
+}
+
+// currentSequences lists the sequences of the session's database.
+func (env *Env) currentSequences() []*catalog.SequenceDescriptor {
 	var out []*catalog.SequenceDescriptor
 	for _, sq := range env.Sequences {
-		if sq.DatabaseID == dbID || dbID == 0 {
+		if env.inCurrent(sq.DatabaseID) {
 			out = append(out, sq)
+		}
+	}
+	return out
+}
+
+// currentTypes lists the user-defined types of the session's database.
+func (env *Env) currentTypes() []*catalog.TypeDescriptor {
+	var out []*catalog.TypeDescriptor
+	for _, t := range env.Types {
+		if env.inCurrent(t.DatabaseID) {
+			out = append(out, t)
 		}
 	}
 	return out
@@ -72,16 +95,11 @@ func yesNo(b bool) string {
 	return "NO"
 }
 
+// currentTables lists the tables of the session's database, by name.
 func (env *Env) currentTables() []*catalog.TableDescriptor {
 	var out []*catalog.TableDescriptor
-	var cur *catalog.DatabaseDescriptor
-	for _, d := range env.Databases {
-		if d.Name == env.Database {
-			cur = d
-		}
-	}
 	for _, t := range env.Tables {
-		if cur != nil && (t.DatabaseID == cur.ID || (t.DatabaseID == 0 && cur.Name == catalog.DefaultDatabase)) {
+		if env.inCurrent(t.DatabaseID) {
 			out = append(out, t)
 		}
 	}
@@ -298,7 +316,7 @@ func init() {
 		}
 		// Enum types: typtype 'e', in the public schema; pg_enum carries
 		// their labels.
-		for _, t := range env.Types {
+		for _, t := range env.currentTypes() {
 			oid := catalog.EnumOID(t.ID)
 			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
@@ -580,7 +598,7 @@ func init() {
 	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
-			for _, t := range env.Types {
+			for _, t := range env.currentTypes() {
 				typ := catalog.EnumOID(t.ID)
 				for i, l := range t.Labels {
 					rows = append(rows, Row{i64(typ<<8 | int64(i)), i64(typ), types.NewFloat(float64(i + 1)), str(l)})
@@ -884,26 +902,20 @@ func init() {
 	is("schemata", []catalog.Column{col("catalog_name", types.String), col("schema_name", types.String), col("schema_owner", types.String), col("default_character_set_name", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
-			for _, d := range env.Databases {
-				for _, sch := range []string{catalog.PublicSchema, PgCatalog, InformationSchema} {
-					rows = append(rows, Row{str(d.Name), str(sch), str("root"), str("UTF8")})
-				}
+			for _, sch := range []string{catalog.PublicSchema, PgCatalog, InformationSchema} {
+				rows = append(rows, Row{str(env.Database), str(sch), str("root"), str("UTF8")})
 			}
 			return rows, nil
 		})
 	is("tables", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("table_type", types.String), col("is_insertable_into", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
-			for _, d := range env.Databases {
-				for _, t := range env.Tables {
-					if t.DatabaseID == d.ID || (t.DatabaseID == 0 && d.Name == catalog.DefaultDatabase) {
-						kind, insertable := "BASE TABLE", "YES"
-						if t.IsView() {
-							kind, insertable = "VIEW", "NO"
-						}
-						rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(kind), str(insertable)})
-					}
+			for _, t := range env.currentTables() {
+				kind, insertable := "BASE TABLE", "YES"
+				if t.IsView() {
+					kind, insertable = "VIEW", "NO"
 				}
+				rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(kind), str(insertable)})
 			}
 			for _, name := range Names() {
 				sch, bare := name[:len(PgCatalog)], name[len(PgCatalog)+1:]
@@ -917,11 +929,9 @@ func init() {
 	is("views", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("view_definition", types.String), col("check_option", types.String), col("is_updatable", types.String), col("is_insertable_into", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
-			for _, d := range env.Databases {
-				for _, t := range env.Tables {
-					if t.IsView() && (t.DatabaseID == d.ID || (t.DatabaseID == 0 && d.Name == catalog.DefaultDatabase)) {
-						rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(t.ViewQuery), str("NONE"), str("NO"), str("NO")})
-					}
+			for _, t := range env.currentTables() {
+				if t.IsView() {
+					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(t.ViewQuery), str("NONE"), str("NO"), str("NO")})
 				}
 			}
 			return rows, nil
@@ -932,43 +942,38 @@ func init() {
 		col("character_maximum_length", types.Int), col("numeric_precision", types.Int), col("numeric_scale", types.Int), col("udt_name", types.String), col("is_identity", types.String), col("is_generated", types.String),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
-		for _, d := range env.Databases {
-			for _, t := range env.Tables {
-				if !(t.DatabaseID == d.ID || (t.DatabaseID == 0 && d.Name == catalog.DefaultDatabase)) {
+		for _, t := range env.currentTables() {
+			n := int64(0)
+			for i := range t.Columns {
+				c := &t.Columns[i]
+				if c.Hidden {
 					continue
 				}
-				n := int64(0)
-				for i := range t.Columns {
-					c := &t.Columns[i]
-					if c.Hidden {
-						continue
-					}
-					n++
-					def, nullable := null(), "YES"
-					if text := ColumnDefault(c); text != "" {
-						def = str(text)
-					}
-					if c.NotNull {
-						nullable = "NO"
-					}
-					prec, scale, maxLen := null(), null(), null()
-					switch {
-					case c.Type == types.Decimal && c.Precision > 0:
-						prec, scale = i64(int64(c.Precision)), i64(int64(c.Scale))
-					case c.Type == types.Int:
-						prec = i64(int64(c.IntWidth()) * 8)
-					case c.Type == types.String && c.MaxLen > 0:
-						maxLen = i64(int64(c.MaxLen))
-					}
-					dataType := FormatType(c)
-					if c.Type.IsArray() {
-						dataType = "ARRAY"
-					} else if c.Type == types.Enum {
-						dataType = "USER-DEFINED"
-					}
-					rows = append(rows, Row{str(d.Name), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(dataType),
-						maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})
+				n++
+				def, nullable := null(), "YES"
+				if text := ColumnDefault(c); text != "" {
+					def = str(text)
 				}
+				if c.NotNull {
+					nullable = "NO"
+				}
+				prec, scale, maxLen := null(), null(), null()
+				switch {
+				case c.Type == types.Decimal && c.Precision > 0:
+					prec, scale = i64(int64(c.Precision)), i64(int64(c.Scale))
+				case c.Type == types.Int:
+					prec = i64(int64(c.IntWidth()) * 8)
+				case c.Type == types.String && c.MaxLen > 0:
+					maxLen = i64(int64(c.MaxLen))
+				}
+				dataType := FormatType(c)
+				if c.Type.IsArray() {
+					dataType = "ARRAY"
+				} else if c.Type == types.Enum {
+					dataType = "USER-DEFINED"
+				}
+				rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(dataType),
+					maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})
 			}
 		}
 		return rows, nil
