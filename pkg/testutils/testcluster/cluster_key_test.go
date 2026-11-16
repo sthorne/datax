@@ -154,7 +154,7 @@ func (c *ckCluster) waitFor(what string, d time.Duration, cond func() bool) {
 }
 
 // waitReported waits until every running node has written its holder
-// record.
+// record, and then until every member is live (waitLive).
 func (c *ckCluster) waitReported(n int) {
 	c.t.Helper()
 	c.waitFor("every node to report its root", 30*time.Second, func() bool {
@@ -166,6 +166,26 @@ func (c *ckCluster) waitReported(n int) {
 			}
 		}
 		return got >= n
+	})
+	c.waitLive(0)
+}
+
+// waitLive waits until node i's status shows every member live. The
+// cluster key's operations refuse while a member's last heartbeat is
+// older than the liveness grace (4 s here, against a beat every 3 s),
+// and under the race detector a member's beats can lag that much while
+// a fresh cluster forms or a restarted node rejoins: an operation that
+// expects some other refusal, or none, waits for this first.
+func (c *ckCluster) waitLive(i int) {
+	c.t.Helper()
+	c.waitFor("every member to be live", 30*time.Second, func() bool {
+		st := c.status(i)
+		for _, nd := range st.Nodes {
+			if !nd.Live {
+				return false
+			}
+		}
+		return len(st.Nodes) == len(c.tc.Nodes)
 	})
 }
 
@@ -282,6 +302,7 @@ func TestClusterKeyRefusals(t *testing.T) {
 			}
 			return got == 3
 		})
+		c.waitLive(0)
 		errText, _ := c.op(0, "init")
 		wantErr(t, "init with a key-file node", errText, "n3 keeps its store key in a key file")
 		wantErr(t, "init with a key-file node", errText, "datax debug enc-root adopt")
@@ -454,6 +475,7 @@ func TestClusterKeyLifecycle(t *testing.T) {
 		t.Fatalf("n2 after a restart: %v", err)
 	}
 	m2b.Release()
+	c.waitLive(2)
 
 	// A rotation of the named key keeps the old version opening.
 	rot, err := ks1.Rotate(ctx, billing.ID)
