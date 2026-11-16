@@ -1996,6 +1996,13 @@ state or the internode protocol does, and an entry below says so.
   cluster's. What a role sees is otherwise unchanged (#312). Reading
   `information_schema.tables`, `columns` and `views` no longer reads every
   table descriptor in the cluster.
+- **`DROP OWNED BY r` and `DROP ROLE r` hung when `r` held default
+  privileges** (`ALTER DEFAULT PRIVILEGES ... TO r` or `FOR ROLE r`), over
+  pgwire, until the client gave up (#322). Removing the default privileges
+  writes the database's descriptor in the statement's transaction, and the
+  key service then looked up its table in a transaction of its own, which
+  waited on that write. The key service's work inside a statement now reads
+  its table in the statement's transaction.
 
 ## 0.57.0 — unreleased
 

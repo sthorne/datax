@@ -84,19 +84,29 @@ var keysTableAddedColumns = []struct{ name, ddl string }{
 func LookupKeysTable(ctx context.Context, db *kvclient.DB, cat *catalog.Accessor) (*catalog.TableDescriptor, error) {
 	var d *catalog.TableDescriptor
 	err := db.RunTxn(ctx, "keys-table", func(ctx context.Context, txn *kvclient.Txn) error {
-		d = nil
-		got, err := cat.LookupIn(ctx, txn, catalog.DefaultDatabase, catalog.KeysTableName)
-		if err != nil {
-			var nf *catalog.ErrTableNotFound
-			if errors.As(err, &nf) {
-				return nil
-			}
-			return err
-		}
-		d = got
-		return nil
+		var err error
+		d, err = LookupKeysTableIn(ctx, txn, cat)
+		return err
 	})
 	return d, err
+}
+
+// LookupKeysTableIn is LookupKeysTable in txn. Work that is part of a
+// statement's transaction must look the table up there: the lookup
+// reads the default database's descriptor, and a transaction of its own
+// would wait on the statement's write to it (DROP OWNED and DROP ROLE
+// write it when the role holds default privileges there) while the
+// statement waits on the lookup.
+func LookupKeysTableIn(ctx context.Context, txn *kvclient.Txn, cat *catalog.Accessor) (*catalog.TableDescriptor, error) {
+	d, err := cat.LookupIn(ctx, txn, catalog.DefaultDatabase, catalog.KeysTableName)
+	if err != nil {
+		var nf *catalog.ErrTableNotFound
+		if errors.As(err, &nf) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return d, nil
 }
 
 // EnsureKeysTable creates the named-keys table if it is not there and
@@ -170,7 +180,7 @@ func (s *Session) listKeys(ctx context.Context, txn *kvclient.Txn, set catalog.R
 	if s.db.ClusterVersion() < version.V22 || !(s.actor() == catalog.RootRole || set.IsAdmin()) {
 		return nil, nil
 	}
-	d, err := LookupKeysTable(ctx, s.db, s.cat)
+	d, err := LookupKeysTableIn(ctx, txn, s.cat)
 	if err != nil || d == nil {
 		return nil, err
 	}

@@ -126,7 +126,7 @@ var describeSamples = []struct {
 		{sql: `GRANT SELECT ON shapes TO shapes_role`},
 		{sql: `REVOKE SELECT ON shapes FROM shapes_role`},
 	}},
-	{"AlterDefaultPrivileges", []describeSample{{sql: `ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO shapes_role2`}}},
+	{"AlterDefaultPrivileges", []describeSample{{sql: `ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO shapes_role`}}},
 	{"AlterOwner", []describeSample{{sql: `ALTER TABLE shapes OWNER TO shapes_role`}}},
 	{"ReassignOwned", []describeSample{{sql: `REASSIGN OWNED BY shapes_role TO shapes_role2`}}},
 	{"CreatePolicy", []describeSample{{sql: `CREATE POLICY shapes_p ON shapes USING (true)`}}},
