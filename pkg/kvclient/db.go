@@ -189,6 +189,15 @@ func (db *DB) ClusterVersion() version.Version {
 	return (*f)()
 }
 
+// poisonsAborted reports whether a resolution with the given status, made
+// on behalf of someone other than the transaction's coordinator, should
+// leave an abort-span entry where it removes an intent (issue #320): an
+// ABORTED one, once the cluster is at v22 (a v21 replica would drop the
+// field, and the replicas of a range must apply alike).
+func (db *DB) poisonsAborted(status enginepb.TxnStatus) bool {
+	return status == enginepb.ABORTED && db.ClusterVersion() >= version.V22
+}
+
 // LocalNodeID is the node this DB runs on (0 for a store-less client).
 func (db *DB) LocalNodeID() base.NodeID {
 	if db.local == nil {
@@ -1407,6 +1416,7 @@ func (db *DB) PushAndResolveIntents(ctx context.Context, intents []storage.Inten
 				TxnID:         intent.Txn.ID,
 				Status:        push.Status,
 				CommitTS:      push.CommitTS,
+				Poison:        db.poisonsAborted(push.Status),
 			})
 			if _, kerr := db.Send(ctx, rba); kerr != nil {
 				return false, kerr

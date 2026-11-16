@@ -394,6 +394,14 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 		return r.evalOnePhase(b, ba)
 	}
 
+	// A transaction whose writes here were removed by a pusher that
+	// aborted it goes no further on this range (issue #320). Checked at
+	// apply, in log order, so every replica decides alike and no removal
+	// can land between the check and the batch's own reads.
+	if err := r.checkAbortSpan(b, ba); err != nil {
+		return nil, err
+	}
+
 	if ba.Header.CreateTxnRecord {
 		if err := r.createTxnRecord(b, ba.Header.Txn); err != nil {
 			return nil, err
@@ -530,7 +538,11 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			ru.PushTxn = resp
 		case *kvpb.ResolveIntentRequest:
-			if err := storage.MVCCResolveIntent(b, req.Key, req.TxnID, req.Status, req.CommitTS); err != nil {
+			removed, err := storage.MVCCResolveIntentFound(b, req.Key, req.TxnID, req.Status, req.CommitTS)
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			if err := r.updateAbortSpan(b, req, removed, ba.Header.Timestamp); err != nil {
 				return nil, kvpb.NewError(err)
 			}
 			ru.ResolveIntent = &kvpb.ResolveIntentResponse{}
@@ -562,6 +574,11 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 			}
 			for _, k := range req.TxnRecordKeys {
 				if err := b.Delete(k); err != nil {
+					return nil, kvpb.NewError(err)
+				}
+			}
+			if !req.AbortSpanCutoff.IsEmpty() {
+				if _, err := collectAbortSpan(b, r.rangeID, req.AbortSpanCutoff); err != nil {
 					return nil, kvpb.NewError(err)
 				}
 			}
@@ -630,6 +647,21 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 // evalReadOnly serves a read-only batch directly from the engine (after the
 // ReadIndex dance made it linearizable).
 func (r *Replica) evalReadOnly(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	br, kerr := r.evalReadOnlyRequests(ba)
+	// The abort span is checked AFTER the reads (issue #320): a pusher's
+	// removal of this transaction's intent and the entry recording it land
+	// in one engine batch, so if a read here missed the intent, the batch
+	// had committed before the read and the check now finds the entry.
+	// Checked before, a removal could land in between. An entry also
+	// outranks whatever the reads ran into (a conflicting intent, say):
+	// the transaction cannot go on either way.
+	if aerr := r.checkAbortSpan(r.store.cfg.Engine, ba); aerr != nil {
+		return nil, aerr
+	}
+	return br, kerr
+}
+
+func (r *Replica) evalReadOnlyRequests(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 	br := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
 	opts := storage.MVCCGetOptions{Inconsistent: ba.Header.ReadInconsistent}
 	ts := readTimestamp(ba)

@@ -158,8 +158,14 @@ func tableDesc(t *testing.T, ctx context.Context, c *ckCluster, name string) *ca
 func tableKVs(t *testing.T, ctx context.Context, c *ckCluster, id uint64) (primary, other [][2][]byte) {
 	t.Helper()
 	lo, hi := keys.TableDataSpan(id)
-	kvs, err := c.tc.Nodes[0].DB().Scan(ctx, lo, hi, 0)
-	if err != nil {
+	// In a transaction, so a write in flight beside the test (a seal job's
+	// batch, a concurrent statement) is pushed rather than failing the read.
+	var kvs []kvpb.KeyValue
+	if err := c.tc.Nodes[0].DB().RunTxn(ctx, "test-table-kvs", func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		kvs, err = txn.Scan(ctx, lo, hi, 0)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	prim := keys.TableIndexPrefix(id, 1)

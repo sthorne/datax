@@ -20,6 +20,34 @@ func spansOf(t *Txn) string {
 	return strings.Join(out, " ")
 }
 
+// TestForgetSpan: forgetting a span drops the point reads inside it and
+// cuts the scans that overlap it back to their parts outside it; reads
+// recorded before the mark are untouched.
+func TestForgetSpan(t *testing.T) {
+	k := func(s string) keys.Key { return keys.Key(s) }
+	txn := &Txn{}
+	txn.recordRead(k("d"), nil)    // an earlier statement's point read
+	txn.recordRead(k("a"), k("z")) // and its scan
+	mark := txn.ReadMark()
+	txn.recordRead(k("a"), k("z")) // straddles the span: both ends kept
+	txn.recordRead(k("a"), k("e")) // ends inside it
+	txn.recordRead(k("f"), k("g")) // wholly inside it
+	txn.recordRead(k("g"), k("p")) // starts inside it
+	txn.recordRead(k("q"), k("r")) // beyond it
+	txn.recordRead(k("d"), nil)    // a point inside it
+	txn.recordRead(k("c"), nil)    // a point before it
+	txn.recordRead(k("m"), nil)    // a point at its end: kept
+	txn.ForgetSpan(mark, k("d"), k("m"))
+	want := "d [a,z) [a,d) [m,z) [a,d) [m,p) [q,r) c m"
+	if got := spansOf(txn); got != want {
+		t.Fatalf("read spans after forgetting [d, m):\n got %s\nwant %s", got, want)
+	}
+	txn.ForgetSpan(mark, k("m"), k("d")) // empty: nothing changes
+	if got := spansOf(txn); got != want {
+		t.Fatalf("an empty span changed the reads: %s", got)
+	}
+}
+
 // TestForgetReads: forgetting a key drops its point read and splits the
 // scans that cover it, leaving the gaps on either side read; reads
 // recorded before the mark are untouched.

@@ -286,6 +286,56 @@ func (t *Txn) ForgetReads(mark int, ks []keys.Key) {
 	t.mu.readSpans = append(t.mu.readSpans[:mark:mark], out...)
 }
 
+// ForgetSpan removes [start, end) from the reads recorded since mark: a
+// point read inside it is dropped and a scan is cut back to the parts
+// outside it. A statement that read further than its result depended
+// on uses it for the excess (issue #320): an ordered scan with a
+// residual filter and a LIMIT reads its span to the end, page by page,
+// though once the limit is met the rows after the last one it kept
+// cannot change its result. Left in the read set they turn every change
+// another transaction commits there into a failed refresh. As with
+// ForgetReads, reads recorded before mark are kept whole.
+func (t *Txn) ForgetSpan(mark int, start, end keys.Key) {
+	if !start.Less(end) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mu.refreshUnusable || mark >= len(t.mu.readSpans) {
+		return
+	}
+	tail := t.mu.readSpans[mark:]
+	out := make([]readSpan, 0, len(tail))
+	for _, sp := range tail {
+		if len(sp.end) == 0 {
+			if sp.start.Less(start) || !sp.start.Less(end) {
+				out = append(out, sp)
+			}
+			continue
+		}
+		if sp.start.Less(start) {
+			cut := sp.end
+			if start.Less(cut) {
+				cut = start
+			}
+			out = append(out, readSpan{start: sp.start, end: cut})
+		}
+		if end.Less(sp.end) {
+			from := sp.start
+			if from.Less(end) {
+				from = end
+			}
+			out = append(out, readSpan{start: from, end: sp.end})
+		}
+	}
+	if mark+len(out) > maxReadSpans {
+		t.mu.refreshUnusable = true
+		t.mu.readSpans = nil
+		return
+	}
+	t.mu.readSpans = append(t.mu.readSpans[:mark:mark], out...)
+}
+
 // recordScan records [start, end) as read, less the keys the scan passed
 // over under LockWaitSkip.
 func (t *Txn) recordScan(ctx context.Context, start, end keys.Key, skipped []storage.Intent) {

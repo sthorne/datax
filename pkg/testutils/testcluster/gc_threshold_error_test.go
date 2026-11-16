@@ -54,3 +54,58 @@ func TestBelowGCThresholdSQLState(t *testing.T) {
 	}
 	execSQL(t, ctx, long, `COMMIT`)
 }
+
+// TestPurgeCutoffSQLStateOverPgwire (issue #320, from its report: a
+// purge's cut-off reached a client as XX000): the same two refusals as
+// TestBelowGCThresholdSQLState, through pgwire with a stock driver, for
+// an explicit transaction that read the table before the purge and for
+// one that wrote it, and for AS OF SYSTEM TIME.
+func TestPurgeCutoffSQLStateOverPgwire(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	tc := Start(t, 1)
+	admin := pgConn(t, ctx, tc, 0)
+	for _, stmt := range []string{
+		`CREATE TABLE p (id INT8 PRIMARY KEY, v TEXT)`,
+		`INSERT INTO p VALUES (1, 'a'), (2, 'a')`,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	before := strconv.FormatInt(tc.Nodes[0].Clock().Now().WallTime, 10)
+	reader, writer := pgConn(t, ctx, tc, 0), pgConn(t, ctx, tc, 0)
+	rtx, err := reader.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rtx.Rollback(context.Background()) }()
+	var v string
+	if err := rtx.QueryRow(ctx, `SELECT v FROM p WHERE id = 1`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	wtx, err := writer.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = wtx.Rollback(context.Background()) }()
+	if err := wtx.QueryRow(ctx, `SELECT v FROM p WHERE id = 2`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	// The versions both read are superseded, then collected.
+	if _, err := admin.Exec(ctx, `UPDATE p SET v = 'b'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `ALTER TABLE p PURGE`); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT v FROM p AS OF SYSTEM TIME '`+before+`' WHERE id = 1`).Scan(&v); sqlState(err) != sql.CodeSnapshotTooOld {
+		t.Fatalf("AS OF SYSTEM TIME below the purge: %v, want %s", err, sql.CodeSnapshotTooOld)
+	}
+	if err := rtx.QueryRow(ctx, `SELECT v FROM p WHERE id = 1`).Scan(&v); sqlState(err) != sql.CodeSerializationFailure {
+		t.Fatalf("a read from before the purge: %v, want %s", err, sql.CodeSerializationFailure)
+	}
+	if _, err := wtx.Exec(ctx, `UPDATE p SET v = 'c' WHERE id = 2`); sqlState(err) != sql.CodeSerializationFailure {
+		t.Fatalf("a write from before the purge: %v, want %s", err, sql.CodeSerializationFailure)
+	}
+}

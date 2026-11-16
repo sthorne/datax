@@ -349,6 +349,14 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	if err != nil {
 		return err
 	}
+	// The abort span (issue #320) goes to both halves: an entry records
+	// that the transaction's writes somewhere in the parent's span were
+	// removed, and which half held them is not recorded. A copy on the
+	// half that held none only refuses a transaction that is aborted
+	// anyway.
+	if err := copyAbortSpan(b, r.rangeID, trig.Right.RangeID); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	thr := r.mu.gcThreshold
 	r.mu.sizeBytes = leftSize

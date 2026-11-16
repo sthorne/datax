@@ -28,7 +28,16 @@ jobs:
       # Every package but the in-process cluster tests, which run in the
       # cluster job below.
       - name: test
-        run: go test -race -timeout 30m $(go list ./... | grep -v '/pkg/testutils/testcluster$')
+        run: |
+          set -o pipefail
+          go test -race -timeout 30m $(go list ./... | grep -v '/pkg/testutils/testcluster$') 2>&1 | tee test.log
+      # The cluster tests log tens of thousands of lines, and a failure
+      # printed early is out of reach of tools that read a job log's tail.
+      # Repeat every failure's lines at the very end.
+      - name: failures
+        if: failure()
+        run: |
+          grep -E -B5 -A40 -- '--- FAIL|^panic:|WARNING: DATA RACE|test timed out' test.log | tail -n 3000 || true
 
   # The in-process cluster tests are most of the suite's time, and under
   # the race detector one package outgrew the 30-minute limit. They run
@@ -59,4 +68,13 @@ jobs:
       - name: test
         env:
           DATAX_REQUIRE_BROWSER: "1"
-        run: go test -race -timeout 30m ${{ matrix.select }} ./pkg/testutils/testcluster/
+        run: |
+          set -o pipefail
+          go test -race -timeout 30m ${{ matrix.select }} ./pkg/testutils/testcluster/ 2>&1 | tee test.log
+      # The cluster tests log tens of thousands of lines, and a failure
+      # printed early is out of reach of tools that read a job log's tail.
+      # Repeat every failure's lines at the very end.
+      - name: failures
+        if: failure()
+        run: |
+          grep -E -B5 -A40 -- '--- FAIL|^panic:|WARNING: DATA RACE|test timed out' test.log | tail -n 3000 || true

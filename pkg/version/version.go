@@ -362,6 +362,19 @@ const (
 	// empties each range of a dropped table's span with one raft command
 	// instead of a tombstone per row. A v21 replica cannot apply the
 	// command, so below v22 the reclaim deletes row by row.
+	//
+	// V22 also introduces the abort span (issue #320,
+	// pkg/kvserver/abortspan.go): a pusher's resolution of an aborted
+	// transaction's intent carries kvpb.ResolveIntentRequest.Poison, and
+	// where it removes an intent the range records the abort in
+	// replicated state (keys.AbortSpanKey) that refuses the
+	// transaction's later requests there; GC removes old entries with
+	// kvpb.GCRequest.AbortSpanCutoff. A v21 replica would drop both
+	// fields and its state would differ from its peers', so neither is
+	// sent below v22: there no range refuses an aborted transaction,
+	// which goes on until its coordinator learns of the abort (from its
+	// heartbeat, after which the coordinator refuses every request
+	// itself, or from its commit).
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

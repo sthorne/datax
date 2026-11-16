@@ -93,15 +93,21 @@ func (r *Replica) getChecksum(id string) (checksumResult, bool) {
 }
 
 // checksumRangeState hashes the range's replicated content in fixed span
-// order: range-local addressed keys, then the MVCC data span — raw engine
-// key/value bytes, so every version, tombstone, intent, and transaction
-// record participates.
+// order: range-local addressed keys, then the MVCC data span, then the
+// range's abort span (issue #320) — raw engine key/value bytes, so every
+// version, tombstone, intent, transaction record and abort-span entry
+// participates. A range without abort-span entries hashes exactly as it
+// did before they existed, so replicas on binaries from either side of
+// the change agree until the cluster reaches v22, which is when entries
+// can first be written.
 func checksumRangeState(snap *storage.Snapshot, desc kvpb.RangeDescriptor) ([]byte, error) {
 	h := sha256.New()
 	loLocal, hiLocal := keys.RangeLocalAddressedSpan(desc.StartKey, desc.EndKey)
+	abortPre := keys.AbortSpanPrefix(desc.RangeID)
 	spans := [][2][]byte{
 		{[]byte(loLocal), []byte(hiLocal)},
 		{storage.EncodeMVCCKey(desc.StartKey, hlc.Timestamp{}), storage.EncodeMVCCKey(desc.EndKey, hlc.Timestamp{})},
+		{[]byte(abortPre), []byte(abortPre.PrefixEnd())},
 	}
 	var lenBuf [8]byte
 	writeChunk := func(b []byte) {

@@ -332,6 +332,28 @@ therefore pushes the transactions behind the intents its reads skipped
 expired, and a live coordinator resolves its own), and each at most once
 a second per gateway — and resolves what turns out finished or expired.
 
+**Reading past the limit.** With a condition the scan cannot use — a
+queue's `WHERE runnable ORDER BY id LIMIT 1` — the limit is not pushed
+into the KV scan, which reads the queue's whole span; until issue #320
+all of it stayed in the read set, and four workers looping
+`SELECT ... SKIP LOCKED` / `UPDATE` / `COMMIT` over 200 rows lost a third
+of their attempts to refresh failures at commit, over rows far beyond the
+one each had taken. A limited scan now takes the part of its span after
+the last row it kept out of the read set (`Txn.ForgetSpan`; an index
+scan, the rest of its index span and the primary rows it fetched behind
+the last entry it used): rows after the limit-th match cannot change the
+result, any more than they could have had the scan stopped there. This
+holds for any limited scan in scan order, so it applies outside SKIP
+LOCKED too; a scan whose rows are sorted afterwards is not limited and
+keeps its whole span. The same queue now loses none
+(`TestSkipLockedContendedReturnsFreeRow`). The report's empty results
+with rows free were the locks of transactions whose commit had failed,
+held until their records expired before #315; a SKIP LOCKED read rightly
+passes over rows locked by a transaction that still looks alive. What is
+left is the moment between a transaction's record turning final and its
+coordinator resolving its intents, in which its rows are still passed
+over.
+
 Measured on the queue test (8 workers on 3 nodes draining 200 rows with
 `ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED` then `DELETE`, one job per
 transaction): every row taken once and no `40001` in any of fifteen
@@ -447,8 +469,10 @@ pushee's anchor range:
 
 - Record COMMITTED / ABORTED / expired → resolve the intent, proceed.
 - Record PENDING and live:
-  - pusher has **higher priority** → write ABORTED into the record (the pushee
-    discovers this at its next heartbeat or EndTxn),
+  - pusher has **higher priority** → write ABORTED into the record and
+    resolve the intent (the pushee discovers this at its next heartbeat,
+    at its EndTxn, or — from v22 — at its next request on a range whose
+    abort span the resolution marked; see [the abort span](#the-abort-span)),
   - otherwise wait for the pushee to finish and push again, for at most
     10 s (`conflictBudget`, `pkg/kvclient/txn.go`), then surface `40001`
     to the client. A wait that can only end in a restart does not wait
@@ -549,6 +573,105 @@ more of them (0.018 per committed transfer against 0.016), since a
 waiter whose holder would have aborted now restarts too. kv 50 % reads
 and hot-row did the same KV work per operation as before and stayed
 within their run-to-run noise.
+
+### The abort span
+
+A pusher that aborts a transaction resolves the intents it ran into, and
+an aborted intent is resolved by removing it. Until issue #320 the
+aborted transaction went on until its next heartbeat or its commit
+found the record ABORTED, and in between it no longer saw what it had
+written: four transactions writing one new key and reading it back
+(`INSERT`, then `SELECT` of the key) had an `INSERT 0 1` followed by an
+empty `SELECT` in about one transaction in a hundred (on main before the
+fix: 51 in 6,000; 36 in 200 in the report, before #315). Nothing such a
+transaction did could commit, but a client acting on the empty read and
+rolling back never saw an error. The defence is CockroachDB's: the
+range remembers the abort.
+
+*What.* An ABORTED resolution sent for someone other than the
+transaction's coordinator — a transactional pusher, a non-transactional
+reader, a purge, a SKIP LOCKED read cleaning up after a dead holder —
+carries `Poison` (`kvpb.ResolveIntentRequest`). Where it removes an
+intent of the transaction, the same replicated command writes an entry
+for the transaction in the range's abort span: `keys.AbortSpanKey(range,
+txn)`, under the range's local prefix, value the resolving batch's
+timestamp (`pkg/kvserver/abortspan.go`). A resolution that removes
+nothing (the intent was gone already) writes nothing: nothing of the
+transaction was taken away there.
+
+*The check.* Every batch of a transaction that reads or writes the
+range's data (Get, Scan, Put, Delete, Increment, Refresh) looks up its
+entry — one point read, whatever the batch reads — and fails with a
+`TxnAbortedError` (SQLSTATE `40001`) if it is there. Record operations,
+resolutions and savepoint rollbacks are not checked: the coordinator
+needs them to learn of the abort and clean up. The check and a removal
+cannot pass each other. A write batch is checked at apply, in log order,
+against the same replicated state the removal changed, so every replica
+decides alike and no removal lands between the check and the batch's own
+reads. A read is checked *after* it has evaluated, against the engine as
+it is then: the removal and the entry are one engine batch, so a read
+that missed the intent ran after that batch had committed, and so does
+the check that follows it (checked before, a removal could land in
+between). An entry also outranks whatever else the read ran into.
+
+*The coordinator.* Once it knows — a request refused, a heartbeat that
+finds the record ABORTED, or its own choice as a deadlock victim — the
+coordinator fails every further request itself (also on ranges where
+nothing was removed, which have no entry) and resolves its remaining
+intents as aborted at once, without `Poison`. That resolution also
+removes the range's entry. Before, a heartbeat's verdict was left for
+"the next operation" to discover, which happened only at the commit, and
+the SQL session's `ROLLBACK` after a failed statement found the
+transaction finished and resolved nothing.
+
+*Replicated state.* The entries are state of the range like its GC
+threshold, so they follow the range wherever its state goes:
+
+- *Snapshots* stream the range's abort span after its data; the receiver
+  clears its own entries for the range (a catch-up install, or a fresh
+  replica where an earlier one of the range lived) before writing the
+  stream's.
+- *Splits* copy every entry to the right-hand range, keeping the left's:
+  an entry records that some write of the transaction in the parent's
+  span was removed, not which, and a copy on the half that held none only
+  refuses a transaction that is aborted anyway.
+- *Merges* copy the right-hand range's entries into the merged range
+  before its local keys go (it is frozen at the subsume, so its entries
+  are the same on every replica), keeping the later timestamp where both
+  sides have one.
+- *Replica removal* wipes them with the rest of the range's local keys.
+- *The consistency checker* hashes the abort span after the range's
+  other two spans; a range with no entries hashes exactly as it did
+  before, so replicas on binaries from either side of the change agree
+  until v22, when entries can first be written.
+
+*GC.* An entry is needed only until the coordinator learns of the abort,
+which its heartbeat tells it within a second, and the coordinator's own
+cleanup usually removes it within milliseconds. What is left — the
+coordinator died, or a split copied an entry to a half the cleanup did
+not visit — the leader's GC pass removes once it is older than
+`AbortSpanTTL` (an hour), with a GC command of its own carrying the
+cutoff (`kvpb.GCRequest.AbortSpanCutoff`) that moves no threshold; each
+replica picks the entries from its own state at the command's position.
+The age is deliberately not tied to the transaction record: an aborted
+record is kept a whole GC TTL (25h by default), and on a contended range
+that would keep an entry for every transaction aborted there in the last
+day; and an entry is only ever written for a transaction whose record
+says ABORTED, which a record never stops saying except by being
+reclaimed, so a record lookup could not keep alive an entry the age
+would not.
+
+*Versions.* A v21 replica would drop both new fields and its state would
+part from its peers', so `Poison` and the cutoff are sent only from
+cluster version v22. Below it no range refuses an aborted transaction;
+the coordinator's own refusal after its heartbeat's verdict, which
+nothing else needs to understand, applies at every version.
+
+With it, the program above has no transaction see its write reported
+and then miss it, and every one that fails a statement fails with
+`40001` (or `23505` for a plain `INSERT` that lost)
+(`TestTxnAbortedReadsOwnWrites`); committed transactions per round are
+the same as before.
 
 Reads below a committed value's timestamp never block (MVCC). A foreign
 intent strictly above both the read timestamp and the uncertainty limit is
@@ -803,7 +926,8 @@ over the three stores and took 3.0 s; with the range clear, 24 entries,
 2. Commit is one Raft write (the record flip).
 3. At commit, `writeTS == readTS` (retry-only serializability).
 4. The uncertainty interval is enforced on every read of non-local data.
-5. A transaction's reads observe its own latest writes.
+5. A transaction's reads observe its own latest writes, or fail (an
+   abort that removed them is recorded in the range's abort span).
 6. After GC, replicas of a range remain byte-identical, and no read ever
    observes a state that GC'd versions could have distinguished.
 

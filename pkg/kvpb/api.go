@@ -163,6 +163,15 @@ type ResolveIntentRequest struct {
 	TxnID    uuid.UUID          `json:"txn_id"`
 	Status   enginepb.TxnStatus `json:"status"`
 	CommitTS hlc.Timestamp      `json:"commit_ts"`
+	// Poison marks an ABORTED resolution by someone other than the
+	// transaction's own coordinator (cluster version v22, issue #320):
+	// when it removes an intent of the transaction, the range records an
+	// abort-span entry, and the transaction's next request on the range
+	// fails with a TxnAbortedError instead of reading past its own
+	// removed write. An ABORTED resolution without it — the
+	// coordinator's own cleanup — removes the range's entry. Sent only
+	// once the cluster is at v22: a v21 replica would drop the field.
+	Poison bool `json:"poison,omitempty"`
 }
 
 // RollbackIntentRequest rolls the transaction's intent on Key back to its
@@ -208,6 +217,11 @@ type GCRequest struct {
 	Threshold     hlc.Timestamp `json:"threshold"`
 	Versions      []GCVersion   `json:"versions,omitempty"`
 	TxnRecordKeys []keys.Key    `json:"txn_record_keys,omitempty"`
+	// AbortSpanCutoff, when set, removes the range's abort-span entries
+	// written at or below it (cluster version v22, issue #320). The
+	// replicas decide which entries those are from their own replicated
+	// state at the command's log position, so they agree.
+	AbortSpanCutoff hlc.Timestamp `json:"abort_span_cutoff,omitempty"`
 }
 
 // ClearRangeRequest removes every MVCC key of one whole range in a single

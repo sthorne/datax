@@ -43,6 +43,18 @@ syntax error or `0A000` feature not supported):
   the statement had to read but would have filtered out. `FOR SHARE`,
   `FOR NO KEY UPDATE`, `FOR KEY SHARE` and `FOR UPDATE OF table` are
   not supported.
+- **Concurrent inserts of one key.** In PostgreSQL the second `INSERT`
+  of a primary key another open transaction has just inserted waits for
+  it, then fails with `23505` if it commits or succeeds if it rolls back.
+  Here the second usually waits too and fails with `23505` (about two
+  thirds of the losers when four transactions race for one key), but it
+  can also get `40001`: at the `INSERT`, when the wait could only end in
+  its own restart (the key it checked was taken after its snapshot); or
+  after `INSERT 0 1`, at a later statement or the `COMMIT`, when the
+  other insert had the priority to abort it. Two of them never both
+  commit. Retrying a `40001` finds the committed row and reports `23505`,
+  so an insert-or-fail loop that already retries `40001` behaves as in
+  PostgreSQL; code that only expects `23505` there needs that retry.
 - **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
   half-even, `22003` on overflow, fixed-scale rendering), the integer
   widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
