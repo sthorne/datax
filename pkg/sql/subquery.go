@@ -443,6 +443,20 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			}
 			agg.AggFilter = f
 		}
+		if len(agg.AggOrder) > 0 {
+			order := make([]parser.OrderCol, len(agg.AggOrder))
+			for i, oc := range agg.AggOrder {
+				order[i] = oc
+				if oc.Expr != nil {
+					ro, err := s.resolveValueExprOpts(ctx, txn, *oc.Expr, params, keepVolatile)
+					if err != nil {
+						return e, err
+					}
+					order[i].Expr = &ro
+				}
+			}
+			agg.AggOrder = order
+		}
 		out.Agg = &agg
 	}
 	if e.Cmp != nil {
@@ -708,6 +722,11 @@ func exprHas(e parser.Expr, pred func(parser.Expr) bool) bool {
 				return true
 			}
 		}
+		for _, oc := range e.Agg.AggOrder {
+			if oc.Expr != nil && exprHas(*oc.Expr, pred) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -854,6 +873,25 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 
 	for i, se := range t.Exprs {
+		if se.Agg != "" && !se.Star && se.Window == nil {
+			// An aggregate select item: a subquery among its arguments,
+			// FILTER or ORDER BY (array_agg(x ORDER BY (SELECT ...))).
+			call := se
+			wrapped := parser.Expr{Agg: &call}
+			if !exprHasSubquery(wrapped) {
+				continue
+			}
+			v, err := s.resolveValueExpr(ctx, txn, wrapped, params)
+			if err != nil {
+				return nil, err
+			}
+			c := cloned()
+			if &c.Exprs[0] == &t.Exprs[0] {
+				c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+			}
+			c.Exprs[i] = *v.Agg
+			continue
+		}
 		if !s.needsResolve(se.Expr) {
 			continue
 		}

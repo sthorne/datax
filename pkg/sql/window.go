@@ -122,8 +122,17 @@ func windowPlanFor(t *parser.Select) (*windowPlan, error) {
 		if err != nil {
 			return 0, err
 		}
-		if se.AggDistinct || len(se.AggFilter) > 0 || len(se.AggOrder) > 0 {
-			return 0, newErrf(CodeFeatureNotSupported, "DISTINCT, FILTER and WITHIN GROUP are not supported on window functions")
+		// PostgreSQL's errors (parse_func.c), FILTER aside, which it
+		// allows on an aggregate used as a window function.
+		switch {
+		case se.AggWithinGroup:
+			return 0, newErrf(CodeFeatureNotSupported, "OVER is not supported for ordered-set aggregate %s", strings.ToLower(se.Agg))
+		case se.AggDistinct:
+			return 0, newErrf(CodeFeatureNotSupported, "DISTINCT is not implemented for window functions")
+		case len(se.AggOrder) > 0:
+			return 0, newErrf(CodeFeatureNotSupported, "aggregate ORDER BY is not implemented for window functions")
+		case len(se.AggFilter) > 0:
+			return 0, newErrf(CodeFeatureNotSupported, "FILTER is not supported on window functions")
 		}
 		if se.AggStar && se.Agg != "COUNT" {
 			return 0, newErrf(CodeSyntaxError, "%s(*) is not supported", se.Agg)

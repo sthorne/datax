@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/sthorne/datax/pkg/sql/builtins"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -51,8 +52,16 @@ type aggSpec struct {
 	distinct bool
 	filter   []parser.Comparison
 	order    *parser.OrderCol // WITHIN GROUP (ORDER BY ...): the ordered-set input
-	name     string
-	key      string // identity, for HAVING reuse
+	// sortBy is the order the aggregate consumes its input in: the
+	// ORDER BY written among its arguments, then (with DISTINCT) the
+	// arguments themselves, as PostgreSQL sorts a DISTINCT aggregate's
+	// input. Only the aggregates whose result shows the order use it.
+	sortBy []parser.OrderCol
+	// sortWritten is how many of sortBy were written (the rest are the
+	// DISTINCT arguments, which order as far as their type allows).
+	sortWritten int
+	name        string
+	key         string // identity, for HAVING reuse
 }
 
 // resolveAggSpec validates and resolves one aggregate select item.
@@ -65,8 +74,18 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 		c, ok := desc.Col(stripQualifier(n))
 		return c.Type, ok
 	}
+	// An ordered-set aggregate takes its direct arguments, then exactly
+	// one WITHIN GROUP argument (none of them for mode); a plain
+	// aggregate takes no WITHIN GROUP. Anything else names no function
+	// PostgreSQL has (42883, with the argument types it looked for).
+	orderedSet := sp.fn == "PERCENTILE_CONT" || sp.fn == "PERCENTILE_DISC" || sp.fn == "MODE"
+	direct := len(aggArgExprs(se))
+	if orderedSet != se.AggWithinGroup || (orderedSet && (len(se.AggOrder) != 1 || (sp.fn == "MODE") != (direct == 0) || direct > 1)) {
+		return sp, newErrf(CodeUndefinedFunction, "function %s does not exist", aggCallSignature(desc, se))
+	}
 	switch {
 	case se.AggStar:
+	case sp.fn == "MODE":
 	case se.AggCol != "":
 		col, ok := desc.Col(se.AggCol)
 		if !ok {
@@ -78,11 +97,13 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 	default:
 		return sp, newErrf(CodeSyntaxError, "%s() requires an argument", se.Agg)
 	}
-	switch sp.fn {
-	case "PERCENTILE_CONT", "PERCENTILE_DISC":
-		if len(se.AggOrder) != 1 {
-			return sp, newErrf(CodeSyntaxError, "%s requires WITHIN GROUP (ORDER BY ...)", strings.ToLower(sp.fn))
+	if !se.AggWithinGroup && (len(se.AggOrder) > 0 || sp.distinct) {
+		if err := resolveAggSort(desc, se, &sp); err != nil {
+			return sp, err
 		}
+	}
+	switch sp.fn {
+	case "PERCENTILE_CONT", "PERCENTILE_DISC", "MODE":
 		oc := se.AggOrder[0]
 		sp.order = &oc
 		if oc.Expr != nil {
@@ -151,6 +172,155 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 	return sp, nil
 }
 
+// aggCallSignature renders an aggregate call as PostgreSQL names the
+// function it looked up: name(argument types), the WITHIN GROUP
+// arguments included (an untyped string literal is "unknown").
+func aggCallSignature(desc *catalog.TableDescriptor, se parser.SelectExpr) string {
+	colType := func(n string) (types.Family, bool) {
+		c, ok := desc.Col(stripQualifier(n))
+		return c.Type, ok
+	}
+	var names []string
+	add := func(e parser.Expr) {
+		if e.Lit != nil && e.Lit.Fam == types.String && !e.Lit.Null && e.Cast == "" && e.BinOp == "" && e.Func == "" {
+			names = append(names, "unknown")
+			return
+		}
+		names = append(names, pgTypeName(exprFamily(e, colType)))
+	}
+	if se.AggStar {
+		names = append(names, "*")
+	}
+	for _, a := range aggArgExprs(se) {
+		add(a)
+	}
+	if se.AggWithinGroup {
+		for _, oc := range se.AggOrder {
+			if oc.Expr != nil {
+				add(*oc.Expr)
+			} else {
+				add(parser.Expr{Column: oc.Column})
+			}
+		}
+	}
+	return strings.ToLower(se.Agg) + "(" + strings.Join(names, ", ") + ")"
+}
+
+// pgTypeName is PostgreSQL's name of a family's type, for messages.
+func pgTypeName(f types.Family) string {
+	if f.IsArray() {
+		return pgTypeName(f.Elem()) + "[]"
+	}
+	switch f {
+	case types.Int:
+		return "bigint"
+	case types.Float:
+		return "double precision"
+	case types.String:
+		return "text"
+	case types.Bool:
+		return "boolean"
+	case types.Decimal:
+		return "numeric"
+	case types.Timestamp:
+		return "timestamp with time zone"
+	case types.Bytes:
+		return "bytea"
+	case types.Unknown:
+		return "unknown"
+	}
+	return strings.ToLower(f.String())
+}
+
+// orderShown reports whether an aggregate's result shows the order of
+// its input: the ones that list their inputs.
+func (sp aggSpec) orderShown() bool {
+	switch sp.fn {
+	case "STRING_AGG", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG":
+		return true
+	}
+	return false
+}
+
+// aggArgExprs lists an aggregate call's arguments as expressions.
+func aggArgExprs(se parser.SelectExpr) []parser.Expr {
+	var out []parser.Expr
+	switch {
+	case se.AggCol != "":
+		out = append(out, parser.Expr{Column: se.AggCol})
+	case se.AggArg != nil:
+		out = append(out, *se.AggArg)
+	}
+	return append(out, se.AggArgs...)
+}
+
+// resolveAggSort resolves an aggregate's ORDER BY (written among its
+// arguments) into sp.sortBy. With DISTINCT, each ORDER BY expression
+// must be one of the arguments (42P10, as in PostgreSQL), and the
+// arguments follow as further keys: PostgreSQL sorts a DISTINCT
+// aggregate's input on them, so array_agg(DISTINCT x) lists x ascending.
+func resolveAggSort(desc *catalog.TableDescriptor, se parser.SelectExpr, sp *aggSpec) error {
+	nested := func(x parser.Expr) bool { return x.Agg != nil || x.Window != nil }
+	for _, oc := range se.AggOrder {
+		if oc.Expr != nil && exprHas(*oc.Expr, nested) {
+			return newErrf(CodeGrouping, "aggregate function calls cannot be nested")
+		}
+	}
+	canon := func(e parser.Expr) parser.Expr {
+		return normalizeExpr(renameExprColumns(e, func(n string) string {
+			if c, ok := desc.Col(n); ok {
+				return fmt.Sprintf("#%d", c.ID)
+			}
+			if c, ok := desc.Col(stripQualifier(n)); ok {
+				return fmt.Sprintf("#%d", c.ID)
+			}
+			return n
+		}))
+	}
+	toExpr := func(oc parser.OrderCol) parser.Expr {
+		if oc.Expr != nil {
+			return *oc.Expr
+		}
+		return parser.Expr{Column: oc.Column}
+	}
+	args := aggArgExprs(se)
+	if sp.distinct {
+		canonArgs := make([]parser.Expr, len(args))
+		for i, a := range args {
+			canonArgs[i] = canon(a)
+		}
+		for _, oc := range se.AggOrder {
+			ce := canon(toExpr(oc))
+			found := false
+			for _, a := range canonArgs {
+				if reflect.DeepEqual(a, ce) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return newErrf(CodeInvalidColumnReference, "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
+			}
+		}
+	}
+	if !sp.orderShown() {
+		// The order cannot change the result (count, sum, max, ...).
+		return nil
+	}
+	for _, oc := range se.AggOrder {
+		e := toExpr(oc)
+		sp.sortBy = append(sp.sortBy, parser.OrderCol{Expr: &e, Desc: oc.Desc, Nulls: oc.Nulls})
+	}
+	sp.sortWritten = len(sp.sortBy)
+	if sp.distinct {
+		for _, a := range args {
+			e := a
+			sp.sortBy = append(sp.sortBy, parser.OrderCol{Expr: &e})
+		}
+	}
+	return nil
+}
+
 // sameSpec reports whether two aggregate computations are identical (so a
 // HAVING aggregate can reuse a projected one's state).
 func sameSpec(a, b aggSpec) bool {
@@ -211,6 +381,9 @@ type aggState struct {
 	distinct []map[string]bool
 	all      []bool // bool_and / every
 	any      []bool // bool_or
+	// sortKeys pairs each collected input with its sort key, for the
+	// aggregates with an input order (aggSpec.sortBy).
+	sortKeys [][][]types.Datum
 }
 
 func newAggState(n int) *aggState {
@@ -227,14 +400,94 @@ func newAggState(n int) *aggState {
 		distinct: make([]map[string]bool, n),
 		all:      make([]bool, n),
 		any:      make([]bool, n),
+		sortKeys: make([][][]types.Datum, n),
 	}
+}
+
+// keepSortKey records the sort key of the input aggregate i just
+// collected, when the aggregate orders its input.
+func (st *aggState) keepSortKey(i int, sp aggSpec, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) error {
+	if len(sp.sortBy) == 0 {
+		return nil
+	}
+	key := make([]types.Datum, len(sp.sortBy))
+	for j, oc := range sp.sortBy {
+		d, err := evalExpr(*oc.Expr, desc, row, params)
+		if err != nil {
+			return err
+		}
+		key[j] = d
+	}
+	st.sortKeys[i] = append(st.sortKeys[i], key)
+	return nil
+}
+
+// sortInputs puts aggregate i's collected inputs (and keys, for the
+// object aggregates) in its ORDER BY order: stable, so inputs that tie
+// keep their arrival order; NULLs last ascending and first descending
+// unless NULLS FIRST | LAST says otherwise.
+func (st *aggState) sortInputs(i int, sp aggSpec) error {
+	keys := st.sortKeys[i]
+	if len(sp.sortBy) == 0 || len(keys) < 2 {
+		return nil
+	}
+	perm := make([]int, len(keys))
+	for j := range perm {
+		perm[j] = j
+	}
+	var sortErr error
+	sort.SliceStable(perm, func(a, b int) bool {
+		ka, kb := keys[perm[a]], keys[perm[b]]
+		for j, oc := range sp.sortBy {
+			da, db := ka[j], kb[j]
+			if da.Null || db.Null {
+				if da.Null == db.Null {
+					continue
+				}
+				return da.Null == nullsFirst(oc)
+			}
+			c, err := da.Compare(db)
+			if err != nil {
+				if j < sp.sortWritten && sortErr == nil {
+					sortErr = err
+				}
+				// A DISTINCT argument of a type without an order
+				// (jsonb) keeps the arrival order.
+				continue
+			}
+			if c == 0 {
+				continue
+			}
+			if oc.Desc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return false
+	})
+	if sortErr != nil {
+		return newErrf(CodeFeatureNotSupported, "%s ORDER BY: %v", strings.ToLower(sp.fn), sortErr)
+	}
+	vals := make([]types.Datum, len(perm))
+	for j, p := range perm {
+		vals[j] = st.vals[i][p]
+	}
+	st.vals[i] = vals
+	if len(st.keys[i]) == len(perm) {
+		ks := make([]types.Datum, len(perm))
+		for j, p := range perm {
+			ks[j] = st.keys[i][p]
+		}
+		st.keys[i] = ks
+	}
+	return nil
 }
 
 // collects reports whether the aggregate keeps every input value.
 func (sp aggSpec) collects() bool {
 	switch sp.fn {
 	case "STRING_AGG", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "JSON_OBJECT_AGG", "JSONB_OBJECT_AGG",
-		"PERCENTILE_CONT", "PERCENTILE_DISC", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
+		"PERCENTILE_CONT", "PERCENTILE_DISC", "MODE", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
 		return true
 	}
 	return false
@@ -261,6 +514,20 @@ func (sp aggSpec) input(desc *catalog.TableDescriptor, row map[catalog.ColumnID]
 		return types.DNull, nil
 	}
 	return d, nil
+}
+
+// seenDistinct reports whether aggregate i (a DISTINCT one) already
+// took these argument values, recording them otherwise.
+func (st *aggState) seenDistinct(i int, args ...types.Datum) bool {
+	if st.distinct[i] == nil {
+		st.distinct[i] = map[string]bool{}
+	}
+	k := encodeGroupKey(args)
+	if st.distinct[i][k] {
+		return true
+	}
+	st.distinct[i][k] = true
+	return false
 }
 
 func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) error {
@@ -292,12 +559,24 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 			if err != nil {
 				return err
 			}
+			if sp.distinct && st.seenDistinct(i, d, v) {
+				continue
+			}
+			if err := st.keepSortKey(i, sp, desc, row, params); err != nil {
+				return err
+			}
 			st.keys[i] = append(st.keys[i], d)
 			st.vals[i] = append(st.vals[i], v)
 			continue
 		}
 		if d.Null {
 			if sp.fn == "JSON_AGG" || sp.fn == "JSONB_AGG" || sp.fn == "ARRAY_AGG" {
+				if sp.distinct && st.seenDistinct(i, d) {
+					continue
+				}
+				if err := st.keepSortKey(i, sp, desc, row, params); err != nil {
+					return err
+				}
 				st.vals[i] = append(st.vals[i], d)
 			}
 			continue
@@ -307,18 +586,14 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 				d = c
 			}
 		}
-		if sp.distinct {
-			if st.distinct[i] == nil {
-				st.distinct[i] = map[string]bool{}
-			}
-			k := encodeGroupKey([]types.Datum{d})
-			if st.distinct[i][k] {
-				continue
-			}
-			st.distinct[i][k] = true
+		if sp.distinct && st.seenDistinct(i, d) {
+			continue
 		}
 		st.counts[i]++
 		if sp.collects() {
+			if err := st.keepSortKey(i, sp, desc, row, params); err != nil {
+				return err
+			}
 			st.vals[i] = append(st.vals[i], d)
 			continue
 		}
@@ -377,6 +652,9 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum, error) {
 	out := make([]types.Datum, len(specs))
 	for i, sp := range specs {
+		if err := st.sortInputs(i, sp); err != nil {
+			return nil, err
+		}
 		switch sp.fn {
 		case "COUNT":
 			out[i] = types.NewInt(st.counts[i])
@@ -482,6 +760,12 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			out[i] = d
 		case "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP":
 			out[i] = statistic(sp.fn, st.vals[i])
+		case "MODE":
+			d, err := modeOf(sp, st.vals[i])
+			if err != nil {
+				return nil, err
+			}
+			out[i] = d
 		case "PERCENTILE_CONT", "PERCENTILE_DISC":
 			frac, err := aggFraction(sp, params)
 			if err != nil {
@@ -516,13 +800,9 @@ func aggFraction(sp aggSpec, params []types.Datum) (float64, error) {
 	return f.F, nil
 }
 
-// percentile computes the ordered-set aggregates over the collected
-// values: _cont interpolates between neighbors, _disc takes the first
-// value at or past the fraction.
-func percentile(sp aggSpec, frac float64, vals []types.Datum) (types.Datum, error) {
-	if len(vals) == 0 {
-		return types.DNull, nil
-	}
+// sortedInputs sorts an ordered-set aggregate's collected (non-NULL)
+// values in its WITHIN GROUP order.
+func sortedInputs(sp aggSpec, vals []types.Datum) ([]types.Datum, error) {
 	sorted := append([]types.Datum(nil), vals...)
 	var sortErr error
 	sort.SliceStable(sorted, func(a, b int) bool {
@@ -536,7 +816,49 @@ func percentile(sp aggSpec, frac float64, vals []types.Datum) (types.Datum, erro
 		return c < 0
 	})
 	if sortErr != nil {
-		return types.Datum{}, newErrf(CodeFeatureNotSupported, "%s: %v", strings.ToLower(sp.fn), sortErr)
+		return nil, newErrf(CodeFeatureNotSupported, "%s: %v", strings.ToLower(sp.fn), sortErr)
+	}
+	return sorted, nil
+}
+
+// modeOf computes mode(): the most frequent value, the first in the
+// WITHIN GROUP order among equally frequent ones (as PostgreSQL's
+// mode_final picks).
+func modeOf(sp aggSpec, vals []types.Datum) (types.Datum, error) {
+	if len(vals) == 0 {
+		return types.DNull, nil
+	}
+	sorted, err := sortedInputs(sp, vals)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	best, bestN := sorted[0], 0
+	for i := 0; i < len(sorted); {
+		j := i + 1
+		for j < len(sorted) {
+			if c, err := sorted[j].Compare(sorted[i]); err != nil || c != 0 {
+				break
+			}
+			j++
+		}
+		if j-i > bestN {
+			best, bestN = sorted[i], j-i
+		}
+		i = j
+	}
+	return best, nil
+}
+
+// percentile computes the ordered-set aggregates over the collected
+// values: _cont interpolates between neighbors, _disc takes the first
+// value at or past the fraction.
+func percentile(sp aggSpec, frac float64, vals []types.Datum) (types.Datum, error) {
+	if len(vals) == 0 {
+		return types.DNull, nil
+	}
+	sorted, err := sortedInputs(sp, vals)
+	if err != nil {
+		return types.Datum{}, err
 	}
 	n := len(sorted)
 	if sp.fn == "PERCENTILE_DISC" {

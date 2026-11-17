@@ -658,6 +658,27 @@ func (pt *paramTyper) expr(e parser.Expr, sc *paramScope) {
 			pt.set(a.Param, fam, false)
 		}
 	}
+	// A parameter that is an operand of arithmetic with a number takes
+	// the number's type, as PostgreSQL resolves an unknown operand
+	// (ORDER BY abs(x - $1) inside an aggregate, SELECT price * $1).
+	if e.Right != nil && (e.BinOp == "+" || e.BinOp == "-" || e.BinOp == "*" || e.BinOp == "/") {
+		lhs := e
+		lhs.BinOp, lhs.Right, lhs.Cast = "", nil, ""
+		bareParam := func(x parser.Expr) bool {
+			return x.Param > 0 && x.BinOp == "" && x.Func == "" && x.Cast == "" && len(x.Path) == 0 && x.Left == nil
+		}
+		numeric := func(f types.Family) bool { return f == types.Int || f == types.Float || f == types.Decimal }
+		if bareParam(*e.Right) {
+			if f := exprFamily(lhs, sc.column); numeric(f) {
+				pt.set(e.Right.Param, f, false)
+			}
+		}
+		if bareParam(lhs) {
+			if f := exprFamily(*e.Right, sc.column); numeric(f) {
+				pt.set(lhs.Param, f, false)
+			}
+		}
+	}
 	// A parameter that is an operand of a vector distance is a vector
 	// (ORDER BY embedding <-> $1), wherever the distance is written: a
 	// client that knows the type then sends it in binary.

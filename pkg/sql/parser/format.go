@@ -63,8 +63,9 @@ func formatExpr(b *strings.Builder, e Expr) {
 	}
 }
 
-// formatAgg renders an aggregate call's name and arguments (a FILTER or
-// WITHIN GROUP clause is not rendered).
+// formatAgg renders an aggregate call's name and arguments, with an
+// ORDER BY written among them (a FILTER or WITHIN GROUP clause is not
+// rendered).
 func formatAgg(b *strings.Builder, se SelectExpr) {
 	b.WriteString(strings.ToLower(se.Agg) + "(")
 	if se.AggDistinct {
@@ -81,6 +82,26 @@ func formatAgg(b *strings.Builder, se SelectExpr) {
 	for _, a := range se.AggArgs {
 		b.WriteString(", ")
 		formatExpr(b, a)
+	}
+	if !se.AggWithinGroup {
+		for i, oc := range se.AggOrder {
+			if i == 0 {
+				b.WriteString(" ORDER BY ")
+			} else {
+				b.WriteString(", ")
+			}
+			if oc.Expr != nil {
+				formatExpr(b, *oc.Expr)
+			} else {
+				b.WriteString(oc.Column)
+			}
+			if oc.Desc {
+				b.WriteString(" DESC")
+			}
+			if oc.Nulls != "" {
+				b.WriteString(" NULLS " + strings.ToUpper(oc.Nulls))
+			}
+		}
 	}
 	b.WriteString(")")
 }
