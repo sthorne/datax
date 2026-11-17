@@ -80,6 +80,9 @@ type Env struct {
 	// one for an admin, its own otherwise); nil when the caller cannot
 	// read them. A function, because most catalog queries never ask.
 	LargeObjects func() ([]LargeObjectInfo, error)
+	// AdvisoryLocks lists the advisory locks held across the cluster
+	// (pg_locks); nil when the session has none to list.
+	AdvisoryLocks func() ([]AdvisoryLockInfo, error)
 	// Keys lists the named keys of the key service (issue #310) as the
 	// datax_keys virtual table shows them: metadata only, for admins;
 	// nil when the caller cannot read them.
@@ -184,6 +187,17 @@ type SealJobInfo struct {
 type LargeObjectInfo struct {
 	OID   int64
 	Owner string
+}
+
+// AdvisoryLockInfo is one granted advisory lock as pg_locks lists it
+// (issue #353): the lock's database and PostgreSQL's three numbers for
+// it, the holding session's process ID and the mode.
+type AdvisoryLockInfo struct {
+	Database       string
+	ClassID, ObjID uint32
+	ObjSubID       uint16
+	PID            int32
+	Mode           string
 }
 
 // RoleOID is a role's stable catalog OID (pg_roles.oid, pg_auth_members,
@@ -638,20 +652,113 @@ func FormatTypeOID(oid int64) string {
 	return "-"
 }
 
+// IndexKeyDef renders key column i of an index as pg_get_indexdef
+// shows it: the column or expression, then a declared collation,
+// operator class and order (name COLLATE "C" text_pattern_ops DESC).
+func IndexKeyDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor, i int) string {
+	key := columnName(d, idx.ColumnIDs[i])
+	if idx.IsExprKey(i) {
+		key = ExprKeyText(idx.Exprs[i])
+	}
+	if len(idx.Collations) == len(idx.ColumnIDs) && idx.Collations[i] != "" {
+		key += ` COLLATE "` + idx.Collations[i] + `"`
+	}
+	if len(idx.OpClasses) == len(idx.ColumnIDs) && idx.OpClasses[i] != "" {
+		key += " " + idx.OpClasses[i]
+	}
+	if len(idx.Directions) == len(idx.ColumnIDs) && idx.Directions[i] != "" {
+		key += " " + idx.Directions[i]
+	}
+	return key
+}
+
+// ExprKeyText renders an expression key as PostgreSQL prints one: a
+// function call as it is, lower(email); anything else in parentheses,
+// ((b + 1)).
+func ExprKeyText(text string) string {
+	for strings.HasPrefix(text, "(") && closingParen(text, 0) == len(text)-1 {
+		text = text[1 : len(text)-1]
+	}
+	if isCallText(text) {
+		return text
+	}
+	return "((" + text + "))"
+}
+
+// IndexExprName is the name of an expression key as an attribute of the
+// index (pg_attribute.attname): the function's name for a call, "expr"
+// otherwise, as PostgreSQL names it.
+func IndexExprName(text string) string {
+	if isCallText(text) {
+		return text[:strings.IndexByte(text, '(')]
+	}
+	return "expr"
+}
+
+// isCallText reports whether an expression's text is one function call
+// (name(...) with the parentheses closing at the end).
+func isCallText(text string) bool {
+	open := strings.IndexByte(text, '(')
+	if open <= 0 || !strings.HasSuffix(text, ")") {
+		return false
+	}
+	for _, r := range text[:open] {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return closingParen(text, open) == len(text)-1
+}
+
+// parenthesized wraps text in parentheses unless one pair already
+// encloses all of it.
+func parenthesized(text string) string {
+	if strings.HasPrefix(text, "(") && closingParen(text, 0) == len(text)-1 {
+		return text
+	}
+	return "(" + text + ")"
+}
+
+// closingParen is the index of the parenthesis closing the one at open,
+// skipping string literals (-1 when there is none).
+func closingParen(text string, open int) int {
+	depth := 0
+	inStr := false
+	for i := open; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case inStr:
+			if c == '\'' {
+				inStr = false
+			}
+		case c == '\'':
+			inStr = true
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// IndexPredicateDef renders a partial index's WHERE clause as
+// pg_get_indexdef ends with it: " WHERE (deleted_at IS NULL)".
+func IndexPredicateDef(idx *catalog.IndexDescriptor) string {
+	if idx.Predicate == "" {
+		return ""
+	}
+	return " WHERE " + parenthesized(idx.Predicate)
+}
+
 // IndexDef renders pg_get_indexdef() for an index.
 func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	cols := make([]string, 0, len(idx.ColumnIDs))
-	for i, id := range idx.ColumnIDs {
-		key := columnName(d, id)
-		// A declared collation and operator class, as PostgreSQL prints
-		// them: (name COLLATE "C" text_pattern_ops).
-		if len(idx.Collations) == len(idx.ColumnIDs) && idx.Collations[i] != "" {
-			key += ` COLLATE "` + idx.Collations[i] + `"`
-		}
-		if len(idx.OpClasses) == len(idx.ColumnIDs) && idx.OpClasses[i] != "" {
-			key += " " + idx.OpClasses[i]
-		}
-		cols = append(cols, key)
+	for i := range idx.ColumnIDs {
+		cols = append(cols, IndexKeyDef(d, idx, i))
 	}
 	if kind, ok := inverted.Lookup(idx.Inverted); ok && len(cols) == 1 {
 		if c, ok := kind.(inverted.Computed); ok {
@@ -675,7 +782,15 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	if idx.Unique && idx.NullsNotDistinct {
 		nulls = " NULLS NOT DISTINCT"
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "), nulls)
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s%s", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "), nulls, IndexPredicateDef(idx))
+}
+
+// IsConstraintIndex reports whether a unique index is also listed as a
+// UNIQUE constraint (pg_constraint, information_schema): one with an
+// expression key or a predicate is not, as in PostgreSQL, where such an
+// index can only be made by CREATE UNIQUE INDEX.
+func IsConstraintIndex(idx *catalog.IndexDescriptor) bool {
+	return idx.Unique && !idx.Computed()
 }
 
 // Access method OIDs, as PostgreSQL numbers them.
@@ -860,14 +975,18 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 			unique = "UNIQUE "
 		}
 		cols := make([]string, 0, len(idx.ColumnIDs))
-		for _, id := range idx.ColumnIDs {
-			cols = append(cols, columnName(d, id))
+		for i := range idx.ColumnIDs {
+			if idx.IsExprKey(i) || len(idx.Directions) > i && idx.Directions[i] != "" {
+				cols = append(cols, IndexKeyDef(d, &idx, i))
+			} else {
+				cols = append(cols, columnName(d, idx.ColumnIDs[i]))
+			}
 		}
 		nulls := ""
 		if idx.Unique && idx.NullsNotDistinct {
 			nulls = " NULLS NOT DISTINCT"
 		}
-		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s", unique, idx.Name, strings.Join(cols, ", "), nulls))
+		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s%s", unique, idx.Name, strings.Join(cols, ", "), nulls, IndexPredicateDef(&idx)))
 	}
 	for i := range d.Constraints {
 		c := &d.Constraints[i]

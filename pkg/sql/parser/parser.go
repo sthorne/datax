@@ -2206,28 +2206,26 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
+	exprs := false
 	for {
-		if fn, arg, col, ok, err := p.parseIndexExpr(); err != nil {
-			return nil, err
-		} else if ok {
-			if len(ci.Columns) > 0 || ci.ExprFunc != "" {
-				return nil, p.errf("an index on an expression takes that one expression and nothing else")
-			}
-			ci.ExprFunc, ci.ExprArg = fn, arg
-			ci.Columns = append(ci.Columns, col)
-			ci.OpClasses = append(ci.OpClasses, "")
-			ci.Collations = append(ci.Collations, "")
-			if p.consumeOp(",") {
-				return nil, p.errf("an index on an expression takes that one expression and nothing else")
-			}
-			break
-		}
-		col, err := p.expectIdent()
+		col, expr, err := p.parseIndexElem(ci.Using)
 		if err != nil {
 			return nil, err
 		}
+		if expr != nil && expr.Func == "to_tsvector" && ci.Using == "gin" {
+			// The text-search index, stored as an inverted kind of
+			// its own over the column: to_tsvector('config', column).
+			if fn, arg, c, ok := textSearchIndexExpr(*expr); ok {
+				ci.ExprFunc, ci.ExprArg = fn, arg
+				col, expr = c, nil
+			} else {
+				return nil, p.errf("an index on to_tsvector(...) needs the configuration written out as its first argument and a column as its second: to_tsvector('english', column)")
+			}
+		}
 		ci.Columns = append(ci.Columns, col)
-		// A collation, then an operator class after the column:
+		ci.Exprs = append(ci.Exprs, expr)
+		exprs = exprs || expr != nil
+		// A collation, then an operator class after the key:
 		// (name COLLATE "C"), (doc jsonb_ops), (name text_pattern_ops).
 		collation := ""
 		if p.consumeIdentWord("collate") {
@@ -2237,27 +2235,45 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 		ci.Collations = append(ci.Collations, collation)
 		opclass := ""
-		if p.peek().kind == tkIdent {
+		if t := p.peek(); t.kind == tkIdent && !p.atIndexNulls() {
 			if opclass, err = p.parseQualifiedWord(); err != nil {
 				return nil, err
 			}
 			opclass = strings.ToLower(opclass)
 		}
 		ci.OpClasses = append(ci.OpClasses, opclass)
+		dir, err := p.parseIndexDirection()
+		if err != nil {
+			return nil, err
+		}
+		ci.Directions = append(ci.Directions, dir)
 		if !p.consumeOp(",") {
 			break
 		}
 	}
-	named, collated := false, false
+	if ci.ExprFunc != "" && len(ci.Columns) > 1 {
+		return nil, p.errf("an index on an expression takes that one expression and nothing else")
+	}
+	if ci.ExprFunc != "" && ci.OpClasses[0] != "" {
+		return nil, p.errf("an index on %s(...) takes no operator class", ci.ExprFunc)
+	}
+	if !exprs {
+		ci.Exprs = nil
+	}
+	named, collated, directed := false, false, false
 	for i := range ci.OpClasses {
 		named = named || ci.OpClasses[i] != ""
 		collated = collated || ci.Collations[i] != ""
+		directed = directed || ci.Directions[i] != ""
 	}
 	if !named {
 		ci.OpClasses = nil
 	}
 	if !collated {
 		ci.Collations = nil
+	}
+	if !directed {
+		ci.Directions = nil
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
@@ -2298,7 +2314,104 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			return nil, err
 		}
 	}
+	// WHERE predicate: a partial index. The source text is what the
+	// descriptor keeps and the catalogs show; the lowered conjuncts are
+	// for the executor's checks.
+	if p.consumeKeyword("WHERE") {
+		start := p.peek().pos
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return nil, err
+		}
+		end := len(p.src)
+		if t := p.peek(); t.kind != tkEOF {
+			end = t.pos
+		}
+		conds, err := lowerBool(n, false)
+		if err != nil {
+			return nil, p.errf("WHERE: %v", err)
+		}
+		ci.Where = strings.TrimSpace(p.src[start:end])
+		ci.WhereConds = conds
+	}
 	return ci, nil
+}
+
+// parseIndexElem parses one key of CREATE INDEX: a column, or an
+// expression — parenthesized, ((lower(email))), (b + 1), or a function
+// call written bare, lower(email). col is set for a column, expr for an
+// expression.
+func (p *parser) parseIndexElem(using string) (col string, expr *Expr, err error) {
+	t := p.peek()
+	call := t.kind != tkOp && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "("
+	if !(t.kind == tkOp && t.text == "(") && !call {
+		col, err = p.expectIdent()
+		return col, nil, err
+	}
+	e, err := p.parseValueOrColumnExpr()
+	if err != nil {
+		return "", nil, err
+	}
+	if isPlainColumn(e) && e.Cast == "" {
+		// (col): a column in parentheses is the column.
+		return e.Column, nil, nil
+	}
+	return "", &e, nil
+}
+
+// textSearchIndexExpr recognizes to_tsvector('config'[::regconfig],
+// column), the expression a GIN index is built on.
+func textSearchIndexExpr(e Expr) (fn, arg, col string, ok bool) {
+	if e.BinOp != "" || e.Cast != "" || len(e.Args) != 2 || len(e.Path) > 0 {
+		return "", "", "", false
+	}
+	a, c := e.Args[0], e.Args[1]
+	if a.Lit == nil || a.Lit.Null || a.Lit.Fam != types.String || a.BinOp != "" || (a.Cast != "" && a.Cast != "regconfig") {
+		return "", "", "", false
+	}
+	if !isPlainColumn(c) || c.Cast != "" {
+		return "", "", "", false
+	}
+	return e.Func, a.Lit.S, c.Column, true
+}
+
+// atIndexNulls reports whether the next words are NULLS FIRST or NULLS
+// LAST (an index key's null ordering, not an operator class).
+func (p *parser) atIndexNulls() bool {
+	t := p.peek()
+	if t.kind != tkIdent || !strings.EqualFold(t.text, "nulls") || p.i+1 >= len(p.toks) {
+		return false
+	}
+	n := p.toks[p.i+1]
+	return strings.EqualFold(n.text, "first") || strings.EqualFold(n.text, "last")
+}
+
+// parseIndexDirection parses an index key's [ASC | DESC] [NULLS FIRST |
+// NULLS LAST] and returns it as pg_get_indexdef shows it: "" for the
+// default (ASC NULLS LAST), "DESC" for DESC NULLS FIRST, otherwise the
+// words that differ from the direction's default.
+func (p *parser) parseIndexDirection() (string, error) {
+	desc := false
+	if p.consumeKeyword("DESC") {
+		desc = true
+	} else {
+		p.consumeKeyword("ASC")
+	}
+	nulls := ""
+	if p.atIndexNulls() {
+		p.i++
+		nulls = strings.ToLower(p.peek().text)
+		p.i++
+	}
+	switch {
+	case !desc && nulls == "first":
+		return "NULLS FIRST", nil
+	case !desc:
+		return "", nil
+	case nulls == "last":
+		return "DESC NULLS LAST", nil
+	}
+	return "DESC", nil
 }
 
 // parseQualifiedWord reads an identifier that may carry a schema
@@ -2315,52 +2428,6 @@ func (p *parser) parseQualifiedWord() (string, error) {
 		}
 	}
 	return word, nil
-}
-
-// parseIndexExpr reads an index key written as an expression,
-// fn('constant'[::type], column), optionally inside one more pair of
-// parentheses as PostgreSQL requires of expressions that are not
-// function calls. ok is false, with nothing consumed, when the key is a
-// plain column.
-func (p *parser) parseIndexExpr() (fn, arg, col string, ok bool, err error) {
-	save := p.i
-	parens := 0
-	for p.peek().kind == tkOp && p.peek().text == "(" {
-		p.i++
-		parens++
-	}
-	name := p.peek()
-	if name.kind != tkIdent || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
-		if parens > 0 {
-			return "", "", "", false, p.errf("an index key is a column, or to_tsvector('config', column) under USING GIN")
-		}
-		p.i = save
-		return "", "", "", false, nil
-	}
-	p.i += 2
-	lit := p.peek()
-	if lit.kind != tkString {
-		return "", "", "", false, p.errf("an index on %s(...) needs the configuration written out as its first argument: %s('english', column)", name.text, name.text)
-	}
-	p.i++
-	if p.consumeOp("::") {
-		// 'english'::regconfig, as pg_dump writes it.
-		if _, err := p.expectIdent(); err != nil {
-			return "", "", "", false, err
-		}
-	}
-	if err := p.expectOp(","); err != nil {
-		return "", "", "", false, err
-	}
-	if col, err = p.expectIdent(); err != nil {
-		return "", "", "", false, err
-	}
-	for i := 0; i <= parens; i++ {
-		if err := p.expectOp(")"); err != nil {
-			return "", "", "", false, err
-		}
-	}
-	return strings.ToLower(name.text), lit.text, col, true, nil
 }
 
 func (p *parser) parseDropTable() (Statement, error) {
@@ -2783,144 +2850,8 @@ func (p *parser) parseSelect() (Statement, error) {
 		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
 	}
 	if p.consumeKeyword("FROM") {
-		// FROM (SELECT ...) AS alias — a derived table. LATERAL is
-		// accepted ahead of the first member, which has nothing to its
-		// left to read.
-		p.consumeLateral()
-		derived := false
-		if sub, ok, err := p.parseSubquery(); err != nil {
+		if err := p.parseFromList(sel); err != nil {
 			return nil, err
-		} else if ok {
-			sel.Derived = sub
-			sel.Alias = p.parseOptTableAlias(false)
-			if sel.Alias == "" {
-				return nil, p.errf("subquery in FROM must have an alias")
-			}
-			derived = true
-		}
-		// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
-		// set-returning function as a table, joinable like any other.
-		funcTable := false
-		if !derived {
-			if fe, ok, err := p.parseFuncTable(); err != nil {
-				return nil, err
-			} else if ok {
-				sel.FuncTable = fe
-				if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
-					return nil, err
-				}
-				funcTable = true
-			}
-		}
-		if !derived && !funcTable {
-			name, err := p.parseTableName()
-			if err != nil {
-				return nil, err
-			}
-			sel.Table = name
-			sel.Alias = p.parseOptTableAlias(true)
-		}
-		// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
-		// words. Joins execute left-deep in syntactic order. A derived
-		// table joins too: it runs as a named relation.
-		for {
-			jk, join, err := p.parseJoinKind()
-			if err != nil {
-				return nil, err
-			}
-			if !join {
-				break
-			}
-			left, cross := jk.left, jk.cross
-			if len(sel.Joins) >= maxJoinTables-1 {
-				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
-			}
-			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
-			jc.Lateral = p.consumeLateral()
-			if fe, ok, err := p.parseFuncTable(); err != nil {
-				return nil, err
-			} else if ok {
-				// A table function as a join member, named by its alias
-				// (the function's name by default).
-				jc.FuncTable = fe
-				if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
-					return nil, err
-				}
-			} else if sub, ok, err := p.parseSubquery(); err != nil {
-				return nil, err
-			} else if ok {
-				jc.Derived = sub
-				jc.Alias = p.parseOptTableAlias(false)
-				if jc.Alias == "" {
-					return nil, p.errf("subquery in FROM must have an alias")
-				}
-				jc.Table = jc.Alias
-			} else if jc.Lateral {
-				return nil, p.errf("LATERAL must be followed by a subquery or a function call, found %q", p.peek().text)
-			} else {
-				jt, err := p.parseTableName()
-				if err != nil {
-					return nil, err
-				}
-				jc.Table = jt
-				jc.Alias = p.parseOptTableAlias(false)
-			}
-			jt := jc.Table
-			if jt == "" {
-				jt = jc.Alias
-			}
-			if cross || jk.natural {
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			if p.consumeIdentWord("using") {
-				if err := p.expectOp("("); err != nil {
-					return nil, err
-				}
-				for {
-					col, err := p.expectIdent()
-					if err != nil {
-						return nil, err
-					}
-					jc.Using = append(jc.Using, col)
-					if !p.consumeOp(",") {
-						break
-					}
-				}
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			if err := p.expectKeyword("ON"); err != nil {
-				return nil, err
-			}
-			// The ON clause is a full boolean expression (parentheses,
-			// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
-			// two column references are the join keys; every other
-			// conjunct is a filter evaluated per candidate match.
-			n, err := p.parseBoolOr()
-			if err != nil {
-				return nil, err
-			}
-			conds, err := lowerBool(n, false)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range conds {
-				if l, r, ok := joinEquality(c); ok {
-					jc.On = append(jc.On, JoinCond{L: l, R: r})
-					continue
-				}
-				jc.Filter = append(jc.Filter, c)
-			}
-			// A lateral member's ON may be any condition (LEFT JOIN
-			// LATERAL ... ON true): it is evaluated per candidate row.
-			if len(jc.On) == 0 && !jc.Lateral {
-				return nil, p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
-			}
-			sel.Joins = append(sel.Joins, jc)
 		}
 		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
 		// untouched; SYSTEM and TIME lex as identifiers).
@@ -2961,6 +2892,214 @@ func (p *parser) parseSelect() (Statement, error) {
 		}
 	}
 	return p.finishSelect(sel)
+}
+
+// parseDerivedTable parses a FROM-list subquery member — (SELECT ...),
+// (WITH ...) or (VALUES ...) — with its required [AS] alias and optional
+// column aliases (AS v(a, b)), which rename the query's leading output
+// columns. ok=false when the next tokens do not open one.
+func (p *parser) parseDerivedTable() (*Select, string, bool, error) {
+	var sub *Select
+	values := false
+	if t := p.peek(); t.kind == tkOp && t.text == "(" && p.toks[p.i+1].kind == tkKeyword && p.toks[p.i+1].text == "VALUES" {
+		values = true
+		p.i++ // (
+		stmt, err := p.parseValuesQuery()
+		if err != nil {
+			return nil, "", false, err
+		}
+		sub = stmt.(*Select)
+		if err := p.parseOrderLimit(sub, true); err != nil {
+			return nil, "", false, err
+		}
+		if sub.Union != nil {
+			sub.OrderBy = byOutputPosition(sub.OrderBy)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, "", false, err
+		}
+	} else {
+		s, ok, err := p.parseSubquery()
+		if err != nil || !ok {
+			return nil, "", false, err
+		}
+		sub = s
+	}
+	alias := p.parseOptTableAlias(false)
+	if alias == "" {
+		if values {
+			return nil, "", false, p.errf("VALUES in FROM must have an alias")
+		}
+		return nil, "", false, p.errf("subquery in FROM must have an alias")
+	}
+	if p.consumeOp("(") {
+		var cols []string
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, "", false, err
+			}
+			cols = append(cols, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, "", false, err
+		}
+		for _, se := range sub.Exprs {
+			if se.Star {
+				return nil, "", false, p.errf("column aliases on a subquery that selects * are not supported: name the columns in its select list")
+			}
+		}
+		if len(cols) > len(sub.Exprs) {
+			return nil, "", false, p.errf("table %q has %d columns available but %d columns specified", alias, len(sub.Exprs), len(cols))
+		}
+		// The head member names a set operation's columns.
+		for i, c := range cols {
+			sub.Exprs[i].Alias = c
+		}
+	}
+	return sub, alias, true, nil
+}
+
+// parseFromList parses a FROM list — the members after FROM, and after
+// UPDATE ... FROM and DELETE ... USING — into sel: the first member
+// (table, derived table or table function) in Table / Derived /
+// FuncTable, the rest in Joins.
+func (p *parser) parseFromList(sel *Select) error {
+	// FROM (SELECT ...) AS alias — a derived table. LATERAL is
+	// accepted ahead of the first member, which has nothing to its
+	// left to read.
+	p.consumeLateral()
+	derived := false
+	if sub, alias, ok, err := p.parseDerivedTable(); err != nil {
+		return err
+	} else if ok {
+		sel.Derived, sel.Alias = sub, alias
+		derived = true
+	}
+	// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
+	// set-returning function as a table, joinable like any other.
+	funcTable := false
+	if !derived {
+		if fe, ok, err := p.parseFuncTable(); err != nil {
+			return err
+		} else if ok {
+			sel.FuncTable = fe
+			if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+				return err
+			}
+			funcTable = true
+		}
+	}
+	if !derived && !funcTable {
+		name, err := p.parseTableName()
+		if err != nil {
+			return err
+		}
+		sel.Table = name
+		sel.Alias = p.parseOptTableAlias(true)
+	}
+	// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
+	// words. Joins execute left-deep in syntactic order. A derived
+	// table joins too: it runs as a named relation.
+	for {
+		jk, join, err := p.parseJoinKind()
+		if err != nil {
+			return err
+		}
+		if !join {
+			break
+		}
+		left, cross := jk.left, jk.cross
+		if len(sel.Joins) >= maxJoinTables-1 {
+			return p.errf("too many joined tables (limit %d)", maxJoinTables)
+		}
+		jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
+		jc.Lateral = p.consumeLateral()
+		if fe, ok, err := p.parseFuncTable(); err != nil {
+			return err
+		} else if ok {
+			// A table function as a join member, named by its alias
+			// (the function's name by default).
+			jc.FuncTable = fe
+			if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+				return err
+			}
+		} else if sub, alias, ok, err := p.parseDerivedTable(); err != nil {
+			return err
+		} else if ok {
+			jc.Derived, jc.Alias = sub, alias
+			jc.Table = jc.Alias
+		} else if jc.Lateral {
+			return p.errf("LATERAL must be followed by a subquery or a function call, found %q", p.peek().text)
+		} else {
+			jt, err := p.parseTableName()
+			if err != nil {
+				return err
+			}
+			jc.Table = jt
+			jc.Alias = p.parseOptTableAlias(false)
+		}
+		jt := jc.Table
+		if jt == "" {
+			jt = jc.Alias
+		}
+		if cross || jk.natural {
+			sel.Joins = append(sel.Joins, jc)
+			continue
+		}
+		if p.consumeIdentWord("using") {
+			if err := p.expectOp("("); err != nil {
+				return err
+			}
+			for {
+				col, err := p.expectIdent()
+				if err != nil {
+					return err
+				}
+				jc.Using = append(jc.Using, col)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return err
+			}
+			sel.Joins = append(sel.Joins, jc)
+			continue
+		}
+		if err := p.expectKeyword("ON"); err != nil {
+			return err
+		}
+		// The ON clause is a full boolean expression (parentheses,
+		// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
+		// two column references are the join keys; every other
+		// conjunct is a filter evaluated per candidate match.
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return err
+		}
+		conds, err := lowerBool(n, false)
+		if err != nil {
+			return err
+		}
+		for _, c := range conds {
+			if l, r, ok := joinEquality(c); ok {
+				jc.On = append(jc.On, JoinCond{L: l, R: r})
+				continue
+			}
+			jc.Filter = append(jc.Filter, c)
+		}
+		// A lateral member's ON may be any condition (LEFT JOIN
+		// LATERAL ... ON true): it is evaluated per candidate row.
+		if len(jc.On) == 0 && !jc.Lateral {
+			return p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
+		}
+		sel.Joins = append(sel.Joins, jc)
+	}
+	return nil
 }
 
 // finishSelect parses the clauses shared by table and derived-table
@@ -3221,20 +3360,8 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 				oc = OrderCol{Expr: &e}
 			}
 		}
-		if p.consumeKeyword("DESC") {
-			oc.Desc = true
-		} else {
-			p.consumeKeyword("ASC")
-		}
-		if p.consumeIdentWord("nulls") {
-			switch {
-			case p.consumeIdentWord("first"):
-				oc.Nulls = "first"
-			case p.consumeIdentWord("last"):
-				oc.Nulls = "last"
-			default:
-				return nil, p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
-			}
+		if err := p.parseSortDirection(&oc); err != nil {
+			return nil, err
 		}
 		out = append(out, oc)
 		if !p.consumeOp(",") {
@@ -3755,7 +3882,7 @@ var caseWords = map[string]bool{"then": true, "else": true, "end": true, "when":
 var tableClauseWords = map[string]bool{
 	"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true, "natural": true, "using": true,
 	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
-	"window": true, "with": true,
+	"window": true, "with": true, "returning": true,
 }
 
 // peekIdentSeq reports whether the next tokens are exactly this sequence of
@@ -3785,24 +3912,39 @@ var notBareColumnLabel = map[string]bool{
 
 // parseOptColumnAlias consumes a select-list item's optional alias:
 // AS name, or a bare name (SELECT count(*) n, (SELECT ...) "Applicable
-// types"). A bare alias is a quoted identifier or one that cannot
-// continue the statement instead (notBareColumnLabel); keywords never
-// are.
+// types"). A bare alias is a quoted identifier, one that cannot
+// continue the statement instead (notBareColumnLabel), or USER; no
+// other keyword is.
 func (p *parser) parseOptColumnAlias() (string, error) {
 	if p.consumeKeyword("AS") {
+		// Any word may follow AS, a reserved one included (SELECT
+		// current_user AS user), as in PostgreSQL.
+		if t := p.peek(); t.kind == tkKeyword {
+			p.i++
+			return strings.ToLower(t.text), nil
+		}
 		return p.expectIdent()
 	}
 	t := p.peek()
+	if t.kind == tkKeyword && t.text == "USER" {
+		// USER is one of the reserved words PostgreSQL takes as a bare
+		// label (SELECT 1 user).
+		p.i++
+		return "user", nil
+	}
 	if t.kind != tkIdent {
 		return "", nil
 	}
-	quoted := t.pos < len(p.src) && p.src[t.pos] == '"'
-	if !quoted && notBareColumnLabel[t.text] {
+	if !p.quoted(t) && notBareColumnLabel[t.text] {
 		return "", nil
 	}
 	p.i++
 	return t.text, nil
 }
+
+// quoted reports whether an identifier token was written in double
+// quotes.
+func (p *parser) quoted(t token) bool { return t.pos < len(p.src) && p.src[t.pos] == '"' }
 
 // parseOptTableAlias consumes an optional [AS] alias after a table name.
 // In the outer-table position (allowAsOf) an AS followed by the
@@ -3846,6 +3988,7 @@ var windowNames = map[string]bool{
 }
 
 var aggNames = map[string]bool{
+	"mode":  true,
 	"count": true, "sum": true, "avg": true, "min": true, "max": true,
 	"string_agg": true, "array_agg": true, "bool_and": true, "bool_or": true, "every": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "variance": true, "var_samp": true, "var_pop": true,
@@ -3854,8 +3997,9 @@ var aggNames = map[string]bool{
 }
 
 // parseAggExpr parses an aggregate call when the next tokens form one:
-// name([DISTINCT] * | expr [, expr ...]) [WITHIN GROUP (ORDER BY expr
-// [ASC | DESC])] [FILTER (WHERE cond)]; ok=false otherwise.
+// name([DISTINCT] * | expr [, expr ...] [ORDER BY terms]) [WITHIN GROUP
+// (ORDER BY terms)] [FILTER (WHERE cond)] [OVER window]; ok=false
+// otherwise.
 func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	t := p.peek()
 	if t.kind != tkIdent || (!aggNames[t.text] && !windowNames[t.text]) {
@@ -3870,8 +4014,9 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		se.AggDistinct = true
 	}
 	if nt := p.peek(); nt.kind == tkOp && nt.text == ")" {
-		// row_number(), rank(), ...: no arguments.
-		if !windowNames[t.text] {
+		// row_number(), rank(), ..., mode() WITHIN GROUP (...): no
+		// arguments.
+		if !windowNames[t.text] && t.text != "mode" {
 			return se, false, p.errf("%s() requires an argument", se.Agg)
 		}
 	} else if p.consumeOp("*") {
@@ -3899,11 +4044,28 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 			}
 			se.AggArgs = append(se.AggArgs, a)
 		}
+		if p.consumeKeyword("ORDER") {
+			// The aggregate's input order: agg(args ORDER BY terms).
+			if err := p.expectKeyword("BY"); err != nil {
+				return se, false, err
+			}
+			order, err := p.parseAggOrderTerms()
+			if err != nil {
+				return se, false, err
+			}
+			se.AggOrder = order
+		}
 	}
 	if err := p.expectOp(")"); err != nil {
 		return se, false, err
 	}
 	if p.peekIdentSeq("within", "group") {
+		if len(se.AggOrder) > 0 {
+			return se, false, p.errf("cannot use multiple ORDER BY clauses with WITHIN GROUP")
+		}
+		if se.AggDistinct {
+			return se, false, p.errf("cannot use DISTINCT with WITHIN GROUP")
+		}
 		p.i += 2
 		if err := p.expectOp("("); err != nil {
 			return se, false, err
@@ -3914,23 +4076,19 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		if err := p.expectKeyword("BY"); err != nil {
 			return se, false, err
 		}
-		e, err := p.parseAddExpr()
+		order, err := p.parseAggOrderTerms()
 		if err != nil {
 			return se, false, err
-		}
-		oc := OrderCol{Expr: &e}
-		if isPlainColumn(e) {
-			oc.Column, oc.Expr = e.Column, nil
-		}
-		if p.consumeKeyword("DESC") {
-			oc.Desc = true
-		} else {
-			p.consumeKeyword("ASC")
 		}
 		if err := p.expectOp(")"); err != nil {
 			return se, false, err
 		}
-		se.AggOrder = []OrderCol{oc}
+		for i, oc := range order {
+			if isPlainColumn(*oc.Expr) {
+				order[i].Column, order[i].Expr = oc.Expr.Column, nil
+			}
+		}
+		se.AggOrder, se.AggWithinGroup = order, true
 	}
 	if p.consumeIdentWord("filter") {
 		if err := p.expectOp("("); err != nil {
@@ -3962,6 +4120,49 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		return se, false, p.errf("%s() requires an OVER clause", se.Agg)
 	}
 	return se, true, nil
+}
+
+// parseAggOrderTerms parses the ORDER BY terms of an aggregate call
+// (after BY): expressions over the aggregate's input rows, each with
+// [ASC | DESC] [NULLS FIRST | LAST]. Unlike a query's ORDER BY, a number
+// is a constant, not an output position (PostgreSQL's SQL99 rule).
+func (p *parser) parseAggOrderTerms() ([]OrderCol, error) {
+	var out []OrderCol
+	for {
+		e, err := p.parseValueOrBool()
+		if err != nil {
+			return nil, err
+		}
+		oc := OrderCol{Expr: &e}
+		if err := p.parseSortDirection(&oc); err != nil {
+			return nil, err
+		}
+		out = append(out, oc)
+		if !p.consumeOp(",") {
+			return out, nil
+		}
+	}
+}
+
+// parseSortDirection parses an ORDER BY term's [ASC | DESC] [NULLS
+// FIRST | LAST].
+func (p *parser) parseSortDirection(oc *OrderCol) error {
+	if p.consumeKeyword("DESC") {
+		oc.Desc = true
+	} else {
+		p.consumeKeyword("ASC")
+	}
+	if p.consumeIdentWord("nulls") {
+		switch {
+		case p.consumeIdentWord("first"):
+			oc.Nulls = "first"
+		case p.consumeIdentWord("last"):
+			oc.Nulls = "last"
+		default:
+			return p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
+		}
+	}
+	return nil
 }
 
 // parseWindowSpec parses what follows OVER: a window name, or
@@ -4132,8 +4333,18 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			cname, named = n, true
 		}
 		if named || p.peekKeyword("UNIQUE") || p.peekKeyword("CHECK") || p.peekKeyword("FOREIGN") || p.peekKeyword("PRIMARY") {
-			if p.peekKeyword("PRIMARY") {
-				return nil, p.errf("ADD PRIMARY KEY is not supported: the primary key is fixed at CREATE TABLE")
+			if p.consumeKeyword("PRIMARY") {
+				// Parsed so the executor can refuse it against the
+				// table (42P16 or 0A000) rather than as a syntax error.
+				if err := p.expectKeyword("KEY"); err != nil {
+					return nil, err
+				}
+				cols, err := p.parseColumnList()
+				if err != nil {
+					return nil, err
+				}
+				at.AddConstraint = &ConstraintDef{Name: cname, Kind: "primary", Columns: cols}
+				break
 			}
 			cd, err := p.parseTableConstraint(cname)
 			if err != nil {
@@ -4685,8 +4896,14 @@ func (p *parser) parseUpdate() (Statement, error) {
 		return nil, err
 	}
 	up.Table = name
+	up.Alias = p.parseOptTableAlias(false)
 	if up.Set, err = p.parseSetClauses(); err != nil {
 		return nil, err
+	}
+	if p.consumeKeyword("FROM") {
+		if up.From, err = p.parseDMLFromList(); err != nil {
+			return nil, err
+		}
 	}
 	up.Where, err = p.parseOptWhere()
 	if err != nil {
@@ -4709,6 +4926,12 @@ func (p *parser) parseDelete() (Statement, error) {
 		return nil, err
 	}
 	del.Table = name
+	del.Alias = p.parseOptTableAlias(false)
+	if p.consumeIdentWord("using") {
+		if del.Using, err = p.parseDMLFromList(); err != nil {
+			return nil, err
+		}
+	}
 	del.Where, err = p.parseOptWhere()
 	if err != nil {
 		return nil, err
@@ -4717,6 +4940,21 @@ func (p *parser) parseDelete() (Statement, error) {
 		return nil, err
 	}
 	return del, nil
+}
+
+// parseDMLFromList parses the FROM list of UPDATE ... FROM or the USING
+// list of DELETE ... USING into join members: the first member becomes a
+// CROSS member like a comma's, the rest keep the kinds written.
+func (p *parser) parseDMLFromList() ([]JoinClause, error) {
+	var sel Select
+	if err := p.parseFromList(&sel); err != nil {
+		return nil, err
+	}
+	first := JoinClause{Cross: true, Table: sel.Table, Alias: sel.Alias, Derived: sel.Derived, FuncTable: sel.FuncTable, FuncCols: sel.FuncCols}
+	if first.Derived != nil {
+		first.Table = first.Alias // a joined subquery's Table is its alias
+	}
+	return append([]JoinClause{first}, sel.Joins...), nil
 }
 
 func (p *parser) parseOptWhere() ([]Comparison, error) {
@@ -6049,17 +6287,22 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "set_config": 3, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1, "to_regtype": 1,
-	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
+	"pg_get_expr": -1, "quote_ident": 1, "pg_get_viewdef": -1, "shobj_description": 2,
 	"pg_get_statisticsobjdef_columns": 1, "pg_relation_is_publishable": 1,
 	"pg_size_pretty": 1, "pg_table_size": 1, "pg_total_relation_size": 1, "pg_relation_size": -1, "pg_database_size": 1,
-	"has_database_privilege": -1, "has_table_privilege": -1, "has_schema_privilege": -1, "pg_tablespace_location": 1,
-	"pg_type_is_visible": 1, "pg_function_is_visible": 1, "pg_get_function_result": 1, "pg_get_function_arguments": 1,
+	"pg_tablespace_location": 1,
+	"pg_type_is_visible":     1, "pg_function_is_visible": 1, "pg_get_function_result": 1, "pg_get_function_arguments": 1,
 	"pg_get_function_identity_arguments": 1, "pg_get_functiondef": 1, "pg_char_to_encoding": 1, "getdatabaseencoding": 0,
 	"pg_get_triggerdef": -1, "pg_get_ruledef": -1,
+	// The system information and privilege functions (pg_get_serial_
+	// sequence, to_regclass, pg_has_role, has_*_privilege, ...; issue
+	// #357) are absent: the session checks the argument count of each
+	// form, 42883 as PostgreSQL reports a call no form matches.
 }
 
 // bareFuncs are called without parentheses (SQL keywords in PostgreSQL).
 var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true,
+	"current_role": true, "current_catalog": true,
 	"current_timestamp": true, "current_date": true, "localtimestamp": true, "current_time": true, "localtime": true}
 
 // precisionFuncs are the SQL-standard clock keywords that also take a
@@ -6113,6 +6356,11 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(e)
 		}
 		return p.parseValueExpr()
+	}
+	if t.kind == tkKeyword && t.text == "USER" {
+		// USER is current_user (a reserved word: never a column).
+		p.i++
+		return p.applyCasts(Expr{Func: "user"})
 	}
 	if t.kind == tkIdent || t.kind == tkKeyword {
 		// Typed literals: INTERVAL '1 day', DATE '2024-01-01', ... — a
@@ -6193,8 +6441,9 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			p.i += 2
 			t = p.peek()
 		}
-		// current_user / session_user need no parentheses.
-		if bareFuncs[t.text] && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "(" || p.toks[p.i+1].text == ".")) {
+		// current_user / session_user need no parentheses; written in
+		// double quotes, the name is a column's.
+		if bareFuncs[t.text] && !p.quoted(t) && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "(" || p.toks[p.i+1].text == ".")) {
 			p.i++
 			e := Expr{Func: t.text}
 			return p.applyCasts(e)

@@ -139,7 +139,7 @@ func TestConstraints(t *testing.T) {
 		code TEXT CONSTRAINT c_code_fkey REFERENCES p (code) ON DELETE SET NULL ON UPDATE CASCADE, n INT8)`)
 	execSQL(t, ctx, s, `CREATE TABLE g (id INT8 PRIMARY KEY, cid INT8, CONSTRAINT g_cid_fkey FOREIGN KEY (cid) REFERENCES c (id) ON DELETE CASCADE)`)
 	execSQL(t, ctx, s, `CREATE TABLE r (id INT8 PRIMARY KEY, pid INT8 REFERENCES p)`)
-	code("no unique key on the referenced columns", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8 REFERENCES c (n))`, sql.CodeInvalidColumnReference)
+	code("no unique key on the referenced columns", `CREATE TABLE bad (id INT8 PRIMARY KEY, n INT8 REFERENCES c (n))`, sql.CodeInvalidForeignKey)
 	code("type mismatch", `CREATE TABLE bad (id INT8 PRIMARY KEY, t TEXT REFERENCES p (id))`, sql.CodeInvalidColumnReference)
 	code("unknown referenced table", `CREATE TABLE bad (id INT8 PRIMARY KEY, t INT8 REFERENCES nosuch)`, sql.CodeUndefinedTable)
 	expect("automatic indexes on the referencing columns", execSQL(t, ctx, s, `SELECT indexname FROM pg_indexes WHERE tablename = 'c' ORDER BY 1`), "c_code_fkey_idx", "c_pid_fkey_idx", "c_pkey")

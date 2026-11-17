@@ -539,3 +539,63 @@ func (rs leaseRecordList) describe(now int64) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// TestNoOldEntryAfterLeaseCommit: a gateway's renewal publishes its lease
+// on the new version, and a drain returns on seeing it, before the
+// gateway's cache holds the new entry. A statement starting on that
+// gateway in between must not be handed the old cached descriptor: the
+// drain already counts the old version as given up there. The renewal is
+// held in that window while the ALTER drains and the statement runs.
+func TestNoOldEntryAfterLeaseCommit(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const ttl = 3 * time.Second
+	sA := leasedSession(t, tc, 0, ttl)
+	sB, catB := leasedSessionWithAccessor(t, tc, 1, ttl)
+
+	execSQL(t, ctx, sA, `CREATE TABLE held (id INT PRIMARY KEY, v INT)`)
+	execSQL(t, ctx, sA, `INSERT INTO held VALUES (1, 10)`)
+	execSQL(t, ctx, sB, `SELECT v FROM held WHERE id = 1`) // B caches version 1
+
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	catalog.SetTestingAfterLeaseCommit(func(a *catalog.Accessor, name string) {
+		if a != catB || !strings.HasSuffix(name, "/held") {
+			return
+		}
+		d := lookupDescriptor(t, ctx, tc.Nodes[1].DB(), "held")
+		if len(d.Columns) < 3 {
+			return // a renewal at version 1
+		}
+		once.Do(func() {
+			close(inWindow)
+			<-release
+		})
+	})
+	defer catalog.SetTestingAfterLeaseCommit(nil)
+
+	alterDone := make(chan struct{})
+	go func() {
+		defer close(alterDone)
+		execSQL(t, ctx, sA, `ALTER TABLE held ADD COLUMN note TEXT`)
+	}()
+	select {
+	case <-inWindow:
+	case <-ctx.Done():
+		t.Fatal("B's renewal never committed the new version")
+	}
+	<-alterDone // the drain saw B's committed lease on version 2
+
+	// B's cache still holds version 1; the statement must not get it.
+	res, serr := trySQL(ctx, sB, `SELECT note FROM held WHERE id = 1`)
+	close(release)
+	if serr != nil {
+		t.Fatalf("B planned against the superseded version after the drain returned: %v", serr)
+	}
+	if len(res.Rows) != 1 || !res.Rows[0][0].Null {
+		t.Fatalf("B sees %+v for the new column", res.Rows)
+	}
+}

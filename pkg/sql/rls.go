@@ -418,6 +418,7 @@ func (rc *rowCheck) checkUpdate(row map[catalog.ColumnID]types.Datum) error {
 // predicate every reader of the table evaluates implicitly.
 var policyFuncsAllowed = map[string]bool{
 	"current_user": true, "session_user": true, "current_setting": true, "current_database": true, "current_schema": true,
+	"current_role": true, "user": true, "current_catalog": true,
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_time": true, "localtime": true,
 }

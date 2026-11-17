@@ -133,12 +133,14 @@ func TestAlterTable(t *testing.T) {
 		t.Fatalf("dropped value resurrected: %+v", res.Rows[0])
 	}
 
-	// Guard rails: PK and indexed columns cannot be dropped.
+	// Guard rail: a PK column cannot be dropped. An indexed column can,
+	// and its indexes go with it, as in PostgreSQL (issue #358).
 	if _, serr := trySQL(ctx, s, `ALTER TABLE t DROP COLUMN id`); serr == nil {
 		t.Fatal("PK column drop accepted")
 	}
 	execSQL(t, ctx, s, `CREATE INDEX by_a ON t (a)`)
-	if _, serr := trySQL(ctx, s, `ALTER TABLE t DROP COLUMN a`); serr == nil {
-		t.Fatal("indexed column drop accepted")
+	execSQL(t, ctx, s, `ALTER TABLE t DROP COLUMN a`)
+	if res := execSQL(t, ctx, s, `SELECT indexname FROM pg_indexes WHERE tablename = 't' AND indexname = 'by_a'`); len(res.Rows) != 0 {
+		t.Fatalf("index on the dropped column survived: %+v", res.Rows)
 	}
 }

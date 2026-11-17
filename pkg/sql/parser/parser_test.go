@@ -796,14 +796,19 @@ func TestParseConstraints(t *testing.T) {
 		`CREATE TABLE t (a INT8 PRIMARY KEY, CONSTRAINT x)`,
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p ON DELETE SET DEFAULT)`,
 		`CREATE TABLE t (a INT8 PRIMARY KEY, b INT8 REFERENCES p MATCH FULL)`,
-		`ALTER TABLE t ADD PRIMARY KEY (a)`,
 		`ALTER TABLE t ALTER COLUMN a SET TYPE INT8`,
+		`ALTER TABLE t ADD PRIMARY KEY`,
 	} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("%q parsed", bad)
 		}
 	}
-	at := parseOne(t, `ALTER TABLE t ADD CONSTRAINT t_qty_check CHECK (qty > 0) NOT VALID`).(*AlterTable)
+	// ADD PRIMARY KEY parses, for the executor to refuse (issue #354).
+	at := parseOne(t, `ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (a, b)`).(*AlterTable)
+	if at.AddConstraint == nil || at.AddConstraint.Kind != "primary" || at.AddConstraint.Name != "t_pk" || len(at.AddConstraint.Columns) != 2 {
+		t.Fatalf("add primary key: %+v", at.AddConstraint)
+	}
+	at = parseOne(t, `ALTER TABLE t ADD CONSTRAINT t_qty_check CHECK (qty > 0) NOT VALID`).(*AlterTable)
 	if at.AddConstraint == nil || at.AddConstraint.Name != "t_qty_check" || at.AddConstraint.Kind != "check" || !at.AddConstraint.NotValid {
 		t.Fatalf("add check: %+v", at.AddConstraint)
 	}

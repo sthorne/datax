@@ -165,7 +165,7 @@ type ColumnDef struct {
 // action] [ON UPDATE action]. Name is "" when the statement gave none.
 type ConstraintDef struct {
 	Name    string
-	Kind    string // "unique", "check", "foreign"
+	Kind    string // "unique", "check", "foreign"; "primary" only from ALTER TABLE ADD PRIMARY KEY, which is refused
 	Columns []string
 	// Check is the CHECK expression's source text; CheckFails the lowered
 	// negation (the row violates the constraint when it holds), for
@@ -365,10 +365,22 @@ type CreateIndex struct {
 	// ExprFunc and ExprArg are set for the one expression an index may
 	// be built on, fn('constant', column) — in practice
 	// to_tsvector('english', body) under USING GIN. Columns then holds
-	// that one column. There are no expression indexes in general; the
-	// executor decides which functions it can index by.
+	// that one column. Any other expression key is in Exprs.
 	ExprFunc string
 	ExprArg  string
+	// Exprs, when any key is an expression other than that one, is
+	// parallel to Columns: the expression ((lower(email)), (b + 1)),
+	// whose Columns entry is then "", or nil for a column key.
+	Exprs []*Expr
+	// Directions, when any key declares an order, is parallel to
+	// Columns: the key's [ASC | DESC] [NULLS FIRST | LAST] as
+	// pg_get_indexdef shows it ("", "DESC", "NULLS FIRST", "DESC NULLS
+	// LAST").
+	Directions []string
+	// Where is a partial index's predicate, as written ("" = none), and
+	// WhereConds its conjuncts.
+	Where      string
+	WhereConds []Comparison
 	// With holds the WITH (name = value) storage parameters, names
 	// lower-cased (USING ivfflat ... WITH (lists = 100)).
 	With map[string]string
@@ -517,16 +529,20 @@ type SelectExpr struct {
 	// AggStar marks COUNT(*); AggCol names a plain column argument, else
 	// AggArg is the argument expression. AggArgs are further arguments
 	// (string_agg's separator, jsonb_object_agg's value); AggDistinct
-	// marks DISTINCT; AggFilter is FILTER (WHERE ...); AggOrder is WITHIN
-	// GROUP (ORDER BY ...) for the ordered-set aggregates.
-	Agg         string
-	AggStar     bool
-	AggCol      string
-	AggArg      *Expr
-	AggArgs     []Expr
-	AggDistinct bool
-	AggFilter   []Comparison
-	AggOrder    []OrderCol
+	// marks DISTINCT; AggFilter is FILTER (WHERE ...). AggOrder is the
+	// aggregate's ORDER BY: written inside the argument list
+	// (string_agg(b, ',' ORDER BY id)), the order the aggregate consumes
+	// its input in, or, with AggWithinGroup, WITHIN GROUP (ORDER BY ...)
+	// for the ordered-set aggregates (percentile_cont, mode).
+	Agg            string
+	AggStar        bool
+	AggCol         string
+	AggArg         *Expr
+	AggArgs        []Expr
+	AggDistinct    bool
+	AggFilter      []Comparison
+	AggOrder       []OrderCol
+	AggWithinGroup bool
 	// Window makes the call a window function: an aggregate computed
 	// over each row's frame, or one of the window-only functions
 	// (ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG,
@@ -737,6 +753,12 @@ type Select struct {
 	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
 	// ForUpdate.
 	LockWait LockWait
+	// DMLTarget is never set by the parser. It marks the select an
+	// UPDATE ... FROM or DELETE ... USING runs to join its target with
+	// the FROM list, naming the member (by alias) that is the target:
+	// the executor hands that select's joined rows back to the
+	// statement, and the target needs no SELECT privilege of its own.
+	DMLTarget string
 }
 
 // LockWait is the wait policy of a FOR UPDATE clause.
@@ -749,9 +771,18 @@ const (
 )
 
 type Update struct {
-	With      []CTE
-	Table     string
-	Set       []SetClause
+	With  []CTE
+	Table string
+	// Alias is the target's alias (UPDATE t [AS] a SET ...), "" when
+	// none was written.
+	Alias string
+	Set   []SetClause
+	// From is the FROM list of UPDATE ... FROM, as join members in
+	// written order: the first is a CROSS member (its Table, Alias,
+	// Derived or FuncTable set as a join member's are), the rest are
+	// joined to it as written — a comma is a CROSS member, a JOIN keeps
+	// its kind and ON / USING. Nil without a FROM clause.
+	From      []JoinClause
 	Where     []Comparison
 	Returning []SelectExpr
 }
@@ -854,8 +885,12 @@ type SetDefault struct {
 }
 
 type Delete struct {
-	With      []CTE
-	Table     string
+	With  []CTE
+	Table string
+	// Alias is the target's alias (DELETE FROM t [AS] a ...).
+	Alias string
+	// Using is the USING list of DELETE ... USING, shaped as Update.From.
+	Using     []JoinClause
 	Where     []Comparison
 	Returning []SelectExpr
 }

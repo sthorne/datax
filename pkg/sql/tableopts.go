@@ -133,13 +133,14 @@ func applyGeneralOptions(desc *catalog.TableDescriptor, options map[string]strin
 func ttlIndexName(table string) string { return table + "_ttl_idx" }
 
 // hasIndexLeadingWith reports whether desc has an index, public or still
-// being built, whose first column is col.
+// being built, whose first column is col (and that has every row: not a
+// partial one).
 func hasIndexLeadingWith(desc *catalog.TableDescriptor, col catalog.ColumnID) bool {
 	if len(desc.PrimaryKey) > 0 && desc.PrimaryKey[0] == col {
 		return true
 	}
 	for _, idx := range desc.Indexes {
-		if len(idx.ColumnIDs) > 0 && idx.ColumnIDs[0] == col {
+		if len(idx.ColumnIDs) > 0 && idx.ColumnIDs[0] == col && !idx.IsPartial() {
 			return true
 		}
 	}

@@ -11,6 +11,75 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Advisory locks** (#353): `pg_advisory_lock`, `pg_try_advisory_lock`,
+  `pg_advisory_unlock`, `pg_advisory_unlock_all`, `pg_advisory_xact_lock`,
+  `pg_try_advisory_xact_lock` and their `_shared` variants, keyed by one
+  `bigint` or two `int4`. They are cluster-wide: sessions on different nodes
+  contend for the same lock. Session locks are reentrant and counted and are
+  released by unlock or when the session ends, a client that disconnects
+  included; transaction locks at `COMMIT`, `ROLLBACK` or `ROLLBACK TO
+  SAVEPOINT`. Unlocking a lock not held returns false with PostgreSQL's
+  `WARNING` (`01000`). Waits honour `lock_timeout` (`55P03`),
+  `statement_timeout` and cancel (`57014`), and never interact with row
+  locks; `pg_locks` lists held advisory locks. Each hold is a record under
+  its node's lease: a dead node's locks are free `AdvisoryLockTTL` (10s)
+  plus the clock offset after its last renewal, and a node that cannot renew
+  ends its sessions holding advisory locks with FATAL `57P01` before another
+  session can take them. Rails, Prisma, golang-migrate and Flyway migrations
+  work. The arguments must be constants or parameters
+  (`pg_try_advisory_lock(id) FROM jobs` is `0A000`). See
+  docs/user/sql.md, "Advisory locks".
+- **Tables without a primary key** (#354): join tables and imported schemas
+  get the same hidden, generated `rowid` key `CREATE TABLE ... AS` has, so
+  duplicate rows are allowed as in PostgreSQL; the rowid is left out of
+  `SELECT *`, `RETURNING *`, `COPY` and the catalogs. A foreign key to such
+  a table needs a unique constraint (`42830`, as PostgreSQL), and "no unique
+  constraint matching given keys" is now `42830` (was `42P10`). `ALTER TABLE
+  ... ADD PRIMARY KEY` parses: `0A000` on a rowid-keyed table, `42P16` on a
+  keyed one. A table keyed only by a hidden rowid, `CREATE TABLE ... AS`
+  tables included, no longer shows an empty `t_pkey` in the catalogs.
+- **`UPDATE ... FROM` and `DELETE ... USING`** (#355): the list takes
+  tables, subqueries, `VALUES`, `WITH` members, views and joins; `SET` and
+  `RETURNING` read its columns, and `RETURNING *` returns the target's
+  columns then the list's. A target row joining several rows changes once
+  (`UPDATE` takes the first joined row). The list's tables need `SELECT`;
+  row-level security, constraints and cascades apply. `UPDATE` and `DELETE`
+  take a target alias, and a `FROM`-list subquery can be a `VALUES` list
+  with column aliases (`(VALUES (1, 'a')) AS v(id, tag)`).
+- **`ORDER BY` inside aggregate calls** (#356): `string_agg(b, ',' ORDER BY
+  id DESC)`, `array_agg(x ORDER BY y NULLS FIRST)`, `jsonb_agg(... ORDER BY
+  ...)`, in grouped queries (expressions, `ROLLUP`), joins, `HAVING` and
+  subqueries. With `DISTINCT`, an `ORDER BY` expression that is no argument
+  is `42P10` and the input is sorted on the arguments, as in PostgreSQL;
+  `array_agg(DISTINCT ...)` and `json_agg(DISTINCT ...)` keep one NULL. On a
+  window call it is `0A000`. `mode() WITHIN GROUP (ORDER BY x)` is added; an
+  ordered-set call without `WITHIN GROUP`, or `WITHIN GROUP` on a plain
+  aggregate, is `42883` (was `42601`). A subquery inside an aggregate's
+  arguments, `FILTER` or `ORDER BY` works.
+- **System functions ORMs and tools call** (#357): `pg_get_serial_sequence`,
+  `to_regclass` / `to_regproc` / `to_regprocedure` / `to_regnamespace` /
+  `to_regrole`, `pg_is_in_recovery()`, `current_schemas(bool)`,
+  `pg_has_role` and the `has_*_privilege` family in every argument form,
+  answered from datax's grants and roles (the stubs that said true are
+  gone). `user`, `current_role` and `current_catalog` are keywords; any
+  word may follow `AS`. `pg_depend` ties SERIAL, identity and `OWNED BY`
+  sequences to their columns (Rails' `pk_and_sequence_for`). `::regclass`
+  reads quoted and `public.`-qualified names and lower-cases unquoted ones,
+  and a system catalog's OID is PostgreSQL's (`'pg_class'::regclass` is
+  1259). `SET synchronize_seqscans`, which pg_dump sends, is accepted.
+- **Partial and expression indexes** (#358, #359): `CREATE [UNIQUE] INDEX
+  ... WHERE predicate` indexes only the matching rows, uniqueness holding
+  among them (soft-delete uniqueness), and the planner uses it when the
+  query's `WHERE` repeats the predicate's conjuncts. `CREATE [UNIQUE] INDEX
+  ON t ((lower(email)))`, `(a, (b + 1))` and `((doc ->> 'k'))` index
+  immutable expressions (`42P17` otherwise), unique on the value, and serve
+  equality and range predicates on the same expression. Both show in
+  `pg_get_indexdef`, `pg_indexes`, `\d` and `pg_index.indpred`, survive
+  `RENAME COLUMN`, `LIKE ... INCLUDING INDEXES` and restore, and are refused
+  on sealed tables. Cluster protocol version v22.
+- **`ASC` / `DESC` and `NULLS FIRST | LAST` per index key** (#360) are
+  accepted and shown; keys stay ascending, and an all-descending `ORDER BY`
+  reverse-scans (Rails' `order: { created_at: :desc }`).
 - **`datax start --locality-advertise=key=value@host:port[,...]`** (#350;
   alias `--locality-advertise-addr`): a node that shares the locality tier
   `key=value` with this node dials it at that address, for example over a
@@ -1605,6 +1674,20 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A statement no longer plans against a schema a drain has written
+  off.** A gateway's lease renewal published the new version, and a
+  schema change's drain returned on seeing it, a moment before the
+  gateway's cache held the new descriptor; a statement starting on that
+  gateway in between was handed the old one (a missing new column, or a
+  write that could commit after the drain). Until the new entry is
+  installed, such a statement now reads the descriptor in its own
+  transaction.
+- **`UPDATE t SET a = b, b = a` swaps** (#355): every `SET` of a row reads
+  the row as it was before the statement, as in PostgreSQL. Before, each
+  value was written before the next was computed, so both columns took
+  `b`.
+- **`ALTER TABLE ... DROP COLUMN` drops the indexes that use the column**
+  (#358), as PostgreSQL does; it was refused.
 - **`jsonb || jsonb` merges** (#342) as in PostgreSQL instead of joining the
   two texts: objects merge (the right side wins), arrays concatenate, a
   non-array is appended or prepended, and two non-arrays make a two-element

@@ -605,13 +605,14 @@ func substituteCond(cmp parser.Comparison, nodes map[*parser.Select]*scopeNode, 
 }
 
 // splitCorrelatedUpdate strips correlated conjuncts from an UPDATE's
-// WHERE clause (the outer scope is the bare table name).
+// WHERE clause (the outer scope is the target's alias, else its bare
+// table name).
 func (s *Session) splitCorrelatedUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.Update) ([]correlatedConjunct, *parser.Update, error) {
 	desc, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {
 		return nil, t, nil // let the ordinary path report the missing table
 	}
-	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, "")
+	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Alias)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -629,7 +630,7 @@ func (s *Session) splitCorrelatedDelete(ctx context.Context, txn *kvclient.Txn, 
 	if err != nil {
 		return nil, t, nil
 	}
-	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, "")
+	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Alias)
 	if err != nil {
 		return nil, nil, err
 	}

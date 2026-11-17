@@ -76,6 +76,9 @@ type SchemaIndex struct {
 	// Method is the access method of an index that is not an ordinary
 	// (btree) one: "gin" for an inverted index.
 	Method string `json:"method,omitempty"`
+	// Where is a partial index's predicate ("" for none); an
+	// expression key is in Columns as pg_get_indexdef shows it.
+	Where string `json:"where,omitempty"`
 }
 
 // SchemaConstraint is one table constraint beyond the primary key and
@@ -581,9 +584,14 @@ func (n *Node) buildSchemaDoc(ctx context.Context) (*SchemaStatus, map[uint64]*c
 			if idx.IsInverted() || idx.IsVector() {
 				si.Method = vtable.IndexMethod(&idx)
 			}
-			for _, id := range idx.ColumnIDs {
+			for i, id := range idx.ColumnIDs {
+				if idx.IsExprKey(i) {
+					si.Columns = append(si.Columns, vtable.ExprKeyText(idx.Exprs[i]))
+					continue
+				}
 				si.Columns = append(si.Columns, colName[id])
 			}
+			si.Where = idx.Predicate
 			t.Indexes = append(t.Indexes, si)
 		}
 		for _, c := range d.Constraints {

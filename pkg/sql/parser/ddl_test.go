@@ -241,7 +241,6 @@ func TestParseTextSearch(t *testing.T) {
 	for src, want := range map[string]CreateIndex{
 		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body))`:             {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "english"},
 		`CREATE INDEX i ON t USING gin ((TO_TSVECTOR('simple'::regconfig, body)))`: {Name: "i", Table: "t", Using: "gin", Columns: []string{"body"}, ExprFunc: "to_tsvector", ExprArg: "simple"},
-		`CREATE INDEX i ON t (lower('x', body))`:                                   {Name: "i", Table: "t", Columns: []string{"body"}, ExprFunc: "lower", ExprArg: "x"},
 		`CREATE INDEX i ON t USING GIN (v tsvector_ops)`:                           {Name: "i", Table: "t", Using: "gin", Columns: []string{"v"}, OpClasses: []string{"tsvector_ops"}},
 	} {
 		got := parseOne(t, src).(*CreateIndex)
@@ -256,7 +255,7 @@ func TestParseTextSearch(t *testing.T) {
 		`CREATE INDEX i ON t USING GIN (other, to_tsvector('english', body))`,
 		`CREATE INDEX i ON t USING GIN (to_tsvector('english', lower(body)))`,
 		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body)`,
-		`CREATE INDEX i ON t USING GIN ((body))`,
+		`CREATE INDEX i ON t (lower('x', body))`,
 		`CREATE INDEX i ON t USING GIN (to_tsvector('english', body) jsonb_ops)`,
 		`CREATE TABLE t (id INT8 PRIMARY KEY, v TSVECTOR[])`,
 		`CREATE TABLE t (id INT8 PRIMARY KEY, q TSQUERY ARRAY)`,

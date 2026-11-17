@@ -97,20 +97,25 @@ CREATE TABLE t (
   PRIMARY KEY (a)                -- or: a INT8 PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS t (...);
+CREATE TABLE users_roles (user_id INT8 REFERENCES users, role_id INT8 REFERENCES roles);  -- no key: a hidden rowid (below)
 DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
 CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX ON t (b, c);                                -- unnamed: t_b_c_idx (t_b_c_idx1, ... when taken)
 CREATE INDEX t_b_like ON t (b text_pattern_ops);         -- also varchar_/bpchar_pattern_ops, COLLATE "C" / "POSIX" / "default"
+CREATE UNIQUE INDEX ON t ((lower(b)));                   -- an expression key: t_lower_idx (below)
+CREATE INDEX ON t (c, (a + 1));                          -- columns and expressions mixed: t_c_expr_idx
+CREATE UNIQUE INDEX ON t (b) WHERE c IS NULL;            -- partial: only the rows the predicate holds for (below)
+CREATE INDEX ON t (a, c DESC NULLS LAST);                -- a declared order per key (below)
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
 CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
 DROP INDEX [CONCURRENTLY] [IF EXISTS] by_b;             -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
-ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK/indexed columns
+ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK columns; drops the indexes that use d
 ALTER TABLE t RENAME TO t2;                             -- foreign keys and sequences follow (they use IDs)
-ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints on the column are rewritten
+ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints, index expressions and predicates are rewritten
 ALTER TABLE t RENAME CONSTRAINT t_b_key TO b_unique;    -- a UNIQUE constraint's index renames with it
 ALTER TABLE t ALTER [COLUMN] b SET DEFAULT 'y';         -- a constant or an expression (below)
 ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
@@ -140,6 +145,70 @@ types' operator classes (`text_pattern_ops`, `varchar_pattern_ops`,
 on a key column and shown by `pg_get_indexdef`; any other collation is
 refused (`0A000`), as is an operator class of another type (`42804`).
 They do not make `LIKE 'abc%'` use the index.
+
+**Expression keys** (`(lower(email))`, `(a + 1)`, `(doc ->> 'k')`, or
+a function call written bare, `lower(email)`) may be mixed with
+columns in an ordinary index, unique or not. An expression may use the
+table's own columns, constants, arithmetic, JSON paths and the builtins
+the [Functions reference](functions.md) lists as immutable, except the
+few PostgreSQL marks stable (`concat`, `concat_ws`, `format`,
+`array_to_string`, the `to_json` / `json_build_*` family). Anything
+stable or volatile (`now()`, `random()`), and anything that
+reads the session's `TimeZone` (a cast or operator over a date or
+time, `date_trunc`, `extract`) is refused with `42P17` ("functions in
+index expression must be marked IMMUTABLE"); a subquery is `0A000`, an
+aggregate `42803`. A unique expression index compares the values: with
+`CREATE UNIQUE INDEX ON users ((lower(email)))`, two emails that differ
+only by case conflict (`23505`). A query uses the index when its WHERE
+clause compares the same expression with a constant — `=`, `<`, `<=`,
+`>`, `>=` — written in any spacing or parenthesization, and with or
+without the casts to text pg_dump adds (`lower((email)::text)`). An
+expression that fails for a row (`(n / m)` with `m = 0`) fails the
+write with its own error. `pg_get_indexdef` shows it as PostgreSQL
+does: `(lower(email))`, `((a + 1))`.
+
+**Partial indexes** (`WHERE predicate`) hold only the rows the
+predicate is true for, and a unique one holds its rule among those rows
+only — `CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL`
+lets any number of deleted rows share an email. Writes keep the index
+exact, an `UPDATE` that moves a row into or out of the predicate
+included; the backfill indexes only the matching rows. The planner uses
+a partial index only when every conjunct of the predicate appears, as
+written, among the `AND`-ed conjuncts of the query's WHERE clause
+(`WHERE email = $1 AND deleted_at IS NULL`); it does not prove
+implications (`n > 10` does not let it use an index `WHERE n > 5`). The
+predicate follows the expression rules above, and may compare a date or
+time column only with `IS [NOT] NULL` (PostgreSQL folds `created_at >
+'2024-01-01'` into a constant when the index is made; datax would read
+the literal in each writer's `TimeZone`, so it is refused, `42P17`). A
+partial unique index is not a constraint: `pg_constraint` does not list
+it and `ON CONFLICT (email)` does not infer it (`42P10`, as in
+PostgreSQL without the `WHERE` of the conflict target, which datax does
+not parse). `pg_get_indexdef`, `pg_indexes` and `\d` show the predicate
+(`WHERE (deleted_at IS NULL)`), and `pg_index.indpred` holds its text
+(`pg_get_expr(indpred, indrelid)` renders it). A GIN index may be
+partial too; an ivfflat index may not. Expression and partial indexes
+need cluster version v22, are refused on a sealed table (they would
+keep what they compute from sealed columns in plaintext), and a table
+that has one cannot be sealed.
+
+**Key order.** `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST` are
+accepted on every key of an ordinary index and shown by
+`pg_get_indexdef` (`(created_at DESC)`), but keys are always stored
+ascending: an `ORDER BY` that runs entirely the other way is served by
+scanning the index in reverse, so `WHERE user_id = $1 ORDER BY
+created_at DESC` uses an index on `(user_id, created_at DESC)` or on
+`(user_id, created_at)` alike. An `ORDER BY` that mixes directions
+(`a ASC, b DESC`) is sorted after the scan, whichever directions the
+index declares. Rows with a NULL key are not in an index (except a
+`NULLS NOT DISTINCT` one), so the declared NULLs order changes nothing.
+
+`ALTER TABLE ... DROP COLUMN` drops the indexes that use the column —
+as a key, in an expression or in a predicate — as PostgreSQL does (one
+a constraint owns is still refused, `2BP01`). `ALTER COLUMN ... TYPE`
+is refused for a column any index uses, an expression or predicate
+included. `LIKE ... INCLUDING INDEXES`, backups, restores and table
+restores carry expressions, predicates and orders.
 `DROP INDEX` names the index alone (it is found on whichever table of
 the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the
@@ -342,11 +411,11 @@ renames them positionally) and, unless `WITH NO DATA`, fills it: the
 query runs once, at one timestamp, and its rows stream in through the
 `COPY` chunk path, a bounded transaction per chunk — so the statement
 never holds one transaction open over a million rows and cannot run
-inside a transaction block (`25001`). A table needs a primary key, so
-a `PRIMARY KEY (cols)` clause may be written among the names
-(CockroachDB's form); without one the table gets a hidden `rowid`
-column (`unique_rowid()`, invisible to `SELECT *`) — and duplicate
-query rows are all kept. Parameters (`$1`) and views in the query
+inside a transaction block (`25001`). A `PRIMARY KEY (cols)` clause
+may be written among the names (CockroachDB's form); without one the
+table gets a hidden `rowid` key like any table declared without one
+([below](#tables-without-a-primary-key)) — and duplicate query rows
+are all kept. Parameters (`$1`) and views in the query
 work. `SELECT ... INTO t` is refused with a pointer here.
 
 **`LIKE source`** inside a column list copies the source's columns
@@ -357,7 +426,9 @@ CONSTRAINTS` the `CHECK` constraints, `INCLUDING INDEXES` the `UNIQUE`
 constraints and secondary indexes (same names), `INCLUDING ALL` every
 one; `EXCLUDING` reverses an option. The primary key is copied whenever
 the statement declares none (PostgreSQL leaves it to `INCLUDING
-INDEXES`; here a table needs one). Foreign keys are never copied.
+INDEXES`); a source keyed by a hidden `rowid` (one declared without a key)
+gives a copy with its own hidden `rowid`. Foreign keys are never
+copied.
 
 **`ALTER COLUMN c TYPE t`** rewrites the column online, in the shape of
 `CREATE INDEX`: a hidden shadow column of the new type joins the
@@ -454,6 +525,50 @@ waiting for size- and load-based splits to catch up.
   v20. On a cluster that has not finalized it, `SPLIT AT` splits as it
   always did — the boundary is not held — and the other two are refused
   with `0A000`.
+
+### Tables without a primary key
+
+A table created without a `PRIMARY KEY` — a join table, an imported
+schema, `CREATE TABLE ... AS` — is keyed by a hidden `INT8 NOT NULL`
+column named `rowid` (`rowid_1`, `rowid_2`, ... when the table has a
+column of that name), filled by `unique_rowid()`. Rows may repeat, as
+in PostgreSQL: two identical rows are two rows, and a `DELETE` or
+`UPDATE` whose `WHERE` matches both changes both.
+
+```sql
+CREATE TABLE users_roles (user_id INT8 REFERENCES users, role_id INT8 REFERENCES roles);
+INSERT INTO users_roles VALUES (1, 10), (1, 10);   -- both kept
+SELECT * FROM users_roles;                          -- user_id, role_id: no rowid
+SELECT rowid, user_id FROM users_roles;             -- by name it is there
+```
+
+The column is left out of `SELECT *`, `RETURNING *`, `COPY ... FROM`
+without a column list, `SHOW CREATE TABLE`, `information_schema`,
+`pg_attribute` (`attnum > 0`) and psql's `\d`; the catalogs show no
+primary key for the table. It cannot be inserted, updated, renamed or
+dropped, and `ADD COLUMN rowid` on such a table is refused (`42710`):
+the name is taken. Every other statement works as on a keyed table —
+`INSERT` (multi-row, `INSERT ... SELECT`), `UPDATE`, `DELETE`, `COPY`,
+`TRUNCATE`, secondary and unique indexes, `CHECK` / `NOT NULL`,
+foreign keys from the table, `ADD` / `DROP COLUMN`, `LIKE`, backup and
+restore.
+
+- *Row ids.* `unique_rowid()` is 48 bits of microsecond time above
+  15 bits of node ID: unique across the cluster with no coordination,
+  ascending on each node, so inserts from several nodes land in
+  different places. Two nodes never share a node ID; a node whose
+  clock steps back across a restart could in principle repeat an id,
+  which the insert then refuses (`23505`) rather than overwrite a row.
+- *Foreign keys to the table* need a `UNIQUE` constraint on the
+  referenced columns, as in PostgreSQL: `REFERENCES t` is refused with
+  `42830` (there is no primary key for referenced table), and so is
+  `REFERENCES t (a)` without a unique constraint on `a`.
+- *`ALTER TABLE ... ADD PRIMARY KEY`* is refused (`0A000`): the new key
+  would re-encode every row and index entry. Create a new table with
+  the key and copy the rows (`INSERT INTO t2 SELECT * FROM t`). On a
+  table that has a primary key it is `42P16`, as in PostgreSQL.
+- *Time-series tables* still declare their key: the timestamp must
+  close it.
 
 ### Defaults, SERIAL, identity columns and sequences
 
@@ -845,9 +960,14 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
-  `current_user`, `current_schema()`, `current_setting(name)`, `set_config`,
+  `current_user` (and the keywords `current_role`, `user`,
+  `session_user`, `current_catalog`), `current_schema()`,
+  `current_schemas(bool)`, `current_setting(name)`, `set_config`,
   `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`,
-  `pg_get_expr`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`,
+  `pg_get_expr`, `pg_typeof`, `pg_size_pretty`,
+  `pg_get_serial_sequence`, `to_regclass` and the other `to_reg*`
+  lookups, `pg_is_in_recovery()`, `pg_has_role` and the
+  `has_*_privilege` family, answered from the grants and roles,
   ...) as well as the sequence and id functions `nextval`, `currval`,
   `lastval`, `setval`, `unique_rowid()`, `gen_random_uuid()` /
   `uuid_generate_v4()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)).
@@ -871,10 +991,22 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
   `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
   `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
-  `json[b]_agg`, `json[b]_object_agg` — over a column or an expression
-  (`SUM(qty * price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER
-  (WHERE ...)`, whole-table or per `GROUP BY` group, including over
-  joins. The select list, `HAVING` and `ORDER BY` take any expression
+  `mode() WITHIN GROUP (ORDER BY x)`, `json[b]_agg`,
+  `json[b]_object_agg` — over a column or an expression (`SUM(qty *
+  price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER (WHERE
+  ...)`, whole-table or per `GROUP BY` group, including over joins. An
+  `ORDER BY` among the arguments sets the order an aggregate takes its
+  input in — `string_agg(name, ', ' ORDER BY created_at DESC)`,
+  `array_agg(x ORDER BY y NULLS FIRST, id)`, `jsonb_agg(row_data ORDER
+  BY pos)` — by any expression over the input rows, with `ASC` /
+  `DESC` and `NULLS FIRST | LAST` (NULLs last ascending, first
+  descending, by default); a number there is a constant, not a
+  position. With `DISTINCT`, every `ORDER BY` expression must be an
+  argument (`42P10` otherwise), and the input is sorted on the
+  arguments as in PostgreSQL, so `array_agg(DISTINCT x)` lists `x`
+  ascending, NULL last. `jsonb` values have no order in datax: ordering
+  an aggregate's input by one is refused (`0A000`), and `DISTINCT` over
+  one keeps the input order. The select list, `HAVING` and `ORDER BY` take any expression
   over aggregate calls and grouping columns: arithmetic (`SUM(a) /
   COUNT(*)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`), function
   calls (`ROUND(AVG(x), 2)`, `COALESCE(MAX(x), 0)`), `CASE`, casts and
@@ -956,7 +1088,8 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   DESC)` works on a grouped query) and before `DISTINCT`, `ORDER BY`
   and `LIMIT`; a window aggregate is evaluated frame by frame, so a
   wide `ROWS` frame over a large partition costs its width. `DISTINCT`,
-  `FILTER` and `WITHIN GROUP` are not accepted on a window call.
+  an `ORDER BY` among the arguments and `WITHIN GROUP` are refused on
+  a window call (`0A000`), as in PostgreSQL; `FILTER` is too.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
@@ -1116,7 +1249,34 @@ INSERT INTO t (a, b, c) VALUES (1, 'x', 1)
   RETURNING c;
 INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING;
 UPSERT INTO t (a, b, c) VALUES (1, 'x', 5);                     -- ON CONFLICT (primary key) DO UPDATE SET every column
+
+UPDATE orders o SET status = s.status FROM staging s WHERE o.id = s.id;   -- values from joined rows
+DELETE FROM posts p USING users u WHERE p.uid = u.id AND u.banned;
+UPDATE t SET c = c + v.d FROM (VALUES (1, 10), (2, 20)) AS v(a, d)
+  WHERE t.a = v.a RETURNING *;                                  -- t's columns, then v's
 ```
+
+`UPDATE ... FROM` and `DELETE ... USING` join the target (with an
+optional alias, `UPDATE t [AS] x`) to a `FROM` (`USING`) list that takes
+anything a `SELECT`'s can: tables, subqueries, `VALUES` lists, `WITH`
+members, views, table functions and explicit joins. `SET`, `WHERE` and
+`RETURNING` read the list's columns, and a subquery in `SET` may
+correlate with both the target and the list. `RETURNING *` returns the
+target's columns followed by the list's. Each target row is updated or
+deleted once however many rows it joins; an `UPDATE` takes its values
+from the first joined row in the order the join reads the list (a
+table by primary key, or by the index used to look it up; a `VALUES`
+list as written) — PostgreSQL leaves that choice unspecified, so write
+the list so that a target row joins one row. The tables in the list
+need `SELECT`, and their row-security policies apply; the target's
+`SELECT` policies and the statement's own (`UPDATE`, `DELETE`) pick the
+rows that change, and constraints, foreign-key actions and primary-key
+moves apply as in any `UPDATE` or `DELETE`. The target is read once
+ahead of the list unless the `WHERE` equates the list with the leading
+column of its primary key or of one of its indexes (or the list has
+joins of its own): then it is looked up per row of the list, so an
+`UPDATE` from a small staging table into a large one reads only the
+rows it changes.
 
 `RETURNING` rows come from the values the statement already has (no
 extra read). The `ON CONFLICT` target must be the primary key or a
@@ -1631,6 +1791,80 @@ What is guaranteed, and what is not:
 - A node running a release from before this feature cannot serve
   `LISTEN` (a syntax error) and is skipped by the others; during a
   rolling upgrade, connect listeners to upgraded nodes.
+
+## Advisory locks
+
+```sql
+SELECT pg_advisory_lock(42);               -- wait for an exclusive lock on 42
+SELECT pg_try_advisory_lock($1);           -- true if taken, false at once if held elsewhere
+SELECT pg_advisory_unlock(42);             -- true; false with a WARNING if not held
+SELECT pg_advisory_lock_shared(1, 2);      -- two int4 keys: a different lock from any bigint
+BEGIN; SELECT pg_advisory_xact_lock(42); ... COMMIT;   -- held until the transaction ends
+```
+
+PostgreSQL's advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock`,
+`pg_advisory_unlock`, `pg_advisory_unlock_all`, `pg_advisory_xact_lock`,
+`pg_try_advisory_xact_lock` and the `_shared` variants, each with one
+`bigint` key or two `int4` keys. What migration tools and job queues use
+them for works unchanged: golang-migrate, Rails, Prisma and Flyway take
+one around a migration.
+
+The rules are PostgreSQL's:
+
+- **Cluster-wide.** A lock is one lock for the whole cluster: sessions
+  on different nodes contend for it exactly as sessions on one node do.
+  Locks belong to a database, as in PostgreSQL.
+- **Session locks are reentrant and counted.** Taking a lock the session
+  already holds succeeds at once and needs another unlock; they are
+  released by `pg_advisory_unlock`, `pg_advisory_unlock_all` or the end
+  of the session (a clean close, or a client that just disappears), not
+  by `COMMIT` or `ROLLBACK`. Unlocking a lock not held returns false
+  with `WARNING: you don't own a lock of type ExclusiveLock` (`01000`).
+- **Transaction locks** (`_xact_`) are released when the transaction
+  commits or rolls back, and by `ROLLBACK TO` a savepoint taken before
+  them; outside a transaction block the statement is the transaction.
+- **Shared and exclusive.** Any number of sessions may hold a shared
+  lock; an exclusive one conflicts with every hold by another session.
+  A session's own holds never conflict with each other.
+- **Waiting.** A blocking call waits until the lock is free, the
+  statement is cancelled, or `statement_timeout` (`57014`) or
+  `lock_timeout` (`55P03`, `canceling statement due to lock timeout`)
+  passes. A failed wait leaves nothing held.
+- **Independent of row locks.** An advisory lock never waits for a row
+  lock or a write, and nothing that locks or writes rows waits for an
+  advisory lock.
+- `pg_locks` lists the advisory locks held across the cluster, with
+  PostgreSQL's `locktype = 'advisory'`, `classid`, `objid`, `objsubid`
+  (`1` for a bigint key, `2` for two int4 keys), `pid` and `mode`.
+
+Where it differs:
+
+- **A node that dies.** A lock held by a session on a node that stops
+  or is cut off from the cluster is released 10 seconds (plus the
+  maximum clock offset) after that node last renewed its advisory-lock
+  lease, once the rest of the cluster is serving again. A node renews
+  its lease every 2.5 seconds while its sessions hold or wait for
+  advisory locks. If it cannot renew in time — it is partitioned from
+  the cluster — it ends every session that held an advisory lock with
+  `FATAL 57P01` before any other session can be granted the lock, so a
+  session is never left believing it holds a lock someone else has.
+  Reconnect and take the lock again.
+- **Waiters are not queued.** When a lock is released, whichever waiter
+  looks first gets it, not the one that has waited longest. A waiter on
+  the releasing node sees the release at once; one on another node
+  within 0.1 seconds.
+- **No deadlock detection.** Two sessions each waiting for a lock the
+  other holds wait until `lock_timeout` or `statement_timeout` ends one
+  of them: set one of them when taking more than one lock.
+- **Once per statement.** Like the other functions with effects, a call
+  runs once per statement, and its arguments must be constants or
+  parameters, not columns (`0A000`): `SELECT pg_try_advisory_lock(id)
+  FROM jobs` is refused; take the lock per job, with the id as a
+  parameter. `pg_locks` lists granted locks only, not waiting sessions,
+  and no row locks.
+- A node running a release from before advisory locks does not have the
+  functions (`42883`); during a rolling upgrade, run migrations through
+  upgraded nodes.
 
 ## Set-returning functions
 

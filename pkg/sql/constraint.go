@@ -155,6 +155,9 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 	if desc.NextIndexID < rowenc.PrimaryIndexID+1 {
 		desc.NextIndexID = rowenc.PrimaryIndexID + 1
 	}
+	if cd.Kind == "primary" {
+		return nil, nil, refuseAddPrimaryKey(desc)
+	}
 	c := catalog.Constraint{ID: desc.NextConstraintID, Kind: cd.Kind, Validated: validated}
 	var parent *catalog.TableDescriptor
 	switch cd.Kind {
@@ -267,6 +270,11 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 				col, _ := ref.ColByID(id)
 				refNames = append(refNames, col.Name)
 			}
+			if len(refNames) == 0 {
+				// Keyed by its hidden rowid alone (issue #354): as in
+				// PostgreSQL, name the columns of a unique constraint.
+				return nil, nil, newErrf(CodeInvalidForeignKey, "there is no primary key for referenced table %q", ref.Name)
+			}
 		}
 		refCols, err := resolveColumns(ref, refNames, "the referenced table")
 		if err != nil {
@@ -283,7 +291,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 			c.RefColumns = append(c.RefColumns, refCols[i].ID)
 		}
 		if !uniqueKeyOf(ref, c.RefColumns) {
-			return nil, nil, newErrf(CodeInvalidColumnReference, "there is no unique constraint matching given keys for referenced table %q", ref.Name)
+			return nil, nil, newErrf(CodeInvalidForeignKey, "there is no unique constraint matching given keys for referenced table %q", ref.Name)
 		}
 		c.OnDelete, c.OnUpdate = cd.OnDelete, cd.OnUpdate
 		if c.OnDelete == "" {
@@ -356,7 +364,7 @@ func uniqueKeyOf(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 		return true
 	}
 	for i := range d.Indexes {
-		if d.Indexes[i].Unique && d.Indexes[i].Public() && same(d.Indexes[i].ColumnIDs) {
+		if d.Indexes[i].Unique && d.Indexes[i].Public() && !d.Indexes[i].Computed() && same(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
@@ -387,7 +395,7 @@ func indexCovers(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 	for i := range d.Indexes {
 		// An inverted index has no key order over its column's values,
 		// and neither has a vector index.
-		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && prefix(d.Indexes[i].ColumnIDs) {
+		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && !d.Indexes[i].IsPartial() && prefix(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
@@ -1604,4 +1612,18 @@ func (s *Session) dropTableConstraints(ctx context.Context, txn *kvclient.Txn, d
 		s.noteDDL(p.Name)
 	}
 	return nil
+}
+
+// refuseAddPrimaryKey is ALTER TABLE ... ADD PRIMARY KEY. A table with a
+// declared key refuses it as PostgreSQL does (42P16). A table created
+// without one is keyed by its hidden rowid (issue #354): a new key would
+// re-encode every row and index entry under it, which datax does not do
+// in place, so it is refused (0A000) with the way round it.
+func refuseAddPrimaryKey(desc *catalog.TableDescriptor) error {
+	for _, id := range desc.PrimaryKey {
+		if c, ok := desc.ColByID(id); ok && !c.Hidden {
+			return newErrf(CodeInvalidTableDefinition, "multiple primary keys for table %q are not allowed", desc.Name)
+		}
+	}
+	return newErrf(CodeFeatureNotSupported, "ALTER TABLE ... ADD PRIMARY KEY is not supported: table %q has no declared primary key and is keyed by a hidden rowid; create a new table with the PRIMARY KEY and copy the rows (INSERT INTO new SELECT * FROM %s)", desc.Name, desc.Name)
 }

@@ -17,14 +17,14 @@ syntax error or `0A000` feature not supported):
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), expressions over aggregates and `GROUP BY` expressions, `ROLLUP` / `CUBE` / `GROUPING SETS`, `DISTINCT ON`, `FILTER (WHERE ...)` and `DISTINCT` on aggregate calls, window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `ALTER TABLE ... ADD COLUMN` with an expression default (`DEFAULT now()`) | sequences (with `OWNED BY`), `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
-| `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
+| `ADD PRIMARY KEY` (a table created without one is keyed by a hidden `rowid`, [reference](sql.md#tables-without-a-primary-key); `0A000`) / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
 | Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
 | The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
-| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
+| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify); so are advisory locks, `pg_advisory_lock` and its relatives, cluster-wide: [reference](sql.md#advisory-locks)) |
 
 ## Things that exist but behave differently
 
@@ -45,6 +45,16 @@ syntax error or `0A000` feature not supported):
   the statement had to read but would have filtered out. `FOR SHARE`,
   `FOR NO KEY UPDATE`, `FOR KEY SHARE` and `FOR UPDATE OF table` are
   not supported.
+- **Advisory locks** (`pg_advisory_lock`, `pg_try_advisory_lock`,
+  `pg_advisory_xact_lock`, the `_shared` variants, `pg_advisory_unlock[_all]`)
+  work cluster-wide with PostgreSQL's semantics, with four differences
+  ([details](sql.md#advisory-locks)): the locks of a node that dies are
+  released about 10 seconds after it stopped renewing its lease, and a
+  node cut off from the cluster ends its sessions that held advisory
+  locks (`57P01`) rather than let two sessions hold one lock; waiters
+  are not served in arrival order; a deadlock between advisory locks is
+  not detected (set `lock_timeout`); and the arguments must be constants
+  or parameters, evaluated once per statement (`0A000` for a column).
 - **Concurrent inserts of one key.** In PostgreSQL the second `INSERT`
   of a primary key another open transaction has just inserted waits for
   it, then fails with `23505` if it commits or succeeds if it rolls back.
@@ -86,8 +96,7 @@ syntax error or `0A000` feature not supported):
   subscript out of range is NULL as in PostgreSQL; `array_agg` over an
   untyped argument yields `text[]`; `unnest` runs in `FROM` (laterally
   too: `FROM t, unnest(t.tags) AS tag`) or in a FROM-less select list
-  (not beside a table's columns), and an aggregate call takes no inner
-  `ORDER BY`.
+  (not beside a table's columns).
 - **Intervals** compare, group and index by PostgreSQL's rule (`'30
   days' = '1 month'`), but a primary key or unique index keeps `'30
   days'` and `'1 month'` as distinct keys (the stored triple is part of
@@ -146,11 +155,12 @@ syntax error or `0A000` feature not supported):
     stems, not against a PostgreSQL server.
   - *Indexes*: `USING GIN (tsvector_column)` and `USING GIN
     (to_tsvector('config', text_column))` — the one expression an index
-    may be built on; the configuration must be written out, as
-    PostgreSQL requires. No expression indexes otherwise (not over a
-    concatenation of columns, not `setweight(...) || ...`), no generated
-    columns and no triggers to maintain a `tsvector` column: the
-    application writes it. No GiST (`USING GIST` is refused), no
+    may be built on in a GIN index; the configuration must be written
+    out, as PostgreSQL requires. A GIN index on any other expression
+    (a concatenation of columns, `setweight(...) || ...`) is refused —
+    expression keys are for ordinary (btree) indexes — and there are no
+    generated columns and no triggers to maintain a `tsvector` column:
+    the application writes it. No GiST (`USING GIST` is refused), no
     `fastupdate`, no `gin_pending_list_limit`.
   - *Planning*: a negated term is never looked up, so a query that is
     only a negation (or an `OR` with one) scans; `tsquery @@ tsvector`
@@ -230,9 +240,8 @@ syntax error or `0A000` feature not supported):
   - *Not there*: `halfvec`, `sparsevec`, `bit` vectors and their
     operators (`<+>` L1 as an operator, `<~>`, `<%>`), `vector *
     vector`, `||`, `subvector`, `binary_quantize`, and the `avg` and
-    `sum` aggregates over vectors (`0A000`). Expression indexes (an
-    index over `(embedding::halfvec(3))`, or over a function of the
-    column) and partial indexes do not exist in datax for any index.
+    `sum` aggregates over vectors (`0A000`). An ivfflat index takes
+    no expression (`(embedding::halfvec(3))`) and no `WHERE` clause.
     `vector[]` columns are refused.
   - *Dimensions*: 16,000 for the type and 2,000 for an index, as in
     pgvector. Elements are float4; a value outside float4's range is
@@ -277,7 +286,12 @@ syntax error or `0A000` feature not supported):
   schema qualifier on a cast's type is ignored (`'1'::foo.int4` is an
   `int4`). And `'t'::regclass` displays as the table's OID (a number,
   where PostgreSQL displays `t`); `oid::regclass` gives the name back
-  (`conrelid::regclass`).
+  (`conrelid::regclass`). The name is read as PostgreSQL reads one
+  (`'"Mixed"'::regclass`, `'public.t'::regclass`), and a system
+  catalog's OID is PostgreSQL's (`'pg_class'::regclass` is 1259). The
+  `to_regclass`, `to_regproc`, `to_regprocedure`, `to_regnamespace`
+  and `to_regrole` lookups return the OID the same way (`NULL` where
+  the cast would fail), not the name.
 - **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
   1 MiB) as the stream arrives, so a failure partway leaves the earlier
   chunks committed — the error names the failing row and how many rows
@@ -297,6 +311,16 @@ syntax error or `0A000` feature not supported):
   rewrites is refused (`0A000`); PostgreSQL cascades after the
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
+- **`UPDATE ... FROM` and `DELETE ... USING`** work as in PostgreSQL
+  ([reference](sql.md#writing)), with three differences. A target row
+  that joins several rows takes its new values from the first of them
+  in the order the join reads the `FROM` list (a table by primary key,
+  or by the index it is looked up through; a `VALUES` list as
+  written), where PostgreSQL uses an unspecified one. The target needs
+  only the `UPDATE` (`DELETE`) privilege, as a plain `UPDATE ... WHERE`
+  does here; PostgreSQL also asks for `SELECT` on the target columns
+  the statement reads. And the `FROM` list's joins have a plain
+  `SELECT`'s limits (`ON` must equate columns, above).
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`, which is
   accepted and changes nothing) and cannot run inside a transaction
   block (`25001`) — except on a table created in the same block, where
@@ -329,8 +353,23 @@ syntax error or `0A000` feature not supported):
   `uuid_ns_*` constants). Any other extension is refused (`0A000`);
   `DROP EXTENSION` of one is `42704`.
 - **`ORDER BY`** takes output names, positions and expressions, but an
-  expression sort never uses an index; NULLs order last ASC / first DESC
-  (PostgreSQL default). Under `UNION`, output names and positions
+  expression sort never uses an index, an expression index included;
+  NULLs order last ASC / first DESC (PostgreSQL default). An index's
+  declared `DESC` / `NULLS FIRST` is shown but not stored: keys are
+  ascending, an all-descending `ORDER BY` reverses the scan and a mixed
+  one sorts ([reference](sql.md#ddl)).
+- **Expression and partial indexes** are supported, with limits
+  ([reference](sql.md#ddl)): a partial index is used only when its
+  predicate's conjuncts appear verbatim in the query's WHERE clause (no
+  implication proofs); a predicate may compare a date or time column
+  only with `IS [NOT] NULL`; anything zone-dependent in an expression
+  (`date_trunc`, casts of timestamps) is refused even where PostgreSQL
+  marks the form immutable (`timestamp without time zone`); `ON
+  CONFLICT (cols) WHERE predicate` is not parsed, so a partial unique
+  index is never an `ON CONFLICT` arbiter except by name (`ON
+  CONSTRAINT`); and `pg_get_indexdef` shows an expression and a
+  predicate as written, without PostgreSQL's inserted casts
+  (`'active'::text`). Under `UNION`, output names and positions
   only. A position after a `*` that is not the whole select
   list is refused.
 - **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
@@ -403,7 +442,8 @@ syntax error or `0A000` feature not supported):
   `lc_time` (messages, numbers, money and dates stay in the C locale;
   `C`, `POSIX` and names shaped like `en_US.UTF-8` are accepted),
   `escape_string_warning`, `array_nulls` (`off` does not make a
-  `NULL` in array input a string), `quote_all_identifiers` and
+  `NULL` in array input a string), `quote_all_identifiers`,
+  `synchronize_seqscans` (pg_dump sets it `off`) and
   `session_replication_role` (`replica` does not disable foreign keys).
   `default_with_oids` takes only `off`, as in PostgreSQL 12 and later.
   The ones that do act: `IntervalStyle` (`postgres`, `iso_8601`,
@@ -425,7 +465,7 @@ The rules are PostgreSQL's; these are the differences.
 |---|---|---|
 | Who is exempt | superusers and `BYPASSRLS` roles always; the owner unless `FORCE` | `root` and `BYPASSRLS` roles always; the owner **and members of `admin`** unless `FORCE` (an admin is treated as an owner of every object) |
 | `TRUNCATE` | allowed with the `TRUNCATE` privilege, ignoring policies | refused (`42501`) to a role the table's policies apply to, whatever it was granted |
-| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user`, `session_user`, `current_setting`, `current_database`, `current_schema` and the clock. They are evaluated once per statement |
+| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user` (also `current_role`, `user`), `session_user`, `current_setting`, `current_database` (also `current_catalog`), `current_schema` and the clock. They are evaluated once per statement |
 | Predicate order | a leakproof-function analysis decides what may run before the policy | the policy is always evaluated first; no statement predicate sees a hidden row |
 | Views | owner's rights by default, `security_invoker` to change it | owner's rights only |
 | `SET row_security = off` | makes a filtered query an error instead (used by `pg_dump`) | the same: `42501` `query would be affected by row-level security policy for table "t"`, without PostgreSQL's hint for an owner under `FORCE` |
@@ -504,7 +544,7 @@ are the differences ([reference](sql.md#large-objects)):
 | `40001` | serialization failure — including a transaction that read data whose history was garbage-collected under it (it ran longer than a table's `gc_ttl`, or a `PURGE` of what it reads ran meanwhile) | retry the whole transaction |
 | `72000` | snapshot too old: `AS OF SYSTEM TIME` names a moment older than the table's GC window (`gc_ttl`, default 25h), or before a `PURGE` or a dropped table's reclaim | read at a later moment; retrying the same one cannot succeed |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
-| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
+| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait (for a row or an advisory lock) outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
 | `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
 | `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
@@ -538,10 +578,13 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `information_schema.tables` / `columns` / `table_constraints` /
   `key_column_usage`, `pg_indexes`, `pg_class` + `pg_attribute` +
   `pg_index` joins, `format_type`, `pg_get_indexdef`,
-  `pg_get_constraintdef`, `'t'::regclass` and existence checks against
-  the catalogs (`SELECT 1 FROM pg_class WHERE relname = ...`; the
-  `to_regclass()` function itself does not exist) return
-  what PostgreSQL would for a schema in the datax subset. Reads of
+  `pg_get_constraintdef`, `'t'::regclass`, `to_regclass()` and
+  existence checks against the catalogs (`SELECT 1 FROM pg_class WHERE
+  relname = ...`) return what PostgreSQL would for a schema in the
+  datax subset. A column's sequence is found as Rails and pg_dump look
+  for it: `pg_get_serial_sequence('t', 'id')` (`public.t_id_seq`, for a
+  SERIAL, identity or `OWNED BY` sequence) and the `pg_depend` rows
+  that tie each such sequence to its column. Reads of
   features datax lacks (triggers, comments) come back
   empty rather than erroring — whatever shape the tool's query takes;
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
@@ -565,6 +608,27 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `0` for a table the reader may not `SELECT` from, where PostgreSQL
   shows them to everyone, and `pg_largeobject_metadata` lists the
   reader's own large objects only.
+- **The privilege functions** (`has_table_privilege`,
+  `has_column_privilege`, `has_any_column_privilege`,
+  `has_sequence_privilege`, `has_schema_privilege`,
+  `has_database_privilege`, `has_function_privilege`,
+  `has_type_privilege`, `has_tablespace_privilege`, `pg_has_role`) take
+  every argument form PostgreSQL's do and answer from datax's grants,
+  ownership and role graph ([Functions
+  reference](functions.md#system-information-and-privileges)). Where
+  the models differ: a column's privilege is its table's (there are no
+  column grants); `REFERENCES`, `TRIGGER` and `MAINTAIN` are the
+  owner's and admins'; a sequence's `USAGE` grant also answers
+  `SELECT`, and `INSERT` / `UPDATE` / `SELECT` on the table that owns a
+  SERIAL sequence answer for the sequence, as `nextval` and `currval`
+  check them; `EXECUTE` on functions and `USAGE` on types are
+  everyone's; `TEMPORARY` on a database follows `CONNECT`; PostgreSQL's
+  predefined roles (`pg_read_all_data`, `pg_write_all_data`) answer as
+  `read_all` and `write_all`, the other `pg_*` ones as roles only
+  admins hold. A user given as an OID no role has answers as `PUBLIC`.
+  Only the object argument may name a column (`has_table_privilege(c.oid,
+  'SELECT')` over `pg_class`); a column user or privilege argument is
+  refused (`0A000`).
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 - **How many tables.** The catalogs, `SHOW TABLES` and name
   resolution cost in proportion to the current database, not to the

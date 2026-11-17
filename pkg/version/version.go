@@ -386,6 +386,13 @@ const (
 	// every column behind a tag byte (rowenc.TaggedIndexKey) that a v21
 	// node would not write; the DDL that declares one is refused until
 	// finalize.
+	//
+	// V22 also introduces expression keys and partial indexes (issues
+	// #358, #359): the index descriptor fields exprs, expr_types and
+	// predicate, omitempty. A v21 node would maintain such an index as
+	// one over its plain columns — entries for rows the predicate
+	// excludes, none computed for an expression — so the DDL that
+	// declares one is refused until finalize.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.

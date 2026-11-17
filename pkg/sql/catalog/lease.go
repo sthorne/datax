@@ -332,9 +332,13 @@ func (a *Accessor) renewAll(ctx context.Context) error {
 // (nil when dropped).
 func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescriptor, error) {
 	dbID, bare := splitCacheKey(name)
-	desc, info, err := a.acquireLease(ctx, dbID, bare, name)
+	desc, info, done, err := a.acquireLease(ctx, dbID, bare, name)
+	defer done() // after the cache below holds the new entry
 	if err != nil {
 		return nil, err // keep the old (still-live) cache entry
+	}
+	if hook := testingAfterLeaseCommit.Load(); hook != nil {
+		(*hook)(a, name)
 	}
 	if desc == nil {
 		a.mu.Lock()
@@ -377,6 +381,20 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 // renewal loops of a running cluster read it while a test sets it.
 var testingBeforeLeaseWrite atomic.Pointer[func(a *Accessor, name string)]
 
+// testingAfterLeaseCommit, when set, runs in a renewal after the lease
+// transaction has committed and before the cache holds the new entry: a
+// test's way to hold a gateway in that window while a drain returns.
+var testingAfterLeaseCommit atomic.Pointer[func(a *Accessor, name string)]
+
+// SetTestingAfterLeaseCommit installs (or, with nil, removes) the hook.
+func SetTestingAfterLeaseCommit(f func(a *Accessor, name string)) {
+	if f == nil {
+		testingAfterLeaseCommit.Store(nil)
+		return
+	}
+	testingAfterLeaseCommit.Store(&f)
+}
+
 // SetTestingBeforeLeaseWrite installs (or, with nil, removes) the hook.
 func SetTestingBeforeLeaseWrite(f func(a *Accessor, name string)) {
 	if f == nil {
@@ -397,7 +415,21 @@ func SetTestingBeforeLeaseWrite(f func(a *Accessor, name string)) {
 // cache for a whole TTL. In one transaction the write cannot commit over
 // a descriptor that changed since the read: the transaction restarts and
 // reads the new version. A dropped table returns a nil descriptor.
-func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, info leaseInfo, err error) {
+//
+// The lease record is visible to a drain the moment the transaction
+// commits, before the caller installs the entry in the cache; a statement
+// handed the old cached entry in between would plan against a version
+// the drain already counts as given up. So just before committing,
+// acquireLease marks name as adopting d.Version, and until done is
+// called — by the caller, after installing — the cache does not hand out
+// an older entry for name (supersededLocked). done is never nil.
+func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, info leaseInfo, done func(), err error) {
+	marked := false
+	done = func() {
+		if marked {
+			a.unmarkAdopting(name)
+		}
+	}
 	err = a.db.RunTxn(ctx, "lease-acquire", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, info = nil, leaseInfo{}
 		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
@@ -431,9 +463,58 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 			return err
 		}
 		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior, handedOutExpiration: handedOut}
+		a.markAdopting(name, d.Version, !marked)
+		marked = true
 		return nil
 	})
-	return desc, info, err
+	return desc, info, done, err
+}
+
+// adoptMark counts the lease transactions on a key that are publishing
+// a version, and the newest such version.
+type adoptMark struct {
+	n       int
+	version uint64
+}
+
+// markAdopting records that a lease transaction on name is about to
+// commit version; first is true on the transaction's first attempt (a
+// retry raises the version but is the same transaction).
+func (a *Accessor) markAdopting(name string, version uint64, first bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.adopting == nil {
+		a.adopting = make(map[string]*adoptMark)
+	}
+	m := a.adopting[name]
+	if m == nil {
+		m = &adoptMark{}
+		a.adopting[name] = m
+	}
+	if first {
+		m.n++
+	}
+	if version > m.version {
+		m.version = version
+	}
+}
+
+func (a *Accessor) unmarkAdopting(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if m := a.adopting[name]; m != nil {
+		if m.n--; m.n <= 0 {
+			delete(a.adopting, name)
+		}
+	}
+}
+
+// supersededLocked reports whether a lease on a newer version of c's
+// table is being or has been published on this gateway and its entry is
+// not yet installed: c must not be handed out. Callers hold a.mu.
+func (a *Accessor) supersededLocked(key string, c *cachedDesc) bool {
+	m := a.adopting[key]
+	return m != nil && c.desc != nil && m.version > c.desc.Version
 }
 
 // carryOver is what the entry acquired at version inherits from the one

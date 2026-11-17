@@ -236,6 +236,13 @@ func (s *Session) checkTableOwnerNoTxn(ctx context.Context, name string) *Error 
 // tablePrivAllowed reports whether the actor may exercise priv on the
 // table or view.
 func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) (bool, error) {
+	return s.tablePrivAllowedSchema(ctx, txn, desc, priv, true)
+}
+
+// tablePrivAllowedSchema is tablePrivAllowed, consulting the schema's
+// USAGE only when schema is set: has_table_privilege and its kin answer
+// for the table's own grants, as PostgreSQL's do.
+func (s *Session) tablePrivAllowedSchema(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string, schema bool) (bool, error) {
 	if txn != nil && txn.Historical() && txn != s.freshTxn && desc.Virtual == "" && !s.system && s.actor() != catalog.RootRole {
 		// root holds every privilege now as then (the sealed tables'
 		// rule is fixed), and asks nothing of today's state: a bounded
@@ -316,8 +323,8 @@ func (s *Session) tablePrivAllowed(ctx context.Context, txn *kvclient.Txn, desc 
 		// longer covers it (issue #312).
 		allowed = true
 	}
-	if !allowed {
-		return false, nil
+	if !allowed || !schema {
+		return allowed, nil
 	}
 	// The schema: USAGE on public is everyone's unless revoked from PUBLIC.
 	usage, err := s.schemaUsageAllowed(ctx, txn, desc.DatabaseID, set)

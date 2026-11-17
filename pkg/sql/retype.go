@@ -164,10 +164,8 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: it draws from a sequence", col.Name)
 		}
 		for _, idx := range desc.Indexes {
-			for _, id := range idx.ColumnIDs {
-				if id == col.ID {
-					return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by index %q (drop it first)", col.Name, idx.Name)
-				}
+			if indexColumnUses(&idx, col) {
+				return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by index %q (drop it first)", col.Name, idx.Name)
 			}
 		}
 		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {

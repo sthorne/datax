@@ -471,6 +471,7 @@ func TestPostgresSettings(t *testing.T) {
 		{"escape_string_warning", "on", "on||bool|on|default|user", "off", "off", "off"},
 		{"array_nulls", "on", "on||bool|on|default|user", "off", "off", "off"},
 		{"quote_all_identifiers", "off", "off||bool|off|default|user", "on", "on", "on"},
+		{"synchronize_seqscans", "on", "on||bool|on|default|user", "off", "off", "off"},
 		{"session_replication_role", "origin", "origin||enum|origin|default|superuser", "replica", "replica", "replica"},
 	} {
 		if got := one("SHOW " + c.name); got != c.def {

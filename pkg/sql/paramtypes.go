@@ -323,9 +323,22 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 				pt.value(set.Value, col.Type, true)
 			}
 		}
+		if len(t.From) > 0 {
+			// The join of the target with the FROM list types the WHERE,
+			// the SET values' subqueries and RETURNING, as a select's.
+			var exprs []parser.SelectExpr
+			for _, set := range t.Set {
+				if !set.Value.IsDefault {
+					exprs = append(exprs, parser.SelectExpr{Expr: set.Value})
+				}
+			}
+			exprs = append(exprs, t.Returning...)
+			pt.selectStmt(dmlFromSelect(t.Table, t.Alias, t.From, t.Where, exprs, true), parent, false)
+			break
+		}
 		c := *t
 		c.With = nil
-		pt.walk(&c, tableScope(parent, desc, t.Table, ""))
+		pt.walk(&c, tableScope(parent, desc, t.Table, t.Alias))
 	case *parser.Delete:
 		restore := pt.with(t.With, parent)
 		defer restore()
@@ -337,9 +350,18 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 			pt.walk(t, parent)
 			break
 		}
+		if len(t.Using) > 0 {
+			exprs := t.Returning
+			if len(exprs) == 0 {
+				one := types.NewInt(1)
+				exprs = []parser.SelectExpr{{Expr: parser.Expr{Lit: &one}}}
+			}
+			pt.selectStmt(dmlFromSelect(t.Table, t.Alias, t.Using, t.Where, exprs, true), parent, false)
+			break
+		}
 		c := *t
 		c.With = nil
-		pt.walk(&c, tableScope(parent, desc, t.Table, ""))
+		pt.walk(&c, tableScope(parent, desc, t.Table, t.Alias))
 	case *parser.Explain:
 		return pt.statement(t.Stmt, parent, top)
 	case *parser.CreateTable:
@@ -656,6 +678,27 @@ func (pt *paramTyper) expr(e parser.Expr, sc *paramScope) {
 				}
 			}
 			pt.set(a.Param, fam, false)
+		}
+	}
+	// A parameter that is an operand of arithmetic with a number takes
+	// the number's type, as PostgreSQL resolves an unknown operand
+	// (ORDER BY abs(x - $1) inside an aggregate, SELECT price * $1).
+	if e.Right != nil && (e.BinOp == "+" || e.BinOp == "-" || e.BinOp == "*" || e.BinOp == "/") {
+		lhs := e
+		lhs.BinOp, lhs.Right, lhs.Cast = "", nil, ""
+		bareParam := func(x parser.Expr) bool {
+			return x.Param > 0 && x.BinOp == "" && x.Func == "" && x.Cast == "" && len(x.Path) == 0 && x.Left == nil
+		}
+		numeric := func(f types.Family) bool { return f == types.Int || f == types.Float || f == types.Decimal }
+		if bareParam(*e.Right) {
+			if f := exprFamily(lhs, sc.column); numeric(f) {
+				pt.set(e.Right.Param, f, false)
+			}
+		}
+		if bareParam(lhs) {
+			if f := exprFamily(*e.Right, sc.column); numeric(f) {
+				pt.set(lhs.Param, f, false)
+			}
 		}
 	}
 	// A parameter that is an operand of a vector distance is a vector

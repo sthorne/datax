@@ -1801,7 +1801,7 @@ RETURNING id
 ```
 
 (or `WHERE id IN (...)`, or the same through `WITH c AS (...) ... WHERE
-id IN (SELECT id FROM c)`; `UPDATE ... FROM` is not supported). The
+id IN (SELECT id FROM c)`). The
 subquery's result is spliced into the outer WHERE, which then reads by
 primary-key point lookups — or not at all when every candidate was
 locked — so the write neither waits for nor touches the rows the

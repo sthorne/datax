@@ -19,6 +19,40 @@ import (
 // whose query names none: a node-local unique id, spread across ranges.
 const rowidColumn = "rowid"
 
+// withRowidKey returns t with the hidden generated primary key added
+// when t declares none (issue #354): a table without a PRIMARY KEY — a
+// join table, CREATE TABLE AS, an imported schema — is keyed by a
+// hidden, NOT NULL INT8 column defaulting to unique_rowid(), so its
+// rows may repeat as in PostgreSQL. The column is named rowid, or
+// rowid_1, rowid_2, ... when the table has a column of that name
+// (CockroachDB's rule). t itself is never modified: it may be a cached
+// statement executed again.
+func withRowidKey(t *parser.CreateTable) (*parser.CreateTable, error) {
+	if len(t.PrimaryKey) > 0 {
+		return t, nil
+	}
+	taken := map[string]bool{}
+	for _, cd := range t.Columns {
+		if cd.PrimaryKey {
+			return t, nil
+		}
+		taken[cd.Name] = true
+	}
+	name := rowidColumn
+	for i := 1; taken[name]; i++ {
+		name = fmt.Sprintf("%s_%d", rowidColumn, i)
+	}
+	e, err := parser.ParseExpr("unique_rowid()")
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	out := *t
+	out.Columns = append(append(make([]parser.ColumnDef, 0, len(t.Columns)+1), t.Columns...),
+		parser.ColumnDef{Name: name, Type: types.Int, NotNull: true, DefaultExpr: &e, Hidden: true})
+	out.PrimaryKey = []string{name}
+	return &out, nil
+}
+
 // execCreateTableAs runs CREATE TABLE ... AS query outside any explicit
 // transaction: the table is created (and its lease drained) first, then
 // the query runs once, at one timestamp, and its rows stream into the
@@ -77,17 +111,6 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 			cd.Precision, cd.Scale = rc.Typmod>>16, rc.Typmod&0xffff-4
 		}
 		ct.Columns = append(ct.Columns, cd)
-	}
-	if len(ct.PrimaryKey) == 0 {
-		if seen[rowidColumn] {
-			return nil, newErrf(CodeDuplicateObject, "column %q is reserved for the generated primary key; give the table a PRIMARY KEY (cols) clause", rowidColumn)
-		}
-		e, perr := parser.ParseExpr("unique_rowid()")
-		if perr != nil {
-			return nil, ToSQLError(perr)
-		}
-		ct.Columns = append(ct.Columns, parser.ColumnDef{Name: rowidColumn, Type: types.Int, NotNull: true, DefaultExpr: &e, Hidden: true})
-		ct.PrimaryKey = []string{rowidColumn}
 	}
 	// Step 1: the table.
 	var created bool
@@ -175,6 +198,14 @@ type likeIndex struct {
 	// opClasses and collations copy the declared operator classes and
 	// collations (parallel to cols; nil = none).
 	opClasses, collations []string
+	// exprs, exprTypes, predicate and directions copy expression keys
+	// (whose cols entry is ""), a partial index's predicate and the
+	// declared orders. The texts name columns, which the copy has by
+	// the same names.
+	exprs      []string
+	exprTypes  []types.Family
+	predicate  string
+	directions []string
 }
 
 // expandLike replaces each LIKE clause of a CREATE TABLE with the source
@@ -277,11 +308,17 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 						continue
 					}
 					var names []string
-					for _, id := range idx.ColumnIDs {
+					for i, id := range idx.ColumnIDs {
+						if idx.IsExprKey(i) {
+							names = append(names, "")
+							continue
+						}
 						names = append(names, byID[id])
 					}
 					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted, nullsNotDistinct: idx.NullsNotDistinct,
-						opClasses: idx.OpClasses, collations: idx.Collations})
+						opClasses: idx.OpClasses, collations: idx.Collations,
+						exprs: append([]string(nil), idx.Exprs...), exprTypes: append([]types.Family(nil), idx.ExprTypes...), predicate: idx.Predicate,
+						directions: append([]string(nil), idx.Directions...)})
 				}
 			}
 		}
@@ -299,8 +336,15 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 		if _, exists := desc.Index(li.name); exists {
 			continue
 		}
+		if (li.predicate != "" || len(li.exprs) > 0) && desc.Sealed() {
+			return newErrf(CodeFeatureNotSupported, "table %q is sealed: index %q, on an expression or with a WHERE clause, cannot be copied to it (it would keep what it computes from sealed columns in plaintext)", desc.Name, li.name)
+		}
 		var ids []catalog.ColumnID
-		for _, name := range li.cols {
+		for i, name := range li.cols {
+			if i < len(li.exprs) && li.exprs[i] != "" {
+				ids = append(ids, 0)
+				continue
+			}
 			col, ok := desc.Col(name)
 			if !ok {
 				return newErrf(CodeUndefinedColumn, "LIKE: column %q does not exist", name)
@@ -311,7 +355,8 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 			desc.NextIndexID = 2
 		}
 		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted, NullsNotDistinct: li.nullsNotDistinct,
-			OpClasses: li.opClasses, Collations: li.collations})
+			OpClasses: li.opClasses, Collations: li.collations,
+			Exprs: li.exprs, ExprTypes: li.exprTypes, Predicate: li.predicate, Directions: li.directions})
 		desc.NextIndexID++
 	}
 	return nil

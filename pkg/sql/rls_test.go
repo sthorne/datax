@@ -65,6 +65,7 @@ func TestValidatePolicyExpr(t *testing.T) {
 		`id IN (1, 2, 3)`,
 		`owner IS NOT NULL`,
 		`tenant = current_database()`,
+		`owner = current_role OR owner = user OR tenant = current_catalog`,
 	} {
 		if err := validatePolicyExpr(desc, "USING", ok); err != nil {
 			t.Errorf("%s: %v", ok, err)

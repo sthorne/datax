@@ -121,6 +121,14 @@ func (s *Session) checkSealable(ctx context.Context, desc *catalog.TableDescript
 	if catalog.IsSystemTableID(desc.ID) || desc.Virtual != "" {
 		return false, newErrf(CodeInsufficientPriv, "the cluster's own tables cannot be sealed")
 	}
+	for i := range desc.Indexes {
+		if desc.Indexes[i].Computed() {
+			// Its entries hold values computed from columns sealing
+			// would cover, or say which rows a condition on them holds
+			// for, in plaintext.
+			return false, newErrf(CodeFeatureNotSupported, "table %q cannot be sealed: index %q is on an expression or has a WHERE clause, and would keep what it computes from sealed columns in plaintext (drop it first)", desc.Name, desc.Indexes[i].Name)
+		}
+	}
 	if s.db.ClusterVersion() < version.V22 {
 		return false, newErrf(CodeFeatureNotSupported, "%s need cluster version %s: finalize the upgrade with `datax debug upgrade` first", what, version.V22)
 	}

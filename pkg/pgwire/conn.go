@@ -359,6 +359,12 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 			}
 			c.backend.Send(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000", Message: msg})
 		}
+		for _, msg := range res.Warnings {
+			if !c.session.SendsWarnings() {
+				break // client_min_messages = error
+			}
+			c.backend.Send(&pgproto3.NoticeResponse{Severity: "WARNING", SeverityUnlocalized: "WARNING", Code: "01000", Message: msg})
+		}
 	}
 	if serr == nil && emit != nil && res != nil {
 		rows, serr = emit(ctx, res)
@@ -400,6 +406,9 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 		session.SetNotify(opts.Notify, c.listener)
 	}
 	session.SetKeyService(opts.KeyService)
+	if opts.Advisory != nil {
+		session.SetAdvisory(opts.Advisory.NewHolder(c.advisoryLost))
+	}
 	session.SetTransport(false, isLoopbackAddr(nc.RemoteAddr()))
 	return c
 }

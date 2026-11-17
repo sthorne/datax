@@ -131,6 +131,7 @@ var pgVarList = []pgVar{
 	boolVar("escape_string_warning", "on"),
 	boolVar("array_nulls", "on"),
 	boolVar("quote_all_identifiers", "off"),
+	boolVar("synchronize_seqscans", "on"), // pg_dump sets it off
 	{name: "default_with_oids", vartype: "bool", boot: "off", context: "user", noShowAll: true, check: func(name, value string) *Error {
 		if value == "on" {
 			return newErrf(CodeFeatureNotSupported, "tables declared WITH OIDS are not supported")
@@ -437,6 +438,10 @@ func (s *Session) SendsNotices() bool {
 	}
 	return true
 }
+
+// SendsWarnings reports whether client_min_messages lets a WARNING
+// reach the client (it does unless the level is error).
+func (s *Session) SendsWarnings() bool { return s.pgVarString("client_min_messages") != "error" }
 
 // rowSecurityOff refuses a query that a table's policies would filter
 // while row_security is off, as PostgreSQL does (pg_dump sets it so a

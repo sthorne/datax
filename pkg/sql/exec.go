@@ -204,6 +204,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
+	if t, err = withRowidKey(t); err != nil {
+		return nil, err
+	}
 	dbName, bare := catalog.SplitTableName(t.Name)
 	if dbName == "" {
 		dbName = s.database
@@ -285,9 +288,6 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		pkNames = colPK
 	} else if len(colPK) > 0 {
 		return nil, newErrf(CodeSyntaxError, "multiple primary key definitions")
-	}
-	if len(pkNames) == 0 {
-		return nil, newErrf(CodeFeatureNotSupported, "table %q must declare a PRIMARY KEY", t.Name)
 	}
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
@@ -482,6 +482,10 @@ func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string,
 	// The timestamp must close the (logical) primary key so each series'
 	// rows are stored in time order and retention trims a key suffix.
 	last, ok := desc.Col(pkNames[len(pkNames)-1])
+	if ok && last.Hidden {
+		// The generated rowid of a table that declares no key (#354).
+		return newErrf(CodeFeatureNotSupported, "a timeseries table must declare a PRIMARY KEY ending in its TIMESTAMPTZ column")
+	}
 	if !ok || last.Type != types.Timestamp {
 		return newErrf(CodeFeatureNotSupported, "a timeseries table's last primary key column must be TIMESTAMPTZ")
 	}
@@ -1270,7 +1274,10 @@ func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []c
 		return plan, nil
 	}
 	for i := range desc.Indexes {
-		if desc.Indexes[i].Unique && same(desc.Indexes[i].ColumnIDs) {
+		// A partial unique index is inferred only from a conflict
+		// target that repeats its predicate, which ON CONFLICT here
+		// cannot write: as in PostgreSQL, such a target matches none.
+		if desc.Indexes[i].Unique && !desc.Indexes[i].Computed() && same(desc.Indexes[i].ColumnIDs) {
 			plan.index = &desc.Indexes[i]
 			return plan, nil
 		}
@@ -1328,7 +1335,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			}
 			ekey, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
 			if err != nil {
-				return false, nil, newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+				return false, nil, invertedEntryErr(idx, err)
 			}
 			if skip {
 				continue
@@ -1758,8 +1765,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		var fam types.Family
 		if plan.hasBounds() {
-			col, _ := desc.ColByID(plan.idx.ColumnIDs[len(plan.idxVals)])
-			fam = col.Type
+			fam, _ = plan.idx.KeyFamily(desc, len(plan.idxVals))
 		}
 		start, end, err := plan.spanBounds(prefix, fam)
 		if err != nil {
@@ -2459,8 +2465,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
-		return nil, err
+	if t.DMLTarget == "" || t.Alias != t.DMLTarget {
+		// (An UPDATE's or DELETE's target heading its join with the
+		// FROM list needs that statement's privilege only.)
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return nil, err
+		}
 	}
 	if len(t.Joins) > 0 {
 		return s.execJoinSelect(ctx, txn, desc, t, params, jc)
@@ -2700,6 +2710,12 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		c.With = nil
 		t = &c
 	}
+	if len(t.From) > 0 {
+		return s.execUpdateFrom(ctx, txn, t, params)
+	}
+	if t.Alias != "" {
+		t = stripUpdateAlias(t)
+	}
 	corr, t2, err := s.splitCorrelatedUpdate(ctx, txn, t)
 	if err != nil {
 		return nil, err
@@ -2719,18 +2735,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
 		return nil, err
 	}
-	pkSet := false // the statement sets a primary-key column: rows may move
-	for _, set := range t.Set {
-		col, ok := desc.Col(set.Column)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", set.Column)
-		}
-		if desc.IsPKCol(col.ID) {
-			if col.Hidden {
-				return nil, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", set.Column)
-			}
-			pkSet = true
-		}
+	pkSet, err := updateSetsPK(desc, t.Set)
+	if err != nil {
+		return nil, err
 	}
 
 	var planKeyStmt parser.Statement
@@ -2776,7 +2783,70 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
-	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, reads)
+	u := updateApply{
+		desc: desc, set: t.Set, rows: rows, pkSet: pkSet, reads: reads,
+		eval: func(i, j int) (types.Datum, error) {
+			value := t.Set[j].Value
+			if exprIsVolatile(value) {
+				var err error
+				if value, err = s.spliceVolatile(ctx, txn, value, params); err != nil {
+					return types.Datum{}, err
+				}
+			}
+			return evalExpr(value, desc, rows[i].row, params)
+		},
+	}
+	if ret != nil {
+		u.retCols = ret.columns()
+		u.ret = func(_ int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error) {
+			return ret.project(desc, row, params)
+		}
+	}
+	return s.applyUpdate(ctx, txn, &u, params)
+}
+
+// updateSetsPK checks an UPDATE's SET columns against the target and
+// reports whether one is a primary-key column (rows may move).
+func updateSetsPK(desc *catalog.TableDescriptor, set []parser.SetClause) (bool, error) {
+	pkSet := false
+	for _, sc := range set {
+		col, ok := desc.Col(sc.Column)
+		if !ok {
+			return false, newErrf(CodeUndefinedColumn, "column %q of relation %q does not exist", sc.Column, desc.Name)
+		}
+		if desc.IsPKCol(col.ID) {
+			if col.Hidden {
+				return false, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", sc.Column)
+			}
+			pkSet = true
+		}
+	}
+	return pkSet, nil
+}
+
+// updateApply is an UPDATE's target rows and how to compute what it
+// writes: eval gives SET clause j's value for row i (DEFAULT is handled
+// by applyUpdate), ret the RETURNING row for row i once updated.
+type updateApply struct {
+	desc  *catalog.TableDescriptor
+	set   []parser.SetClause
+	rows  []fetchedRow
+	pkSet bool
+	// reads: the statement read the table to find or compute its rows
+	// (the new rows must then pass the SELECT policies too).
+	reads   bool
+	eval    func(i, j int) (types.Datum, error)
+	ret     func(i int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error)
+	retCols []ResultColumn
+}
+
+// applyUpdate writes an UPDATE's new rows: SET values, NOT NULL and type
+// modifiers, moved primary keys, row security's WITH CHECK, unique keys
+// and foreign keys checked for the statement as a whole, then the
+// writes and RETURNING.
+func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateApply, params []types.Datum) (*Result, error) {
+	desc, rows, pkSet := u.desc, u.rows, u.pkSet
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, u.reads)
 	if err != nil {
 		return nil, err
 	}
@@ -2797,7 +2867,11 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	for i, fr := range rows {
 		oldRow := copyRow(fr.row)
 		oldRows[i] = oldRow
-		for _, set := range t.Set {
+		// Every SET is evaluated against the row as it was, and the
+		// values are written after, so SET a = b, b = a swaps as in
+		// PostgreSQL.
+		pending := make([]types.Datum, len(u.set))
+		for j, set := range u.set {
 			col, _ := desc.Col(set.Column)
 			var d types.Datum
 			switch {
@@ -2806,13 +2880,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 					return nil, err
 				}
 			default:
-				value := set.Value
-				if exprIsVolatile(value) {
-					if value, err = s.spliceVolatile(ctx, txn, value, params); err != nil {
-						return nil, err
-					}
-				}
-				if d, err = evalExpr(value, desc, fr.row, params); err != nil {
+				if d, err = u.eval(i, j); err != nil {
 					return nil, err
 				}
 			}
@@ -2827,7 +2895,11 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 			if cerr2 != nil {
 				return nil, cerr2
 			}
-			fr.row[col.ID] = d
+			pending[j] = d
+		}
+		for j, set := range u.set {
+			col, _ := desc.Col(set.Column)
+			fr.row[col.ID] = pending[j]
 		}
 	}
 	// The rows' keys after the update: a row whose primary key changes
@@ -2909,8 +2981,8 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 				return nil, err
 			}
 		}
-		if ret != nil {
-			out, err := ret.project(desc, fr.row, params)
+		if u.ret != nil {
+			out, err := u.ret(i, fr.row)
 			if err != nil {
 				return nil, err
 			}
@@ -2924,8 +2996,8 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
-	if ret != nil {
-		res.Columns = ret.columns()
+	if u.ret != nil {
+		res.Columns = u.retCols
 	}
 	res.Tag = fmt.Sprintf("UPDATE %d", len(rows))
 	return res, nil
@@ -2942,6 +3014,12 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		c := *t
 		c.With = nil
 		t = &c
+	}
+	if len(t.Using) > 0 {
+		return s.execDeleteUsing(ctx, txn, t, params)
+	}
+	if t.Alias != "" {
+		t = stripDeleteAlias(t)
 	}
 	corr, t2, err := s.splitCorrelatedDelete(ctx, txn, t)
 	if err != nil {
@@ -3002,13 +3080,28 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
+	var project func(int, map[catalog.ColumnID]types.Datum) ([]types.Datum, error)
+	var retCols []ResultColumn
+	if ret != nil {
+		retCols = ret.columns()
+		project = func(_ int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error) {
+			return ret.project(desc, row, params)
+		}
+	}
+	return s.applyDelete(ctx, txn, desc, rows, project, retCols)
+}
+
+// applyDelete deletes rows of desc — their foreign-key actions, index
+// entries and a re-shard's shadow copies with them — and projects
+// RETURNING (ret, nil without one) from each deleted row.
+func (s *Session) applyDelete(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, rows []fetchedRow, ret func(int, map[catalog.ColumnID]types.Datum) ([]types.Datum, error), retCols []ResultColumn) (*Result, error) {
 	guard, err := s.guard(ctx, txn, desc)
 	if err != nil {
 		return nil, err
 	}
 	res := &Result{}
 	var wb kvclient.WriteBatch
-	for _, fr := range rows {
+	for i, fr := range rows {
 		if err := guard.checkDelete(ctx, txn, fr.row, &wb); err != nil {
 			return nil, err
 		}
@@ -3024,7 +3117,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 			return nil, err
 		}
 		if ret != nil {
-			out, err := ret.project(desc, fr.row, params)
+			out, err := ret(i, fr.row)
 			if err != nil {
 				return nil, err
 			}
@@ -3035,7 +3128,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		return nil, err
 	}
 	if ret != nil {
-		res.Columns = ret.columns()
+		res.Columns = retCols
 	}
 	res.Tag = fmt.Sprintf("DELETE %d", len(rows))
 	return res, nil
@@ -3199,13 +3292,30 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		if uses := policyColumnUses(desc, col.Name); len(uses) > 0 {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by policy %s (drop the policy first)", t.DropCol, strings.Join(uses, ", "))
 		}
+		// The indexes that read the column — as a key, in an
+		// expression key or in a predicate — are dropped with it, as in
+		// PostgreSQL. (One a constraint owns was refused above.)
+		var keptIndexes []catalog.IndexDescriptor
+		var wipes []indexWipe
 		for _, idx := range desc.Indexes {
-			for _, id := range idx.ColumnIDs {
-				if id == col.ID {
-					return nil, newErrf(CodeFeatureNotSupported, "cannot drop column %q: used by index %q", t.DropCol, idx.Name)
-				}
+			if !indexColumnUses(&idx, col) {
+				keptIndexes = append(keptIndexes, idx)
+				continue
 			}
+			if !idx.Public() {
+				return nil, newErrf(CodeObjectInUse, "cannot drop column %q: index %q, which uses it, is still being built", t.DropCol, idx.Name)
+			}
+			if desc.Reshard != nil {
+				return nil, newErrf(CodeObjectInUse, "cannot drop column %q of table %q while a re-shard is in progress: index %q uses it", t.DropCol, desc.Name, idx.Name)
+			}
+			w := indexWipe{tableID: desc.ID, indexID: idx.ID}
+			if idx.IsVector() {
+				w.vectorBuild = idx.Vector.Build
+			}
+			wipes = append(wipes, w)
 		}
+		desc.Indexes = keptIndexes
+		s.pendingWipes = append(s.pendingWipes, wipes...)
 		kept := desc.Columns[:0]
 		for _, c := range desc.Columns {
 			if c.ID != col.ID {
@@ -3665,10 +3775,8 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 				in = append(in, desc.Name+"_pkey")
 			}
 			for _, idx := range desc.Indexes {
-				for _, id := range idx.ColumnIDs {
-					if id == c.ID {
-						in = append(in, idx.Name)
-					}
+				if indexColumnUses(&idx, *c) {
+					in = append(in, idx.Name)
 				}
 			}
 			res.Rows = append(res.Rows, []types.Datum{str(c.Name), str(vtable.FormatType(c)), types.NewBool(!c.NotNull && !desc.IsPKCol(c.ID)), def, str("{" + strings.Join(in, ",") + "}")})
@@ -3690,7 +3798,9 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		}
 		for _, idx := range desc.Indexes {
 			for j, id := range idx.ColumnIDs {
-				if c, ok := desc.ColByID(id); ok {
+				if idx.IsExprKey(j) {
+					res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(idx.Name), types.NewBool(!idx.Unique), types.NewInt(int64(j + 1)), str(idx.Exprs[j])})
+				} else if c, ok := desc.ColByID(id); ok {
 					res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(idx.Name), types.NewBool(!idx.Unique), types.NewInt(int64(j + 1)), str(c.Name)})
 				}
 			}

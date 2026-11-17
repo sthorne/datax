@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // What an ordinary index's key columns may declare (issue #348), the
@@ -33,15 +35,21 @@ var textOpClasses = map[string]bool{
 // an ordinary (btree) index and returns what the descriptor records:
 // the class's name when pg_get_indexdef shows it, "" otherwise.
 func ordinaryOpClass(opclass string, col *catalog.Column) (string, error) {
+	return keyOpClass(opclass, col.Type, fmt.Sprintf("column %q", col.Name))
+}
+
+// keyOpClass is ordinaryOpClass for a key of family fam, named by what
+// in errors (a column, or an expression).
+func keyOpClass(opclass string, fam types.Family, what string) (string, error) {
 	if opclass == "" {
 		return "", nil
 	}
 	shown, ok := textOpClasses[opclass]
 	if !ok {
-		return "", newErrf(CodeFeatureNotSupported, "operator class %q is not supported for column %q of an ordinary index (an ordinary index compares bytewise; text_pattern_ops, varchar_pattern_ops and bpchar_pattern_ops are accepted on string columns)", opclass, col.Name)
+		return "", newErrf(CodeFeatureNotSupported, "operator class %q is not supported for %s of an ordinary index (an ordinary index compares bytewise; text_pattern_ops, varchar_pattern_ops and bpchar_pattern_ops are accepted on string keys)", opclass, what)
 	}
-	if col.Type != types.String {
-		return "", newErrf(CodeDatatypeMismatch, "operator class %q does not accept data type %s", opclass, col.Type)
+	if fam != types.String {
+		return "", newErrf(CodeDatatypeMismatch, "operator class %q does not accept data type %s", opclass, fam)
 	}
 	if !shown {
 		return "", nil
@@ -49,18 +57,18 @@ func ordinaryOpClass(opclass string, col *catalog.Column) (string, error) {
 	return opclass, nil
 }
 
-// indexCollation checks a COLLATE written after an index column and
+// indexCollation checks a COLLATE written after an index key and
 // returns what the descriptor records: "C" or "POSIX", or "" for the
 // default. An index compares bytewise, which is what C and POSIX ask
 // for; the default collation is the same order in datax (see
 // docs/user/postgres-differences.md). Any other collation would order
 // differently, so it is refused rather than ignored.
-func indexCollation(collation string, col *catalog.Column) (string, error) {
+func indexCollation(collation string, fam types.Family) (string, error) {
 	if collation == "" {
 		return "", nil
 	}
-	if col.Type != types.String {
-		return "", newErrf(CodeDatatypeMismatch, "collations are not supported by type %s", col.Type)
+	if fam != types.String {
+		return "", newErrf(CodeDatatypeMismatch, "collations are not supported by type %s", fam)
 	}
 	switch strings.ToLower(collation) {
 	case "default":
@@ -73,53 +81,140 @@ func indexCollation(collation string, col *catalog.Column) (string, error) {
 	return "", newErrf(CodeFeatureNotSupported, "collation %q is not supported in an index: datax compares strings bytewise, as the \"C\" collation does (COLLATE \"C\", \"POSIX\" and \"default\" are accepted)", collation)
 }
 
-// newIndexDescriptor validates CREATE INDEX's key columns against desc
-// and appends the index to it in the given state, allocating its ID.
-// kind is the inverted kind (nil for an ordinary or vector index).
+// isExprKey reports whether key i of CREATE INDEX is an expression.
+func isExprKey(t *parser.CreateIndex, i int) bool {
+	return i < len(t.Exprs) && t.Exprs[i] != nil
+}
+
+// hasExprKeys reports whether any key of CREATE INDEX is an expression
+// (other than the text-search one, ExprFunc).
+func hasExprKeys(t *parser.CreateIndex) bool {
+	for i := range t.Exprs {
+		if t.Exprs[i] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// checkIndexForm refuses what only an ordinary (btree) index takes —
+// expression keys, ASC/DESC and NULLS FIRST/LAST — on another access
+// method, and a predicate on a vector index, before anything else looks
+// at the keys.
+func checkIndexForm(t *parser.CreateIndex) error {
+	method := t.Using
+	if method == "" || method == "btree" {
+		return nil
+	}
+	if hasExprKeys(t) {
+		return newErrf(CodeFeatureNotSupported, "access method %q does not support expression keys (an expression is indexed USING btree; USING GIN takes to_tsvector('config', column))", method)
+	}
+	for _, d := range t.Directions {
+		if d != "" {
+			return newErrf(CodeFeatureNotSupported, "access method %q does not support ASC/DESC options", method)
+		}
+	}
+	if t.Where != "" && (method == "ivfflat" || method == "hnsw") {
+		return newErrf(CodeFeatureNotSupported, "access method %q does not support a WHERE clause (partial index)", method)
+	}
+	return nil
+}
+
+// newIndexDescriptor validates CREATE INDEX's keys against desc and
+// appends the index to it in the given state, allocating its ID. kind
+// is the inverted kind (nil for an ordinary or vector index).
 func (s *Session) newIndexDescriptor(t *parser.CreateIndex, desc *catalog.TableDescriptor, kind inverted.Kind, vector bool, state string) (*catalog.IndexDescriptor, error) {
+	if err := checkIndexForm(t); err != nil {
+		return nil, err
+	}
 	var colIDs []catalog.ColumnID
-	var opclasses, collations []string
-	declared := false
+	var opclasses, collations, exprs, directions []string
+	var exprTypes []types.Family
+	declared, computed, directed := false, false, false
 	seenCol := map[catalog.ColumnID]bool{}
 	for i, name := range t.Columns {
-		col, ok := desc.Col(name)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
-		}
-		if kind == nil && !vector && !types.IsIndexable(col.Type) {
-			if col.Type == types.Vector {
-				return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it for nearest-neighbour search with USING ivfflat", name, col.Type)
+		var fam types.Family
+		var what string
+		if isExprKey(t, i) {
+			if kind != nil || vector {
+				return nil, newErrf(CodeFeatureNotSupported, "only an ordinary (btree) index takes an expression key")
 			}
-			if col.Type == types.Jsonb || col.Type == types.Tsvector {
-				return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
+			text, f, err := indexKeyExpr(desc, *t.Exprs[i])
+			if err != nil {
+				return nil, err
 			}
-			return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
+			colIDs = append(colIDs, 0)
+			exprs = append(exprs, text)
+			exprTypes = append(exprTypes, f)
+			fam, what, computed = f, "expression "+text, true
+		} else {
+			col, ok := desc.Col(name)
+			if !ok {
+				return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+			}
+			if kind == nil && !vector && !types.IsIndexable(col.Type) {
+				if col.Type == types.Vector {
+					return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it for nearest-neighbour search with USING ivfflat", name, col.Type)
+				}
+				if col.Type == types.Jsonb || col.Type == types.Tsvector {
+					return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
+				}
+				return nil, newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
+			}
+			if kind != nil && col.Type != kind.Family() {
+				return nil, newErrf(CodeFeatureNotSupported, "operator class %q does not index column %q of type %s", kind.Name(), name, col.Type)
+			}
+			if seenCol[col.ID] {
+				return nil, newErrf(CodeSyntaxError, "duplicate column %q in index", name)
+			}
+			seenCol[col.ID] = true
+			colIDs = append(colIDs, col.ID)
+			exprs = append(exprs, "")
+			exprTypes = append(exprTypes, 0)
+			fam, what = col.Type, fmt.Sprintf("column %q", col.Name)
 		}
-		if kind != nil && col.Type != kind.Family() {
-			return nil, newErrf(CodeFeatureNotSupported, "operator class %q does not index column %q of type %s", kind.Name(), name, col.Type)
-		}
-		if seenCol[col.ID] {
-			return nil, newErrf(CodeSyntaxError, "duplicate column %q in index", name)
-		}
-		seenCol[col.ID] = true
-		colIDs = append(colIDs, col.ID)
 		collation := ""
 		if i < len(t.Collations) {
 			var err error
-			if collation, err = indexCollation(t.Collations[i], &col); err != nil {
+			if collation, err = indexCollation(t.Collations[i], fam); err != nil {
 				return nil, err
 			}
 		}
 		opclass := ""
 		if kind == nil && !vector && i < len(t.OpClasses) {
 			var err error
-			if opclass, err = ordinaryOpClass(t.OpClasses[i], &col); err != nil {
+			if opclass, err = keyOpClass(t.OpClasses[i], fam, what); err != nil {
 				return nil, err
 			}
 		}
+		direction := ""
+		if i < len(t.Directions) {
+			direction = t.Directions[i]
+		}
 		collations = append(collations, collation)
 		opclasses = append(opclasses, opclass)
+		directions = append(directions, direction)
 		declared = declared || collation != "" || opclass != ""
+		directed = directed || direction != ""
+	}
+	if t.Where != "" {
+		if vector {
+			return nil, newErrf(CodeFeatureNotSupported, "access method %q does not support a WHERE clause (partial index)", t.Using)
+		}
+		if err := checkIndexPredicate(desc, t.Where); err != nil {
+			return nil, err
+		}
+	}
+	if computed || t.Where != "" {
+		if s.db.ClusterVersion() < version.V22 {
+			return nil, newErrf(CodeFeatureNotSupported, "expression and partial indexes need cluster version %s (finalize the upgrade first)", version.V22)
+		}
+		if desc.Sealed() {
+			// The entries would hold values computed from sealed
+			// columns, or say which rows a condition on them holds for,
+			// in plaintext.
+			return nil, newErrf(CodeFeatureNotSupported, "table %q is sealed: an index on an expression, or with a WHERE clause, would keep what it computes from sealed columns in plaintext (index the columns themselves)", desc.Name)
+		}
 	}
 	if desc.NextIndexID < rowenc.PrimaryIndexID+1 {
 		desc.NextIndexID = rowenc.PrimaryIndexID + 1
@@ -131,9 +226,16 @@ func (s *Session) newIndexDescriptor(t *parser.CreateIndex, desc *catalog.TableD
 		// on another it is accepted and has no effect, as in
 		// PostgreSQL.
 		NullsNotDistinct: t.Unique && t.NullsNotDistinct,
+		Predicate:        t.Where,
 	}
 	if declared {
 		idx.OpClasses, idx.Collations = opclasses, collations
+	}
+	if computed {
+		idx.Exprs, idx.ExprTypes = exprs, exprTypes
+	}
+	if directed {
+		idx.Directions = directions
 	}
 	if idx.NullsNotDistinct {
 		if err := s.requireNullsNotDistinct(); err != nil {
@@ -152,9 +254,14 @@ func (s *Session) newIndexDescriptor(t *parser.CreateIndex, desc *catalog.TableD
 // PostgreSQL's ChooseRelationName does: <table>_<columns>_idx, cut to
 // 63 bytes, with a number after "idx" when the name is taken.
 func chooseIndexName(desc *catalog.TableDescriptor, t *parser.CreateIndex) string {
-	parts := t.Columns
+	parts := append([]string(nil), t.Columns...)
 	if t.ExprFunc != "" {
 		parts = []string{t.ExprFunc}
+	}
+	for i := range parts {
+		if isExprKey(t, i) {
+			parts[i] = exprKeyName(*t.Exprs[i])
+		}
 	}
 	addition := strings.Join(parts, "_")
 	taken := func(name string) bool {
@@ -176,6 +283,19 @@ func chooseIndexName(desc *catalog.TableDescriptor, t *parser.CreateIndex) strin
 			return name
 		}
 	}
+}
+
+// exprKeyName is the name PostgreSQL's FigureColname gives an index's
+// expression key: a function's name, a cast column's name, otherwise
+// "expr".
+func exprKeyName(e parser.Expr) string {
+	switch {
+	case e.Func != "" && e.BinOp == "" && e.Left == nil:
+		return e.Func
+	case e.Column != "" && e.BinOp == "" && len(e.Path) == 0:
+		return e.Column
+	}
+	return "expr"
 }
 
 // makeObjectName is PostgreSQL's: name1_name2_label within 63 bytes,
@@ -235,6 +355,9 @@ func (s *Session) createdInBlock(txn *kvclient.Txn, id uint64) bool {
 func (s *Session) execCreateIndexInTxn(ctx context.Context, txn *kvclient.Txn, t *parser.CreateIndex) (*Result, error) {
 	if t.Concurrently {
 		return nil, newErrf(CodeActiveTransaction, "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")
+	}
+	if err := checkIndexForm(t); err != nil {
+		return nil, err
 	}
 	shared, err := s.lookup(ctx, txn, t.Table)
 	if err != nil {

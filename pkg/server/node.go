@@ -241,6 +241,11 @@ type Config struct {
 	// client may leave an upload idle (0 = default 10m).
 	LargeObjectSweepInterval time.Duration
 	LargeObjectUploadGrace   time.Duration
+	// AdvisoryLockTTL is how long the node's advisory-lock lease lasts
+	// unrenewed (pkg/sql/advisory; 0 = advisory.DefaultTTL, 10s): with
+	// the maximum clock offset, how long the advisory locks of a node
+	// that died stay held.
+	AdvisoryLockTTL time.Duration
 	// ReshardRetireFor is how long a completed re-shard's superseded
 	// layout stays on disk serving AS OF SYSTEM TIME below the swap
 	// before the janitor reclaims it (0 = the GC TTL, matching the

@@ -587,6 +587,12 @@ func (f *fingerprinter) update(s *Update) {
 	f.kw(strings.ToLower(s.Table))
 	f.kw("SET")
 	f.setClauses(s.Set)
+	if len(s.From) > 0 {
+		f.kw("FROM")
+		for _, j := range s.From {
+			f.join(j)
+		}
+	}
 	f.where(s.Where)
 	f.returning(s.Returning)
 }
@@ -595,6 +601,12 @@ func (f *fingerprinter) delete(s *Delete) {
 	f.table(s.Table)
 	f.kw("DELETE FROM")
 	f.kw(strings.ToLower(s.Table))
+	if len(s.Using) > 0 {
+		f.kw("USING")
+		for _, j := range s.Using {
+			f.join(j)
+		}
+	}
 	f.where(s.Where)
 	f.returning(s.Returning)
 }

@@ -639,9 +639,14 @@ func TestVectorTypeOverPgx(t *testing.T) {
 	if err := conn.QueryRow(ctx, `SHOW ivfflat.probes`).Scan(&probes); err != nil || probes != "auto" {
 		t.Fatalf("RESET ivfflat.probes: %q (%v)", probes, err)
 	}
-	// A column that is indexed keeps its type and its place.
+	// A column that is indexed keeps its type; dropping it drops its
+	// indexes, the ivfflat one included, as in PostgreSQL (issue #358).
 	refused("0A000", `ALTER TABLE items ALTER COLUMN embedding TYPE vector(4)`)
-	refused("0A000", `ALTER TABLE items DROP COLUMN embedding`)
+	exec(`ALTER TABLE items DROP COLUMN embedding`)
+	var left int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'items' AND indexdef LIKE '%embedding%'`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("indexes on the dropped vector column: %d (%v)", left, err)
+	}
 }
 
 // TestVectorExactKNN: without an index, ORDER BY distance LIMIT k is

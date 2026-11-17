@@ -427,6 +427,69 @@ type IndexDescriptor struct {
 	// index without them.
 	OpClasses  []string `json:"opclasses,omitempty"`
 	Collations []string `json:"collations,omitempty"`
+	// Exprs, when set, is parallel to ColumnIDs: the SQL text of a key
+	// that is an expression over the row's columns (lower(email),
+	// b + 1), as parser.FormatExpr renders it, and "" for a key that is
+	// a plain column. An expression key's ColumnIDs entry is 0 and its
+	// value is encoded as ExprTypes says (parallel too). The SQL layer
+	// computes the values (rowenc.SetKeyComputer). Cluster version v22:
+	// a node that does not know the fields would not compute them, so
+	// the DDL that declares one is refused until finalize.
+	Exprs     []string       `json:"exprs,omitempty"`
+	ExprTypes []types.Family `json:"expr_types,omitempty"`
+	// Predicate is a partial index's WHERE clause, as SQL text: only the
+	// rows it is true for have entries (and a unique index's rule holds
+	// among them only). Cluster version v22, like Exprs.
+	Predicate string `json:"predicate,omitempty"`
+	// Directions, when set, is parallel to ColumnIDs: how a key column
+	// was declared to sort, as pg_get_indexdef shows it ("DESC",
+	// "NULLS FIRST", "DESC NULLS LAST"; "" for the default ASC). Keys
+	// are always encoded ascending, and the planner serves a descending
+	// ORDER BY by scanning in reverse, so the field changes nothing but
+	// how the index is shown.
+	Directions []string `json:"directions,omitempty"`
+}
+
+// IsExprKey reports whether key column i of the index is an expression.
+func (idx *IndexDescriptor) IsExprKey(i int) bool {
+	return i < len(idx.Exprs) && idx.Exprs[i] != ""
+}
+
+// HasExprKeys reports whether any key column of the index is an
+// expression.
+func (idx *IndexDescriptor) HasExprKeys() bool {
+	for i := range idx.Exprs {
+		if idx.Exprs[i] != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPartial reports whether the index has a predicate (WHERE).
+func (idx *IndexDescriptor) IsPartial() bool { return idx.Predicate != "" }
+
+// Computed reports whether the index's entries need the SQL layer to
+// compute them from a row: an expression key or a predicate.
+func (idx *IndexDescriptor) Computed() bool { return idx.IsPartial() || idx.HasExprKeys() }
+
+// KeyFamily is the family key column i of the index is encoded as: the
+// column's type, or an expression key's result type.
+func (idx *IndexDescriptor) KeyFamily(d *TableDescriptor, i int) (types.Family, bool) {
+	if i >= len(idx.ColumnIDs) {
+		return types.Unknown, false
+	}
+	if idx.IsExprKey(i) {
+		if i < len(idx.ExprTypes) {
+			return idx.ExprTypes[i], true
+		}
+		return types.Unknown, false
+	}
+	c, ok := d.ColByID(idx.ColumnIDs[i])
+	if !ok {
+		return types.Unknown, false
+	}
+	return c.Type, true
 }
 
 // VectorIndex describes an IVF ("inverted file") index: the vectors of
@@ -852,6 +915,13 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		if idx.Collations != nil {
 			out.Indexes[i].Collations = append([]string(nil), idx.Collations...)
 		}
+		if idx.Exprs != nil {
+			out.Indexes[i].Exprs = append([]string(nil), idx.Exprs...)
+			out.Indexes[i].ExprTypes = append([]types.Family(nil), idx.ExprTypes...)
+		}
+		if idx.Directions != nil {
+			out.Indexes[i].Directions = append([]string(nil), idx.Directions...)
+		}
 	}
 	if d.Constraints != nil {
 		out.Constraints = make([]Constraint, len(d.Constraints))
@@ -1020,6 +1090,12 @@ type Accessor struct {
 	idleAfter  time.Duration
 	acquiring  int
 
+	// adopting marks the keys whose lease transaction is publishing a
+	// version newer than the cached one (lease.go, acquireLease): from
+	// just before that commit until the new entry is installed, the
+	// cached entry is not handed out.
+	adopting map[string]*adoptMark
+
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
 	statsDB    *kvclient.DB
@@ -1091,8 +1167,9 @@ func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.nowWallLocked()
-	c, ok := a.cache[cacheKey(dbID, name)]
-	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration {
+	key := cacheKey(dbID, name)
+	c, ok := a.cache[key]
+	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration || a.supersededLocked(key, c) {
 		return nil
 	}
 	c.handedOut = true
@@ -1117,7 +1194,14 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
 	now := a.nowWallLocked()
-	if c, ok := a.cache[key]; ok && (c.expiration == 0 || now < c.expiration) {
+	if c, ok := a.cache[key]; ok && a.supersededLocked(key, c) {
+		// A lease on a newer version is committing or has committed and
+		// its entry is not installed yet: a drain may already have seen
+		// this gateway adopt it, so the old entry must not be handed out.
+		// The statement reads the descriptor in its own transaction.
+		a.mu.Unlock()
+		return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	} else if ok && (c.expiration == 0 || now < c.expiration) {
 		// This statement plans against a descriptor it did not read in
 		// its own transaction, so its only bound is the deadline below.
 		// Mark the entry: until it expires, a drain that sees this
@@ -1157,7 +1241,8 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	// own transaction read — if that is older than the leased one,
 	// its read of the descriptor conflicts with the schema change
 	// at commit, as any stale read does.
-	ld, info, err := a.acquireLease(ctx, dbID, name, key)
+	ld, info, done, err := a.acquireLease(ctx, dbID, name, key)
+	defer done()
 	if err != nil || ld == nil {
 		// Without a lease the cache may not be trusted beyond this
 		// statement; return the descriptor uncached. d was read

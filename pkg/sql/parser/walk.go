@@ -55,10 +55,12 @@ func (w *Walker) Statement(stmt Statement) {
 		for i := range t.Set {
 			w.WalkExpr(&t.Set[i].Value)
 		}
+		w.joins(t.From)
 		w.Conds(t.Where)
 		w.selectExprs(t.Returning)
 	case *Delete:
 		w.ctes(t.With)
+		w.joins(t.Using)
 		w.Conds(t.Where)
 		w.selectExprs(t.Returning)
 	case *Explain:
@@ -112,16 +114,7 @@ func (w *Walker) selectMember(m *Select) {
 	if m.FuncTable != nil {
 		w.WalkExpr(m.FuncTable)
 	}
-	for i := range m.Joins {
-		j := &m.Joins[i]
-		if j.Derived != nil {
-			w.SelectStmt(j.Derived)
-		}
-		if j.FuncTable != nil {
-			w.WalkExpr(j.FuncTable)
-		}
-		w.Conds(j.Filter)
-	}
+	w.joins(m.Joins)
 	w.selectExprs(m.Exprs)
 	w.Conds(m.Where)
 	for i := range m.GroupBy {
@@ -142,6 +135,21 @@ func (w *Walker) selectMember(m *Select) {
 		if m.OffsetParam > 0 {
 			w.OnParam(m.OffsetParam)
 		}
+	}
+}
+
+// joins walks join members: their subqueries, table-function calls and
+// ON filters.
+func (w *Walker) joins(js []JoinClause) {
+	for i := range js {
+		j := &js[i]
+		if j.Derived != nil {
+			w.SelectStmt(j.Derived)
+		}
+		if j.FuncTable != nil {
+			w.WalkExpr(j.FuncTable)
+		}
+		w.Conds(j.Filter)
 	}
 }
 

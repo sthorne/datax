@@ -63,15 +63,23 @@ const (
 	CodeBadCopyFormat             = "22P04"
 	CodeQueryCanceled             = "57014"
 	CodeLockNotAvailable          = "55P03"
+	CodeAdminShutdown             = "57P01"
 	CodeIdleInTransactionTimeout  = "25P03"
 	CodeReadOnlyTransaction       = "25006"
 	CodeInvalidCatalogName        = "3D000"
+	CodeInvalidSchemaName         = "3F000"
 	CodeDuplicateDatabase         = "42P04"
 	CodeDependentObjectsExist     = "2BP01"
 	CodeObjectInUse               = "55006"
 	CodeWrongObjectType           = "42809"
 	CodeInvalidGrantOperation     = "0LP01"
 	CodeInvalidObjectDefinition   = "42P17"
+	// CodeInvalidTableDefinition: invalid_table_definition (a second
+	// primary key).
+	CodeInvalidTableDefinition = "42P16"
+	// CodeInvalidForeignKey: invalid_foreign_key (a reference to columns
+	// no primary key or unique constraint covers).
+	CodeInvalidForeignKey = "42830"
 
 	// CodeSnapshotTooOld is PostgreSQL's snapshot_too_old: a read whose
 	// timestamp lies below the history the cluster keeps.
@@ -96,6 +104,12 @@ const (
 	// operator class or collation that does not apply to the column's
 	// type.
 	CodeDatatypeMismatch = "42804"
+
+	// CodeWindowing is PostgreSQL's windowing_error, and
+	// CodeUndefinedParameter its undefined_parameter: an index
+	// expression with a window function or a $n.
+	CodeWindowing          = "42P20"
+	CodeUndefinedParameter = "42P02"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.
