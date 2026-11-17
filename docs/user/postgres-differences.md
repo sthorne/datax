@@ -3,6 +3,8 @@
 datax speaks the PostgreSQL wire protocol and a subset of its SQL. Standard
 drivers, `psql`, and ORMs that stay inside the subset work unmodified. This
 page is the honest list of where the road ends, with workarounds.
+(Maintainers: every known gap, with its priority and status, is kept in
+the [compatibility gap register](../compatibility-gaps.md).)
 
 ## Things that will error immediately
 
@@ -12,10 +14,10 @@ syntax error or `0A000` feature not supported):
 | Missing | Workaround |
 |---|---|
 | Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
-| `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
+| `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), `FILTER (WHERE ...)` and `DISTINCT` on aggregate calls, window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
-| `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
-| `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and narrowing conversions, `COMMENT ON` objects other than tables, views, indexes and columns, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening and text conversions), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
+| `ALTER TABLE ... ADD COLUMN` with an expression default (`DEFAULT now()`) | sequences (with `OWNED BY`), `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
+| `ADD PRIMARY KEY` / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
@@ -97,7 +99,10 @@ syntax error or `0A000` feature not supported):
   grouped SELECT lists refuse), containment `@>` / `<@` and key
   existence `?` / `?|` / `?&` (single-table only), equality comparison,
   and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
-  `HAVING` or after a computed left-hand side.
+  `HAVING` or after a computed left-hand side. Beware `jsonb || jsonb`:
+  it concatenates the two texts (`'{"a":1}'::jsonb || '{"b":2}'` is
+  `{"a":1}{"b":2}`) rather than merging the objects — use `jsonb_set`;
+  `-`, `#-` and subscripting (`j['a']`) are refused.
 - **GIN indexes: JSONB and full-text search.** `CREATE INDEX ... USING GIN
   (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
   each value with its path (closer to PostgreSQL's `jsonb_path_ops` than
@@ -251,10 +256,14 @@ syntax error or `0A000` feature not supported):
   the enclosing query (memoized on the referenced values), so a
   correlated subquery over a large outer table costs outer rows × inner
   query. Prefer a `JOIN` when the outer side is big.
-- **Casts are absorbed.** `x::type` and `CAST(x AS type)` parse and do
-  nothing (types come from the schema); the one exception is
-  `'name'::regclass`, which resolves a table name to its OID. There is no
-  `oid::regclass` back to a name.
+- **Casts are performed** (`'42'::int`, `3.7::int8`, `x::text`,
+  [reference](sql.md#reading)), with two differences. A cast to a type
+  datax does not have — `citext`, `hstore`, `money`, `xml`, `inet`,
+  `pg_lsn`, a range type, or a name that is no type at all — is accepted
+  and yields `text`, so `'A'::citext = 'a'` is false rather than an
+  error. And `'t'::regclass` displays as the table's OID (a number, where
+  PostgreSQL displays `t`); `oid::regclass` gives the name back
+  (`conrelid::regclass`).
 - **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
   1 MiB) as the stream arrives, so a failure partway leaves the earlier
   chunks committed — the error names the failing row and how many rows
@@ -274,7 +283,6 @@ syntax error or `0A000` feature not supported):
   rewrites is refused (`0A000`); PostgreSQL cascades after the
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
-- **`CREATE USER name PASSWORD '...'`** — no `WITH`.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
   inside a transaction block.
 - **`ORDER BY`** takes output names, positions and expressions, but an
@@ -283,8 +291,21 @@ syntax error or `0A000` feature not supported):
   positions only. A position after a `*` that is not the whole select
   list is refused; `GROUP BY` takes columns and positions of columns,
   not expressions.
-- **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
-  precision on the wire, nanosecond internally. `current_time` is a
+- **Time zones are only half there** ([#340](https://github.com/sthorne/datax/issues/340)).
+  `SET TimeZone` (or `SET TIME ZONE`) is accepted, `SHOW` echoes it, and
+  `TIMESTAMPTZ` text output is rendered in that zone
+  (`2024-01-01 05:00:00-05`). Everything else stays UTC: an input
+  without an offset (`'2024-06-01 12:00'::timestamptz`) is read as UTC,
+  not in the session zone; `date_trunc`, `extract`, `to_char`,
+  `::date` and `current_date` compute in UTC (`date_trunc('day', ...)`
+  under `America/New_York` gives `2023-12-31 19:00:00-05` for a
+  morning of 1 January); the binary format is UTC, as in PostgreSQL; and
+  `AT TIME ZONE`, `timezone()` and zone names inside literals are
+  refused (`42601`, `42883`, `22007`). Keep sessions in UTC for now.
+  Microsecond precision on the binary wire, nanosecond internally — and
+  in text output, where computed values such as `now()` show nine
+  fractional digits (`13:18:04.787705724+00`) where PostgreSQL shows at
+  most six. `current_time` is a
   `time` (PostgreSQL's is `timetz`), and `localtimestamp` a
   `timestamptz` like `current_timestamp`.
 - **`EXPLAIN`** returns one plain-text line, not a plan tree (`EXPLAIN
@@ -433,8 +454,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
 
 - **psql**: `\l`, `\dt`, `\di`, `\d t`, `\d+ t`, `\d index`, `\du`,
   `\dn`, `\dp` / `\z`, `\dT`, `\db`, `\dx`, `\df`, `\dS`, tab completion
-  and the `+` variants render; the list commands for features datax lacks
-  (`\dv`, `\ds`, `\dy`, `\dRp`, `\dew`, `\dAf`, `\dAo`, `\dAp`, ...)
+  and the `+` variants render; `\dv` lists the views, `\ds` the
+  sequences and `\sv` prints a view; the list commands for features
+  datax lacks (`\dm`, `\dy`, `\dRp`, `\dew`, `\dAf`, `\dAo`, `\dAp`, ...)
   render empty. `\dd` lists constraint comments (`COMMENT ON CONSTRAINT`)
   and `\dconfig` the settings the session changed. Sizes (`\dt+`, `\l+`) show blank: `pg_table_size`
   and `pg_database_size` are `NULL`.
@@ -445,8 +467,9 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `information_schema.tables` / `columns` / `table_constraints` /
   `key_column_usage`, `pg_indexes`, `pg_class` + `pg_attribute` +
   `pg_index` joins, `format_type`, `pg_get_indexdef`,
-  `pg_get_constraintdef`, `'t'::regclass` and `to_regclass`-style
-  existence checks (`SELECT 1 FROM pg_class WHERE relname = ...`) return
+  `pg_get_constraintdef`, `'t'::regclass` and existence checks against
+  the catalogs (`SELECT 1 FROM pg_class WHERE relname = ...`; the
+  `to_regclass()` function itself does not exist) return
   what PostgreSQL would for a schema in the datax subset. Reads of
   features datax lacks (triggers, comments, extensions) come back
   empty rather than erroring — whatever shape the tool's query takes;
