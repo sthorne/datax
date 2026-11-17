@@ -104,6 +104,12 @@ const (
 	// operator class or collation that does not apply to the column's
 	// type.
 	CodeDatatypeMismatch = "42804"
+
+	// CodeWindowing is PostgreSQL's windowing_error, and
+	// CodeUndefinedParameter its undefined_parameter: an index
+	// expression with a window function or a $n.
+	CodeWindowing          = "42P20"
+	CodeUndefinedParameter = "42P02"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.

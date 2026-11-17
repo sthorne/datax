@@ -74,9 +74,9 @@ func PrettyKey(desc *catalog.TableDescriptor, k keys.Key) string {
 		fams = pkFamilies(desc)
 	case idx != nil:
 		b.WriteString("/" + idx.Name)
-		for _, id := range idx.ColumnIDs {
-			c, _ := desc.ColByID(id)
-			fams = append(fams, c.Type)
+		for i := range idx.ColumnIDs {
+			fam, _ := idx.KeyFamily(desc, i)
+			fams = append(fams, fam)
 		}
 		if !idx.Unique {
 			fams = append(fams, pkFamilies(desc)...)

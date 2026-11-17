@@ -158,6 +158,9 @@ func pickInverted(desc *catalog.TableDescriptor, where []parser.Comparison, para
 		if !idx.IsInverted() || !idx.Public() || len(idx.ColumnIDs) != 1 {
 			continue
 		}
+		if idx.IsPartial() && !predicateImplied(desc, idx, where) {
+			continue // no entries for the rows outside its predicate
+		}
 		kind, ok := inverted.Lookup(idx.Inverted)
 		if !ok {
 			continue

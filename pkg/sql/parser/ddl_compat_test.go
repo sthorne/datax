@@ -2,6 +2,7 @@ package parser
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -52,5 +53,51 @@ func TestParseIndexCompat(t *testing.T) {
 	ce := parseOne(t, `CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public VERSION '1.1' CASCADE`).(*CreateExtension)
 	if !ce.IfNotExists || ce.Name != "uuid-ossp" {
 		t.Fatalf("CREATE EXTENSION parsed as %+v", ce)
+	}
+}
+
+// TestParseIndexForms: expression keys, ASC/DESC and NULLS FIRST/LAST
+// per key, and a partial index's WHERE (issues #358-#360).
+func TestParseIndexForms(t *testing.T) {
+	ci := parseOne(t, `CREATE UNIQUE INDEX ON users ((lower(email)) DESC NULLS LAST, a, (b + 1) text_pattern_ops, lower(c) NULLS FIRST) WHERE deleted_at IS NULL AND status = 'x'`).(*CreateIndex)
+	if len(ci.Columns) != 4 || ci.Columns[0] != "" || ci.Columns[1] != "a" || ci.Columns[2] != "" || ci.Columns[3] != "" {
+		t.Fatalf("columns: %q", ci.Columns)
+	}
+	if len(ci.Exprs) != 4 || FormatExpr(*ci.Exprs[0]) != "lower(email)" || ci.Exprs[1] != nil || FormatExpr(*ci.Exprs[2]) != "b + 1" || FormatExpr(*ci.Exprs[3]) != "lower(c)" {
+		t.Fatalf("exprs: %+v", ci.Exprs)
+	}
+	if want := []string{"DESC NULLS LAST", "", "", "NULLS FIRST"}; strings.Join(ci.Directions, "|") != strings.Join(want, "|") {
+		t.Fatalf("directions: %q", ci.Directions)
+	}
+	if ci.OpClasses[2] != "text_pattern_ops" {
+		t.Fatalf("opclasses: %q", ci.OpClasses)
+	}
+	if ci.Where != "deleted_at IS NULL AND status = 'x'" || len(ci.WhereConds) != 2 {
+		t.Fatalf("where: %q %+v", ci.Where, ci.WhereConds)
+	}
+	for src, want := range map[string]string{
+		`CREATE INDEX i ON t (a ASC)`:              "",
+		`CREATE INDEX i ON t (a DESC)`:             "DESC",
+		`CREATE INDEX i ON t (a DESC NULLS FIRST)`: "DESC",
+		`CREATE INDEX i ON t (a ASC NULLS LAST)`:   "",
+		`CREATE INDEX i ON t (a NULLS FIRST)`:      "NULLS FIRST",
+	} {
+		got := parseOne(t, src).(*CreateIndex)
+		if d := strings.Join(got.Directions, ""); d != want || got.Exprs != nil {
+			t.Errorf("%s: directions %q exprs %v", src, got.Directions, got.Exprs)
+		}
+	}
+	// A column in parentheses is the column; a statement after the
+	// predicate is not part of it.
+	if ci := parseOne(t, `CREATE INDEX i ON t ((a)) WHERE b > 1;`).(*CreateIndex); ci.Columns[0] != "a" || ci.Exprs != nil || ci.Where != "b > 1" {
+		t.Fatalf("(a): %+v", ci)
+	}
+	for _, bad := range []string{
+		`CREATE INDEX i ON t (a) WHERE`,
+		`CREATE INDEX i ON t (a DESC DESC)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s parsed", bad)
+		}
 	}
 }

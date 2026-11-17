@@ -610,7 +610,7 @@ func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescript
 	}
 	k := keys.TableIndexPrefix(desc.ID, idx.ID)
 	for i, d := range vals {
-		col, ok := desc.ColByID(idx.ColumnIDs[i])
+		fam, ok := idx.KeyFamily(desc, i)
 		if !ok {
 			return nil, fmt.Errorf("index %q references unknown column %d", idx.Name, idx.ColumnIDs[i])
 		}
@@ -622,12 +622,56 @@ func EncodeIndexPrefix(desc *catalog.TableDescriptor, idx *catalog.IndexDescript
 			continue
 		}
 		var err error
-		k, err = AppendIndexKeyDatum(k, idx, col.Type, d)
+		k, err = AppendIndexKeyDatum(k, idx, fam, d)
 		if err != nil {
-			return nil, fmt.Errorf("column %q: %w", col.Name, err)
+			return nil, fmt.Errorf("%s: %w", keyColumnLabel(desc, idx, i), err)
 		}
 	}
 	return k, nil
+}
+
+// keyColumnLabel names key column i of the index in an error.
+func keyColumnLabel(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, i int) string {
+	if idx.IsExprKey(i) {
+		return fmt.Sprintf("expression %s", idx.Exprs[i])
+	}
+	col, _ := desc.ColByID(idx.ColumnIDs[i])
+	return fmt.Sprintf("column %q", col.Name)
+}
+
+// KeyComputer computes what an index with an expression key or a
+// predicate (catalog.IndexDescriptor.Computed) holds for a row: the
+// value of every key column, the plain ones included, and whether the
+// row satisfies the predicate (has entries at all). Evaluating SQL is
+// the SQL layer's, so it registers the function (SetKeyComputer); this
+// package only encodes what it returns.
+type KeyComputer func(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) (vals []types.Datum, include bool, err error)
+
+var keyComputer KeyComputer
+
+// SetKeyComputer registers the function every encoder of an index's
+// entries calls for a computed index. It is set once, at init.
+func SetKeyComputer(f KeyComputer) { keyComputer = f }
+
+// indexKeyValues returns the values of the index's key columns for row,
+// and include=false when the row has no entry in it because it does not
+// satisfy the index's predicate.
+func indexKeyValues(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, row map[catalog.ColumnID]types.Datum) ([]types.Datum, bool, error) {
+	if idx.Computed() {
+		if keyComputer == nil {
+			return nil, false, fmt.Errorf("index %q has expression keys or a predicate, and nothing here computes them", idx.Name)
+		}
+		return keyComputer(desc, idx, row)
+	}
+	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
+	for _, colID := range idx.ColumnIDs {
+		d, ok := row[colID]
+		if !ok {
+			d = types.DNull
+		}
+		vals = append(vals, d)
+	}
+	return vals, true, nil
 }
 
 // The tags of a NULLS NOT DISTINCT unique index's key columns: each
@@ -678,17 +722,16 @@ func EncodeIndexEntry(desc *catalog.TableDescriptor, idx *catalog.IndexDescripto
 // supplies the suffix, so a shadow row carrying the new bucket value
 // yields the new-layout entry.
 func EncodeIndexEntryAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, entryID uint64, row map[catalog.ColumnID]types.Datum) (key keys.Key, value []byte, skip bool, err error) {
-	vals := make([]types.Datum, 0, len(idx.ColumnIDs))
-	tagged := TaggedIndexKey(idx)
-	for _, colID := range idx.ColumnIDs {
-		d, ok := row[colID]
-		if !ok {
-			d = types.DNull
+	vals, include, err := indexKeyValues(desc, idx, row)
+	if err != nil || !include {
+		return nil, nil, true, err
+	}
+	if !TaggedIndexKey(idx) {
+		for _, d := range vals {
+			if d.Null {
+				return nil, nil, true, nil
+			}
 		}
-		if d.Null && !tagged {
-			return nil, nil, true, nil
-		}
-		vals = append(vals, d)
 	}
 	at := *idx
 	at.ID = entryID
@@ -733,6 +776,13 @@ func IndexEntriesAt(desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor,
 			return nil, err
 		}
 		return []IndexEntry{{Key: key, Value: val}}, nil
+	}
+	if idx.IsPartial() {
+		// A partial inverted index: a row the predicate does not hold
+		// for has no entries.
+		if _, include, err := indexKeyValues(desc, idx, row); err != nil || !include {
+			return nil, err
+		}
 	}
 	elements, err := invertedElements(desc, idx, row)
 	if err != nil || len(elements) == 0 {
@@ -902,13 +952,13 @@ func IndexEntryPrimaryKey(desc *catalog.TableDescriptor, idx *catalog.IndexDescr
 		return nil, fmt.Errorf("key not in index %q", idx.Name)
 	}
 	rest := []byte(key[len(prefix):])
-	for _, colID := range idx.ColumnIDs {
-		col, ok := desc.ColByID(colID)
+	for i, colID := range idx.ColumnIDs {
+		fam, ok := idx.KeyFamily(desc, i)
 		if !ok {
 			return nil, fmt.Errorf("index %q references unknown column %d", idx.Name, colID)
 		}
 		var err error
-		rest, err = skipDatum(rest, col.Type)
+		rest, err = skipDatum(rest, fam)
 		if err != nil {
 			return nil, fmt.Errorf("index %q entry: %w", idx.Name, err)
 		}

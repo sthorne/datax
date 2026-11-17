@@ -202,9 +202,9 @@ func TestTableRestoreRefusesFieldsItDoesNotKnow(t *testing.T) {
 	// An index field, on the table that has an index.
 	m := *man
 	m.Tables = append([]backupTable(nil), man.Tables...)
-	m.Tables[0].Descriptor = json.RawMessage(strings.Replace(string(m.Tables[0].Descriptor), `"name":"by_customer"`, `"name":"by_customer","predicate":"total > 0"`, 1))
+	m.Tables[0].Descriptor = json.RawMessage(strings.Replace(string(m.Tables[0].Descriptor), `"name":"by_customer"`, `"name":"by_customer","storage_params":{"fillfactor":"70"}`, 1))
 	_, err := planTableRestore(&m, RestoreOptions{Tables: []RestoreTable{{Name: "shop.orders"}}, DropForeignKeys: true})
-	if err == nil || !strings.Contains(err.Error(), `the index field "predicate"`) {
+	if err == nil || !strings.Contains(err.Error(), `the index field "storage_params"`) {
 		t.Errorf("got %v, want a refusal naming the index field", err)
 	}
 }

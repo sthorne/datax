@@ -155,11 +155,12 @@ syntax error or `0A000` feature not supported):
     stems, not against a PostgreSQL server.
   - *Indexes*: `USING GIN (tsvector_column)` and `USING GIN
     (to_tsvector('config', text_column))` — the one expression an index
-    may be built on; the configuration must be written out, as
-    PostgreSQL requires. No expression indexes otherwise (not over a
-    concatenation of columns, not `setweight(...) || ...`), no generated
-    columns and no triggers to maintain a `tsvector` column: the
-    application writes it. No GiST (`USING GIST` is refused), no
+    may be built on in a GIN index; the configuration must be written
+    out, as PostgreSQL requires. A GIN index on any other expression
+    (a concatenation of columns, `setweight(...) || ...`) is refused —
+    expression keys are for ordinary (btree) indexes — and there are no
+    generated columns and no triggers to maintain a `tsvector` column:
+    the application writes it. No GiST (`USING GIST` is refused), no
     `fastupdate`, no `gin_pending_list_limit`.
   - *Planning*: a negated term is never looked up, so a query that is
     only a negation (or an `OR` with one) scans; `tsquery @@ tsvector`
@@ -239,9 +240,8 @@ syntax error or `0A000` feature not supported):
   - *Not there*: `halfvec`, `sparsevec`, `bit` vectors and their
     operators (`<+>` L1 as an operator, `<~>`, `<%>`), `vector *
     vector`, `||`, `subvector`, `binary_quantize`, and the `avg` and
-    `sum` aggregates over vectors (`0A000`). Expression indexes (an
-    index over `(embedding::halfvec(3))`, or over a function of the
-    column) and partial indexes do not exist in datax for any index.
+    `sum` aggregates over vectors (`0A000`). An ivfflat index takes
+    no expression (`(embedding::halfvec(3))`) and no `WHERE` clause.
     `vector[]` columns are refused.
   - *Dimensions*: 16,000 for the type and 2,000 for an index, as in
     pgvector. Elements are float4; a value outside float4's range is
@@ -353,8 +353,23 @@ syntax error or `0A000` feature not supported):
   `uuid_ns_*` constants). Any other extension is refused (`0A000`);
   `DROP EXTENSION` of one is `42704`.
 - **`ORDER BY`** takes output names, positions and expressions, but an
-  expression sort never uses an index; NULLs order last ASC / first DESC
-  (PostgreSQL default). Under `UNION`, output names and positions
+  expression sort never uses an index, an expression index included;
+  NULLs order last ASC / first DESC (PostgreSQL default). An index's
+  declared `DESC` / `NULLS FIRST` is shown but not stored: keys are
+  ascending, an all-descending `ORDER BY` reverses the scan and a mixed
+  one sorts ([reference](sql.md#ddl)).
+- **Expression and partial indexes** are supported, with limits
+  ([reference](sql.md#ddl)): a partial index is used only when its
+  predicate's conjuncts appear verbatim in the query's WHERE clause (no
+  implication proofs); a predicate may compare a date or time column
+  only with `IS [NOT] NULL`; anything zone-dependent in an expression
+  (`date_trunc`, casts of timestamps) is refused even where PostgreSQL
+  marks the form immutable (`timestamp without time zone`); `ON
+  CONFLICT (cols) WHERE predicate` is not parsed, so a partial unique
+  index is never an `ON CONFLICT` arbiter except by name (`ON
+  CONSTRAINT`); and `pg_get_indexdef` shows an expression and a
+  predicate as written, without PostgreSQL's inserted casts
+  (`'active'::text`). Under `UNION`, output names and positions
   only. A position after a `*` that is not the whole select
   list is refused.
 - **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
