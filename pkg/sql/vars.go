@@ -551,9 +551,22 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			}
 			vars.isolation = strings.ToLower(unquote(value))
 		}
-	case "integer_datetimes", "standard_conforming_strings", "server_encoding", "server_version":
+	case "standard_conforming_strings":
+		// pg_dump scripts open with SET standard_conforming_strings = on:
+		// that is the only behavior datax has, so on is a no-op and off
+		// is refused rather than silently ignored.
 		if !reset {
-			return newErrf(CodeInvalidParameterValue, "parameter %q cannot be changed", name)
+			on, ok := parsePGBool(unquote(value))
+			if !ok {
+				return invalid("parameter %q requires a Boolean value", name)
+			}
+			if !on {
+				return newErrf(CodeFeatureNotSupported, "standard_conforming_strings = off is not supported")
+			}
+		}
+	case "integer_datetimes", "server_encoding", "server_version":
+		if !reset {
+			return newErrf(CodeCantChangeRuntimeParam, "parameter %q cannot be changed", name)
 		}
 	default:
 		if pv, ok := pgVars[name]; ok {

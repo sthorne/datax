@@ -90,7 +90,7 @@ func TestSessionVariables(t *testing.T) {
 	refused(`SET client_encoding = 'LATIN1'`, sql.CodeInvalidParameterValue)
 	refused(`SET transaction_isolation = 'chaotic'`, sql.CodeInvalidParameterValue)
 	refused(`SET default_transaction_read_only = maybe`, sql.CodeInvalidParameterValue)
-	refused(`SET server_version = '15'`, sql.CodeInvalidParameterValue)
+	refused(`SET server_version = '15'`, sql.CodeCantChangeRuntimeParam) // 55P02, as PostgreSQL
 	refused(`SET foreign_key_cascade_limit = 0`, sql.CodeInvalidParameterValue)
 
 	// RESET one, RESET ALL, SHOW ALL and pg_settings agree.
@@ -515,6 +515,14 @@ func TestPostgresSettings(t *testing.T) {
 	refused(`SET default_with_oids = on`, sql.CodeFeatureNotSupported, `tables declared WITH OIDS are not supported`)
 	refused(`SET server_version_num = 150000`, sql.CodeCantChangeRuntimeParam, `parameter "server_version_num" cannot be changed`)
 	refused(`RESET max_identifier_length`, sql.CodeCantChangeRuntimeParam, `parameter "max_identifier_length" cannot be changed`)
+	// pg_dump scripts begin with SET standard_conforming_strings = on.
+	execSQL(t, ctx, s, `SET standard_conforming_strings = on`)
+	execSQL(t, ctx, s, `SET standard_conforming_strings TO 'true'`)
+	if got := one(`SHOW standard_conforming_strings`); got != "on" {
+		t.Fatalf("standard_conforming_strings = %q", got)
+	}
+	refused(`SET standard_conforming_strings = off`, sql.CodeFeatureNotSupported, `standard_conforming_strings = off is not supported`)
+	refused(`SET server_version = '16'`, sql.CodeCantChangeRuntimeParam, `parameter "server_version" cannot be changed`)
 	refused(`SET no_such_setting = on`, sql.CodeUndefinedObject, `unrecognized configuration parameter "no_such_setting"`)
 	refused(`SHOW enable_warp_drive`, sql.CodeUndefinedObject, `unrecognized configuration parameter "enable_warp_drive"`)
 
