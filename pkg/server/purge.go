@@ -294,7 +294,7 @@ func (n *Node) purgeCallRaw(ctx context.Context, id base.NodeID, req cluster.Adm
 	if id == n.ident.NodeID {
 		return n.serveAdminOp(ctx, req), nil
 	}
-	addr, err := n.registry.Resolve(id)
+	addr, err := n.resolvePeer(id)
 	if err != nil {
 		return resp, err
 	}

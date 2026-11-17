@@ -95,6 +95,7 @@ func startCluster(t testing.TB, numNodes int, localities []string, opt func(*ser
 	range1 := cluster.Range1Descriptor(nodeIDs)
 
 	tc := &TestCluster{T: t}
+	cfgs := make([]server.Config, numNodes)
 	for i := 0; i < numNodes; i++ {
 		pglis, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -119,6 +120,15 @@ func startCluster(t testing.TB, numNodes int, localities []string, opt func(*ser
 		if opt != nil {
 			opt(&cfg)
 		}
+		cfgs[i] = cfg
+	}
+	// The pre-agreed membership carries what the options advertised
+	// (--locality-advertise), as the nodes' first heartbeats would: every
+	// config shares the one nodes slice.
+	for i := range cfgs {
+		nodes[i].LocalityAddresses = cfgs[i].LocalityAddresses
+	}
+	for i, cfg := range cfgs {
 		n, err := server.Start(cfg)
 		if err != nil {
 			t.Fatalf("starting node %d: %v", i+1, err)

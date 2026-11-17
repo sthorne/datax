@@ -467,7 +467,11 @@ func runDebug(args []string) error {
 			if bv == 0 {
 				bv = 1
 			}
-			fmt.Printf("%s  %s  locality=%s  version=v%d  last-heartbeat=%s ago%s\n", nd.NodeID, nd.Address, nd.Locality, bv, age.Round(time.Second), state)
+			locAddrs := ""
+			if len(nd.LocalityAddresses) > 0 {
+				locAddrs = "  locality-advertise=" + base.FormatLocalityAddresses(nd.LocalityAddresses)
+			}
+			fmt.Printf("%s  %s  locality=%s%s  version=v%d  last-heartbeat=%s ago%s\n", nd.NodeID, nd.Address, nd.Locality, locAddrs, bv, age.Round(time.Second), state)
 		}
 	case "rebalance":
 		fmt.Println("rebalance done")

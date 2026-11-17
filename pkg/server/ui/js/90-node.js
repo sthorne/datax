@@ -45,6 +45,7 @@ function renderNode(d) {
     tileHTML("address", d.address ? esc(d.address) + copyBtn("this node's address", d.address) : "—") +
     tileHTML("sql", d.sql_address ? esc(d.sql_address) + copyBtn("this node's SQL address", d.sql_address) : "—") +
     tile("locality", d.locality || "—") +
+    (d.locality_addresses ? tile("locality addresses", d.locality_addresses) : "") +
     tile("version", (d.release ? "v" + d.release + " · " : "") + "protocol v" + (d.binary_version || 1) + (d.cluster_version ? " · cluster v" + d.cluster_version : "")) +
     // Uptime is a machine figure and the machine tiles carry it; it is
     // repeated here only for a node that reports no machine section.

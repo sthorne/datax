@@ -88,7 +88,7 @@ func (n *Node) askPeersForClusterKey(ctx context.Context, m *ckMarker, missing [
 		}
 		cctx, cancel := context.WithTimeout(ctx, clusterKeyCall)
 		var resp cluster.AdminResponse
-		err = n.trans.Call(cctx, nd.Address, "admin", cluster.AdminRequest{Op: "cluster-key-handover", ClusterKey: &cluster.ClusterKeyRequest{
+		err = n.trans.Call(cctx, n.peerAddr(nd), "admin", cluster.AdminRequest{Op: "cluster-key-handover", ClusterKey: &cluster.ClusterKeyRequest{
 			ClusterID: clusterID, NodeID: n.ident.NodeID, Exchange: x.Public(),
 		}}, &resp)
 		cancel()
@@ -275,7 +275,18 @@ func (n *Node) serveClusterKeyHandover(ctx context.Context, req cluster.AdminReq
 		return refuse(fmt.Sprintf("n%d is being decommissioned", p.NodeID))
 	}
 	age := time.Duration(n.clock.Now().WallTime - nd.LivenessTime)
-	if ok, why := clusterKeyAskerAllowed(age, n.livenessGrace(), nd.Address, rpc.PeerHost(ctx), resolveHost); !ok {
+	from := rpc.PeerHost(ctx)
+	ok, why := clusterKeyAskerAllowed(age, n.livenessGrace(), nd.Address, from, resolveHost)
+	// A peer sharing a locality tier with this node dials it at its
+	// --locality-advertise address, from its own: the hosts of its
+	// locality addresses are where it is registered too.
+	for _, la := range nd.LocalityAddresses {
+		if ok {
+			break
+		}
+		ok, _ = clusterKeyAskerAllowed(age, n.livenessGrace(), la.Address, from, resolveHost)
+	}
+	if !ok {
 		return refuse(fmt.Sprintf("n%d: %s", p.NodeID, why))
 	}
 	m, err := n.readCKMarker(ctx)

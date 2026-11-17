@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/storage"
 )
@@ -23,6 +24,9 @@ type ClusterNode struct {
 	NodeID   int    `json:"node_id"`
 	Address  string `json:"address"`
 	Locality string `json:"locality,omitempty"`
+	// LocalityAddresses are the node's --locality-advertise entries, as
+	// the flag spells them.
+	LocalityAddresses string `json:"locality_addresses,omitempty"`
 	// Live is derived from the last heartbeat vs the liveness grace
 	// window (the same rule the allocator uses).
 	Live     bool  `json:"live"`
@@ -273,21 +277,22 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 	grace := n.livenessGrace().Nanoseconds()
 	for _, nd := range n.registry.All() {
 		doc.Nodes = append(doc.Nodes, ClusterNode{
-			NodeID:       int(nd.NodeID),
-			Address:      nd.Address,
-			Locality:     nd.Locality.String(),
-			Live:         now-nd.LivenessTime <= grace,
-			AgoMs:        (now - nd.LivenessTime) / int64(time.Millisecond),
-			Draining:     nd.Draining,
-			ShuttingDown: nd.ShuttingDown,
-			LeaderQPS:    nd.LeaderQPS,
-			LeaderCount:  nd.LeaderCount,
-			ReplicaBytes: nd.ReplicaBytes,
-			Machine:      nd.Machine,
-			Latency:      nd.Latency,
-			SQL:          nd.SQL,
-			HotRanges:    nd.HotRanges,
-			BigRanges:    nd.BigRanges,
+			NodeID:            int(nd.NodeID),
+			Address:           nd.Address,
+			LocalityAddresses: base.FormatLocalityAddresses(nd.LocalityAddresses),
+			Locality:          nd.Locality.String(),
+			Live:              now-nd.LivenessTime <= grace,
+			AgoMs:             (now - nd.LivenessTime) / int64(time.Millisecond),
+			Draining:          nd.Draining,
+			ShuttingDown:      nd.ShuttingDown,
+			LeaderQPS:         nd.LeaderQPS,
+			LeaderCount:       nd.LeaderCount,
+			ReplicaBytes:      nd.ReplicaBytes,
+			Machine:           nd.Machine,
+			Latency:           nd.Latency,
+			SQL:               nd.SQL,
+			HotRanges:         nd.HotRanges,
+			BigRanges:         nd.BigRanges,
 		})
 		if nd.NodeID == n.ident.NodeID {
 			last := &doc.Nodes[len(doc.Nodes)-1]

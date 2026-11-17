@@ -50,6 +50,7 @@ const HELP = {
   "node": "The node's id. n1, n2 and so on are assigned when a node first joins and are never reused.",
   "status": "Live, draining or down. Draining means the node is shutting down gracefully: it is shedding leases and finishing its SQL connections, and it should not be sent new work.",
   "locality": "The node's declared position in the failure domains — region, zone, rack. Replication uses it to spread a range's replicas across domains, so it decides what a node's loss actually costs.",
+  "locality addresses": "The node's --locality-advertise entries: a peer that shares one of these tiers with it dials it at that address (a private network inside a region, say) instead of its public address, and falls back to the public one if that does not answer.",
   "address": "The address other nodes and this console reach it on.",
   "heartbeat": "How long since this node last checked in. A node is treated as down once it misses enough heartbeats; everything else in its row is as of that last heartbeat.",
   "host cpu": "Processor time in use across the whole machine, not just this process. Sustained high CPU with high iowait usually means the disk, not the processor, is the limit.",

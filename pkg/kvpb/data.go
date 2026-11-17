@@ -85,9 +85,16 @@ func (d *RangeDescriptor) String() string {
 // NodeDescriptor describes a node in the registry (range 1). The liveness
 // timestamp is updated by periodic heartbeats.
 type NodeDescriptor struct {
-	NodeID   base.NodeID   `json:"node_id"`
-	Address  string        `json:"address"`
-	Locality base.Locality `json:"locality"`
+	NodeID  base.NodeID `json:"node_id"`
+	Address string      `json:"address"`
+	// LocalityAddresses are the node's --locality-advertise entries: the
+	// address a peer sharing an entry's tier dials in place of Address
+	// (see base.SelectLocalityAddress). Absent from rows written by
+	// binaries that predate it, which every reader takes as none: such a
+	// node is dialed at Address, as before. Additive JSON, so no version
+	// gate: an older reader ignores the field.
+	LocalityAddresses []base.LocalityAddress `json:"locality_addresses,omitempty"`
+	Locality          base.Locality          `json:"locality"`
 	// LivenessTime is the HLC wall time of the node's last heartbeat.
 	LivenessTime int64 `json:"liveness_time"`
 	// Draining marks a node being decommissioned: the allocator moves its

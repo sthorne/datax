@@ -2,9 +2,12 @@ package kvpb
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/storage/enginepb"
 )
 
@@ -15,6 +18,9 @@ import (
 
 const (
 	goldenNodeDescriptor = `{"node_id":4,"address":"10.0.0.4:26257","locality":{"tiers":[{"key":"region","value":"eu"},{"key":"rack","value":"2"}]},"liveness_time":1725000000000000000,"draining":true,"binary_version":2,"leader_qps":12.5,"leader_count":7,"replica_bytes":4096,"hot_ranges":[{"range_id":9,"qps":11.25}],"big_ranges":[{"range_id":8,"bytes":2048}]}`
+
+	// A row from a node started with --locality-advertise.
+	goldenNodeDescriptorLocalityAddrs = `{"node_id":4,"address":"203.0.113.4:26257","locality_addresses":[{"tier":{"key":"region","value":"eu"},"address":"10.0.0.4:26257"}],"locality":{"tiers":[{"key":"region","value":"eu"}]},"liveness_time":1}`
 
 	// A v1-era registry row: none of the post-v1 additive fields present.
 	goldenNodeDescriptorV1 = `{"node_id":4,"address":"10.0.0.4:26257","locality":{},"liveness_time":1}`
@@ -51,6 +57,53 @@ func TestGoldenNodeDescriptor(t *testing.T) {
 	}
 	if old.NodeID != 4 || old.BinaryVersion != 0 || old.Draining {
 		t.Fatalf("v1 row decoded %+v", old)
+	}
+}
+
+// TestGoldenNodeDescriptorLocalityAddresses: the --locality-advertise
+// entries round-trip, a row without them decodes to none and encodes
+// without the field (so it reads the same to a binary that predates it),
+// and an older reader's view of a row with them — the struct without the
+// field — still decodes.
+func TestGoldenNodeDescriptorLocalityAddresses(t *testing.T) {
+	var nd NodeDescriptor
+	if err := json.Unmarshal([]byte(goldenNodeDescriptorLocalityAddrs), &nd); err != nil {
+		t.Fatal(err)
+	}
+	want := []base.LocalityAddress{{Tier: base.Tier{Key: "region", Value: "eu"}, Address: "10.0.0.4:26257"}}
+	if !reflect.DeepEqual(nd.LocalityAddresses, want) || nd.Address != "203.0.113.4:26257" {
+		t.Fatalf("decoded %+v", nd)
+	}
+	raw, err := json.Marshal(nd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != goldenNodeDescriptorLocalityAddrs {
+		t.Fatalf("encoding changed:\n got %s\nwant %s", raw, goldenNodeDescriptorLocalityAddrs)
+	}
+
+	var old NodeDescriptor
+	if err := json.Unmarshal([]byte(goldenNodeDescriptorV1), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.LocalityAddresses != nil {
+		t.Fatalf("v1 row decoded locality addresses %+v", old.LocalityAddresses)
+	}
+	raw, err = json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "locality_addresses") {
+		t.Fatalf("a row without entries encodes the field: %s", raw)
+	}
+
+	// What a binary from before the field reads of a new row.
+	var before struct {
+		NodeID  base.NodeID `json:"node_id"`
+		Address string      `json:"address"`
+	}
+	if err := json.Unmarshal([]byte(goldenNodeDescriptorLocalityAddrs), &before); err != nil || before.Address != "203.0.113.4:26257" {
+		t.Fatalf("older reader: %+v %v", before, err)
 	}
 }
 

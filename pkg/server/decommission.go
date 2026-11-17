@@ -33,11 +33,12 @@ func (n *Node) serveDecommission(ctx context.Context, req cluster.AdminRequest) 
 		n.draining.Store(!req.Cancel)
 		// Publish immediately rather than waiting a heartbeat.
 		nd := kvpb.NodeDescriptor{
-			NodeID:       n.ident.NodeID,
-			Address:      n.addr,
-			Locality:     n.cfg.Locality,
-			LivenessTime: n.clock.Now().WallTime,
-			Draining:     n.draining.Load(),
+			NodeID:            n.ident.NodeID,
+			Address:           n.addr,
+			LocalityAddresses: n.cfg.LocalityAddresses,
+			Locality:          n.cfg.Locality,
+			LivenessTime:      n.clock.Now().WallTime,
+			Draining:          n.draining.Load(),
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
@@ -48,7 +49,7 @@ func (n *Node) serveDecommission(ctx context.Context, req cluster.AdminRequest) 
 	}
 
 	// Forward to the target so its own process holds the flag.
-	if addr, err := n.registry.Resolve(req.NodeID); err == nil {
+	if addr, err := n.resolvePeer(req.NodeID); err == nil {
 		fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		var resp cluster.AdminResponse
 		err := n.trans.Call(fctx, addr, "admin", req, &resp)
