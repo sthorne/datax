@@ -70,7 +70,11 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 	}
 	if e.BinOp != "" && e.Right != nil {
 		rhs := exprFamily(*e.Right, colType)
-		fam = arithFamily(e.BinOp, fam, rhs)
+		if f, ok := jsonbConcatFamily(e, fam, rhs); ok {
+			fam = f
+		} else {
+			fam = arithFamily(e.BinOp, fam, rhs)
+		}
 	}
 	if e.Cast != "" {
 		fam = builtins.CastFamily(e.Cast, fam)

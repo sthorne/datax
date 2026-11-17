@@ -560,3 +560,42 @@ func TextArrayLiteral(elems []string, nulls []bool) string {
 	b.WriteByte('}')
 	return b.String()
 }
+
+// ConcatJSONB is jsonb || jsonb, as PostgreSQL defines it: two objects
+// merge their keys (the right operand's value wins on a duplicate key),
+// two arrays concatenate, and otherwise each operand that is not an
+// array is taken as a one-element array, so an array appends or
+// prepends the other operand and two non-arrays become a two-element
+// array.
+func ConcatJSONB(l, r types.Datum) (types.Datum, error) {
+	lv, err := decodeJSON(l.S)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	rv, err := decodeJSON(r.S)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	lo, lObj := lv.(map[string]any)
+	ro, rObj := rv.(map[string]any)
+	if lObj && rObj {
+		out := make(map[string]any, len(lo)+len(ro))
+		for k, v := range lo {
+			out[k] = v
+		}
+		for k, v := range ro {
+			out[k] = v
+		}
+		return encodeJSON(out)
+	}
+	asArray := func(v any) []any {
+		if a, ok := v.([]any); ok {
+			return a
+		}
+		return []any{v}
+	}
+	la, ra := asArray(lv), asArray(rv)
+	out := make([]any, 0, len(la)+len(ra))
+	out = append(append(out, la...), ra...)
+	return encodeJSON(out)
+}
