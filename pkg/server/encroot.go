@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/sthorne/datax/pkg/cluster"
@@ -158,15 +159,56 @@ func (n *Node) resealStoreKeyLive(oldKey, newKey []byte) error {
 // later, so nothing sealed under the old key outlives the rotation.
 func (n *Node) adoptStoreKey(ctx context.Context, newKey []byte) {
 	n.encKeyMu.Lock()
-	hadKey := n.encKey != nil
-	if hadKey {
+	oldKey := n.encKey
+	if oldKey != nil {
 		// The key it replaces stays held, not released: a reader that
 		// took it before the swap may still be using it.
 		n.encKey = enc.HoldKey(newKey)
 	}
 	n.encKeyMu.Unlock()
-	if hadKey {
+	if oldKey != nil {
+		// The export can fail (its scans are best-effort and retried at
+		// the next heartbeat), so first reseal the file that is there:
+		// whatever happens to the export, nothing on disk stays sealed
+		// under the retired key.
+		n.resealMetadataBackup(oldKey, newKey)
 		n.exportMetadata(ctx)
+	}
+}
+
+// resealMetadataBackup rewrites the metadata backup file, if there is
+// one sealed under oldKey, sealed under newKey. It holds exportMu, so an
+// export that took the old key before the swap has written by then.
+func (n *Node) resealMetadataBackup(oldKey, newKey []byte) {
+	if n.cfg.Dir == "" {
+		return
+	}
+	n.exportMu.Lock()
+	defer n.exportMu.Unlock()
+	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)
+	sealed, err := os.ReadFile(final)
+	if err != nil {
+		return
+	}
+	if _, err := enc.Unseal(MetadataBackupMagic, newKey, sealed); err == nil {
+		return
+	}
+	raw, err := enc.Unseal(MetadataBackupMagic, oldKey, sealed)
+	if err != nil {
+		log.Debugf("metadata backup reseal: %v", err)
+		return
+	}
+	if sealed, err = enc.Seal(MetadataBackupMagic, newKey, raw); err != nil {
+		log.Debugf("metadata backup reseal: %v", err)
+		return
+	}
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, sealed, 0o600); err != nil {
+		log.Debugf("metadata backup reseal: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		log.Debugf("metadata backup reseal: %v", err)
 	}
 }
 
