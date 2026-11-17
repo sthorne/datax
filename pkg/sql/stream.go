@@ -236,6 +236,7 @@ func (st *RowStream) restart(ctx context.Context) error {
 		st.txn = next
 		st.s.streamTop = true
 		st.s.discardNotify() // the statement starts over
+		st.s.advisoryRestart()
 		res, err := st.s.execStmt(ctx, next, st.stmt, st.params)
 		st.s.streamTop = false
 		st.notifs = st.s.takeNotify()

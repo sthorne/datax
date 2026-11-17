@@ -21,6 +21,7 @@ import (
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/pgwire"
 	"github.com/sthorne/datax/pkg/security"
+	"github.com/sthorne/datax/pkg/sql/advisory"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -66,6 +67,7 @@ func (n *Node) startSQL() error {
 		return found, nil
 	}
 	opts.Notify = n.notifyHub()
+	opts.Advisory = advisory.NewManager(n.stopper.Ctx(), advisory.Config{DB: n.db, NodeID: int32(n.ident.NodeID), TTL: n.cfg.AdvisoryLockTTL})
 	if ks := n.KeyService(); ks != nil {
 		opts.KeyService = ks
 	}

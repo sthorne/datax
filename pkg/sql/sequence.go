@@ -467,6 +467,11 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 				return e, serr
 			}
 		}
+		if _, ok := advisoryFuncs[e.Func]; ok {
+			if serr := advisoryArgsConstant(e); serr != nil {
+				return e, serr
+			}
+		}
 		args := make([]types.Datum, len(e.Args))
 		for i, a := range e.Args {
 			d, err := evalExpr(a, nil, nil, params)
@@ -486,6 +491,14 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 		}
 		if sealFuncs[e.Func] {
 			v, err := s.evalSealFunc(ctx, txn, e.Func, args)
+			if err != nil {
+				return e, err
+			}
+			out.Func, out.Args, out.Lit = "", nil, &v
+			return out, nil
+		}
+		if _, ok := advisoryFuncs[e.Func]; ok {
+			v, err := s.evalAdvisoryFunc(ctx, e.Func, args)
 			if err != nil {
 				return e, err
 			}

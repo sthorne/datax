@@ -1632,6 +1632,80 @@ What is guaranteed, and what is not:
   `LISTEN` (a syntax error) and is skipped by the others; during a
   rolling upgrade, connect listeners to upgraded nodes.
 
+## Advisory locks
+
+```sql
+SELECT pg_advisory_lock(42);               -- wait for an exclusive lock on 42
+SELECT pg_try_advisory_lock($1);           -- true if taken, false at once if held elsewhere
+SELECT pg_advisory_unlock(42);             -- true; false with a WARNING if not held
+SELECT pg_advisory_lock_shared(1, 2);      -- two int4 keys: a different lock from any bigint
+BEGIN; SELECT pg_advisory_xact_lock(42); ... COMMIT;   -- held until the transaction ends
+```
+
+PostgreSQL's advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock`,
+`pg_advisory_unlock`, `pg_advisory_unlock_all`, `pg_advisory_xact_lock`,
+`pg_try_advisory_xact_lock` and the `_shared` variants, each with one
+`bigint` key or two `int4` keys. What migration tools and job queues use
+them for works unchanged: golang-migrate, Rails, Prisma and Flyway take
+one around a migration.
+
+The rules are PostgreSQL's:
+
+- **Cluster-wide.** A lock is one lock for the whole cluster: sessions
+  on different nodes contend for it exactly as sessions on one node do.
+  Locks belong to a database, as in PostgreSQL.
+- **Session locks are reentrant and counted.** Taking a lock the session
+  already holds succeeds at once and needs another unlock; they are
+  released by `pg_advisory_unlock`, `pg_advisory_unlock_all` or the end
+  of the session (a clean close, or a client that just disappears), not
+  by `COMMIT` or `ROLLBACK`. Unlocking a lock not held returns false
+  with `WARNING: you don't own a lock of type ExclusiveLock` (`01000`).
+- **Transaction locks** (`_xact_`) are released when the transaction
+  commits or rolls back, and by `ROLLBACK TO` a savepoint taken before
+  them; outside a transaction block the statement is the transaction.
+- **Shared and exclusive.** Any number of sessions may hold a shared
+  lock; an exclusive one conflicts with every hold by another session.
+  A session's own holds never conflict with each other.
+- **Waiting.** A blocking call waits until the lock is free, the
+  statement is cancelled, or `statement_timeout` (`57014`) or
+  `lock_timeout` (`55P03`, `canceling statement due to lock timeout`)
+  passes. A failed wait leaves nothing held.
+- **Independent of row locks.** An advisory lock never waits for a row
+  lock or a write, and nothing that locks or writes rows waits for an
+  advisory lock.
+- `pg_locks` lists the advisory locks held across the cluster, with
+  PostgreSQL's `locktype = 'advisory'`, `classid`, `objid`, `objsubid`
+  (`1` for a bigint key, `2` for two int4 keys), `pid` and `mode`.
+
+Where it differs:
+
+- **A node that dies.** A lock held by a session on a node that stops
+  or is cut off from the cluster is released 10 seconds (plus the
+  maximum clock offset) after that node last renewed its advisory-lock
+  lease, once the rest of the cluster is serving again. A node renews
+  its lease every 2.5 seconds while its sessions hold or wait for
+  advisory locks. If it cannot renew in time — it is partitioned from
+  the cluster — it ends every session that held an advisory lock with
+  `FATAL 57P01` before any other session can be granted the lock, so a
+  session is never left believing it holds a lock someone else has.
+  Reconnect and take the lock again.
+- **Waiters are not queued.** When a lock is released, whichever waiter
+  looks first gets it, not the one that has waited longest. A waiter on
+  the releasing node sees the release at once; one on another node
+  within 0.1 seconds.
+- **No deadlock detection.** Two sessions each waiting for a lock the
+  other holds wait until `lock_timeout` or `statement_timeout` ends one
+  of them: set one of them when taking more than one lock.
+- **Once per statement.** Like the other functions with effects, a call
+  runs once per statement, and its arguments must be constants or
+  parameters, not columns (`0A000`): `SELECT pg_try_advisory_lock(id)
+  FROM jobs` is refused; take the lock per job, with the id as a
+  parameter. `pg_locks` lists granted locks only, not waiting sessions,
+  and no row locks.
+- A node running a release from before advisory locks does not have the
+  functions (`42883`); during a rolling upgrade, run migrations through
+  upgraded nodes.
+
 ## Set-returning functions
 
 `generate_series`, `jsonb_each`, `jsonb_each_text`, `jsonb_array_elements`,

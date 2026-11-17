@@ -19,6 +19,7 @@ import (
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql"
+	"github.com/sthorne/datax/pkg/sql/advisory"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/notify"
 	"github.com/sthorne/datax/pkg/util/log"
@@ -121,6 +122,10 @@ type ServerOptions struct {
 	// KeyService is the node's key service (issue #310), given to every
 	// session; nil refuses the key statements and functions.
 	KeyService sql.KeyService
+	// Advisory is the node's share of the cluster's advisory locks
+	// (issue #353; nil: a manager of this server's own, with the default
+	// lease).
+	Advisory *advisory.Manager
 }
 
 // Server accepts SQL client connections.
@@ -152,6 +157,9 @@ func (s *Server) Activity() *Activity { return s.act }
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
 	if opts.Notify == nil {
 		opts.Notify = notify.NewHub(stopper.Ctx(), notify.Config{NodeID: opts.NodeID})
+	}
+	if opts.Advisory == nil && db != nil {
+		opts.Advisory = advisory.NewManager(stopper.Ctx(), advisory.Config{DB: db, NodeID: opts.NodeID})
 	}
 	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold), cancel: newCancelRegistry()}
 	stopper.AddCloser(func() { _ = lis.Close() })

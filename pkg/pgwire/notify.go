@@ -158,3 +158,26 @@ func (c *conn) notifyEnd(r notify.Reason) {
 		_ = c.nc.SetReadDeadline(time.Now()) // wakes Receive; see run
 	}
 }
+
+// advisoryLost ends the connection because its node lost the lease its
+// advisory locks were held under (pkg/sql/advisory): another session
+// may have been granted them since. A statement in flight is cancelled;
+// the connection ends with FATAL at once if idle, or after it.
+func (c *conn) advisoryLost() {
+	bye := &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "57P01",
+		Message: "terminating connection: this node could not renew its advisory-lock lease in time, so the advisory locks this session held may have been granted to other sessions",
+		Hint:    "Reconnect and take the locks again."}
+	c.mu.Lock()
+	c.st.draining, c.st.cut = true, true
+	if c.st.bye == nil {
+		c.st.bye = bye
+	}
+	idle := c.st.idle
+	if idle {
+		_ = c.nc.SetReadDeadline(time.Now()) // wakes Receive; see run
+	}
+	c.mu.Unlock()
+	if !idle {
+		c.cancelStatement()
+	}
+}

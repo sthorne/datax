@@ -80,6 +80,9 @@ type Env struct {
 	// one for an admin, its own otherwise); nil when the caller cannot
 	// read them. A function, because most catalog queries never ask.
 	LargeObjects func() ([]LargeObjectInfo, error)
+	// AdvisoryLocks lists the advisory locks held across the cluster
+	// (pg_locks); nil when the session has none to list.
+	AdvisoryLocks func() ([]AdvisoryLockInfo, error)
 	// Keys lists the named keys of the key service (issue #310) as the
 	// datax_keys virtual table shows them: metadata only, for admins;
 	// nil when the caller cannot read them.
@@ -184,6 +187,17 @@ type SealJobInfo struct {
 type LargeObjectInfo struct {
 	OID   int64
 	Owner string
+}
+
+// AdvisoryLockInfo is one granted advisory lock as pg_locks lists it
+// (issue #353): the lock's database and PostgreSQL's three numbers for
+// it, the holding session's process ID and the mode.
+type AdvisoryLockInfo struct {
+	Database       string
+	ClassID, ObjID uint32
+	ObjSubID       uint16
+	PID            int32
+	Mode           string
 }
 
 // RoleOID is a role's stable catalog OID (pg_roles.oid, pg_auth_members,

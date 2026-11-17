@@ -510,6 +510,11 @@ func WithLockTimeout(ctx context.Context, d time.Duration) context.Context {
 	return context.WithValue(ctx, lockTimeoutKey{}, d)
 }
 
+// LockTimeoutFrom returns the lock timeout ctx carries (0 = none): for
+// a wait outside the KV layer (an advisory lock) to honour lock_timeout
+// as a wait on an intent does.
+func LockTimeoutFrom(ctx context.Context) time.Duration { return lockTimeoutFrom(ctx) }
+
 func lockTimeoutFrom(ctx context.Context) time.Duration {
 	d, _ := ctx.Value(lockTimeoutKey{}).(time.Duration)
 	return d

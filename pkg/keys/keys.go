@@ -418,6 +418,46 @@ func PeerUnsealSettingKey() Key { return systemKey("settings", "peer-unseal") }
 // meet the settings above.
 func ClusterSettingKey(name string) Key { return systemKey("settings", name) }
 
+// AdvisoryLockPrefix is the prefix of every holder record of one
+// advisory lock (issue #353, pkg/sql/advisory): the lock's database and
+// PostgreSQL's three numbers for it (classid, objid, objsubid).
+func AdvisoryLockPrefix(db string, classID, objID uint32, subID uint16) Key {
+	k := systemKey("advisory", db)
+	k = Key(encoding.EncodeUint64(k, uint64(classID)))
+	k = Key(encoding.EncodeUint64(k, uint64(objID)))
+	return Key(encoding.EncodeUint64(k, uint64(subID)))
+}
+
+// AdvisoryLockKey is one session's hold of an advisory lock in one
+// mode (JSON): the holder is named by its node, the node's lease term
+// it holds the lock under, and a per-node session number.
+func AdvisoryLockKey(db string, classID, objID uint32, subID uint16, node int32, term, session uint64, mode uint8) Key {
+	k := AdvisoryLockPrefix(db, classID, objID, subID)
+	k = Key(encoding.EncodeUint64(k, uint64(uint32(node))))
+	k = Key(encoding.EncodeUint64(k, term))
+	k = Key(encoding.EncodeUint64(k, session))
+	return Key(encoding.EncodeUint64(k, uint64(mode)))
+}
+
+// AdvisoryLockSpan covers every advisory lock's holder records.
+func AdvisoryLockSpan() (Key, Key) {
+	p := systemKey("advisory")
+	return p, p.PrefixEnd()
+}
+
+// AdvisoryLeaseKey holds a node's advisory-lock lease (JSON): the term
+// its sessions hold advisory locks under and when it expires. A holder
+// record whose term is not its node's live lease term holds nothing.
+func AdvisoryLeaseKey(node int32) Key {
+	return Key(encoding.EncodeUint64(systemKey("advisory-lease"), uint64(uint32(node))))
+}
+
+// AdvisoryLeaseSpan covers every node's advisory-lock lease.
+func AdvisoryLeaseSpan() (Key, Key) {
+	p := systemKey("advisory-lease")
+	return p, p.PrefixEnd()
+}
+
 // ClusterKeyMarkerKey holds the cluster key's record (issue #310, JSON;
 // pkg/server/clusterkey.go): which cluster key is current, the versions
 // still accepted, imported keys, and for each a check value that tells a

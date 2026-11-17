@@ -63,6 +63,7 @@ const (
 	CodeBadCopyFormat             = "22P04"
 	CodeQueryCanceled             = "57014"
 	CodeLockNotAvailable          = "55P03"
+	CodeAdminShutdown             = "57P01"
 	CodeIdleInTransactionTimeout  = "25P03"
 	CodeReadOnlyTransaction       = "25006"
 	CodeInvalidCatalogName        = "3D000"

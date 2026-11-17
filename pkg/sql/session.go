@@ -117,6 +117,9 @@ type Result struct {
 	// Notices are messages for the client, sent as NOTICEs before the
 	// statement completes (a sealed table's plaintext columns, say).
 	Notices []string
+	// Warnings are sent the same way as WARNINGs (SQLSTATE 01000): an
+	// advisory unlock of a lock the session did not hold.
+	Warnings []string
 	// Stream, when set, delivers the rows on demand instead of Rows (a
 	// scan-shaped SELECT on a streaming session, see stream.go); the
 	// consumer pulls it with Next, closes it, and takes the tag from it.
@@ -251,6 +254,11 @@ type Session struct {
 
 	// notify is the session's LISTEN / NOTIFY state (listen.go).
 	notify notifyState
+
+	// adv is the session's advisory-lock state (advlock.go); warnings
+	// collects the running statement's WARNINGs for its result.
+	adv      advisoryState
+	warnings []string
 
 	// keys is the node's key service (keyservice.go; nil: none here).
 	// transportMarked / transportOK record whether the SQL server said
@@ -529,6 +537,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	env.LargeObjects = func() ([]vtable.LargeObjectInfo, error) { return s.listLargeObjects(ctx, txn, set) }
 	env.Keys = func() ([]vtable.KeyInfo, error) { return s.listKeys(ctx, txn, set) }
 	env.SealJobs = func() ([]vtable.SealJobInfo, error) { return s.listSealJobs(ctx, txn) }
+	if s.adv.h != nil {
+		env.AdvisoryLocks = func() ([]vtable.AdvisoryLockInfo, error) { return s.listAdvisoryLocks(ctx) }
+	}
 	// information_schema does not list a table whose schema the session
 	// may not use, as the console does not list it (issue #259): both
 	// ask catalog.SchemaUsageDenied, so SHOW TABLES and /api/schema
@@ -672,6 +683,7 @@ func (s *Session) Close(ctx context.Context) {
 		s.txn = nil
 	}
 	s.discardNotify()
+	s.advisoryClose()
 	s.state = StateIdle
 }
 
@@ -683,6 +695,14 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	s.memUsed = 0
 	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
 	s.invalidateRoles()
+	s.advisoryStatement()
+	s.warnings = nil
+	defer func() {
+		if res != nil && len(s.warnings) > 0 {
+			res.Warnings = append(res.Warnings, s.warnings...)
+		}
+		s.warnings = nil
+	}()
 	var deadline time.Time
 	if d := s.vars.statementTimeout; d > 0 {
 		parent := ctx
@@ -787,6 +807,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.txn = nil
 		s.state = StateIdle
 		s.endTxnVars()
+		s.advisoryEndTxn()
 		pending := s.pendingDDL
 		if err != nil {
 			s.forgetDDL()
@@ -824,6 +845,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			return nil, ToSQLError(err)
 		}
 		s.notifySavepoint(t.Name)
+		s.advisorySavepoint(t.Name)
 		return &Result{Tag: "SAVEPOINT"}, nil
 
 	case *parser.ReleaseSavepoint:
@@ -834,6 +856,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 		}
 		s.notifyReleaseSavepoint(t.Name)
+		s.advisoryReleaseSavepoint(t.Name)
 		return &Result{Tag: "RELEASE"}, nil
 
 	case *parser.RollbackToSavepoint:
@@ -870,6 +893,9 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// publishes them itself when it is drained.
 		s.discardNotify()
 		res, serr := s.executeData(ctx, stmt, params)
+		// The statement was its transaction: its transaction-level
+		// advisory locks go with it.
+		s.advisoryEndTxn()
 		if serr != nil {
 			s.discardNotify()
 			return nil, serr
@@ -1167,6 +1193,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		s.extraDDL, s.pendingWipes = nil, nil
 		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
+		s.advisoryRestart()
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		if err == nil && TestingBeforeImplicitCommit != nil {
 			TestingBeforeImplicitCommit()
@@ -1204,6 +1231,7 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 	for attempt := 0; ; attempt++ {
 		s.streamTop = true
 		s.discardNotify() // a retry starts the statement over
+		s.advisoryRestart()
 		res, err := s.execStmt(ctx, txn, sel, params)
 		s.streamTop = false
 		if err == nil && res.Stream != nil {
@@ -1251,6 +1279,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.keyLeaseAfterCommit = false
 	s.discardNotify()
+	s.advisoryEndTxn()
 	s.state = StateIdle
 }
 
@@ -2508,6 +2537,7 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 		return nil, newErrf(CodeInvalidSavepoint, "%v", err)
 	}
 	s.notifyRollbackToSavepoint(name)
+	s.advisoryRollbackToSavepoint(name)
 	s.loRollbackToSavepoint()
 	// The tables created in the block may have been rolled back with
 	// the savepoint; forget them all rather than track which (CREATE

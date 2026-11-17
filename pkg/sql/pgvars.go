@@ -438,6 +438,10 @@ func (s *Session) SendsNotices() bool {
 	return true
 }
 
+// SendsWarnings reports whether client_min_messages lets a WARNING
+// reach the client (it does unless the level is error).
+func (s *Session) SendsWarnings() bool { return s.pgVarString("client_min_messages") != "error" }
+
 // rowSecurityOff refuses a query that a table's policies would filter
 // while row_security is off, as PostgreSQL does (pg_dump sets it so a
 // dump never silently misses rows).
