@@ -446,13 +446,25 @@ func init() {
 	pg("pg_extension", []catalog.Column{
 		col("oid", types.Int), col("extname", types.String), col("extowner", types.Int), col("extnamespace", types.Int),
 		col("extrelocatable", types.Bool), col("extversion", types.String), col("extconfig", types.String), col("extcondition", types.String),
-	}, empty)
-	// pg_available_extensions: none. datax packages no installable
-	// extension (CREATE EXTENSION vector is accepted only because the
-	// type is built in), as pg_available_extensions() also answers.
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		// The built-in extensions (extensions.go), always installed.
+		var rows []Row
+		for _, e := range Extensions {
+			rows = append(rows, Row{i64(e.OID), str(e.Name), i64(10), i64(e.Namespace), boolean(e.Relocatable), str(e.Version), null(), null()})
+		}
+		return rows, nil
+	})
+	// pg_available_extensions: the same extensions, each installed at
+	// its one version (pg_available_extensions() answers the same).
 	pg("pg_available_extensions", []catalog.Column{
 		col("name", types.String), col("default_version", types.String), col("installed_version", types.String), col("comment", types.String),
-	}, empty)
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		var rows []Row
+		for _, e := range Extensions {
+			rows = append(rows, Row{str(e.Name), str(e.Version), str(e.Version), str(e.Comment)})
+		}
+		return rows, nil
+	})
 	pg("pg_description", []catalog.Column{
 		col("objoid", types.Int), col("classoid", types.Int), col("objsubid", types.Int), col("description", types.String),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {

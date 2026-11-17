@@ -95,14 +95,34 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execAlterTable(ctx, txn, t)
 	case *parser.DropIndex:
 		return s.execDropIndex(ctx, txn, t)
+	case *parser.CreateIndex:
+		// Reached only inside a transaction block (executeData runs the
+		// online build outside one).
+		return s.execCreateIndexInTxn(ctx, txn, t)
 	case *parser.CreateExtension:
-		// pgvector's type, operators and index method are built in, so
-		// the statement that would install them has nothing to do; any
-		// other extension is something datax does not have.
-		if t.Name != "vector" {
-			return nil, newErrf(CodeFeatureNotSupported, "extension %q is not available (datax has no extensions; \"vector\" is accepted because its type and operators are built in)", t.Name)
+		// The extensions datax accepts are built in (vtable.Extensions:
+		// plpgsql, pgcrypto's gen_random_uuid, uuid-ossp's
+		// uuid_generate_v4, pgvector), so the statement that would
+		// install one has nothing to do; any other extension is
+		// something datax does not have.
+		if _, ok := vtable.LookupExtension(t.Name); !ok {
+			return nil, newErrf(CodeFeatureNotSupported, "extension %q is not available (datax has no installable extensions; %s are accepted because what they provide is built in)", t.Name, vtable.ExtensionNames())
 		}
 		return &Result{Tag: "CREATE EXTENSION"}, nil
+	case *parser.DropExtension:
+		// A built-in extension cannot be removed; dropping one does
+		// nothing. Any other name is not installed, as in PostgreSQL.
+		var notices []string
+		for _, name := range t.Names {
+			if _, ok := vtable.LookupExtension(name); ok {
+				continue
+			}
+			if !t.IfExists {
+				return nil, newErrf(CodeUndefinedObject, "extension %q does not exist", name)
+			}
+			notices = append(notices, fmt.Sprintf("extension %q does not exist, skipping", name))
+		}
+		return &Result{Tag: "DROP EXTENSION", Notices: notices}, nil
 	case *parser.CreateView:
 		return s.execCreateView(ctx, txn, t)
 	case *parser.CommentOn:
@@ -335,6 +355,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 		return nil, err
 	}
+	s.noteCreatedTable(txn, desc.ID)
 	// SERIAL and identity columns own a sequence named <table>_<col>_seq,
 	// created now that the table has its ID; the column defaults to
 	// nextval of it.

@@ -268,6 +268,11 @@ type Session struct {
 	// pendingDDL names tables changed inside the open explicit transaction;
 	// lease adoption for them is drained at COMMIT.
 	pendingDDL []string
+	// createdTables are the IDs of the tables created in the open
+	// transaction block createdTxn (index_keys.go): CREATE INDEX on one
+	// of them runs inside the block.
+	createdTxn    *kvclient.Txn
+	createdTables map[uint64]bool
 }
 
 // NewSession creates a root session (internal components, tests, tools).
@@ -1031,10 +1036,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.execReshardOnline(ctx, at)
 	}
 
-	if ci, ok := stmt.(*parser.CreateIndex); ok {
-		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
-		}
+	if ci, ok := stmt.(*parser.CreateIndex); ok && s.state != StateOpen {
+		// Inside a block, CREATE INDEX runs with the block's other
+		// statements (execCreateIndexInTxn): on a table created in the
+		// block, or refused.
 		if serr := s.checkTableOwnerNoTxn(ctx, ci.Table); serr != nil {
 			return nil, serr
 		}
@@ -2504,6 +2509,10 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 	}
 	s.notifyRollbackToSavepoint(name)
 	s.loRollbackToSavepoint()
+	// The tables created in the block may have been rolled back with
+	// the savepoint; forget them all rather than track which (CREATE
+	// INDEX on one is then refused in the block, never wrongly allowed).
+	s.createdTxn, s.createdTables = nil, nil
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
 }

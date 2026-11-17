@@ -172,6 +172,9 @@ type likeIndex struct {
 	inverted string
 	// nullsNotDistinct copies UNIQUE NULLS NOT DISTINCT.
 	nullsNotDistinct bool
+	// opClasses and collations copy the declared operator classes and
+	// collations (parallel to cols; nil = none).
+	opClasses, collations []string
 }
 
 // expandLike replaces each LIKE clause of a CREATE TABLE with the source
@@ -277,7 +280,8 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					for _, id := range idx.ColumnIDs {
 						names = append(names, byID[id])
 					}
-					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted, nullsNotDistinct: idx.NullsNotDistinct})
+					indexes = append(indexes, likeIndex{name: idx.Name, unique: idx.Unique, cols: names, inverted: idx.Inverted, nullsNotDistinct: idx.NullsNotDistinct,
+						opClasses: idx.OpClasses, collations: idx.Collations})
 				}
 			}
 		}
@@ -306,7 +310,8 @@ func addLikeIndexes(desc *catalog.TableDescriptor, indexes []likeIndex) error {
 		if desc.NextIndexID < 2 {
 			desc.NextIndexID = 2
 		}
-		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted, NullsNotDistinct: li.nullsNotDistinct})
+		desc.Indexes = append(desc.Indexes, catalog.IndexDescriptor{ID: desc.NextIndexID, Name: li.name, Unique: li.unique, ColumnIDs: ids, State: catalog.IndexStatePublic, Inverted: li.inverted, NullsNotDistinct: li.nullsNotDistinct,
+			OpClasses: li.opClasses, Collations: li.collations})
 		desc.NextIndexID++
 	}
 	return nil

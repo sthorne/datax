@@ -418,6 +418,15 @@ type IndexDescriptor struct {
 	// omitempty and set only at creation. Cluster version v22: a node
 	// that does not know the field would key the entries untagged.
 	NullsNotDistinct bool `json:"nulls_not_distinct,omitempty"`
+	// OpClasses and Collations, when set, are parallel to ColumnIDs: the
+	// operator class (text_pattern_ops) and collation ("C", "POSIX") a
+	// column of an ordinary index was declared with, "" for the
+	// default. Every ordinary index compares bytewise, which is what
+	// these ask for, so they change nothing but how the index is shown
+	// (pg_get_indexdef); a node that does not know the fields shows the
+	// index without them.
+	OpClasses  []string `json:"opclasses,omitempty"`
+	Collations []string `json:"collations,omitempty"`
 }
 
 // VectorIndex describes an IVF ("inverted file") index: the vectors of
@@ -837,6 +846,12 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 	for i, idx := range d.Indexes {
 		out.Indexes[i] = idx
 		out.Indexes[i].ColumnIDs = append([]ColumnID(nil), idx.ColumnIDs...)
+		if idx.OpClasses != nil {
+			out.Indexes[i].OpClasses = append([]string(nil), idx.OpClasses...)
+		}
+		if idx.Collations != nil {
+			out.Indexes[i].Collations = append([]string(nil), idx.Collations...)
+		}
 	}
 	if d.Constraints != nil {
 		out.Constraints = make([]Constraint, len(d.Constraints))

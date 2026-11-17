@@ -341,18 +341,27 @@ type DropType struct {
 // ShowFunctions is SHOW FUNCTIONS: the builtin function reference.
 type ShowFunctions struct{}
 
-// CreateIndex is CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols).
+// CreateIndex is CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS]
+// [name] ON table (cols).
 type CreateIndex struct {
 	Unique      bool
 	IfNotExists bool
-	Name        string
-	Table       string
-	Columns     []string
+	// Concurrently is CONCURRENTLY: every build is online already, so it
+	// changes nothing but the refusal inside a transaction block.
+	Concurrently bool
+	// Name is "" when the statement leaves it out; the executor picks
+	// one (<table>_<columns>_idx), as PostgreSQL does.
+	Name    string
+	Table   string
+	Columns []string
 	// Using is the access method of USING (lower-cased; "" = none
 	// given, an ordinary index). OpClasses, when any column names an
-	// operator class, is parallel to Columns ("" = none for that column).
-	Using     string
-	OpClasses []string
+	// operator class, is parallel to Columns ("" = none for that column);
+	// so is Collations, when any column names a COLLATE (as written:
+	// a quoted name keeps its case).
+	Using      string
+	OpClasses  []string
+	Collations []string
 	// ExprFunc and ExprArg are set for the one expression an index may
 	// be built on, fn('constant', column) — in practice
 	// to_tsvector('english', body) under USING GIN. Columns then holds
@@ -375,14 +384,26 @@ type CreateIndex struct {
 // written for PostgreSQL with pgvector ("CREATE EXTENSION vector")
 // loads, and the executor refuses any other name.
 type CreateExtension struct {
-	Name string
+	Name        string
+	IfNotExists bool
 }
 
-// DropIndex is DROP INDEX [IF EXISTS] [db.]name: the index is found on
-// whichever table of the database carries it.
-type DropIndex struct {
-	Name     string
+// DropExtension is DROP EXTENSION [IF EXISTS] name [, ...] [CASCADE |
+// RESTRICT]. The extensions datax accepts are built in and cannot be
+// removed, so for them it does nothing.
+type DropExtension struct {
+	Names    []string
 	IfExists bool
+}
+
+// DropIndex is DROP INDEX [CONCURRENTLY] [IF EXISTS] [db.]name
+// [CASCADE | RESTRICT]: the index is found on whichever table of the
+// database carries it.
+type DropIndex struct {
+	Name         string
+	IfExists     bool
+	Concurrently bool
+	Cascade      bool
 }
 
 // AlterIndex is ALTER INDEX [IF EXISTS] [db.]name RENAME TO new.
@@ -1058,6 +1079,7 @@ func (*ShowSequences) stmt()          {}
 func (*ShowFunctions) stmt()          {}
 func (*CreateIndex) stmt()            {}
 func (*CreateExtension) stmt()        {}
+func (*DropExtension) stmt()          {}
 func (*DropIndex) stmt()              {}
 func (*CreateView) stmt()             {}
 func (*CommentOn) stmt()              {}

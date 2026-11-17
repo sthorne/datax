@@ -86,6 +86,7 @@ var describeSamples = []struct {
 	{"AlterType", []describeSample{{sql: `ALTER TYPE shapes_mood ADD VALUE 'c'`}}},
 	{"CommentOn", []describeSample{{sql: `COMMENT ON TABLE shapes IS 'shapes'`}}},
 	{"CreateExtension", []describeSample{{sql: `CREATE EXTENSION IF NOT EXISTS vector`}}},
+	{"DropExtension", []describeSample{{sql: `DROP EXTENSION IF EXISTS "uuid-ossp"`}}},
 	{"Analyze", []describeSample{{sql: `ANALYZE shapes`}}},
 	{"ShowStats", []describeSample{{sql: `SHOW STATS FOR shapes`, rows: true}}},
 	{"ShowTables", []describeSample{{sql: `SHOW TABLES`, rows: true}}},
