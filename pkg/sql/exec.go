@@ -1461,7 +1461,7 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...), Limit: -1}
 	stripTableAlias(sel)
 	for _, se := range sel.Exprs {
-		if se.Agg != "" {
+		if se.Agg != "" || !se.Star && exprHasAgg(se.Expr) {
 			return nil, newErrf(CodeGrouping, "aggregate functions are not allowed in RETURNING")
 		}
 		if !se.Star && exprHasSubquery(se.Expr) {
@@ -3482,11 +3482,6 @@ func stripTableAlias(t *parser.Select) {
 	w.SelectStmt(&self)
 	for i := range t.GroupBy {
 		strip(&t.GroupBy[i])
-	}
-	for i := range t.Having {
-		if t.Having[i].Column != "" {
-			strip(&t.Having[i].Column)
-		}
 	}
 }
 

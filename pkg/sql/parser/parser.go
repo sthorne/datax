@@ -2580,10 +2580,11 @@ func (p *parser) parseSelect() (Statement, error) {
 			sel.Exprs = append(sel.Exprs, SelectExpr{Star: true})
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
-		} else if ok && se.Window != nil && p.continuesValue() {
-			// A window call that starts a larger expression (count(*)
-			// OVER () > 3, sum(x) OVER w * 2): parse the whole item as a
-			// value, with the call as an operand.
+		} else if ok && p.continuesValue() {
+			// An aggregate or window call that starts a larger expression
+			// (SUM(a) / COUNT(*), count(*) OVER () > 3, sum(x) OVER w * 2):
+			// parse the whole item as a value, with the call as an
+			// operand.
 			p.i = itemStart
 			e, err := p.parseValueOrBool()
 			if err != nil {
@@ -3033,6 +3034,7 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 	var out []OrderCol
 	for {
 		var oc OrderCol
+		termStart := p.i
 		if t := p.peek(); t.kind == tkNumber {
 			n, err := strconv.Atoi(t.text)
 			star := firstStar(exprs)
@@ -3056,9 +3058,14 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 			oc.Ordinal = n
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
-		} else if ok {
+		} else if ok && !p.continuesValue() {
 			oc = OrderCol{Agg: &se}
 		} else {
+			if ok {
+				// An aggregate call starting a larger expression
+				// (ORDER BY SUM(a) / COUNT(*)): parse the whole term.
+				p.i = termStart
+			}
 			// A bare (possibly qualified) name sorts by that column or
 			// output name; anything else is a computed sort key.
 			e, err := p.parseValueOrBool()
@@ -3441,40 +3448,15 @@ func (p *parser) parseOptTableAlias(allowAsOf bool) string {
 	return ""
 }
 
-// parseHaving parses the HAVING conjunction: each conjunct compares an
-// aggregate call or a column/output name against a literal or parameter.
-func (p *parser) parseHaving() ([]HavingCond, error) {
-	var out []HavingCond
-	for {
-		var hc HavingCond
-		if se, ok, err := p.parseAggExpr(); err != nil {
-			return nil, err
-		} else if ok {
-			hc.Agg = &se
-		} else {
-			col, err := p.expectIdent()
-			if err != nil {
-				return nil, err
-			}
-			hc.Column = col
-		}
-		if op, ok := p.parseCmpOp(); ok {
-			val, err := p.parseValueOrColumnExpr()
-			if err != nil {
-				return nil, err
-			}
-			hc.Op, hc.Value = op, val
-		} else {
-			// A bare boolean aggregate or column: HAVING bool_or(x).
-			tr := types.NewBool(true)
-			hc.Op, hc.Value = "=", Expr{Lit: &tr}
-		}
-		out = append(out, hc)
-		if !p.consumeKeyword("AND") {
-			break
-		}
+// parseHaving parses the HAVING condition: a boolean expression, like
+// WHERE's, over grouping expressions and aggregate calls (an aggregate
+// call parses as Expr.Agg wherever a value may stand).
+func (p *parser) parseHaving() ([]Comparison, error) {
+	n, err := p.parseBoolOr()
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	return lowerBool(n, false)
 }
 
 // windowNames are the window-only functions: they need an OVER clause.
@@ -4634,8 +4616,9 @@ func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
 		t := p.peek()
 		tr := types.NewBool(true)
 		if computed {
-			// A bare boolean call or value (pg_table_is_visible(c.oid)).
-			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil || lhs.Cast != "" {
+			// A bare boolean call or value (pg_table_is_visible(c.oid),
+			// HAVING bool_or(x)).
+			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil || lhs.Cast != "" || lhs.Agg != nil {
 				base.Op, base.Value = "=", Expr{Lit: &tr}
 				return one(base)
 			}
@@ -5786,9 +5769,9 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		// rather than a syntax error.
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && (aggNames[t.text] || windowNames[t.text]) {
 			// An aggregate or window call inside an expression: a window
-			// call (with OVER) becomes a value the window stage supplies;
-			// a plain aggregate keeps its call form for the evaluator to
-			// refuse or, in HAVING/ORDER BY, the grouped paths to place.
+			// call (with OVER) becomes a value the window stage supplies,
+			// a plain aggregate one the grouped executor computes per
+			// group (and any other context refuses).
 			se, ok, err := p.parseAggExpr()
 			if err != nil {
 				return Expr{}, err
@@ -5796,17 +5779,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if ok && se.Window != nil {
 				return p.applyCasts(Expr{Window: &se})
 			}
-			e := Expr{Func: strings.ToLower(se.Agg)}
-			switch {
-			case se.AggStar:
-				e.Args = []Expr{{Column: "*"}}
-			case se.AggCol != "":
-				e.Args = []Expr{{Column: se.AggCol}}
-			case se.AggArg != nil:
-				e.Args = []Expr{*se.AggArg}
-			}
-			e.Args = append(e.Args, se.AggArgs...)
-			return p.applyCasts(e)
+			return p.applyCasts(Expr{Agg: &se})
 		}
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && t.text != "array" {
 			arity, isFunc := scalarFuncs[t.text]
@@ -5898,6 +5871,9 @@ func outputName(se SelectExpr) string {
 	}
 	if se.Agg != "" {
 		return strings.ToLower(se.Agg) // the aggregate's output name
+	}
+	if se.Expr.Agg != nil && se.Expr.BinOp == "" && len(se.Expr.Path) == 0 {
+		return strings.ToLower(se.Expr.Agg.Agg) // count(*)::int is "count"
 	}
 	return "?column?"
 }

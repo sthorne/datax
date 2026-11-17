@@ -403,6 +403,37 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		out.Args = args
 	}
+	if e.Agg != nil {
+		// An aggregate call inside an expression: its arguments and
+		// FILTER resolve like a select item's.
+		agg := *e.Agg
+		if agg.AggArg != nil {
+			a, err := s.resolveValueExprOpts(ctx, txn, *agg.AggArg, params, keepVolatile)
+			if err != nil {
+				return e, err
+			}
+			agg.AggArg = &a
+		}
+		if len(agg.AggArgs) > 0 {
+			args := make([]parser.Expr, len(agg.AggArgs))
+			for i, a := range agg.AggArgs {
+				ra, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
+				if err != nil {
+					return e, err
+				}
+				args[i] = ra
+			}
+			agg.AggArgs = args
+		}
+		if len(agg.AggFilter) > 0 {
+			f, err := s.resolveWhereSubs(ctx, txn, agg.AggFilter, params)
+			if err != nil {
+				return e, err
+			}
+			agg.AggFilter = f
+		}
+		out.Agg = &agg
+	}
 	if e.Cmp != nil {
 		// A boolean value: its EXISTS / IN / scalar subqueries resolve
 		// like a WHERE conjunct's.
@@ -580,6 +611,22 @@ func exprHas(e parser.Expr, pred func(parser.Expr) bool) bool {
 			return true
 		}
 	}
+	if e.Agg != nil {
+		// An aggregate call's arguments and FILTER (inside an expression).
+		if e.Agg.AggArg != nil && exprHas(*e.Agg.AggArg, pred) {
+			return true
+		}
+		for _, a := range e.Agg.AggArgs {
+			if exprHas(a, pred) {
+				return true
+			}
+		}
+		for _, c := range e.Agg.AggFilter {
+			if condHas(c, pred) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -739,19 +786,12 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 		c.Exprs[i].Expr = v
 	}
 
-	for i, hc := range t.Having {
-		if !exprHasSub(hc.Value) {
-			continue
-		}
-		v, err := s.resolveValueExpr(ctx, txn, hc.Value, params)
-		if err != nil {
-			return nil, err
-		}
-		c := cloned()
-		if &c.Having[0] == &t.Having[0] {
-			c.Having = append([]parser.HavingCond(nil), t.Having...)
-		}
-		c.Having[i].Value = v
+	having, err := s.resolveWhereSubs(ctx, txn, t.Having, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(having) > 0 && &having[0] != &t.Having[0] {
+		cloned().Having = having
 	}
 	for i, oc := range t.OrderBy {
 		if oc.Expr == nil || !exprHasSub(*oc.Expr) {
@@ -954,33 +994,32 @@ func stripAliasQualifier(name, alias string) string {
 // table's alias stripped from every column reference, so the synthetic
 // descriptor's bare column names resolve.
 func derivedSelect(t *parser.Select) *parser.Select {
+	strip := func(n string) string { return stripAliasQualifier(n, t.Alias) }
 	c := *t
 	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
 	for i := range c.Exprs {
-		if c.Exprs[i].Expr.Column != "" {
-			c.Exprs[i].Expr.Column = stripAliasQualifier(c.Exprs[i].Expr.Column, t.Alias)
-		}
-		if c.Exprs[i].AggCol != "" {
-			c.Exprs[i].AggCol = stripAliasQualifier(c.Exprs[i].AggCol, t.Alias)
+		if !c.Exprs[i].Star {
+			c.Exprs[i] = renameSelectExpr(c.Exprs[i], strip)
 		}
 	}
-	c.Where = append([]parser.Comparison(nil), t.Where...)
-	for i := range c.Where {
-		c.Where[i].Column = stripAliasQualifier(c.Where[i].Column, t.Alias)
-	}
+	c.Where = renameCondColumns(t.Where, strip)
 	c.GroupBy = append([]string(nil), t.GroupBy...)
 	for i := range c.GroupBy {
-		c.GroupBy[i] = stripAliasQualifier(c.GroupBy[i], t.Alias)
+		c.GroupBy[i] = strip(c.GroupBy[i])
 	}
-	c.Having = append([]parser.HavingCond(nil), t.Having...)
-	for i := range c.Having {
-		if c.Having[i].Column != "" {
-			c.Having[i].Column = stripAliasQualifier(c.Having[i].Column, t.Alias)
-		}
-	}
+	c.Having = renameCondColumns(t.Having, strip)
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 	for i := range c.OrderBy {
-		c.OrderBy[i].Column = stripAliasQualifier(c.OrderBy[i].Column, t.Alias)
+		oc := &c.OrderBy[i]
+		oc.Column = strip(oc.Column)
+		if oc.Expr != nil {
+			e := renameExprColumns(*oc.Expr, strip)
+			oc.Expr = &e
+		}
+		if oc.Agg != nil {
+			a := renameSelectExpr(*oc.Agg, strip)
+			oc.Agg = &a
+		}
 	}
 	return &c
 }

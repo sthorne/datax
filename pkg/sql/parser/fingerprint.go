@@ -197,20 +197,7 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	}
 	if len(s.Having) > 0 {
 		f.kw("HAVING")
-		for i, h := range s.Having {
-			if i > 0 {
-				f.kw("AND")
-			}
-			f.sp()
-			if h.Agg != nil {
-				f.selectExpr(*h.Agg)
-			} else {
-				f.w(strings.ToLower(h.Column))
-			}
-			f.kw(strings.ToUpper(h.Op))
-			f.sp()
-			f.expr(h.Value)
-		}
+		f.comparisons(s.Having)
 	}
 	f.orderBy(s.OrderBy)
 	// The presence of LIMIT/OFFSET is a shape; the number is a value.
@@ -499,6 +486,8 @@ func (f *fingerprinter) atom(e Expr) {
 		f.w(")")
 	case e.Window != nil:
 		f.selectExpr(*e.Window)
+	case e.Agg != nil:
+		f.selectExpr(*e.Agg)
 	case e.Column != "":
 		f.w(strings.ToLower(e.Column))
 		for range e.Path {

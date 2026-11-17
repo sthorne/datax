@@ -1336,6 +1336,11 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 	case e.Sub != nil:
 		// Scalar subqueries are evaluated and spliced before execution.
 		return types.Datum{}, newErrf(CodeInternal, "unresolved scalar subquery")
+	case e.Agg != nil:
+		// The grouped executor replaces every aggregate call it computes;
+		// one reaching evaluation stands where none may (WHERE, ON, a
+		// row-by-row select list).
+		return types.Datum{}, newErrf(CodeGrouping, "aggregate function %s() is not allowed here", strings.ToLower(e.Agg.Agg))
 	default:
 		return types.Datum{}, newErrf(CodeInternal, "empty expression")
 	}

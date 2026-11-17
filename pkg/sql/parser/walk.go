@@ -124,13 +124,7 @@ func (w *Walker) selectMember(m *Select) {
 	}
 	w.selectExprs(m.Exprs)
 	w.Conds(m.Where)
-	for i := range m.Having {
-		h := &m.Having[i]
-		if h.Agg != nil {
-			w.selectExpr(h.Agg)
-		}
-		w.WalkExpr(&h.Value)
-	}
+	w.Conds(m.Having)
 	w.orderCols(m.OrderBy)
 	for i := range m.Windows {
 		w.windowSpec(&m.Windows[i].Spec)
@@ -230,6 +224,9 @@ func (w *Walker) WalkExpr(e *Expr) {
 	}
 	if e.Window != nil {
 		w.selectExpr(e.Window)
+	}
+	if e.Agg != nil {
+		w.selectExpr(e.Agg)
 	}
 }
 

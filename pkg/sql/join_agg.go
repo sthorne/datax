@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"strings"
+
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -49,30 +51,47 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 		}
 		return canonJoinName(sides, ref), nil
 	}
+	// strict renames a reference that must be a join column (the select
+	// list, aggregate arguments); lenient leaves one that is not, which
+	// may be an output name (HAVING n = 2, ORDER BY total * 2) for the
+	// grouped resolver to place or refuse.
+	var firstErr error
+	strict := func(name string) string {
+		n, err := canon(name)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return name
+		}
+		return n
+	}
+	lenient := func(name string) string {
+		if n, err := canon(name); err == nil {
+			return n
+		}
+		return name
+	}
 	c := *t
 	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+	outputs := map[string]bool{}
 	for i := range c.Exprs {
 		se := &c.Exprs[i]
-		if se.Expr.Column != "" && se.Expr.BinOp == "" {
-			name, err := canon(se.Expr.Column)
-			if err != nil {
-				return nil, err
-			}
-			if se.Alias == "" {
-				_, bare := splitQualified(se.Expr.Column)
-				se.Alias = bare
-			}
-			se.Expr.Column = name
+		if se.Expr.Column != "" && se.Expr.BinOp == "" && se.Alias == "" && len(se.Expr.Path) == 0 {
+			_, bare := splitQualified(se.Expr.Column)
+			se.Alias = bare
 		}
-		if se.AggCol != "" && se.AggCol != "*" {
-			name, err := canon(se.AggCol)
-			if err != nil {
-				return nil, err
-			}
-			se.AggCol = name
+		*se = renameSelectExpr(*se, strict)
+		if firstErr != nil {
+			return nil, firstErr
 		}
-		if err := canonAggExprs(se, canon); err != nil {
-			return nil, err
+		switch {
+		case se.Alias != "":
+			outputs[se.Alias] = true
+		case se.Agg != "":
+			outputs[strings.ToLower(se.Agg)] = true
+		default:
+			outputs[parser.OutputName(*se)] = true
 		}
 	}
 	c.GroupBy = append([]string(nil), t.GroupBy...)
@@ -83,55 +102,36 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 		}
 		c.GroupBy[i] = name
 	}
-	c.Having = append([]parser.HavingCond(nil), t.Having...)
-	for i := range c.Having {
-		hc := &c.Having[i]
-		if hc.Agg != nil {
-			agg := *hc.Agg
-			if agg.AggCol != "" && agg.AggCol != "*" {
-				name, err := canon(agg.AggCol)
-				if err != nil {
-					return nil, err
-				}
-				agg.AggCol = name
-			}
-			if err := canonAggExprs(&agg, canon); err != nil {
-				return nil, err
-			}
-			hc.Agg = &agg
-		} else if hc.Column != "" {
-			// A grouped column reference canonicalizes; anything else may
-			// be an output name (aggregate alias) — leave it for the
-			// grouped resolver's output-name fallback.
-			if name, err := canon(hc.Column); err == nil {
-				hc.Column = name
-			}
-		}
-	}
-	// ORDER BY over grouped output resolves by RESULT name: strip any
-	// qualifier that resolves to a join column (its output name is the
-	// bare form set above); leave aggregate output names untouched.
+	c.Having = renameCondColumns(t.Having, lenient)
+	// ORDER BY over grouped output resolves by RESULT name first: a
+	// qualified reference to a join column whose bare name is an output
+	// name sorts by that output; any other join column keeps its
+	// canonical name for the grouped resolver (a grouping column, or a
+	// column it refuses as neither grouped nor aggregated).
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 	for i := range c.OrderBy {
 		oc := &c.OrderBy[i]
-		if oc.Agg != nil {
-			agg := *oc.Agg
-			if agg.AggCol != "" && agg.AggCol != "*" {
-				name, err := canon(agg.AggCol)
-				if err != nil {
-					return nil, err
-				}
-				agg.AggCol = name
-			}
-			if err := canonAggExprs(&agg, canon); err != nil {
-				return nil, err
+		switch {
+		case oc.Agg != nil:
+			agg := renameSelectExpr(*oc.Agg, strict)
+			if firstErr != nil {
+				return nil, firstErr
 			}
 			oc.Agg = &agg
-			continue
-		}
-		if _, err := resolveJoinRef(sides, oc.Column); err == nil {
-			_, bare := splitQualified(oc.Column)
-			oc.Column = bare
+		case oc.Expr != nil:
+			e := renameExprColumns(*oc.Expr, lenient)
+			oc.Expr = &e
+		case oc.Column != "":
+			if outputs[oc.Column] {
+				continue
+			}
+			if ref, err := resolveJoinRef(sides, oc.Column); err == nil {
+				if outputs[ref.col.Name] {
+					oc.Column = ref.col.Name
+				} else {
+					oc.Column = canonJoinName(sides, ref)
+				}
+			}
 		}
 	}
 	// WHERE was already applied to the joined rows; the grouped executor
@@ -139,6 +139,19 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 	// double-resolve un-canonicalized names.
 	c.Where = nil
 	return &c, nil
+}
+
+// renameSelectExpr returns a copy of a select item (or aggregate call)
+// with every column reference renamed: its expression, and an
+// aggregate's argument, extra arguments, FILTER and WITHIN GROUP.
+func renameSelectExpr(se parser.SelectExpr, rename func(string) string) parser.SelectExpr {
+	out := se
+	out.Expr = renameExprColumns(se.Expr, rename)
+	if se.AggCol != "" && se.AggCol != "*" {
+		out.AggCol = rename(se.AggCol)
+	}
+	_ = canonAggExprs(&out, func(n string) (string, error) { return rename(n), nil })
+	return out
 }
 
 // canonAggExprs rewrites the column references inside an aggregate's
@@ -236,6 +249,10 @@ func renameExprColumns(e parser.Expr, rename func(string) string) parser.Expr {
 	if e.Cmp != nil {
 		c := renameCondColumns([]parser.Comparison{*e.Cmp}, rename)[0]
 		out.Cmp = &c
+	}
+	if e.Agg != nil {
+		a := renameSelectExpr(*e.Agg, rename)
+		out.Agg = &a
 	}
 	return out
 }

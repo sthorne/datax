@@ -62,6 +62,8 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		}
 	case e.Cmp != nil:
 		fam = types.Bool
+	case e.Agg != nil:
+		fam = aggFamily(*e.Agg, colType)
 	}
 	if len(e.Path) > 0 {
 		fam = pathResultType(e.Path)
@@ -74,6 +76,23 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		fam = builtins.CastFamily(e.Cast, fam)
 	}
 	return fam
+}
+
+// aggFamily is the result family of an aggregate call: its argument's
+// family through the aggregate's result rule (aggSpec.resultType).
+func aggFamily(se parser.SelectExpr, colType func(name string) (types.Family, bool)) types.Family {
+	sp := aggSpec{fn: se.Agg}
+	switch {
+	case len(se.AggOrder) == 1 && se.AggOrder[0].Expr != nil:
+		sp.argType = exprFamily(*se.AggOrder[0].Expr, colType)
+	case len(se.AggOrder) == 1:
+		sp.argType = exprFamily(parser.Expr{Column: se.AggOrder[0].Column}, colType)
+	case se.AggCol != "":
+		sp.argType = exprFamily(parser.Expr{Column: se.AggCol}, colType)
+	case se.AggArg != nil:
+		sp.argType = exprFamily(*se.AggArg, colType)
+	}
+	return sp.resultType()
 }
 
 // arithFamily is the result family of l op r.

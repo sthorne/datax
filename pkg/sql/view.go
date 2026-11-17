@@ -204,6 +204,9 @@ func stmtTables(stmt parser.Statement) []string {
 		if e.Window != nil {
 			exprs([]parser.SelectExpr{*e.Window})
 		}
+		if e.Agg != nil && e.Agg.AggArg != nil {
+			expr(*e.Agg.AggArg)
+		}
 	}
 	conds = func(cs []parser.Comparison) {
 		for _, c := range cs {
@@ -249,9 +252,7 @@ func stmtTables(stmt parser.Statement) []string {
 			}
 			exprs(m.Exprs)
 			conds(m.Where)
-			for _, h := range m.Having {
-				expr(h.Value)
-			}
+			conds(m.Having)
 			for _, oc := range m.OrderBy {
 				if oc.Expr != nil {
 					expr(*oc.Expr)

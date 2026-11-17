@@ -11,6 +11,19 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Expressions over aggregates** (#335): the select list, `HAVING` and
+  `ORDER BY` of a grouped or aggregate query take any scalar expression over
+  aggregate calls and grouping columns — `SUM(a) / COUNT(*)`, `ROUND(AVG(x),
+  2)`, `COALESCE(MAX(x), 0)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`,
+  `CASE WHEN COUNT(*) > 1 ...`, casts — with or without `GROUP BY` and over
+  joins; an aggregate keeps its `DISTINCT` and `FILTER` inside an expression.
+  `HAVING` is a full boolean condition (`OR`, `NOT`, `IN`, `LIKE`, an
+  aggregate on either side). The aggregates are computed per group and the
+  expression is evaluated over them, and the extended protocol describes the
+  result with its real type. A column that is neither grouped nor aggregated
+  is refused with `42803`, as is an aggregate in `WHERE`. Before, an
+  aggregate could only stand alone in the select list (`SUM(a) / COUNT(*)`
+  was a syntax error) and `HAVING` took one comparison per conjunct.
 - **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
   extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
   INDEX`, both supported, but not here): when the table already has a

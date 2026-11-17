@@ -62,6 +62,13 @@ type Expr struct {
 	// expression; the executor computes it as a window item and
 	// substitutes its value.
 	Window *SelectExpr `json:"window,omitempty"`
+	// Agg is an aggregate call (no OVER) used as a value inside an
+	// expression (SUM(a) / COUNT(*), ROUND(AVG(x), 2), CASE WHEN
+	// COUNT(*) > 1 ...): the grouped executor computes it per group and
+	// evaluates the expression around it over the group's values. A
+	// select item that is a lone aggregate call keeps the SelectExpr.Agg
+	// form instead.
+	Agg *SelectExpr `json:"agg,omitempty"`
 }
 
 // CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
@@ -557,15 +564,6 @@ type OrderCol struct {
 	Agg *SelectExpr
 }
 
-// HavingCond is one HAVING conjunct: an aggregate call (HAVING COUNT(*) > 5)
-// or a group-column/output name (HAVING city != 'x') compared to a value.
-type HavingCond struct {
-	Agg    *SelectExpr // aggregate form; nil for the column form
-	Column string
-	Op     string
-	Value  Expr
-}
-
 // ColumnRef is a possibly-qualified column reference (t.c or c).
 type ColumnRef struct {
 	Table  string // alias or table name; "" = unqualified
@@ -663,7 +661,9 @@ type Select struct {
 	SetOp   string
 	Where   []Comparison
 	GroupBy []string
-	Having  []HavingCond
+	// Having is the HAVING condition, a conjunction like Where's over
+	// grouping expressions and aggregate calls.
+	Having  []Comparison
 	OrderBy []OrderCol
 	Limit   int64 // -1 = none
 	// Offset skips that many rows before Limit applies (0 = none).

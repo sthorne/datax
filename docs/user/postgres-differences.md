@@ -11,7 +11,7 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
@@ -93,8 +93,8 @@ syntax error or `0A000` feature not supported):
   `TIME WITH TIME ZONE` is refused at parse (`42601`).
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
-- **JSONB**: `->`/`->>` extraction (single-table queries and joins;
-  grouped SELECT lists refuse), containment `@>` / `<@` and key
+- **JSONB**: `->`/`->>` extraction (single-table queries, joins and
+  grouped select lists), containment `@>` / `<@` and key
   existence `?` / `?|` / `?&` (single-table only), equality comparison,
   and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
   `HAVING` or after a computed left-hand side.
@@ -279,8 +279,8 @@ syntax error or `0A000` feature not supported):
   inside a transaction block.
 - **`ORDER BY`** takes output names, positions and expressions, but an
   expression sort never uses an index; NULLs order last ASC / first DESC
-  (PostgreSQL default). Under `GROUP BY` and `UNION`, output names and
-  positions only. A position after a `*` that is not the whole select
+  (PostgreSQL default). Under `UNION`, output names and positions
+  only. A position after a `*` that is not the whole select
   list is refused; `GROUP BY` takes columns and positions of columns,
   not expressions.
 - **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond

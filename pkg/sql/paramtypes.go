@@ -443,19 +443,8 @@ func (pt *paramTyper) member(m *parser.Select, parent *paramScope, top bool) {
 			pt.err = err
 		}
 	}
-	for _, h := range m.Having {
-		fam, fixed := types.Unknown, true
-		switch {
-		case h.Agg != nil && h.Agg.Agg == "COUNT":
-			fam = types.Int
-		case h.Agg != nil && (h.Agg.Agg == "MIN" || h.Agg.Agg == "MAX" || h.Agg.Agg == "SUM") && h.Agg.AggCol != "":
-			fam, _ = sc.column(h.Agg.AggCol)
-			fixed = false
-		case h.Agg == nil && h.Column != "":
-			fam, _ = sc.column(h.Column)
-		}
-		pt.value(h.Value, fam, fixed)
-	}
+	// HAVING's conjuncts type like WHERE's, an aggregate call on the
+	// left by its result type (exprFamily).
 	pt.walkSelect(&c, sc)
 }
 
