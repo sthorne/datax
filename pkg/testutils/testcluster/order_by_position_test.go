@@ -52,6 +52,8 @@ func TestOrderByPosition(t *testing.T) {
 		{`SELECT a, count(*) FROM o GROUP BY 1 ORDER BY 1`, []string{"x|2", "y|1", "z|1"}},
 		{`SELECT a AS k, count(*) FROM o GROUP BY 1 ORDER BY 1`, []string{"x|2", "y|1", "z|1"}},
 		{`SELECT id AS a, count(*) FROM o GROUP BY 1 ORDER BY 1`, []string{"1|1", "2|1", "3|1", "4|1"}},
+		// GROUP BY n of an expression item groups by the expression (#336).
+		{`SELECT lower(a), count(*) FROM o GROUP BY 1 ORDER BY 1`, []string{"x|2", "y|1", "z|1"}},
 	} {
 		got, err := rlsTryRows(ctx, c, tc.q)
 		if err != nil {
@@ -64,11 +66,10 @@ func TestOrderByPosition(t *testing.T) {
 	}
 	// What a position cannot name is refused, not resolved by a name.
 	for q, code := range map[string]string{
-		`SELECT a, b FROM o ORDER BY 3`:               "42601",
-		`SELECT count(*) FROM o GROUP BY 1`:           "42601",
-		`SELECT lower(a), count(*) FROM o GROUP BY 1`: "42601",
-		`SELECT *, b * 2 FROM o ORDER BY 4`:           "42601",
-		`SELECT a FROM o ORDER BY 0`:                  "42601",
+		`SELECT a, b FROM o ORDER BY 3`:     "42601",
+		`SELECT count(*) FROM o GROUP BY 1`: "42803",
+		`SELECT *, b * 2 FROM o ORDER BY 4`: "42601",
+		`SELECT a FROM o ORDER BY 0`:        "42601",
 	} {
 		if _, err := rlsTryRows(ctx, c, q); rlsCode(err) != code {
 			t.Errorf("%s: %v, want %s", q, err, code)

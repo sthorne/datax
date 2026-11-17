@@ -750,12 +750,12 @@ gets a fresh key. One tenant's key is rotated with
 
 ```sql
 [WITH [RECURSIVE] name [(cols)] AS (query | INSERT/UPDATE/DELETE ... RETURNING ...), ...]
-SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
+SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
   FROM t [AS a] | (query) AS d
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
-  [GROUP BY col | position, ...] [HAVING ...]
+  [GROUP BY expr | position | ROLLUP (...) | CUBE (...) | GROUPING SETS (...) | (), ...] [HAVING ...]
   [WINDOW name AS (...), ...]
   [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
   [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
@@ -851,10 +851,30 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   `json[b]_agg`, `json[b]_object_agg` — over a column or an expression
   (`SUM(qty * price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER
   (WHERE ...)`, whole-table or per `GROUP BY` group, including over
-  joins. `HAVING` filters on aggregates or group columns (a bare
-  boolean aggregate works: `HAVING bool_and(ok)`). An expression *over*
-  an aggregate (`SUM(a) / COUNT(*)`) is not yet supported; compute it
-  in the client or a derived table.
+  joins. The select list, `HAVING` and `ORDER BY` take any expression
+  over aggregate calls and grouping columns: arithmetic (`SUM(a) /
+  COUNT(*)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`), function
+  calls (`ROUND(AVG(x), 2)`, `COALESCE(MAX(x), 0)`), `CASE`, casts and
+  comparisons, with or without `GROUP BY`. `HAVING` is a full boolean
+  condition like `WHERE` (`HAVING COUNT(*) > 5 OR MIN(x) < 0`; a bare
+  boolean aggregate works: `HAVING bool_and(ok)`). A column that is
+  neither grouped nor inside an aggregate is refused with `42803`, as
+  is an aggregate in `WHERE` or nested in another aggregate.
+- **GROUP BY** takes expressions (`GROUP BY date_trunc('day', at)`,
+  `GROUP BY a % 10`), positions (`GROUP BY 1` groups by select item 1's
+  expression) and output names that are no input column (`SELECT a % 10
+  AS bucket ... GROUP BY bucket`). A select item, `HAVING` or `ORDER BY`
+  term may use a grouped expression whole or compute over it
+  (`upper(kind)` grouped, `upper(kind) || '!'` shown). `ROLLUP (a, b)`,
+  `CUBE (a, b)` and `GROUPING SETS ((a, b), (a), ())` group by each of
+  their grouping sets in turn and return the union, the keys a set leaves
+  out NULL in its rows; items combine as in PostgreSQL (`GROUP BY a,
+  ROLLUP (b, c)` is the sets `(a, b, c)`, `(a, b)`, `(a)`), and `(a, b)`
+  inside them is one element. `GROUPING(a, b)` tells a rolled-up NULL
+  from a NULL key: a bit per argument, set when the row's grouping set
+  leaves that key out (`HAVING GROUPING(a) = 1` keeps the subtotals). An
+  empty grouping set gives its row over no rows too (`COUNT(*)` 0). At
+  most 4096 grouping sets and 12 `CUBE` elements.
 - **Joins** execute left-deep in the order written — until
   [statistics](#table-statistics) exist for every joined table, at which
   point INNER joins are automatically reordered to drive from the
@@ -879,8 +899,8 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   index lookup rather than a scan per row (not for a `LEFT` side, or
   with a `RIGHT` / `FULL` join in the chain).
   Join select lists take columns, `*`, expressions, `->`/`->>` paths
-  and subqueries; under `GROUP BY` they narrow to plain columns and
-  aggregates.
+  and subqueries; under `GROUP BY`, expressions over grouping columns
+  and aggregates.
 - **WITH (common table expressions)**: `WITH name [(cols)] AS (query),
   ... SELECT ...` — also on `INSERT`, `UPDATE` and `DELETE`, and inside
   a subquery or a set-operation member. Each member is materialized
@@ -973,9 +993,19 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   unnamed expression (`ORDER BY 1` over `a || b`) and a column another
   item's alias also names sort as written; after a set operation it is
   the result's column n. A position at or after a `*` is accepted only
-  when the `*` is the whole select list. `GROUP BY n` groups by the
-  column select item n reads; a position that is an expression or an
-  aggregate is refused (`42601`), as grouping takes columns.
+  when the `*` is the whole select list. `GROUP BY n` groups by select
+  item n's expression; an aggregate item is refused (`42803`).
+- **DISTINCT** removes duplicate result rows. **DISTINCT ON (exprs)**
+  keeps, of each group of rows equal on the expressions (NULLs equal),
+  the first in `ORDER BY` order — `SELECT DISTINCT ON (player) player,
+  game, score FROM scores ORDER BY player, score DESC` is each player's
+  best game. The `ORDER BY` must begin with the `DISTINCT ON`
+  expressions (in any order; `42P10` otherwise) and may go on to order
+  within the groups; without `ORDER BY` the row kept is whichever comes
+  first. A position or an output name in the list stands for that select
+  item. It works over single tables, joins, derived tables and grouped
+  queries, before `LIMIT` / `OFFSET`; not with window functions
+  (`0A000`) or `FOR UPDATE`.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when

@@ -1461,7 +1461,7 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...), Limit: -1}
 	stripTableAlias(sel)
 	for _, se := range sel.Exprs {
-		if se.Agg != "" {
+		if se.Agg != "" || !se.Star && exprHasAgg(se.Expr) {
 			return nil, newErrf(CodeGrouping, "aggregate functions are not allowed in RETURNING")
 		}
 		if !se.Star && exprHasSubquery(se.Expr) {
@@ -2301,6 +2301,14 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// whatever the select's shape (grouped, windowed, plain): t.c and
 	// alias.c become c.
 	stripTableAlias(t)
+	if len(t.DistinctOn) > 0 {
+		if err := checkDistinctOn(t); err != nil {
+			return nil, err
+		}
+		if hasWindows(t.Exprs) {
+			return nil, newErrf(CodeFeatureNotSupported, "SELECT DISTINCT ON with window functions is not supported")
+		}
+	}
 	if hasWindows(t.Exprs) {
 		return s.execWindowed(ctx, txn, t, params)
 	}
@@ -2587,6 +2595,15 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			}
 		}
 	}
+	if len(t.DistinctOn) > 0 {
+		// The rows are in ORDER BY order: keep each DISTINCT ON group's
+		// first (LIMIT applies after).
+		if rows, err = keepFirstDistinct(rows, func(fr fetchedRow) ([]types.Datum, error) {
+			return evalExprList(t.DistinctOn, tableEnv{desc: desc, row: fr.row}, params)
+		}); err != nil {
+			return nil, err
+		}
+	}
 	res := &Result{}
 	for _, p := range proj {
 		res.Columns = append(res.Columns, colResult(p.name, p.col))
@@ -2643,7 +2660,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 		res.Rows = append(res.Rows, out)
 	}
-	if t.Distinct {
+	if t.Distinct && len(t.DistinctOn) == 0 {
 		// Degenerate grouping over the projection: keep first occurrences
 		// (rows are already in the requested order).
 		res.Rows = dedupeRows(res.Rows)
@@ -3480,14 +3497,6 @@ func stripTableAlias(t *parser.Select) {
 		},
 	}
 	w.SelectStmt(&self)
-	for i := range t.GroupBy {
-		strip(&t.GroupBy[i])
-	}
-	for i := range t.Having {
-		if t.Having[i].Column != "" {
-			strip(&t.Having[i].Column)
-		}
-	}
 }
 
 // emptyCatalogSelect answers a select whose base table is an

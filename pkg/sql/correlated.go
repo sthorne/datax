@@ -261,7 +261,7 @@ func innerSubShape(sub *parser.Select) bool {
 		}
 	}
 	for _, hc := range sub.Having {
-		if exprHasSubquery(hc.Value) {
+		if condHas(hc, func(x parser.Expr) bool { return x.Sub != nil }) {
 			return false
 		}
 	}
@@ -431,13 +431,19 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		}
 	}
 	for _, g := range sub.GroupBy {
-		record(g, false, "GROUP BY")
+		exprColumns(g, func(n string) { record(n, false, "GROUP BY") })
 	}
 	for _, hc := range sub.Having {
 		if hc.Column != "" {
 			record(hc.Column, false, "HAVING")
 		}
+		if hc.Expr != nil {
+			exprColumns(*hc.Expr, func(n string) { record(n, false, "HAVING") })
+		}
 		exprColumns(hc.Value, func(n string) { record(n, true, "HAVING") })
+		for _, v := range hc.Values {
+			exprColumns(v, func(n string) { record(n, true, "HAVING") })
+		}
 	}
 	for _, oc := range sub.OrderBy {
 		record(oc.Column, false, "ORDER BY")
@@ -809,11 +815,8 @@ func substituteSub(sub *parser.Select, node *scopeNode, row map[catalog.ColumnID
 		}
 	}
 	if len(sub.Having) > 0 {
-		c.Having = append([]parser.HavingCond(nil), sub.Having...)
-		for i := range c.Having {
-			if c.Having[i].Value, err = substituteExpr(c.Having[i].Value, node, row, params); err != nil {
-				return nil, err
-			}
+		if c.Having, err = substituteConds(sub.Having, node, row, params); err != nil {
+			return nil, err
 		}
 	}
 	return &c, nil

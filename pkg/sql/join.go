@@ -854,6 +854,13 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		}
 		s.note("sort: %d joined rows in memory", len(joined))
 	}
+	if len(t.DistinctOn) > 0 {
+		if joined, err = keepFirstDistinct(joined, func(jr joinedRow) ([]types.Datum, error) {
+			return evalExprList(t.DistinctOn, joinEnv{sides, jr}, params)
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	res := &Result{}
 	for _, p := range proj {
@@ -907,7 +914,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		}
 		res.Rows = append(res.Rows, out)
 	}
-	if t.Distinct {
+	if t.Distinct && len(t.DistinctOn) == 0 {
 		res.Rows = dedupeRows(res.Rows)
 	}
 	res.Rows = trimRows(res.Rows, t)

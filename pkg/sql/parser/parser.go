@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"github.com/sthorne/datax/pkg/sql/builtins"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -2587,6 +2588,27 @@ func (p *parser) parseSelect() (Statement, error) {
 	// DISTINCT is not a reserved word — it lexes as an identifier.
 	if p.consumeIdentWord("distinct") {
 		sel.Distinct = true
+		// DISTINCT ON (expr, ...): resolved against the select list once
+		// it is parsed.
+		if t := p.peek(); t.kind == tkKeyword && t.text == "ON" {
+			p.i++
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			for {
+				e, err := p.parseValueOrBool()
+				if err != nil {
+					return nil, err
+				}
+				sel.DistinctOn = append(sel.DistinctOn, e)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for {
 		itemStart := p.i
@@ -2594,10 +2616,11 @@ func (p *parser) parseSelect() (Statement, error) {
 			sel.Exprs = append(sel.Exprs, SelectExpr{Star: true})
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
-		} else if ok && se.Window != nil && p.continuesValue() {
-			// A window call that starts a larger expression (count(*)
-			// OVER () > 3, sum(x) OVER w * 2): parse the whole item as a
-			// value, with the call as an operand.
+		} else if ok && p.continuesValue() {
+			// An aggregate or window call that starts a larger expression
+			// (SUM(a) / COUNT(*), count(*) OVER () > 3, sum(x) OVER w * 2):
+			// parse the whole item as a value, with the call as an
+			// operand.
 			p.i = itemStart
 			e, err := p.parseValueOrBool()
 			if err != nil {
@@ -2635,6 +2658,13 @@ func (p *parser) parseSelect() (Statement, error) {
 		if !p.consumeOp(",") {
 			break
 		}
+	}
+	for i, e := range sel.DistinctOn {
+		r, err := p.distinctOnItem(sel.Exprs, e)
+		if err != nil {
+			return nil, err
+		}
+		sel.DistinctOn[i] = r
 	}
 	if p.consumeKeyword("INTO") {
 		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
@@ -2833,29 +2863,8 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 		if err := p.expectKeyword("BY"); err != nil {
 			return nil, err
 		}
-		for {
-			if t := p.peek(); t.kind == tkNumber {
-				// GROUP BY n: the column select item n reads.
-				name, err := p.groupByPosition(sel.Exprs, t.text)
-				if err != nil {
-					return nil, err
-				}
-				p.i++
-				sel.GroupBy = append(sel.GroupBy, name)
-				if !p.consumeOp(",") {
-					break
-				}
-				continue
-			}
-			// Possibly qualified: GROUP BY c.name over a join.
-			ref, err := p.parseColumnRef()
-			if err != nil {
-				return nil, err
-			}
-			sel.GroupBy = append(sel.GroupBy, ref.String())
-			if !p.consumeOp(",") {
-				break
-			}
+		if err := p.parseGroupBy(sel); err != nil {
+			return nil, err
 		}
 	}
 	if p.consumeIdentWord("having") {
@@ -3055,6 +3064,7 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 	var out []OrderCol
 	for {
 		var oc OrderCol
+		termStart := p.i
 		if t := p.peek(); t.kind == tkNumber {
 			n, err := strconv.Atoi(t.text)
 			star := firstStar(exprs)
@@ -3078,9 +3088,14 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 			oc.Ordinal = n
 		} else if se, ok, err := p.parseAggExpr(); err != nil {
 			return nil, err
-		} else if ok {
+		} else if ok && !p.continuesValue() {
 			oc = OrderCol{Agg: &se}
 		} else {
+			if ok {
+				// An aggregate call starting a larger expression
+				// (ORDER BY SUM(a) / COUNT(*)): parse the whole term.
+				p.i = termStart
+			}
 			// A bare (possibly qualified) name sorts by that column or
 			// output name; anything else is a computed sort key.
 			e, err := p.parseValueOrBool()
@@ -3115,24 +3130,261 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 	}
 }
 
-// groupByPosition resolves GROUP BY n to the column select item n
-// reads, by the item and never by its output name (an alias may name
-// another column). Grouping takes columns, so an item that is an
-// expression is refused (a syntax error, as GROUP BY of the expression
-// written out is), and so is an aggregate.
-func (p *parser) groupByPosition(exprs []SelectExpr, text string) (string, error) {
+// maxGroupingSets bounds the grouping sets a GROUP BY expands to
+// (PostgreSQL's limit), and maxCubeElems a CUBE's elements.
+const (
+	maxGroupingSets = 4096
+	maxCubeElems    = 12
+)
+
+// parseGroupBy parses the GROUP BY list (after BY): grouping
+// expressions (a position names a select item's expression), ROLLUP
+// (...), CUBE (...), GROUPING SETS (...) and the empty set (). The
+// items combine as PostgreSQL combines them: the grouping sets are the
+// cross product of each item's sets. sel.GroupBy gets the distinct
+// expressions; sel.GroupingSets the sets as positions into it, unless
+// every item was a plain expression (one set of all of them).
+func (p *parser) parseGroupBy(sel *Select) error {
+	sets := [][]Expr{{}}
+	plain := true
+	for {
+		item, isPlain, err := p.parseGroupingElement(sel.Exprs, true)
+		if err != nil {
+			return err
+		}
+		plain = plain && isPlain
+		if len(sets)*len(item) > maxGroupingSets {
+			return p.errf("too many grouping sets present (maximum %d)", maxGroupingSets)
+		}
+		var next [][]Expr
+		for _, s := range sets {
+			for _, is := range item {
+				next = append(next, append(append([]Expr(nil), s...), is...))
+			}
+		}
+		sets = next
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	keyOf := func(e Expr) int {
+		for i, k := range sel.GroupBy {
+			if reflect.DeepEqual(k, e) {
+				return i
+			}
+		}
+		sel.GroupBy = append(sel.GroupBy, e)
+		return len(sel.GroupBy) - 1
+	}
+	var idx [][]int
+	for _, s := range sets {
+		set := []int{}
+		for _, e := range s {
+			k := keyOf(e)
+			dup := false
+			for _, x := range set {
+				dup = dup || x == k
+			}
+			if !dup {
+				set = append(set, k)
+			}
+		}
+		idx = append(idx, set)
+	}
+	if !plain {
+		sel.GroupingSets = idx
+	}
+	return nil
+}
+
+// parseGroupingElement parses one GROUP BY item (top) or one element of
+// a GROUPING SETS list, returning its grouping sets; plain reports a
+// grouping expression (or a parenthesized list of them) rather than
+// ROLLUP, CUBE, GROUPING SETS or ().
+func (p *parser) parseGroupingElement(exprs []SelectExpr, top bool) ([][]Expr, bool, error) {
+	call := func(word string) bool {
+		return p.peekIdentWord(word) && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "("
+	}
+	switch {
+	case call("rollup"), call("cube"):
+		cube := p.peek().text == "cube"
+		p.i += 2
+		var elems [][]Expr
+		for {
+			el, err := p.parseGroupComposite(exprs)
+			if err != nil {
+				return nil, false, err
+			}
+			elems = append(elems, el)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, false, err
+		}
+		var sets [][]Expr
+		if !cube {
+			// ROLLUP (a, b, c): (a, b, c), (a, b), (a), ().
+			for n := len(elems); n >= 0; n-- {
+				var s []Expr
+				for _, el := range elems[:n] {
+					s = append(s, el...)
+				}
+				sets = append(sets, s)
+			}
+			return sets, false, nil
+		}
+		// CUBE (a, b): every subset, (a, b), (a), (b), ().
+		if len(elems) > maxCubeElems {
+			return nil, false, p.errf("CUBE is limited to %d elements", maxCubeElems)
+		}
+		n := len(elems)
+		for mask := 1<<n - 1; mask >= 0; mask-- {
+			var s []Expr
+			for j, el := range elems {
+				if mask&(1<<(n-1-j)) != 0 {
+					s = append(s, el...)
+				}
+			}
+			sets = append(sets, s)
+		}
+		return sets, false, nil
+	case p.peekIdentSeq("grouping", "sets"):
+		p.i += 2
+		if err := p.expectOp("("); err != nil {
+			return nil, false, err
+		}
+		var sets [][]Expr
+		for {
+			s, _, err := p.parseGroupingElement(exprs, false)
+			if err != nil {
+				return nil, false, err
+			}
+			sets = append(sets, s...)
+			if len(sets) > maxGroupingSets {
+				return nil, false, p.errf("too many grouping sets present (maximum %d)", maxGroupingSets)
+			}
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, false, err
+		}
+		return sets, false, nil
+	}
+	if t := p.peek(); t.kind == tkOp && t.text == "(" && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == ")" {
+		p.i += 2
+		return [][]Expr{{}}, false, nil // (): the empty grouping set
+	}
+	el, err := p.parseGroupComposite(exprs)
+	if err != nil {
+		return nil, false, err
+	}
+	return [][]Expr{el}, true, nil
+}
+
+// parseGroupComposite parses a grouping expression, or a parenthesized
+// list of them that groups as one element ((a, b) in ROLLUP ((a, b), c)
+// or GROUPING SETS ((a, b), ())).
+func (p *parser) parseGroupComposite(exprs []SelectExpr) ([]Expr, error) {
+	if t := p.peek(); t.kind == tkOp && t.text == "(" {
+		// A parenthesized expression ((a + b) * 2, (n % 2)) is one
+		// expression; a list ((a, b)) is a composite element.
+		start := p.i
+		if e, err := p.parseGroupExpr(exprs); err == nil {
+			return []Expr{e}, nil
+		}
+		p.i = start + 1
+		var list []Expr
+		for {
+			e, err := p.parseGroupExpr(exprs)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, e)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		return list, nil
+	}
+	e, err := p.parseGroupExpr(exprs)
+	if err != nil {
+		return nil, err
+	}
+	return []Expr{e}, nil
+}
+
+// parseGroupExpr parses one grouping expression: a position (an
+// integer) stands for the expression of that select item.
+func (p *parser) parseGroupExpr(exprs []SelectExpr) (Expr, error) {
+	if t := p.peek(); t.kind == tkNumber {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkEOF || nxt.kind == tkKeyword || nxt.kind == tkIdent ||
+			nxt.kind == tkOp && (nxt.text == "," || nxt.text == ")" || nxt.text == ";") {
+			p.i++
+			return p.groupByPosition(exprs, t.text)
+		}
+	}
+	return p.parseValueOrBool()
+}
+
+// groupByPosition resolves GROUP BY n to select item n's expression,
+// by the item and never by its output name (an alias may name another
+// column). An aggregate item stays an aggregate call, which the
+// executor refuses in GROUP BY (42803).
+func (p *parser) groupByPosition(exprs []SelectExpr, text string) (Expr, error) {
 	n, err := strconv.Atoi(text)
 	if star := firstStar(exprs); err != nil || n < 1 || n > len(exprs) || (star >= 0 && n > star) {
-		return "", p.errf("GROUP BY position %s is not in the select list", text)
+		return Expr{}, p.errf("GROUP BY position %s is not in the select list", text)
 	}
 	se := exprs[n-1]
 	switch {
-	case se.Agg != "" || se.Window != nil:
-		return "", p.errf("GROUP BY position %d is an aggregate; aggregate functions are not allowed in GROUP BY", n)
-	case !isPlainColumn(se.Expr):
-		return "", p.errf("GROUP BY position %d is an expression; GROUP BY takes columns (group by the column and compute the expression in the select list)", n)
+	case se.Window != nil:
+		return Expr{}, p.errf("GROUP BY position %d is a window function; window functions are not allowed in GROUP BY", n)
+	case se.Agg != "":
+		call := se
+		call.Alias = ""
+		return Expr{Agg: &call}, nil
 	}
-	return se.Expr.Column, nil
+	return se.Expr, nil
+}
+
+// distinctOnItem resolves a DISTINCT ON expression as PostgreSQL does:
+// an integer is a position in the select list and a bare name an
+// output name before an input column, each standing for the select
+// item's expression.
+func (p *parser) distinctOnItem(exprs []SelectExpr, e Expr) (Expr, error) {
+	item := func(se SelectExpr) Expr {
+		if se.Agg != "" {
+			call := se
+			call.Alias = ""
+			if se.Window != nil {
+				return Expr{Window: &call}
+			}
+			return Expr{Agg: &call}
+		}
+		return se.Expr
+	}
+	if e.Lit != nil && e.Lit.Fam == types.Int && e.BinOp == "" && e.Cast == "" && e.Left == nil && len(e.Path) == 0 {
+		n := int(e.Lit.I)
+		if star := firstStar(exprs); n < 1 || n > len(exprs) || (star >= 0 && n > star) {
+			return e, p.errf("SELECT DISTINCT ON position %d is not in the select list", n)
+		}
+		return item(exprs[n-1]), nil
+	}
+	if isPlainColumn(e) && e.Cast == "" && !strings.Contains(e.Column, ".") {
+		for _, se := range exprs {
+			if !se.Star && se.Alias == e.Column {
+				return item(se), nil
+			}
+		}
+	}
+	return e, nil
 }
 
 // firstStar is the index of a select list's first * (bare or
@@ -3463,40 +3715,15 @@ func (p *parser) parseOptTableAlias(allowAsOf bool) string {
 	return ""
 }
 
-// parseHaving parses the HAVING conjunction: each conjunct compares an
-// aggregate call or a column/output name against a literal or parameter.
-func (p *parser) parseHaving() ([]HavingCond, error) {
-	var out []HavingCond
-	for {
-		var hc HavingCond
-		if se, ok, err := p.parseAggExpr(); err != nil {
-			return nil, err
-		} else if ok {
-			hc.Agg = &se
-		} else {
-			col, err := p.expectIdent()
-			if err != nil {
-				return nil, err
-			}
-			hc.Column = col
-		}
-		if op, ok := p.parseCmpOp(); ok {
-			val, err := p.parseValueOrColumnExpr()
-			if err != nil {
-				return nil, err
-			}
-			hc.Op, hc.Value = op, val
-		} else {
-			// A bare boolean aggregate or column: HAVING bool_or(x).
-			tr := types.NewBool(true)
-			hc.Op, hc.Value = "=", Expr{Lit: &tr}
-		}
-		out = append(out, hc)
-		if !p.consumeKeyword("AND") {
-			break
-		}
+// parseHaving parses the HAVING condition: a boolean expression, like
+// WHERE's, over grouping expressions and aggregate calls (an aggregate
+// call parses as Expr.Agg wherever a value may stand).
+func (p *parser) parseHaving() ([]Comparison, error) {
+	n, err := p.parseBoolOr()
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	return lowerBool(n, false)
 }
 
 // windowNames are the window-only functions: they need an OVER clause.
@@ -4656,8 +4883,9 @@ func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
 		t := p.peek()
 		tr := types.NewBool(true)
 		if computed {
-			// A bare boolean call or value (pg_table_is_visible(c.oid)).
-			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil || lhs.Cast != "" {
+			// A bare boolean call or value (pg_table_is_visible(c.oid),
+			// HAVING bool_or(x)).
+			if lhs.Func != "" || lhs.Lit != nil || lhs.Case != nil || lhs.Cast != "" || lhs.Agg != nil {
 				base.Op, base.Value = "=", Expr{Lit: &tr}
 				return one(base)
 			}
@@ -5808,9 +6036,9 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		// rather than a syntax error.
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && (aggNames[t.text] || windowNames[t.text]) {
 			// An aggregate or window call inside an expression: a window
-			// call (with OVER) becomes a value the window stage supplies;
-			// a plain aggregate keeps its call form for the evaluator to
-			// refuse or, in HAVING/ORDER BY, the grouped paths to place.
+			// call (with OVER) becomes a value the window stage supplies,
+			// a plain aggregate one the grouped executor computes per
+			// group (and any other context refuses).
 			se, ok, err := p.parseAggExpr()
 			if err != nil {
 				return Expr{}, err
@@ -5818,17 +6046,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if ok && se.Window != nil {
 				return p.applyCasts(Expr{Window: &se})
 			}
-			e := Expr{Func: strings.ToLower(se.Agg)}
-			switch {
-			case se.AggStar:
-				e.Args = []Expr{{Column: "*"}}
-			case se.AggCol != "":
-				e.Args = []Expr{{Column: se.AggCol}}
-			case se.AggArg != nil:
-				e.Args = []Expr{*se.AggArg}
-			}
-			e.Args = append(e.Args, se.AggArgs...)
-			return p.applyCasts(e)
+			return p.applyCasts(Expr{Agg: &se})
 		}
 		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && t.text != "array" {
 			arity, isFunc := scalarFuncs[t.text]
@@ -5920,6 +6138,9 @@ func outputName(se SelectExpr) string {
 	}
 	if se.Agg != "" {
 		return strings.ToLower(se.Agg) // the aggregate's output name
+	}
+	if se.Expr.Agg != nil && se.Expr.BinOp == "" && len(se.Expr.Path) == 0 {
+		return strings.ToLower(se.Expr.Agg.Agg) // count(*)::int is "count"
 	}
 	return "?column?"
 }

@@ -122,6 +122,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		}
 		// Execution addresses a single table's columns by bare name.
 		stripTableAlias(t)
+		if err := checkDistinctOn(t); err != nil {
+			return nil, ToSQLError(err)
+		}
 		if hasWindows(t.Exprs) {
 			wp, err := windowPlanFor(t)
 			if err != nil {

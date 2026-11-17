@@ -11,6 +11,36 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`SELECT DISTINCT ON (exprs)`** (#337): of each group of rows equal on the
+  expressions, the first in `ORDER BY` order is kept, before `LIMIT` and
+  `OFFSET`. The `ORDER BY` must begin with the `DISTINCT ON` expressions
+  (`42P10` otherwise, at Describe too); positions and output names stand for
+  the select items. Over single tables, joins, derived tables and grouped
+  queries; not with window functions (`0A000`). Before, `DISTINCT ON` was a
+  syntax error.
+- **`GROUP BY` expressions, `ROLLUP`, `CUBE` and `GROUPING SETS`** (#336):
+  `GROUP BY` takes any expression (`date_trunc('day', ts)`, `a % 10`), a
+  position of an expression item, or an output name that is no input column;
+  select items, `HAVING` and `ORDER BY` may use a grouped expression or compute
+  over it. `ROLLUP (...)`, `CUBE (...)`, `GROUPING SETS (...)` and `()` group
+  by each grouping set and return the union, the keys a set leaves out NULL,
+  combined across items as in PostgreSQL; `GROUPING(...)` tells a rolled-up
+  NULL from a NULL key, and an empty grouping set has its row over no input.
+  Over single tables, joins and derived tables. Before, `GROUP BY` took
+  columns and positions of column items only.
+- **Expressions over aggregates** (#335): the select list, `HAVING` and
+  `ORDER BY` of a grouped or aggregate query take any scalar expression over
+  aggregate calls and grouping columns — `SUM(a) / COUNT(*)`, `ROUND(AVG(x),
+  2)`, `COALESCE(MAX(x), 0)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`,
+  `CASE WHEN COUNT(*) > 1 ...`, casts — with or without `GROUP BY` and over
+  joins; an aggregate keeps its `DISTINCT` and `FILTER` inside an expression.
+  `HAVING` is a full boolean condition (`OR`, `NOT`, `IN`, `LIKE`, an
+  aggregate on either side). The aggregates are computed per group and the
+  expression is evaluated over them, and the extended protocol describes the
+  result with its real type. A column that is neither grouped nor aggregated
+  is refused with `42803`, as is an aggregate in `WHERE`. Before, an
+  aggregate could only stand alone in the select list (`SUM(a) / COUNT(*)`
+  was a syntax error) and `HAVING` took one comparison per conjunct.
 - **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
   extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
   INDEX`, both supported, but not here): when the table already has a

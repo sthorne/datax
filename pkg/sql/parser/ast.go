@@ -62,6 +62,13 @@ type Expr struct {
 	// expression; the executor computes it as a window item and
 	// substitutes its value.
 	Window *SelectExpr `json:"window,omitempty"`
+	// Agg is an aggregate call (no OVER) used as a value inside an
+	// expression (SUM(a) / COUNT(*), ROUND(AVG(x), 2), CASE WHEN
+	// COUNT(*) > 1 ...): the grouped executor computes it per group and
+	// evaluates the expression around it over the group's values. A
+	// select item that is a lone aggregate call keeps the SelectExpr.Agg
+	// form instead.
+	Agg *SelectExpr `json:"agg,omitempty"`
 }
 
 // CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
@@ -557,15 +564,6 @@ type OrderCol struct {
 	Agg *SelectExpr
 }
 
-// HavingCond is one HAVING conjunct: an aggregate call (HAVING COUNT(*) > 5)
-// or a group-column/output name (HAVING city != 'x') compared to a value.
-type HavingCond struct {
-	Agg    *SelectExpr // aggregate form; nil for the column form
-	Column string
-	Op     string
-	Value  Expr
-}
-
 // ColumnRef is a possibly-qualified column reference (t.c or c).
 type ColumnRef struct {
 	Table  string // alias or table name; "" = unqualified
@@ -665,10 +663,24 @@ type Select struct {
 	// ""), "INTERSECT" or "EXCEPT". Members form a flat list in written
 	// order; INTERSECT binds tighter than the other two, which associate
 	// left to right, and the executor applies that precedence.
-	SetOp   string
-	Where   []Comparison
-	GroupBy []string
-	Having  []HavingCond
+	SetOp string
+	Where []Comparison
+	// GroupBy are the distinct grouping expressions (a plain column is
+	// Expr{Column}; GROUP BY n is the expression of select item n).
+	// GroupingSets, when set (ROLLUP, CUBE, GROUPING SETS), are the
+	// grouping sets as positions into GroupBy: the result is the union of
+	// the groupings by each set, the keys outside a set NULL in its rows;
+	// nil is the one set of every key.
+	GroupBy      []Expr
+	GroupingSets [][]int
+	// DistinctOn are the expressions of SELECT DISTINCT ON (...)
+	// (Distinct is set too): of each group of rows equal on them, the
+	// first in ORDER BY order is kept. A position or an output name
+	// written there is resolved to the select item's expression.
+	DistinctOn []Expr
+	// Having is the HAVING condition, a conjunction like Where's over
+	// grouping expressions and aggregate calls.
+	Having  []Comparison
 	OrderBy []OrderCol
 	Limit   int64 // -1 = none
 	// Offset skips that many rows before Limit applies (0 = none).
