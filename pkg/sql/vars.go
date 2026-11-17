@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -202,12 +203,18 @@ func onOff(b bool) string {
 	return "off"
 }
 
-// settings lists the session variables SHOW ALL and pg_settings report.
+// settings lists the session variables SHOW ALL and pg_settings report,
+// by name: the built-in ones and the custom ones this session has set
+// (issue #330), as PostgreSQL lists its placeholder variables.
 func (s *Session) settings() [][2]string {
-	out := make([][2]string, 0, len(varNames))
+	out := make([][2]string, 0, len(varNames)+len(s.vars.custom))
 	for _, v := range varNames {
 		out = append(out, [2]string{v.name, s.varValue(v.name)})
 	}
+	for name, value := range s.vars.custom {
+		out = append(out, [2]string{name, value})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return strings.ToLower(out[i][0]) < strings.ToLower(out[j][0]) })
 	return out
 }
 
@@ -223,6 +230,13 @@ func (s *Session) settingDefaults() map[string]string {
 	}
 	return out
 }
+
+// unrecognizedSettingFunc is the function a per-row current_setting()
+// falls to when the row's name is none of the session's settings (see
+// resolveValueExprOpts): it raises 42704, or returns NULL with
+// missing_ok. A query that names it ("current_setting:unrecognized"(x))
+// gets just that, which is harmless.
+const unrecognizedSettingFunc = "current_setting:unrecognized"
 
 // setting resolves a SHOW name to the setting's canonical name and value.
 func (s *Session) setting(name string) (string, string, bool) {
@@ -566,7 +580,6 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 			// RESET ALL: every variable to its default (the database stays).
 			s.vars = defaultVars()
 			s.localVars = nil
-			s.cascadeLimit = 0
 			s.applyRole()
 			return &Result{Tag: tag}, nil
 		}
@@ -620,8 +633,6 @@ func (s *Session) execSetVar(ctx context.Context, t *parser.SetVar) (*Result, *E
 	switch name {
 	case "role":
 		s.applyRole()
-	case "foreign_key_cascade_limit":
-		s.cascadeLimit = s.vars.cascadeLimit
 	case "transaction_read_only":
 		// SET TRANSACTION READ WRITE lifts a block's default read-only
 		// start; READ ONLY sets it.

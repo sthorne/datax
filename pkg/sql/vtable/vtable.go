@@ -97,7 +97,8 @@ type Env struct {
 	Settings [][2]string
 	// SettingDefaults maps a setting's name to the value a new session
 	// has (pg_settings' boot_val; a setting whose value differs reports
-	// source 'session').
+	// source 'session'). A setting it lacks is a custom one the session
+	// set (app.tenant).
 	SettingDefaults map[string]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo

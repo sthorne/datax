@@ -395,6 +395,22 @@ func TestPsqlCatalogQueries(t *testing.T) {
 			}
 		}
 	}
+	// \dconfig lists a custom setting the session SET (issue #330), and
+	// reads its value with current_setting(s.name) (issue #329), in one
+	// psql session.
+	out, err := runPsql(ctx, psql, url, `SET app.tenant = 'acme'`, `\dconfig`)
+	if err != nil || strings.Contains(out, "ERROR") {
+		t.Fatalf("psql SET app.tenant; \\dconfig: %v\n%s", err, out)
+	}
+	listed := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if name, value, ok := strings.Cut(line, "|"); ok {
+			listed[strings.TrimSpace(name)] = strings.TrimSpace(value)
+		}
+	}
+	if listed["app.tenant"] != "acme" || listed["application_name"] != "psql" {
+		t.Fatalf("psql \\dconfig after SET app.tenant lacks app.tenant = acme:\n%s", out)
+	}
 }
 
 // lookPsql finds the psql binary, for end-to-end runs: $DATAX_PSQL
@@ -407,9 +423,14 @@ func lookPsql() (string, error) {
 	return exec.LookPath("psql")
 }
 
-// runPsql runs one backslash command through psql and returns its output.
-func runPsql(ctx context.Context, psql, url, cmd string) (string, error) {
-	out, err := exec.CommandContext(ctx, psql, url, "-c", cmd).CombinedOutput()
+// runPsql runs commands (backslash commands or SQL) through psql, in
+// one session and in order, and returns its output.
+func runPsql(ctx context.Context, psql, url string, cmds ...string) (string, error) {
+	args := []string{url}
+	for _, c := range cmds {
+		args = append(args, "-c", c)
+	}
+	out, err := exec.CommandContext(ctx, psql, args...).CombinedOutput()
 	return string(out), err
 }
 

@@ -238,6 +238,138 @@ func TestSessionVariables(t *testing.T) {
 	_ = rendered
 }
 
+// TestCurrentSettingAndPgSettings (issues #329, #330): current_setting()
+// on a name that is no setting raises 42704 in both its constant and
+// per-row forms (a dotted custom name never SET included), and returns
+// NULL with missing_ok; custom settings the session SET appear in
+// pg_settings and SHOW ALL as session strings; and
+// foreign_key_cascade_limit, once SET, reads source 'session' with the
+// default as boot_val, and SET LOCAL of it ends with the block.
+func TestCurrentSettingAndPgSettings(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	waitForDatabases(t, ctx, sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor()))
+	execSQL(t, ctx, sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor()), `CREATE TABLE names (id INT8 PRIMARY KEY, n TEXT, ok BOOL)`)
+
+	// setup gives each subtest a fresh session and its helpers.
+	type helpers struct {
+		s       *sql.Session
+		refused func(stmt, code, msg string)
+		want    func(stmt string, w ...string)
+		col     func(stmt string) []string
+	}
+	setup := func(t *testing.T) helpers {
+		s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+		h := helpers{s: s}
+		h.refused = func(stmt, code, msg string) {
+			t.Helper()
+			if _, serr := trySQL(ctx, s, stmt); serr == nil || serr.Code != code || !strings.Contains(serr.Msg, msg) {
+				t.Fatalf("%s: %v, want %s %q", stmt, serr, code, msg)
+			}
+		}
+		// col reads one column of every row as text ("NULL" for NULL).
+		h.col = func(stmt string) []string {
+			t.Helper()
+			var out []string
+			for _, r := range execSQL(t, ctx, s, stmt).Rows {
+				if r[0].Null {
+					out = append(out, "NULL")
+				} else {
+					out = append(out, r[0].Text())
+				}
+			}
+			return out
+		}
+		h.want = func(stmt string, w ...string) {
+			t.Helper()
+			if got := h.col(stmt); strings.Join(got, ",") != strings.Join(w, ",") {
+				t.Fatalf("%s: %v, want %v", stmt, got, w)
+			}
+		}
+		return h
+	}
+
+	t.Run("constant", func(t *testing.T) {
+		h := setup(t)
+		h.refused(`SELECT current_setting('nosuch')`, sql.CodeUndefinedObject, `unrecognized configuration parameter "nosuch"`)
+		h.refused(`SELECT current_setting('nosuch', false)`, sql.CodeUndefinedObject, `unrecognized configuration parameter "nosuch"`)
+		h.refused(`SELECT current_setting('app.never_set')`, sql.CodeUndefinedObject, `unrecognized configuration parameter "app.never_set"`)
+		h.want(`SELECT current_setting('nosuch', true)`, "NULL")
+		h.want(`SELECT current_setting('app.never_set', true)`, "NULL")
+		h.want(`SELECT current_setting(NULL)`, "NULL") // strict
+		execSQL(t, ctx, h.s, `SET app.never_set = 'now set'`)
+		h.want(`SELECT current_setting('app.never_set')`, "now set")
+	})
+
+	t.Run("per-row", func(t *testing.T) {
+		h := setup(t)
+		execSQL(t, ctx, h.s, `INSERT INTO names VALUES (1, 'search_path', false), (2, 'TIMEZONE', false), (3, 'nosuch', true), (4, 'app.never_set', true), (5, NULL, false)`)
+		h.want(`SELECT current_setting(n) FROM names WHERE id <= 2 ORDER BY id`, "public", "UTC")
+		h.refused(`SELECT current_setting(n) FROM names ORDER BY id`, sql.CodeUndefinedObject, `unrecognized configuration parameter "nosuch"`)
+		h.refused(`SELECT current_setting(n, false) FROM names WHERE id = 4`, sql.CodeUndefinedObject, `unrecognized configuration parameter "app.never_set"`)
+		h.want(`SELECT current_setting(n, true) FROM names ORDER BY id`, "public", "UTC", "NULL", "NULL", "NULL")
+		h.want(`SELECT current_setting(n, ok) FROM names WHERE id <> 5 ORDER BY id`, "public", "UTC", "NULL", "NULL")
+		h.want(`SELECT current_setting(n) FROM names WHERE id = 5`, "NULL") // strict: a NULL name is NULL
+		// A custom setting once SET is known.
+		execSQL(t, ctx, h.s, `SET app.never_set = 'now set'`)
+		h.want(`SELECT current_setting(n) FROM names WHERE id = 4`, "now set")
+		// Every name pg_settings lists is one current_setting() knows
+		// (psql's \dconfig reads them so).
+		if got := h.col(`SELECT current_setting(s.name) = s.setting FROM pg_settings s`); len(got) < 15 || strings.Contains(strings.Join(got, ","), "false") {
+			t.Fatalf("current_setting over pg_settings: %v", got)
+		}
+	})
+
+	t.Run("custom settings listed", func(t *testing.T) {
+		h := setup(t)
+		h.want(`SELECT name FROM pg_settings WHERE name LIKE 'app.%'`)
+		execSQL(t, ctx, h.s, `SET app.tenant = 'acme'`)
+		execSQL(t, ctx, h.s, `SELECT set_config('app.user_id', '42', false)`)
+		h.want(`SELECT name || '|' || setting || '|' || source || '|' || vartype || '|' || coalesce(boot_val, 'NULL') FROM pg_settings WHERE name LIKE 'app.%' ORDER BY name`,
+			"app.tenant|acme|session|string|NULL", "app.user_id|42|session|string|NULL")
+		all := execSQL(t, ctx, h.s, `SHOW ALL`)
+		var shown []string
+		for _, r := range all.Rows {
+			if strings.HasPrefix(r[0].Text(), "app.") {
+				shown = append(shown, r[0].Text()+"="+r[1].Text())
+			}
+		}
+		if strings.Join(shown, ",") != "app.tenant=acme,app.user_id=42" {
+			t.Fatalf("SHOW ALL custom settings: %v", shown)
+		}
+		if n := len(h.col(`SELECT name FROM pg_settings`)); n != len(all.Rows) {
+			t.Fatalf("SHOW ALL %d rows, pg_settings %d", len(all.Rows), n)
+		}
+		// \dconfig's own query lists them, values read per row.
+		h.want(`SELECT s.name || '=' || pg_catalog.current_setting(s.name) FROM pg_catalog.pg_settings s WHERE s.source <> 'default' AND s.setting IS DISTINCT FROM s.boot_val ORDER BY 1`,
+			"app.tenant=acme", "app.user_id=42")
+		// A SET LOCAL one leaves with its block.
+		execSQL(t, ctx, h.s, `BEGIN`)
+		execSQL(t, ctx, h.s, `SET LOCAL app.scratch = 'x'`)
+		h.want(`SELECT setting FROM pg_settings WHERE name = 'app.scratch'`, "x")
+		execSQL(t, ctx, h.s, `ROLLBACK`)
+		h.want(`SELECT setting FROM pg_settings WHERE name = 'app.scratch'`)
+	})
+
+	t.Run("foreign_key_cascade_limit", func(t *testing.T) {
+		h := setup(t)
+		fk := `SELECT setting || '|' || source || '|' || boot_val FROM pg_settings WHERE name = 'foreign_key_cascade_limit'`
+		h.want(fk, "10000|default|10000")
+		execSQL(t, ctx, h.s, `SET foreign_key_cascade_limit = 5`)
+		h.want(fk, "5|session|10000")
+		h.want(`SELECT current_setting('foreign_key_cascade_limit')`, "5")
+		execSQL(t, ctx, h.s, `RESET foreign_key_cascade_limit`)
+		h.want(fk, "10000|default|10000")
+		execSQL(t, ctx, h.s, `BEGIN`)
+		execSQL(t, ctx, h.s, `SET LOCAL foreign_key_cascade_limit = 7`)
+		h.want(fk, "7|session|10000")
+		execSQL(t, ctx, h.s, `ROLLBACK`)
+		h.want(fk, "10000|default|10000")
+		h.want(`SHOW foreign_key_cascade_limit`, "10000")
+	})
+}
+
 // TestCancelAndTimeouts (issue #97): a CancelRequest (pgx's context
 // cancellation) stops a running statement with 57014 and rolls its
 // transaction back so another session's conflicting write proceeds, the
