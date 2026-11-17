@@ -920,9 +920,23 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   the base or as a join member — and table functions (`unnest(array)`,
   `pg_available_extensions()`, `pg_partition_ancestors(rel)`), which
   join like tables too: `FROM unnest(array) [AS] s(x)`, `LEFT JOIN
-  pg_available_extensions() ae(name, default_version, comment) ON ...`
-  (not laterally: their arguments cannot read another member's
-  columns). Correlated subqueries — ones that reference
+  pg_available_extensions() ae(name, default_version, comment) ON ...`.
+  **`LATERAL`**: a subquery written `LATERAL (SELECT ...)`, and any
+  table function call (implicitly lateral, as in PostgreSQL), may read
+  the columns of the `FROM` members to its left — `FROM users u,
+  LATERAL (SELECT * FROM orders o WHERE o.user_id = u.id ORDER BY
+  created DESC LIMIT 3) o` (top-N per group), `FROM t, unnest(t.tags)
+  AS tag`. It joins by comma, `CROSS JOIN LATERAL`, `JOIN LATERAL ...
+  ON cond` or `LEFT JOIN LATERAL ... ON true` (a row with no match is
+  kept, the lateral columns NULL); a lateral `ON` may be any condition.
+  It runs once per row of the members to its left (a correlated nested
+  loop, memoized on the values it reads; `EXPLAIN` shows the level),
+  and laterals chain and nest. A reference to a member further right is
+  `42P01`; `RIGHT` and `FULL JOIN LATERAL` are refused (`42P10`). The
+  lateral subquery is a plain select (over a table, a join or no
+  table; not over a derived table or a set operation of its own) and
+  reads the outer row anywhere but its `ORDER BY`, `GROUP BY` and
+  aggregate arguments. Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,

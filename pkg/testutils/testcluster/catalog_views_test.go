@@ -511,9 +511,10 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	eq("RIGHT JOIN a WITH member", names(execSQL(t, ctx, root, `WITH w AS (SELECT tag FROM u) SELECT w.tag FROM t RIGHT JOIN w ON w.tag = t.name ORDER BY 1`)), "x", "y", "z")
 	eq("RIGHT JOIN a catalog", names(execSQL(t, ctx, root, `SELECT n.nspname FROM pg_class c RIGHT JOIN pg_namespace n ON n.oid = c.relnamespace AND c.relname = 't' WHERE c.relname IS NULL AND n.nspname = 'information_schema'`)), "information_schema")
 	eq("pg_partition_ancestors in FROM", names(execSQL(t, ctx, root, `SELECT count(*) FROM pg_partition_ancestors('t')`)), "1")
-	if _, serr := trySQL(ctx, root, `SELECT t.name FROM t CROSS JOIN unnest(ARRAY[t.id]) AS k(x)`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
-		t.Fatalf("LATERAL table function: %v", serr)
-	}
+	// A call reading an earlier member's columns is implicitly LATERAL:
+	// it runs per row of the members to its left.
+	eq("LATERAL table function", names(execSQL(t, ctx, root, `SELECT t.name || ':' || k.x FROM t CROSS JOIN unnest(ARRAY[t.id, t.qty]) AS k(x) ORDER BY t.id, k.x`)),
+		"Alice:1", "Alice:5", "bob:2", "bob:3", "carol:3", "carol:3")
 	if r := execSQL(t, ctx, root, `SELECT * FROM pg_available_extensions()`); len(r.Rows) != 0 || len(r.Columns) != 3 || r.Columns[0].Name != "name" || r.Columns[2].Name != "comment" {
 		t.Fatalf("pg_available_extensions(): %+v %+v", r.Columns, r.Rows)
 	}

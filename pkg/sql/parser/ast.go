@@ -602,11 +602,16 @@ type JoinClause struct {
 	// ORDINALITY] AS a(c1, c2), or LEFT JOIN f() a(c1, c2) ON ...), with
 	// the names of its leading columns; Table is empty then. A call
 	// whose arguments use no column runs once and joins as a relation;
-	// one reading an earlier member's columns (LATERAL) is parsed for
-	// the catalog queries tools send but does not execute.
+	// one reading an earlier member's columns is implicitly LATERAL and
+	// runs once per row of the members to its left.
 	FuncTable *Expr
 	FuncCols  []string
-	On        []JoinCond
+	// Lateral marks LATERAL written before a subquery or table function
+	// member: it may read the columns of the members to its left, and
+	// runs once per row of them (a correlated nested loop; see
+	// pkg/sql/lateral.go). Its ON clause may be any condition.
+	Lateral bool
+	On      []JoinCond
 	// Filter holds the ON conjuncts that are not join-key equalities
 	// (tc.relkind = 't', a.attnum > 0, NOT a.attisdropped). They are part
 	// of the join condition: a candidate match failing them is not a
