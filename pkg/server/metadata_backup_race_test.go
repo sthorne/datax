@@ -73,3 +73,36 @@ func TestMetadataBackupRotationWritesLast(t *testing.T) {
 		t.Fatalf("the backup holds %s, want the rotation's export", got)
 	}
 }
+
+// TestMetadataBackupResealedWithoutExport: a rotation reseals the backup
+// already on disk before it exports, so the file never stays under the
+// retired key when the export's scans fail (they are best-effort).
+func TestMetadataBackupResealedWithoutExport(t *testing.T) {
+	key1 := bytes.Repeat([]byte{1}, 32)
+	key2 := bytes.Repeat([]byte{2}, 32)
+	dir := t.TempDir()
+	n := &Node{cfg: Config{Dir: dir}, encKey: key1}
+	n.writeMetadataBackup([]byte(`{"from":"heartbeat"}`))
+
+	n.encKeyMu.Lock()
+	n.encKey = key2
+	n.encKeyMu.Unlock()
+	n.resealMetadataBackup(key1, key2)
+
+	raw, err := os.ReadFile(filepath.Join(dir, MetadataBackupFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := enc.Unseal(MetadataBackupMagic, key2, raw)
+	if err != nil {
+		t.Fatalf("the metadata backup was not resealed under the new key: %v", err)
+	}
+	if string(got) != `{"from":"heartbeat"}` {
+		t.Fatalf("the backup holds %s", got)
+	}
+	// A second reseal (already under the new key) leaves it alone.
+	n.resealMetadataBackup(key1, key2)
+	if again, _ := os.ReadFile(filepath.Join(dir, MetadataBackupFile)); !bytes.Equal(again, raw) {
+		t.Fatal("a reseal of a backup already under the new key rewrote it")
+	}
+}

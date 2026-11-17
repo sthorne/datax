@@ -63,6 +63,17 @@ func (s *Session) findIndex(ctx context.Context, txn *kvclient.Txn, name string)
 // index now; its entries are wiped after the commit and the lease drain,
 // once no gateway can still write it.
 func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parser.DropIndex) (*Result, error) {
+	// CONCURRENTLY: the drop is one descriptor write and never blocks
+	// writers, so it changes nothing — but, as in PostgreSQL, that form
+	// cannot run inside a transaction block or cascade.
+	if t.Concurrently {
+		if s.state == StateOpen && txn == s.txn {
+			return nil, newErrf(CodeActiveTransaction, "DROP INDEX CONCURRENTLY cannot run inside a transaction block")
+		}
+		if t.Cascade {
+			return nil, newErrf(CodeFeatureNotSupported, "DROP INDEX CONCURRENTLY does not support CASCADE")
+		}
+	}
 	desc, idx, err := s.findIndex(ctx, txn, t.Name)
 	if err != nil {
 		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedObject && t.IfExists {

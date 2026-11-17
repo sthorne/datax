@@ -26,15 +26,18 @@ import (
 
 // NodeDetail is the /api/node document.
 type NodeDetail struct {
-	NodeID        int    `json:"node_id"`
-	Address       string `json:"address,omitempty"`
-	SQLAddr       string `json:"sql_address,omitempty"`
-	Locality      string `json:"locality,omitempty"`
-	Live          bool   `json:"live"`
-	Draining      bool   `json:"draining,omitempty"`
-	ShuttingDown  bool   `json:"shutting_down,omitempty"`
-	HeartbeatAgo  int64  `json:"heartbeat_ago_ms"`
-	BinaryVersion int    `json:"binary_version,omitempty"`
+	NodeID   int    `json:"node_id"`
+	Address  string `json:"address,omitempty"`
+	SQLAddr  string `json:"sql_address,omitempty"`
+	Locality string `json:"locality,omitempty"`
+	// LocalityAddresses are the node's --locality-advertise entries, as
+	// the flag spells them.
+	LocalityAddresses string `json:"locality_addresses,omitempty"`
+	Live              bool   `json:"live"`
+	Draining          bool   `json:"draining,omitempty"`
+	ShuttingDown      bool   `json:"shutting_down,omitempty"`
+	HeartbeatAgo      int64  `json:"heartbeat_ago_ms"`
+	BinaryVersion     int    `json:"binary_version,omitempty"`
 	// ClusterVersion is the version this node has mirrored locally.
 	ClusterVersion int    `json:"cluster_version,omitempty"`
 	Release        string `json:"release,omitempty"`
@@ -89,19 +92,20 @@ func (n *Node) localNodeDetail(ctx context.Context, v keyViewer) NodeDetail {
 	admin := v.all
 	st := n.statusSummaryFor(v)
 	d := NodeDetail{
-		NodeID:         int(n.ident.NodeID),
-		Address:        n.addr,
-		SQLAddr:        n.SQLAddr(),
-		Locality:       n.cfg.Locality.String(),
-		Live:           true,
-		Draining:       n.draining.Load(),
-		ShuttingDown:   n.shuttingDown.Load(),
-		BinaryVersion:  int(n.binaryVersion()),
-		ClusterVersion: int(n.readClusterVersion(ctx)),
-		Release:        version.Release,
-		Status:         &st,
-		Events:         []events.Event{},
-		Operations:     []Operation{},
+		NodeID:            int(n.ident.NodeID),
+		Address:           n.addr,
+		SQLAddr:           n.SQLAddr(),
+		Locality:          n.cfg.Locality.String(),
+		LocalityAddresses: base.FormatLocalityAddresses(n.cfg.LocalityAddresses),
+		Live:              true,
+		Draining:          n.draining.Load(),
+		ShuttingDown:      n.shuttingDown.Load(),
+		BinaryVersion:     int(n.binaryVersion()),
+		ClusterVersion:    int(n.readClusterVersion(ctx)),
+		Release:           version.Release,
+		Status:            &st,
+		Events:            []events.Event{},
+		Operations:        []Operation{},
 	}
 	if st.Machine != nil {
 		d.UptimeSeconds = st.Machine.ProcessUp
@@ -208,6 +212,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 	}
 	now := n.clock.Now().WallTime
 	doc.Address, doc.Locality, doc.Draining, doc.ShuttingDown = nd.Address, nd.Locality.String(), nd.Draining, nd.ShuttingDown
+	doc.LocalityAddresses = base.FormatLocalityAddresses(nd.LocalityAddresses)
 	doc.Live = now-nd.LivenessTime <= n.livenessGrace().Nanoseconds()
 	doc.HeartbeatAgo = (now - nd.LivenessTime) / int64(time.Millisecond)
 	doc.BinaryVersion = nd.BinaryVersion
@@ -215,7 +220,7 @@ func (n *Node) serveNodeAPI(w http.ResponseWriter, req *http.Request) {
 	if nd.Machine != nil {
 		doc.UptimeSeconds = nd.Machine.UptimeSeconds
 	}
-	addr, err := n.registry.Resolve(id)
+	addr, err := n.resolvePeer(id)
 	if err != nil {
 		doc.Error = err.Error()
 		_ = enc.Encode(doc)

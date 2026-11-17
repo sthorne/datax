@@ -1273,11 +1273,13 @@ func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parse
 		}
 		rows = append(rows, []types.Datum{*e.Lit})
 	case "pg_available_extensions":
-		// datax packages no installable extension: CREATE EXTENSION
-		// vector is accepted only because its type is built in, and
-		// pg_extension lists nothing.
+		// The extensions datax has built in (vtable.Extensions), as the
+		// pg_available_extensions view and pg_extension list them.
 		if len(fe.Args) != 0 {
 			return nil, nil, newErrf(CodeUndefinedFunction, "pg_available_extensions takes no arguments")
+		}
+		for _, e := range vtable.Extensions {
+			rows = append(rows, []types.Datum{types.NewString(e.Name), types.NewString(e.Version), types.NewString(e.Comment)})
 		}
 	default:
 		// A set-returning builtin (generate_series, jsonb_each, ...)
@@ -1474,7 +1476,7 @@ var splicedFuncs = map[string]bool{
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
-	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true,
+	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true, "uuid_generate_v4": true,
 	// The text-search functions take the session's default
 	// configuration when the call names none.
 	"to_tsvector": true, "to_tsquery": true, "plainto_tsquery": true, "phraseto_tsquery": true, "websearch_to_tsquery": true,

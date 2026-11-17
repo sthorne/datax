@@ -72,6 +72,11 @@ type Builtin struct {
 	Hidden bool
 	// Aliases are other names for the same function.
 	Aliases []string
+	// Bytea marks a text function that also has a bytea form
+	// (length, octet_length, substring, position): a bytea argument
+	// reaches Fn as itself, its raw bytes in S, instead of being
+	// rendered as its hex text, and Fn dispatches on the family.
+	Bytea bool
 	// Session marks a function the session evaluates itself (no Fn):
 	// listed and arity-checked here, called elsewhere.
 	Session bool
@@ -297,6 +302,10 @@ func (b *Builtin) coerceArgs(args []types.Datum) (coerced []types.Datum, null bo
 		}
 		want := b.argFamily(i)
 		if want == Any || a.Fam == want {
+			coerced[i] = a
+			continue
+		}
+		if want == types.String && a.Fam == types.Bytes && b.Bytea {
 			coerced[i] = a
 			continue
 		}

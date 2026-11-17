@@ -89,7 +89,7 @@ func (n *Node) serveRangeAPI(w http.ResponseWriter, req *http.Request) {
 			}
 			continue
 		}
-		addr, err := n.registry.Resolve(rep.NodeID)
+		addr, err := n.resolvePeer(rep.NodeID)
 		if err != nil {
 			rd.Error = err.Error()
 			continue

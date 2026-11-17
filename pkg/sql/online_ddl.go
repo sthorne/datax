@@ -5,6 +5,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -48,9 +49,14 @@ func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDesc
 		if t.ExprFunc != "" {
 			return nil, newErrf(CodeFeatureNotSupported, "indexes on expressions are not supported, except USING GIN (to_tsvector('config', column))")
 		}
+		// The operator classes the string types have are accepted
+		// (newIndexDescriptor checks each against its column); a
+		// column that does not exist is reported there too.
 		for i, oc := range t.OpClasses {
-			if oc != "" {
-				return nil, newErrf(CodeFeatureNotSupported, "operator class %q is not supported for column %q of an ordinary index", oc, t.Columns[i])
+			if col, ok := desc.Col(t.Columns[i]); ok {
+				if _, err := ordinaryOpClass(oc, &col); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return nil, nil
@@ -140,6 +146,25 @@ const backfillChunkSize = 64
 // execCreateIndexOnline runs the state machine. The session has already
 // rejected explicit-transaction contexts.
 func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateIndex) (*Result, *Error) {
+	if t.Name == "" {
+		// CREATE INDEX ON t (cols): the name is chosen from the table as
+		// it is now. One taken in the meantime fails the publish below
+		// as a duplicate.
+		var name string
+		if err := s.db.RunTxn(ctx, "create-index-name", func(ctx context.Context, txn *kvclient.Txn) error {
+			desc, err := s.lookup(ctx, txn, t.Table)
+			if err != nil {
+				return err
+			}
+			name = chooseIndexName(desc, t)
+			return nil
+		}); err != nil {
+			return nil, ToSQLError(err)
+		}
+		c := *t
+		c.Name = name
+		t = &c
+	}
 	// A vector index trains its centres before anything is published
 	// (see vector_index.go): vec is then the index's description, its
 	// centres already committed. nil for every other kind of index, and
@@ -201,57 +226,15 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 				return newErrf(CodeObjectInUse, "table %q changed while index %q was being prepared; run CREATE INDEX again", t.Table, t.Name)
 			}
 		}
-		var colIDs []catalog.ColumnID
-		seenCol := map[catalog.ColumnID]bool{}
-		for _, name := range t.Columns {
-			col, ok := desc.Col(name)
-			if !ok {
-				return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
-			}
-			if kind == nil && vspec == nil && !types.IsIndexable(col.Type) {
-				if col.Type == types.Vector {
-					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it for nearest-neighbour search with USING ivfflat", name, col.Type)
-				}
-				if col.Type == types.Jsonb || col.Type == types.Tsvector {
-					return newErrf(CodeFeatureNotSupported, "column %q of type %s has no ordered key encoding; index it with USING GIN", name, col.Type)
-				}
-				return newErrf(CodeFeatureNotSupported, "column %q of type %s cannot be indexed (no ordered key encoding)", name, col.Type)
-			}
-			if kind != nil && col.Type != kind.Family() {
-				return newErrf(CodeFeatureNotSupported, "operator class %q does not index column %q of type %s", kind.Name(), name, col.Type)
-			}
-			if seenCol[col.ID] {
-				return newErrf(CodeSyntaxError, "duplicate column %q in index", name)
-			}
-			seenCol[col.ID] = true
-			colIDs = append(colIDs, col.ID)
-		}
-		if desc.NextIndexID < rowenc.PrimaryIndexID+1 {
-			desc.NextIndexID = rowenc.PrimaryIndexID + 1
-		}
-		idx := catalog.IndexDescriptor{
-			ID: desc.NextIndexID, Name: t.Name, Unique: t.Unique,
-			ColumnIDs: colIDs, State: catalog.IndexStateWriteOnly,
-			// NULLS NOT DISTINCT means something only to a unique index;
-			// on another it is accepted and has no effect, as in
-			// PostgreSQL.
-			NullsNotDistinct: t.Unique && t.NullsNotDistinct,
-		}
-		if idx.NullsNotDistinct {
-			if err := s.requireNullsNotDistinct(); err != nil {
-				return err
-			}
-		}
-		if kind != nil {
-			idx.Inverted = kind.Name()
+		idx, err := s.newIndexDescriptor(t, desc, kind, vspec != nil, catalog.IndexStateWriteOnly)
+		if err != nil {
+			return err
 		}
 		idx.Vector = vec
-		desc.NextIndexID++
-		desc.Indexes = append(desc.Indexes, idx)
 		indexID = idx.ID
 		notices = nil
 		if desc.Sealed() {
-			notices = []string{sealedIndexNotice(desc, &idx)}
+			notices = []string{sealedIndexNotice(desc, idx)}
 		}
 		return s.cat.Update(ctx, txn, desc)
 	})
@@ -463,58 +446,65 @@ func (s *Session) backfillChunk(ctx context.Context, table string, indexID uint6
 		if err != nil {
 			return err
 		}
-		var wb kvclient.WriteBatch
-		seen := map[string]string{}
-		for _, kv := range kvs {
-			row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
+		return s.writeIndexEntries(ctx, txn, desc, idx, kvs)
+	})
+}
+
+// writeIndexEntries writes idx's entries for the primary rows kvs of
+// desc in txn, refusing a duplicate of a unique index's values among
+// them or against an entry already in the index.
+func (s *Session) writeIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, idx *catalog.IndexDescriptor, kvs []kvpb.KeyValue) error {
+	var wb kvclient.WriteBatch
+	seen := map[string]string{}
+	for _, kv := range kvs {
+		row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
+		if err != nil {
+			return err
+		}
+		entries, err := rowenc.IndexEntries(desc, idx, row)
+		if err != nil {
+			return invertedEntryErr(idx, err)
+		}
+		if len(entries) == 0 {
+			// NULLS DISTINCT: a row with a NULL has no entry and
+			// duplicates nothing (refused before v22, as the write
+			// path refuses it).
+			if idx.Unique && !uniqueNullsDistinct(txn) {
+				return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column (NULLs in a unique index need cluster version %s: finalize the upgrade first)", idx.Name, version.V22)
+			}
+			continue
+		}
+		if !idx.Unique {
+			// One entry, or one per element of an inverted index's
+			// value. A row with many elements makes this chunk's batch
+			// that many times larger; MaxElementsPerValue bounds it.
+			for _, e := range entries {
+				wb.Put(e.Key, e.Value)
+			}
+			continue
+		}
+		key, val := entries[0].Key, entries[0].Value
+		{
+			// Duplicates within the chunk, then against entries earlier
+			// chunks (or concurrent writers) committed: a unique entry's
+			// value is the encoded primary key, so an existing entry
+			// with a different value is another row with the same
+			// indexed values.
+			if prev, dup := seen[string(key)]; dup && prev != string(val) {
+				return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
+			}
+			seen[string(key)] = string(val)
+			existing, err := txn.Get(ctx, key)
 			if err != nil {
 				return err
 			}
-			entries, err := rowenc.IndexEntries(desc, idx, row)
-			if err != nil {
-				return invertedEntryErr(idx, err)
+			if existing != nil && string(existing) != string(val) {
+				return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
 			}
-			if len(entries) == 0 {
-				// NULLS DISTINCT: a row with a NULL has no entry and
-				// duplicates nothing (refused before v22, as the write
-				// path refuses it).
-				if idx.Unique && !uniqueNullsDistinct(txn) {
-					return newErrf(CodeNotNullViolation, "cannot create unique index %q: a row has NULL in an indexed column (NULLs in a unique index need cluster version %s: finalize the upgrade first)", idx.Name, version.V22)
-				}
-				continue
-			}
-			if !idx.Unique {
-				// One entry, or one per element of an inverted index's
-				// value. A row with many elements makes this chunk's batch
-				// that many times larger; MaxElementsPerValue bounds it.
-				for _, e := range entries {
-					wb.Put(e.Key, e.Value)
-				}
-				continue
-			}
-			key, val := entries[0].Key, entries[0].Value
-			{
-				// Duplicates within the chunk, then against entries earlier
-				// chunks (or concurrent writers) committed: a unique entry's
-				// value is the encoded primary key, so an existing entry
-				// with a different value is another row with the same
-				// indexed values.
-				if prev, dup := seen[string(key)]; dup && prev != string(val) {
-					return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
-				}
-				seen[string(key)] = string(val)
-				existing, err := txn.Get(ctx, key)
-				if err != nil {
-					return err
-				}
-				if existing != nil && string(existing) != string(val) {
-					return newErrf(CodeUniqueViolation, "cannot create unique index %q: duplicate values exist", idx.Name)
-				}
-			}
-			wb.Put(key, val)
 		}
-		return txn.RunBatch(ctx, &wb)
-	})
+		wb.Put(key, val)
+	}
+	return txn.RunBatch(ctx, &wb)
 }
 
 // wipeIndexEntries best-effort deletes an abandoned (or superseded)

@@ -1,6 +1,7 @@
 package builtins
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -30,11 +31,17 @@ func text(d types.Datum) string {
 
 func init() {
 	register(&Builtin{Name: "length", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.Int, Category: catString,
-		Doc: "Number of characters in the string.", Aliases: []string{"char_length", "character_length"},
-		Fn: func(a []types.Datum) (types.Datum, error) { return i64(int64(utf8.RuneCountInString(a[0].S))), nil }})
+		Doc: "Number of characters in the string (of bytes in a bytea).", Aliases: []string{"char_length", "character_length"},
+		Bytea: true,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if a[0].Fam == types.Bytes {
+				return i64(int64(len(a[0].S))), nil
+			}
+			return i64(int64(utf8.RuneCountInString(a[0].S))), nil
+		}})
 	register(&Builtin{Name: "octet_length", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.Int, Category: catString,
-		Doc: "Number of bytes in the string.",
-		Fn:  func(a []types.Datum) (types.Datum, error) { return i64(int64(len(a[0].S))), nil }})
+		Doc: "Number of bytes in the string or bytea.", Bytea: true,
+		Fn: func(a []types.Datum) (types.Datum, error) { return i64(int64(len(a[0].S))), nil }})
 	register(&Builtin{Name: "lower", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.String, Category: catString,
 		Doc: "The string in lower case.",
 		Fn:  func(a []types.Datum) (types.Datum, error) { return str(strings.ToLower(a[0].S)), nil }})
@@ -85,28 +92,20 @@ func init() {
 			return str(strings.Join(parts, a[0].S)), nil
 		}})
 	register(&Builtin{Name: "substring", Args: []types.Family{types.String, types.Int, types.Int}, MinArgs: 2, Ret: types.String, Category: catString,
-		Doc: "The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])).", Aliases: []string{"substr"},
+		Doc: "The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes.", Aliases: []string{"substr"},
+		Bytea: true, RetOf: stringOrBytes,
 		Fn: func(a []types.Datum) (types.Datum, error) {
-			runes := []rune(a[0].S)
-			start := a[1].I
-			length := int64(len(runes)) + 1
-			if len(a) > 2 {
-				if a[2].I < 0 {
-					return types.Datum{}, errf(CodeInvalidArgument, "negative substring length not allowed")
+			if a[0].Fam == types.Bytes {
+				from, to, err := substringWindow(a, int64(len(a[0].S)))
+				if err != nil {
+					return types.Datum{}, err
 				}
-				length = a[2].I
+				return types.NewBytes([]byte(a[0].S[from-1 : to-1])), nil
 			}
-			// PostgreSQL: the window is [start, start+length) in 1-based
-			// positions, clipped to the string.
-			from, to := start, start+length
-			if from < 1 {
-				from = 1
-			}
-			if to > int64(len(runes))+1 {
-				to = int64(len(runes)) + 1
-			}
-			if to <= from {
-				return str(""), nil
+			runes := []rune(a[0].S)
+			from, to, err := substringWindow(a, int64(len(runes)))
+			if err != nil {
+				return types.Datum{}, err
 			}
 			return str(string(runes[from-1 : to-1])), nil
 		}})
@@ -133,11 +132,23 @@ func init() {
 			return str(string(r[int64(len(r))-n:])), nil
 		}})
 	register(&Builtin{Name: "position", Args: []types.Family{types.String, types.String}, MinArgs: 2, Ret: types.Int, Category: catString,
-		Doc: "1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack)); strpos(haystack, needle) takes them the other way round.",
-		Fn:  func(a []types.Datum) (types.Datum, error) { return i64(runeIndex(a[1].S, a[0].S)), nil }})
+		Doc:   "1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack); over bytea, the byte offset); strpos(haystack, needle) takes them the other way round.",
+		Bytea: true,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if bytea(a) {
+				return byteaIndex(a[1], a[0])
+			}
+			return i64(runeIndex(a[1].S, a[0].S)), nil
+		}})
 	register(&Builtin{Name: "strpos", Args: []types.Family{types.String, types.String}, MinArgs: 2, Ret: types.Int, Category: catString, Hidden: true,
-		Doc: "1-based position of the second argument in the first, 0 when absent.",
-		Fn:  func(a []types.Datum) (types.Datum, error) { return i64(runeIndex(a[0].S, a[1].S)), nil }})
+		Doc:   "1-based position of the second argument in the first, 0 when absent.",
+		Bytea: true,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if bytea(a) {
+				return byteaIndex(a[0], a[1])
+			}
+			return i64(runeIndex(a[0].S, a[1].S)), nil
+		}})
 	register(&Builtin{Name: "replace", Args: []types.Family{types.String, types.String, types.String}, MinArgs: 3, Ret: types.String, Category: catString,
 		Doc: "Replaces every occurrence of the second argument with the third.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
@@ -217,7 +228,7 @@ func init() {
 			return str(string(rune(a[0].I))), nil
 		}})
 	register(&Builtin{Name: "md5", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.String, Category: catString,
-		Doc: "The MD5 hash as 32 hex characters.",
+		Doc: "The MD5 hash as 32 hex characters (of a bytea's bytes).", Bytea: true,
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			sum := md5.Sum([]byte(a[0].S))
 			return str(hex.EncodeToString(sum[:])), nil
@@ -325,6 +336,80 @@ func clamp(v, lo, hi int64) int64 {
 
 // runeIndex is the 1-based character position of needle in s, 0 when
 // absent.
+// substringWindow is substring's [from, to) in 1-based positions over
+// a value of n characters (or bytes): from the start for the length,
+// clipped to the value, as PostgreSQL computes it; from == to is empty.
+func substringWindow(a []types.Datum, n int64) (from, to int64, err error) {
+	start := a[1].I
+	length := n + 1
+	if len(a) > 2 {
+		if a[2].I < 0 {
+			return 0, 0, errf(CodeInvalidArgument, "negative substring length not allowed")
+		}
+		length = a[2].I
+	}
+	from, to = start, start+length
+	if length > 0 && to < start {
+		to = n + 1 // start+length overflowed
+	}
+	if from < 1 {
+		from = 1
+	}
+	if to > n+1 {
+		to = n + 1
+	}
+	if to <= from {
+		return 1, 1, nil
+	}
+	return from, to, nil
+}
+
+// stringOrBytes types substring: bytea in, bytea out.
+func stringOrBytes(args []types.Family) types.Family {
+	if len(args) > 0 && args[0] == types.Bytes {
+		return types.Bytes
+	}
+	return types.String
+}
+
+// bytea reports whether a Bytea builtin got a bytea argument: its call
+// is then the bytea form.
+func bytea(a []types.Datum) bool {
+	for _, d := range a {
+		if d.Fam == types.Bytes {
+			return true
+		}
+	}
+	return false
+}
+
+// byteaArg is an argument of a bytea call: a bytea, or text read as
+// bytea input (an untyped literal beside a bytea takes its type).
+func byteaArg(d types.Datum) ([]byte, error) {
+	if d.Fam == types.Bytes {
+		return []byte(d.S), nil
+	}
+	b, err := types.ParseBytes(d.S)
+	if err != nil {
+		return nil, errf(CodeInvalidText, "invalid input syntax for type bytea")
+	}
+	return b, nil
+}
+
+// byteaIndex is position over bytea: the 1-based byte offset of
+// needle's first occurrence in s, 0 when absent.
+func byteaIndex(s, needle types.Datum) (types.Datum, error) {
+	h, err := byteaArg(s)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	n, err := byteaArg(needle)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return i64(int64(bytes.Index(h, n)) + 1), nil
+}
+
 func runeIndex(s, needle string) int64 {
 	i := strings.Index(s, needle)
 	if i < 0 {

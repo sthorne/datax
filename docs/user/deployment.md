@@ -42,6 +42,72 @@ range. Give every node the same tier names in the same order. Leaving
 localities off works, but placement then has no failure domains to spread
 across.
 
+### Locality addresses
+
+`--locality-advertise` (alias `--locality-advertise-addr`, CockroachDB's
+name) gives a node a second address for the peers that share one of its
+locality tiers, typically a private network inside a region, while
+`--advertise` stays the public address every other node uses:
+
+```
+--locality-advertise region=us-mia@192.168.144.22:26257
+```
+
+The value is a comma-separated list of `key=value@host:port` entries. Each
+`key=value` must be one of the node's own `--locality` tiers, and each tier
+may appear once. A malformed entry, a tier the node doesn't have, or a bad
+`host:port` stops the node at startup with an error naming the flag.
+
+When a node dials a peer, it uses the peer's first entry whose tier (the
+same key **and** value) is also one of its own tiers, and the peer's public
+address when no entry matches. This applies to every connection between
+nodes: raft, snapshots, KV requests, the latency pings, and the admin and
+re-announce calls. `--join` addresses are always dialed as given.
+
+The node has to accept connections on that address, so its `--listen`
+must cover it (for example `0.0.0.0:26257`). In secure mode, its node
+certificate must also name the address's host (`datax cert create-node
+--hosts`). If a dial to a locality address fails, the dialing node uses
+the public address instead and logs a warning, at most once a minute per
+peer. It tries the locality address again in the background every 10
+seconds. So a misconfigured private network slows the cluster down but
+doesn't partition it. `datax_rpc_locality_dials_total` and
+`datax_rpc_locality_fallbacks_total` on `/metrics` count both outcomes.
+The entries are shown wherever a node's address is: `datax debug nodes`,
+the console's node list and node page, `/status`, and `/api/node`.
+
+A two-region cluster with a public network between the regions and a
+private one within each:
+
+```sh
+# us-mia: public 203.0.113.x, private 192.168.144.x
+datax init  --dir /var/lib/datax --listen 0.0.0.0:26257 \
+            --advertise 203.0.113.21:26257 \
+            --locality region=us-mia,zone=a \
+            --locality-advertise region=us-mia@192.168.144.21:26257
+datax start --dir /var/lib/datax --listen 0.0.0.0:26257 \
+            --advertise 203.0.113.22:26257 \
+            --locality region=us-mia,zone=b \
+            --locality-advertise region=us-mia@192.168.144.22:26257 \
+            --join 203.0.113.21:26257
+
+# us-atl: public 198.51.100.x, private 10.20.0.x
+datax start --dir /var/lib/datax --listen 0.0.0.0:26257 \
+            --advertise 198.51.100.31:26257 \
+            --locality region=us-atl,zone=a \
+            --locality-advertise region=us-atl@10.20.0.31:26257 \
+            --join 203.0.113.21:26257
+datax start --dir /var/lib/datax --listen 0.0.0.0:26257 \
+            --advertise 198.51.100.32:26257 \
+            --locality region=us-atl,zone=b \
+            --locality-advertise region=us-atl@10.20.0.32:26257 \
+            --join 203.0.113.21:26257
+```
+
+The two us-mia nodes reach each other over 192.168.144.x and the two
+us-atl nodes over 10.20.0.x. Traffic between the regions, and every
+`--join`, uses the public 203.0.113.x and 198.51.100.x addresses.
+
 ## Clocks
 
 Nodes tolerate at most `--max-offset` (default `500ms`) of clock skew; a

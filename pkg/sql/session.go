@@ -268,6 +268,11 @@ type Session struct {
 	// pendingDDL names tables changed inside the open explicit transaction;
 	// lease adoption for them is drained at COMMIT.
 	pendingDDL []string
+	// createdTables are the IDs of the tables created in the open
+	// transaction block createdTxn (index_keys.go): CREATE INDEX on one
+	// of them runs inside the block.
+	createdTxn    *kvclient.Txn
+	createdTables map[uint64]bool
 }
 
 // NewSession creates a root session (internal components, tests, tools).
@@ -579,6 +584,8 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	env.Settings = s.settings()
 	env.SettingDefaults = s.settingDefaults()
 	env.SettingTypes = settingTypes
+	env.SettingRaw = pgSettingRaw
+	env.SettingContexts = pgSettingContexts
 	if s.SessionsHook != nil {
 		env.Sessions = s.SessionsHook()
 	}
@@ -732,6 +739,21 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 	}
+	// A cast to a type that does not exist fails the statement before it
+	// runs (and, in a transaction block, the block).
+	{
+		var txn *kvclient.Txn
+		if s.state == StateOpen {
+			txn = s.txn
+		}
+		if serr := s.checkCastTypes(ctx, txn, stmt); serr != nil {
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
+			return nil, serr
+		}
+	}
 
 	switch t := stmt.(type) {
 	case *parser.Begin:
@@ -741,6 +763,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.txn = s.db.NewTxn("sql")
 		s.state = StateOpen
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
+		// BEGIN's modes run as the SET TRANSACTION they stand for.
+		for _, m := range t.Modes {
+			if _, serr := s.execSetVar(ctx, m); serr != nil {
+				s.rollback(ctx)
+				return nil, serr
+			}
+		}
 		return &Result{Tag: "BEGIN"}, nil
 
 	case *parser.Commit:
@@ -1007,10 +1036,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.execReshardOnline(ctx, at)
 	}
 
-	if ci, ok := stmt.(*parser.CreateIndex); ok {
-		if s.state == StateOpen {
-			return nil, newErrf(CodeActiveTransaction, "CREATE INDEX cannot run inside a transaction block")
-		}
+	if ci, ok := stmt.(*parser.CreateIndex); ok && s.state != StateOpen {
+		// Inside a block, CREATE INDEX runs with the block's other
+		// statements (execCreateIndexInTxn): on a table created in the
+		// block, or refused.
 		if serr := s.checkTableOwnerNoTxn(ctx, ci.Table); serr != nil {
 			return nil, serr
 		}
@@ -1357,8 +1386,21 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		if err != nil {
 			return types.Datum{}, err
 		}
-		if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
-			return types.Datum{}, err
+		handled := false
+		if e.BinOp == "||" {
+			// jsonb || jsonb merges (issue #342).
+			var d types.Datum
+			if d, handled, err = evalJSONBConcat(e, base, rhs); err != nil {
+				return types.Datum{}, err
+			}
+			if handled {
+				base = d
+			}
+		}
+		if !handled {
+			if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
+				return types.Datum{}, err
+			}
 		}
 	}
 	if e.Cast != "" {
@@ -2467,6 +2509,10 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 	}
 	s.notifyRollbackToSavepoint(name)
 	s.loRollbackToSavepoint()
+	// The tables created in the block may have been rolled back with
+	// the savepoint; forget them all rather than track which (CREATE
+	// INDEX on one is then refused in the block, never wrongly allowed).
+	s.createdTxn, s.createdTables = nil, nil
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
 }

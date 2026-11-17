@@ -99,11 +99,13 @@ CREATE TABLE t (
 CREATE TABLE IF NOT EXISTS t (...);
 DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE INDEX ON t (b, c);                                -- unnamed: t_b_c_idx (t_b_c_idx1, ... when taken)
+CREATE INDEX t_b_like ON t (b text_pattern_ops);         -- also varchar_/bpchar_pattern_ops, COLLATE "C" / "POSIX" / "default"
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
 CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
-DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
+DROP INDEX [CONCURRENTLY] [IF EXISTS] by_b;             -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
 ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK/indexed columns
@@ -126,7 +128,18 @@ SHOW TABLES;
 ```
 
 `CREATE INDEX` backfills online in bounded chunks, like PostgreSQL's
-`CREATE INDEX CONCURRENTLY`; it cannot run inside an explicit transaction.
+`CREATE INDEX CONCURRENTLY`, so `CONCURRENTLY` is accepted and changes
+nothing. It cannot run inside an explicit transaction, except on a table
+created in the same transaction block (see [DDL in transaction
+blocks](#ddl)); the `CONCURRENTLY` forms of `CREATE INDEX` and `DROP
+INDEX` never can (`25001`), as in PostgreSQL. An ordinary index compares
+its keys bytewise — the order of the `C` collation — so the string
+types' operator classes (`text_pattern_ops`, `varchar_pattern_ops`,
+`bpchar_pattern_ops` and the defaults `text_ops`, `varchar_ops`,
+`bpchar_ops`) and `COLLATE "C"`, `"POSIX"` or `"default"` are accepted
+on a key column and shown by `pg_get_indexdef`; any other collation is
+refused (`0A000`), as is an operator class of another type (`42804`).
+They do not make `LIKE 'abc%'` use the index.
 `DROP INDEX` names the index alone (it is found on whichever table of
 the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the
@@ -383,12 +396,19 @@ back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
 COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 `DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
 `DROP VIEW`, the sequence, database, role and ownership statements,
-`GRANT` / `REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
-CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
-TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
-drain and sweep (or stream) in several transactions of their own and
-are refused inside a block with `25001`; so are `SPLIT AT` and
-`UNSPLIT`, range operations rather than descriptor writes.
+`GRANT` / `REVOKE`, `CREATE` / `DROP EXTENSION`. So does `CREATE INDEX`
+on a table created earlier in the same block — the table is invisible
+to everyone else until the block commits, so the index is published at
+once, filled from the block's own rows, and commits or rolls back with
+the table (a Rails or Django migration's `create_table` and `add_index`).
+After `ROLLBACK TO SAVEPOINT` the block no longer counts the tables it
+created as its own. The multi-transaction statements — `CREATE INDEX` on
+any other table, `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`,
+`ALTER COLUMN TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`,
+`ANALYZE` — publish, drain and sweep (or stream) in several transactions
+of their own and are refused inside a block with `25001`; so are `SPLIT
+AT` and `UNSPLIT`, range operations rather than descriptor writes, and
+`USING ivfflat`, whose centres are trained in transactions of their own.
 
 #### SPLIT AT and UNSPLIT
 
@@ -801,7 +821,8 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   position, with PostgreSQL's text forms and error codes (`'abc'::int`
   is `22P02`), `DECIMAL(p,s)` and `VARCHAR(n)` typmods applied on the
   cast, `'name'::regclass` resolving a table name to its catalog OID
-  and `oid::regclass` on a column giving the table's name —, `E'...'`
+  and `oid::regclass` on a column giving the table's name; a cast to a
+  type that does not exist is `42704` —, `E'...'`
   escape strings, and the builtin functions: conditionals (`coalesce`,
   `nullif`, `greatest`, `least`), strings (`length`, `lower`, `upper`,
   `substring` / `substr`, `position`, `trim` / `ltrim` / `rtrim` /
@@ -842,7 +863,9 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   column's name (`at::date` describes as `at`).
 - **JSONB operators**: `->` / `->>` (key or array index: `j -> 0`),
   `#>` / `#>>` with a text-array path (`j #>> '{a,0,b}'`), containment
-  `@>` / `<@`, and key existence `?`, `?|`, `?&` — everywhere an
+  `@>` / `<@`, key existence `?`, `?|`, `?&`, and concatenation `||`
+  (objects merge, the right side winning; arrays concatenate; a
+  non-array is appended or prepended as an element) — everywhere an
   expression goes, including HAVING and grouped select lists.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
@@ -1421,7 +1444,7 @@ vector scan of index "items_embedding" (ivfflat, <->: the nearest 10 of 100 list
 ## Transactions and retries
 
 ```sql
-BEGIN;                                   -- or START TRANSACTION
+BEGIN;                                   -- or START TRANSACTION; BEGIN READ ONLY etc. take SET TRANSACTION's modes
 UPDATE accounts SET balance = balance - 10 WHERE id = 1;
 UPDATE accounts SET balance = balance + 10 WHERE id = 2;
 COMMIT;                                  -- ROLLBACK / ABORT to abandon
@@ -1670,7 +1693,7 @@ SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is ro
 SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ read and rendered in the zone
 SET application_name = 'billing';             -- shown by pg_stat_activity / SHOW SESSIONS
 SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / ROLLBACK
-SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
+SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006); BEGIN READ ONLY does the same
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;   -- source 'session' where this session changed it (psql's \dconfig)
@@ -1694,14 +1717,20 @@ invalid value `22023`:
 | `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it; storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
 | `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
-| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY` and DDL with `25006` |
-| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
+| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` (also as `BEGIN` / `START TRANSACTION` modes) | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY`, DDL, `nextval()` and `setval()` with `25006` |
+| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` (also as a `BEGIN` / `START TRANSACTION` mode) | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
 | `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |
 | `default_text_search_config` | `english` (default), `simple`; `pg_catalog.` may qualify either | the configuration `to_tsvector`, `to_tsquery` and their relatives use when a call names none; reported schema-qualified (`pg_catalog.english`), as PostgreSQL does |
 | `ivfflat.probes` | `auto` (default: the square root of the index's lists) or 1 to 32768 | how many clusters of an ivfflat index a nearest-neighbour query reads: more is higher recall and slower ([Vectors](#vectors)) |
 | `vector_index_scan` | `on` (default), `off` | `off` answers every nearest-neighbour query exactly, by scanning, whatever vector index exists |
+| `IntervalStyle` | `postgres` (default), `iso_8601`, `sql_standard`, `postgres_verbose` | the text format of an `INTERVAL` column on the wire (`P1Y2M3DT4H5M6S` in `iso_8601`, as Rails expects); `::text` casts, arrays and JSON keep the `postgres` format; reported to the client as a parameter status |
+| `bytea_output` | `hex` (default), `escape` | the text format of a `BYTEA` column on the wire |
+| `client_min_messages` | `debug5` ... `debug1`, `log`, `notice` (default), `warning`, `error` | at `warning` or `error`, `NOTICE`s are not sent |
+| `row_security` | `on` (default), `off` | `off` refuses (`42501`) a query that a table's row-level security policies would filter, as `pg_dump` expects |
+| `server_version_num`, `max_identifier_length` | `140000`, `63` | read only (`55P02`) |
+| PostgreSQL's other common settings: `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `lc_*`, `default_transaction_isolation`, ... | PostgreSQL's values, checked as PostgreSQL checks them | accepted, kept and reported, with no effect: the list is in [Differences from PostgreSQL](postgres-differences.md) |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 **Custom settings.** A name with a prefix and a dot (`app.tenant`,
@@ -2037,9 +2066,11 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
 `pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
 `pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`,
-`pg_policy`, `pg_policies`, `pg_description`
+`pg_policy`, `pg_policies`, `pg_description`, `pg_extension` and
+`pg_available_extensions` (the built-in extensions: `plpgsql`,
+`pgcrypto`, `uuid-ossp` and `vector`, always installed)
 (and empty stand-ins for the catalogs of features datax lacks —
-publications, extensions, functions, triggers, operator classes and
+publications, functions, triggers, operator classes and
 families, `pg_amop`, `pg_amproc`, ...), plus
 `information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and

@@ -63,6 +63,10 @@ type sessionVars struct {
 	// noVectorScan is vector_index_scan = off: nearest-neighbour queries
 	// are answered exactly, by scanning, whatever index exists.
 	noVectorScan bool
+	// pg holds PostgreSQL's settings of pgvars.go the session changed
+	// from their defaults, by name. Replaced, never changed in place,
+	// like custom.
+	pg map[string]string
 }
 
 // isCustomVar reports whether name is a custom setting's: PostgreSQL's
@@ -90,8 +94,8 @@ func defaultVars() sessionVars {
 }
 
 // varNames are the settings in SHOW ALL order, with their pg_settings
-// vartype and unit.
-var varNames = []struct{ name, vartype, unit string }{
+// vartype and unit; PostgreSQL's of pgvars.go follow.
+var varNames = withPGVars([]struct{ name, vartype, unit string }{
 	{"application_name", "string", ""},
 	{"client_encoding", "string", ""},
 	{"database", "string", ""},
@@ -115,7 +119,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"transaction_isolation", "string", ""},
 	{"transaction_read_only", "bool", ""},
 	{"vector_index_scan", "bool", ""},
-}
+})
 
 // settingTypes is varNames' vartype and unit by name, for pg_settings.
 var settingTypes = func() map[string][2]string {
@@ -143,6 +147,9 @@ func canonicalVar(name string) string {
 		if strings.EqualFold(v.name, name) {
 			return v.name
 		}
+	}
+	if v := lookupPGVar(strings.TrimSpace(name)); v != nil {
+		return v.name // one SHOW ALL leaves out (default_with_oids)
 	}
 	return ""
 }
@@ -202,6 +209,9 @@ func (s *Session) varValue(name string) string {
 		return "serializable" // the truth, whatever was requested
 	case "transaction_read_only":
 		return onOff(v.txnReadOnly || (s.state != StateOpen && v.defaultReadOnly))
+	}
+	if pv, ok := pgVars[name]; ok {
+		return s.showPGVar(pv)
 	}
 	return ""
 }
@@ -272,6 +282,7 @@ func (s *Session) ReportedParams() [][2]string {
 		{"client_encoding", s.vars.clientEncoding},
 		{"DateStyle", s.vars.dateStyle},
 		{"TimeZone", s.vars.timeZoneName},
+		{"IntervalStyle", s.IntervalStyle()},
 	}
 }
 
@@ -540,11 +551,27 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			}
 			vars.isolation = strings.ToLower(unquote(value))
 		}
-	case "integer_datetimes", "standard_conforming_strings", "server_encoding", "server_version":
+	case "standard_conforming_strings":
+		// pg_dump scripts open with SET standard_conforming_strings = on:
+		// that is the only behavior datax has, so on is a no-op and off
+		// is refused rather than silently ignored.
 		if !reset {
-			return newErrf(CodeInvalidParameterValue, "parameter %q cannot be changed", name)
+			on, ok := parsePGBool(unquote(value))
+			if !ok {
+				return invalid("parameter %q requires a Boolean value", name)
+			}
+			if !on {
+				return newErrf(CodeFeatureNotSupported, "standard_conforming_strings = off is not supported")
+			}
+		}
+	case "integer_datetimes", "server_encoding", "server_version":
+		if !reset {
+			return newErrf(CodeCantChangeRuntimeParam, "parameter %q cannot be changed", name)
 		}
 	default:
+		if pv, ok := pgVars[name]; ok {
+			return applyPGVar(vars, pv, value, reset)
+		}
 		return newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", name)
 	}
 	return nil
@@ -642,10 +669,16 @@ func (s *Session) endTxnVars() {
 	s.vars.txnReadOnly = false
 }
 
+// readOnly reports whether the statement running now is in a read-only
+// transaction: SET TRANSACTION / BEGIN READ ONLY, or
+// default_transaction_read_only for an implicit or a block's start.
+func (s *Session) readOnly() bool {
+	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
+}
+
 // readOnlyViolation refuses a write in a read-only transaction (25006).
 func (s *Session) readOnlyViolation(stmt parser.Statement) *Error {
-	readOnly := s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
-	if !readOnly {
+	if !s.readOnly() {
 		return nil
 	}
 	if kind := writeKind(stmt); kind != "" {
@@ -670,7 +703,7 @@ func writeKind(stmt parser.Statement) string {
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
 		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
 		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze,
-		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy,
+		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy, *parser.CreateExtension, *parser.DropExtension,
 		*parser.CreateEncryptionKey, *parser.AlterEncryptionKey, *parser.DropEncryptionKey, *parser.SetClusterSetting:
 		return "DDL"
 	}

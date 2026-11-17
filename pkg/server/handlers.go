@@ -56,10 +56,11 @@ func (n *Node) serveJoin(ctx context.Context, req cluster.JoinRequest) cluster.J
 		return cluster.JoinResponse{Error: err.Error()}
 	}
 	nd := kvpb.NodeDescriptor{
-		NodeID:       kvNodeID(newID),
-		Address:      req.Address,
-		Locality:     req.Locality,
-		LivenessTime: n.clock.Now().WallTime,
+		NodeID:            kvNodeID(newID),
+		Address:           req.Address,
+		LocalityAddresses: req.LocalityAddresses,
+		Locality:          req.Locality,
+		LivenessTime:      n.clock.Now().WallTime,
 	}
 	raw, err := json.Marshal(nd)
 	if err != nil {
@@ -114,6 +115,9 @@ func (n *Node) serveReannounce(req cluster.JoinRequest) cluster.JoinResponse {
 		}
 	}
 	n.registry.UpsertAddress(req.NodeID, req.Address)
+	if req.LocalityAddresses != nil {
+		n.registry.SetLocalityAddresses(req.NodeID, req.LocalityAddresses)
+	}
 	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 		log.Debugf("persisting registry: %v", err)
 	}
@@ -199,19 +203,20 @@ func (n *Node) refreshRegistry(ctx context.Context) error {
 func (n *Node) publishLiveness(ctx context.Context) {
 	load := n.store.LoadSummary(loadAdvertiseTopK)
 	nd := kvpb.NodeDescriptor{
-		NodeID:        n.ident.NodeID,
-		Address:       n.addr,
-		Locality:      n.cfg.Locality,
-		LivenessTime:  n.clock.Now().WallTime,
-		Draining:      n.draining.Load(),
-		ShuttingDown:  n.shuttingDown.Load(),
-		BinaryVersion: int(n.binaryVersion()),
-		LeaderQPS:     load.LeaderQPS,
-		LeaderCount:   load.LeaderCount,
-		ReplicaBytes:  load.ReplicaBytes,
-		HotRanges:     load.HotRanges,
-		BigRanges:     load.BigRanges,
-		Machine:       n.machineSummary(),
+		NodeID:            n.ident.NodeID,
+		Address:           n.addr,
+		LocalityAddresses: n.cfg.LocalityAddresses,
+		Locality:          n.cfg.Locality,
+		LivenessTime:      n.clock.Now().WallTime,
+		Draining:          n.draining.Load(),
+		ShuttingDown:      n.shuttingDown.Load(),
+		BinaryVersion:     int(n.binaryVersion()),
+		LeaderQPS:         load.LeaderQPS,
+		LeaderCount:       load.LeaderCount,
+		ReplicaBytes:      load.ReplicaBytes,
+		HotRanges:         load.HotRanges,
+		BigRanges:         load.BigRanges,
+		Machine:           n.machineSummary(),
 	}
 	if n.pinger != nil {
 		nd.Latency = n.pinger.Snapshot()

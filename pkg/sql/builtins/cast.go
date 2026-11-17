@@ -19,7 +19,9 @@ import (
 // (numeric(10,2), varchar(20)); the catalog-only types tools cast to
 // (name, oid, regtype, regnamespace, "char", ...) and any other name
 // datax does not model pass the value through unchanged, since it is
-// already in its representational form.
+// already in its representational form. A name that is none of these
+// (KnownCastType) is refused before execution (42704), except a
+// user-defined type the session resolves.
 func Cast(d types.Datum, typ string) (types.Datum, error) {
 	name, mods := splitTypmod(strings.ToLower(strings.TrimSpace(typ)))
 	if i := strings.LastIndexByte(name, '.'); i >= 0 {
@@ -218,9 +220,8 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			}
 		}
 		return v, nil
-	case "regclass", "name", "oid", "regtype", "regnamespace", "regproc", "regprocedure", "regrole", "regoper", "regoperator",
-		"regconfig", "regdictionary", "xid", "xid8", "tid", "cid", "int2vector", "oidvector", "cstring",
-		"aclitem", "pg_node_tree", "pg_lsn", "unknown", "any", "anyelement", "anyarray", "record", "void":
+	}
+	if passThroughTypes[name] {
 		return d, nil
 	}
 	if strings.HasSuffix(name, "[]") {
@@ -242,6 +243,53 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 		return d, nil
 	}
 	return types.Datum{}, errf(CodeNotSupported, "cannot cast type %s to %s", strings.ToLower(d.Fam.String()), name)
+}
+
+// passThroughTypes are the catalog-only types tools cast to: datax
+// keeps such a value in its representational form.
+var passThroughTypes = map[string]bool{
+	"regclass": true, "name": true, "oid": true, "regtype": true, "regnamespace": true, "regproc": true,
+	"regprocedure": true, "regrole": true, "regoper": true, "regoperator": true, "regconfig": true,
+	"regdictionary": true, "xid": true, "xid8": true, "tid": true, "cid": true, "int2vector": true,
+	"oidvector": true, "cstring": true, "aclitem": true, "pg_node_tree": true, "unknown": true, "any": true,
+	"anyelement": true, "anyarray": true, "record": true, "void": true,
+}
+
+// castTypes are the type names Cast converts to (after the qualifier and
+// typmod are removed), multi-word spellings included.
+var castTypes = map[string]bool{
+	"int2": true, "smallint": true, "int4": true, "int": true, "integer": true, "int8": true, "bigint": true,
+	"float4": true, "real": true, "float8": true, "float": true, "double": true, "double precision": true,
+	"numeric": true, "decimal": true, "dec": true,
+	"text": true, "varchar": true, "char": true, "character": true, "bpchar": true, "string": true, "character varying": true,
+	"bool": true, "boolean": true,
+	"timestamp": true, "timestamptz": true, "timestamp with time zone": true, "timestamp without time zone": true,
+	"interval": true, "time": true, "time without time zone": true, "time with time zone": true, "timetz": true,
+	"date": true, "bytea": true, "bytes": true, "blob": true, "uuid": true, "json": true, "jsonb": true,
+	"tsvector": true, "tsquery": true, "vector": true,
+}
+
+// KnownCastType reports whether typ (as a cast writes it: lower-cased,
+// optionally qualified, with a typmod and array brackets) names a type
+// datax has: one Cast converts to, a catalog type it passes through, or
+// an array of either. Any other name is a user-defined type or none.
+func KnownCastType(typ string) bool {
+	name := CastBaseType(typ)
+	return castTypes[name] || passThroughTypes[name]
+}
+
+// CastBaseType is typ without its qualifier, typmod and array brackets
+// (pg_catalog.numeric(10,2)[] is numeric): the name a catalog lookup of
+// a user-defined type takes.
+func CastBaseType(typ string) string {
+	name, _ := splitTypmod(strings.ToLower(strings.TrimSpace(typ)))
+	for strings.HasSuffix(name, "[]") {
+		name = strings.TrimSpace(strings.TrimSuffix(name, "[]"))
+	}
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
 }
 
 // splitTypmod separates numeric(10,2) into "numeric" and ["10", "2"].

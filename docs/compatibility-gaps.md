@@ -47,16 +47,16 @@ Open gaps by area and priority.
 | Area | P1 | P2 | P3 | Total |
 |---|---:|---:|---:|---:|
 | [PG: Query language](#query-language) | 4 | 17 | 7 | 28 |
-| [PG: Functions and operators](#functions-and-operators) | 2 | 15 | 5 | 22 |
-| [PG: Types](#types) | 2 | 11 | 14 | 27 |
-| [PG: DDL](#ddl) | 9 | 13 | 6 | 28 |
+| [PG: Functions and operators](#functions-and-operators) | 1 | 15 | 5 | 21 |
+| [PG: Types](#types) | 0 | 12 | 15 | 27 |
+| [PG: DDL](#ddl) | 7 | 14 | 6 | 27 |
 | [PG: Programmability](#programmability) | 2 | 3 | 2 | 7 |
-| [PG: Transactions and concurrency](#transactions-and-concurrency) | 3 | 5 | 4 | 12 |
+| [PG: Transactions and concurrency](#transactions-and-concurrency) | 2 | 5 | 5 | 12 |
 | [PG: Security](#security) | 0 | 6 | 4 | 10 |
-| [PG: Extensions](#extensions) | 1 | 6 | 4 | 11 |
+| [PG: Extensions](#extensions) | 0 | 6 | 4 | 10 |
 | [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 3 | 4 | 7 |
 | [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 1 | 7 | 6 | 14 |
-| [PG: Operations](#operations) | 2 | 4 | 6 | 12 |
+| [PG: Operations](#operations) | 1 | 4 | 7 | 12 |
 | [CR: Changefeeds / CDC](#changefeeds-and-cdc) | 1 | 0 | 1 | 2 |
 | [CR: Multi-region and placement](#multi-region-and-placement) | 0 | 5 | 2 | 7 |
 | [CR: Indexes, computed columns, spatial](#indexes-computed-columns-and-spatial) | 0 | 6 | 1 | 7 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 4 |
-| **PostgreSQL total** | **26** | **90** | **62** | **178** |
+| **PostgreSQL total** | **18** | **92** | **65** | **175** |
 | **CockroachDB total** | **2** | **25** | **18** | **45** |
-| **All** | **28** | **115** | **80** | **223** |
+| **All** | **20** | **117** | **83** | **220** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -133,7 +133,6 @@ which do exist: see PG-F-022.
 | PG-F-001 | **Regex leftovers**: `regexp_instr`; `substring(s from pattern)`; back references and lookaround (patterns run on RE2) | `42883`; `2201B` | the other `regexp_*` functions (#339) | P2 | S | D | — |
 | PG-F-002 | **Set-returning function leftovers**: `generate_subscripts`, `string_to_table`, `pg_get_keywords` | `42883` | `generate_series`, `regexp_split_to_table`, `unnest` (#339) | P3 | S | D | — |
 | PG-F-003 | **JSON processing leftovers**: `jsonb_to_record[set]`, `jsonb_populate_record[set]`, `jsonb_set_lax`, `jsonb_object`, `array_to_json`, `row_to_json` (no row type); `jsonb_each` returns keys in stored order, not PostgreSQL's length-then-bytes order | `42883`; silently different order | `jsonb_each`, `jsonb_array_elements`, `jsonb_object_keys`, `jsonb_insert` (#339) | P2 | M | D | — |
-| PG-F-004 | **`jsonb \|\| jsonb` concatenates text**: `'{"a":1}'::jsonb \|\| '{"b":2}'::jsonb` returns `{"a":1}{"b":2}`, also on a column (`j \|\| '{"z":1}'`), so `UPDATE t SET j = j \|\| ...` writes a value that is not a merged object | silently different (wrong result; PostgreSQL merges the objects) | `jsonb_set` one key at a time | P1 | S | V | — |
 | PG-F-005 | Other **jsonb operators**: `-` (delete key or index), `#-` (delete path), subscripting `j['a']` (14), ordering comparisons (`ORDER BY j`) | `0A000 unsupported operand for -: JSONB`; `42601 unexpected character '#'`; `42883 function array_subscript(jsonb, text) does not exist`; `XX000 ORDER BY: JSONB values have no order` | `jsonb_set`; `->` | P2 | S | V | — |
 | PG-F-006 | **Date/time function leftovers**: `date_bin`, `date_add` / `date_subtract` (16), `make_timestamptz(..., zone)` (and it ignores the session zone), `timeofday`, `to_char(interval, ...)`, `to_number` | `42883 unknown function "date_bin"`; `42601 make_timestamptz() takes 6 argument(s), got 7`; `42883 function does not exist for argument type INTERVAL` | `date_trunc`; `AT TIME ZONE` (#340) | P2 | M | V | — |
 | PG-F-008 | **System functions ORMs and tools call**: `pg_get_serial_sequence` (Rails, Hibernate), `to_regclass`, `pg_is_in_recovery` (pg_dump's first query), `current_schemas`, `pg_has_role`, `has_sequence_privilege`, `has_column_privilege`, the keywords `current_catalog`, `current_role`, `user` | `42883 unknown function "pg_get_serial_sequence"`; `42703 column "current_role" is not available in this context`; `42601 expected value, found "USER"` | query `pg_class`, `pg_sequences` directly | P1 | S | V | — |
@@ -158,32 +157,32 @@ which do exist: see PG-F-022.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-T-001 | **Time-zone leftovers** after #340: a literal without an offset in a join's `ON` condition is read as UTC (`ON` conditions are not zone-resolved); `to_jsonb`, `array_to_string` and `format` render a `timestamptz` in UTC; zone abbreviations are a fixed list; whether the startup `ParameterStatus` reports the session zone is not re-checked | silently different | put such a filter in `WHERE`; write offsets in literals | P2 | S | D | — |
-| PG-T-002 | **Casts to unsupported or unknown type names are accepted and yield text**: `'a'::foo_unknown_type`, `::citext`, `::hstore`, `::money`, `::xml`, `::inet`, `::pg_lsn`, `::int4multirange` all succeed as `text`; `'A'::citext = 'a'` is false; `'12.34'::money + '1'::money` "works" | silently different (PostgreSQL: `42704 type "..." does not exist`, or the type's semantics) | — | P1 | S | V | — |
-| PG-T-003 | **`bytea` in expressions**: `length('\x0102'::bytea)` is 6 (the text's length) and `length(b)` / `octet_length(b)` over a 4-byte `bytea` column are 10 (its hex text) | silently different (PostgreSQL: 2 and 4) | measure client-side | P1 | S | V | — |
+| PG-T-003 | **`bytea` in the remaining expressions**: `bytea \|\| bytea` returns text (`\x0102\x03`, not `\x010203`); `btrim`, `ltrim`, `rtrim`, `reverse`, `repeat`, `lower`, `left`, `right` and `split_part` of a `bytea` work on its hex text; `get_byte`, `set_byte`, `get_bit`, `bit_length` and `convert_from` do not exist; bytea input does not take the escape format (`'abc\000'::bytea` is 7 bytes, not 4); `char_length(bytea)` answers instead of `42883` (`length`, `octet_length`, `substring`, `position` and `md5` work on bytes since #344) | silently different; `42883 unknown function "get_byte"` | do byte work client-side | P2 | S | V | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
 | PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; years outside 1678–2261; special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'` | `22007 invalid input syntax for type date: "infinity"` (and likewise) | sentinel values; `now()` | P2 | M | V | — |
 | PG-T-006 | `TIMESTAMP` (without time zone) expressions and casts become `timestamptz`; `date + interval` is `timestamptz` (PostgreSQL: `timestamp`); a bind parameter for a `TIMESTAMP` column describes as `timestamptz` | silently different (wire type) | pass UTC | P2 | M | V | — |
 | PG-T-007 | Arrays: multidimensional (`ARRAY[[1,2],[3,4]]`, `INT8[][]` is one-dimensional), slices `a[1:2]`, arrays in keys or btree indexes, GIN over arrays, arrays of `JSONB`, enums or vectors | `42601 expected value, found "["`; `42601 array slices (v[i:j]) are not supported`; `42601 JSONB[] is not supported`; `42601 arrays of enum type mood are not supported` | `JSONB` arrays | P2 | M | V | — |
 | PG-T-008 | Composite (row) types: `CREATE TYPE ... AS (...)`, row-typed columns, `ROW(...)` values | `42601 CREATE TYPE supports AS ENUM only, found "("` | `JSONB` | P2 | L | V | — |
 | PG-T-009 | Domains: `CREATE DOMAIN` | `42601 expected TABLE, found "domain"` | `CHECK` on each column | P2 | M | V | — |
-| PG-T-010 | Range and multirange types (`int4range`, `tstzrange`, `daterange`, ..., operators `@>`, `&&`, `-\|-`, functions `lower`, `upper`, `isempty`) | columns `42704 type "tstzrange" does not exist`; `42883 unknown function "int4range"`; `'{[1,3)}'::int4multirange` silently text (PG-T-002) | two columns | P2 | L | V | — |
-| PG-T-011 | Network types `inet`, `cidr`, `macaddr`, `macaddr8`, their operators (`<<`, `>>`, `&&`, `+`) and functions (`host`, `network`, `masklen`, ...) | `42704 type "inet" does not exist`; `'10.0.0.1'::inet` silently text; `42883 unknown function "host"` | `TEXT` with `CHECK` | P2 | M | V | — |
+| PG-T-010 | Range and multirange types (`int4range`, `tstzrange`, `daterange`, ..., operators `@>`, `&&`, `-\|-`, functions `lower`, `upper`, `isempty`) | columns `42704 type "tstzrange" does not exist`; `42883 unknown function "int4range"`; `'{[1,3)}'::int4multirange` is `42704` (since #343) | two columns | P2 | L | V | — |
+| PG-T-011 | Network types `inet`, `cidr`, `macaddr`, `macaddr8`, their operators (`<<`, `>>`, `&&`, `+`) and functions (`host`, `network`, `masklen`, ...) | `42704 type "inet" does not exist` (casts too, since #343); `42883 unknown function "host"` | `TEXT` with `CHECK` | P2 | M | V | — |
 | PG-T-012 | OID and reg* types: OIDs are 64-bit (`'pg_class'::regclass::oid` is `1099511627777`), `'t'::regclass` prints the number (PostgreSQL prints `t`), `regproc` / `regnamespace` / `regrole` resolve only partly, `'vector'::regtype` does not resolve | silently different | `oid::regclass` on a column gives the name (works) | P2 | S | V | — |
 | PG-T-013 | `numeric` `NaN` and `±Infinity` (14) | `22P02 invalid input syntax for type numeric: "NaN"` | `float8` | P2 | S | V | — |
 | PG-T-014 | Geometric types (`point`, `line`, `lseg`, `box`, `path`, `polygon`, `circle`) and operators | `42704 type "point" does not exist`; `42883 unknown function "point"` | two `float8` columns; PostGIS is PG-E-002 | P3 | L | V | — |
 | PG-T-015 | Bit strings `BIT(n)`, `BIT VARYING`, `B'1010'` and bit operators | `42601 expected ")", found "("`; `42601 unexpected character '&'` | `INT8` or `BYTEA` | P3 | M | V | — |
-| PG-T-016 | `money` | `42704 type "money" does not exist`; cast silently text | `DECIMAL(19,2)` | P3 | S | V | — |
-| PG-T-017 | `xml` and the XML functions (`xmlparse`, `xpath`, `xmlelement`, `xmlagg`, ...) | `42704 type "xml" does not exist`; cast silently text; `42601` / `42883` for the functions | `TEXT` | P3 | L | V | — |
+| PG-T-016 | `money` | `42704 type "money" does not exist`, for columns and casts | `DECIMAL(19,2)` | P3 | S | V | — |
+| PG-T-017 | `xml` and the XML functions (`xmlparse`, `xpath`, `xmlelement`, `xmlagg`, ...) | `42704 type "xml" does not exist`, for columns and casts; `42601` / `42883` for the functions | `TEXT` | P3 | L | V | — |
 | PG-T-018 | `TIME WITH TIME ZONE` (`timetz`) | column `42601 TIME WITH TIME ZONE is not supported`; `'12:00:00+02'::timetz` silently drops the offset (`12:00:00`) | `TIME` + offset column, or `TIMESTAMPTZ` | P3 | M | V | — |
 | PG-T-019 | Interval: `IntervalStyle` other than `postgres` (it is not even a setting); field qualifiers in a literal (`INTERVAL '1 2:03:04' DAY TO SECOND`); qualifiers on a column are not enforced | `42704 unrecognized configuration parameter "intervalstyle"`; `42601 unexpected "TO" after statement` | — | P3 | S | V | — |
 | PG-T-020 | `json` is stored and returned as `jsonb` (key order, whitespace and duplicate keys are not kept: `'{"b":1,  "a":2, "a":3}'` returns `{"a":3,"b":1}`) | silently different | — | P3 | S | V | — |
 | PG-T-021 | Enums: `ADD VALUE BEFORE` / `AFTER`, `RENAME VALUE`, `RENAME TO`; `pg_typeof('ok'::mood)` is `text`; `DROP TYPE ... CASCADE` does not drop columns | `42601 ADD VALUE BEFORE / AFTER is not supported` | recreate the type | P3 | M | V | — |
-| PG-T-022 | `pg_lsn`, `xid`, `xid8`, `tid`, `txid_snapshot`, `pg_snapshot` as types | cast to `pg_lsn` silently text (PG-T-002); no columns | — | P3 | S | V | — |
+| PG-T-022 | `pg_lsn`, `xid`, `xid8`, `tid`, `txid_snapshot`, `pg_snapshot` as types | cast to `pg_lsn` is `42704` (since #343); no columns | — | P3 | S | V | — |
 | PG-T-023 | Type modifiers: an invalid typmod is `42601` (PostgreSQL `22023`); modifiers on other types (`FLOAT8(3)`) accepted and ignored | as stated | — | P3 | S | D | — |
 | PG-T-024 | `CHAR(n)` is stored trimmed, so `c = 'ab  '` compares the literal with its spaces (PostgreSQL trims both sides) | silently different | trim the literal | P3 | S | D | — |
 | PG-T-025 | `tsvector` / `tsquery`: own parser and stemmer, no ordering, no arrays of them, `english` and `simple` only, `regconfig` is text (detailed in the user doc) | as in the user doc | — | P3 | L | D | — |
 | PG-T-026 | Expression results lose their declared typmod and describe as the family (`DECIMAL(10,2)` arithmetic is `numeric`; `a + 1` over `INT4` is `INT8`) | silently different (Describe output) | cast | P3 | M | D | — |
 | PG-T-027 | `"char"`, `name` and other internal types behave as `text` | silently different | — | P3 | S | V | — |
+| PG-T-028 | **Cast leftovers**: a schema qualifier on a cast type is ignored (`1::foo.int8` is accepted, PostgreSQL `3F000`); over the extended protocol an unknown cast type fails at Execute, not Parse; casts written in row-level security policy text are not checked when the policy is created; `foo 'lit'` for an unknown `foo` is `42601`, not `42704`; `json` and `jsonb` are one type, so `\|\|` on a `json` column merges where PostgreSQL refuses `json \|\| json` | silently different, or a different SQLSTATE | — | P3 | S | V | — |
 
 ### DDL
 
@@ -193,8 +192,6 @@ which do exist: see PG-F-022.
 | PG-D-002 | **Every table needs a declared primary key** (a join table without one, `CREATE TABLE t (a INT, b TEXT)`) | `0A000 table "nopk2" must declare a PRIMARY KEY` (only `CREATE TABLE ... AS` gets a hidden `rowid`) | add a key; or `CREATE TABLE ... AS SELECT` then load | P1 | M | V | — |
 | PG-D-003 | **Partial indexes** (`CREATE [UNIQUE] INDEX ... WHERE ...`) | `42601 unexpected "WHERE" after statement` | full index; uniqueness in the application | P1 | M | V | — |
 | PG-D-004 | **Expression indexes** (`(lower(email))`, unique on an expression); only `to_tsvector('config', col)` is accepted, and the error for `lower(b)` misleads | `42601 an index on lower(...) needs the configuration written out as its first argument: lower('english', column)` | store the expression in a column the application maintains | P1 | M | V | — |
-| PG-D-005 | **`CREATE INDEX CONCURRENTLY`**: builds are always online, but the keyword is refused, and `CREATE INDEX` is refused inside a transaction block (Rails/Django concurrent-index migrations, many migration tools) | `42601 expected ON, found "t_conc"` | drop the keyword | P1 | S | V | — |
-| PG-D-006 | **Operator classes on btree indexes** (`text_pattern_ops`, `varchar_pattern_ops` — Django creates a `_like` index with `varchar_pattern_ops` for every indexed or unique `CharField`/`TextField`) and `COLLATE` in an index | `0A000 operator class "text_pattern_ops" is not supported for column "b" of an ordinary index`; `42601 expected ")", found "C"` | — (no `LIKE` prefix optimization anyway) | P1 | S | V | — |
 | PG-D-007 | **Several actions in one `ALTER TABLE`** (`ADD COLUMN a INT, ADD COLUMN b INT`; Rails `bulk: true`, Prisma, pg_dump) | `42601 unexpected "," after statement` | one statement per action | P1 | M | V | — |
 | PG-D-008 | **`ADD COLUMN` with a non-constant default** (`DEFAULT now()`, `DEFAULT gen_random_uuid()`) | `0A000 ADD COLUMN takes a constant DEFAULT only` | add nullable, backfill, then `SET DEFAULT` | P1 | M | V | — |
 | PG-D-009 | **Temporary tables** (`CREATE TEMP TABLE`, `ON COMMIT DROP`) and `UNLOGGED` tables | `42601 expected TABLE, found "temp" / "unlogged"` | ordinary tables with session-unique names | P1 | L | V | — |
@@ -217,6 +214,7 @@ which do exist: see PG-F-022.
 | PG-D-026 | `COMMENT ON` objects other than tables, views, indexes, columns and constraints: `SEQUENCE`, `TYPE`, `DATABASE`, `SCHEMA`, `ROLE`, `FUNCTION`, `EXTENSION`, ... | `42601 COMMENT ON supports TABLE, VIEW, INDEX, COLUMN and CONSTRAINT, found "sequence"` | — | P3 | S | V | — |
 | PG-D-027 | `CREATE COLLATION`, `CREATE CAST`, `CREATE OPERATOR [CLASS \| FAMILY]`, `CREATE AGGREGATE`, `CREATE STATISTICS`, `SECURITY LABEL` | `42601 expected TABLE, found "collation"` (and likewise); `42601 unsupported statement "security"` | — | P3 | L | V | — |
 | PG-D-028 | `RENAME TO` across databases | refused (user doc) | recreate | P3 | S | D | — |
+| PG-D-029 | **Index leftovers**: pattern operator classes are accepted but do not make `LIKE 'abc%'` use the index; `pg_index.indclass` / `indcollation` are not modelled and `pg_opclass` is empty; `SHOW CREATE TABLE` does not print operator classes or collations; a duplicate index name is `42710` (PostgreSQL `42P07`); a quoted `"concurrently"` index name is read as the keyword; `CREATE INDEX` in a transaction block is refused (`25001`) unless the block created the table, since the online build spans transactions | silently different, or `25001 CREATE INDEX cannot run inside a transaction block` | build the index outside the block | P2 | M | V | — |
 
 ### Programmability
 
@@ -235,7 +233,6 @@ which do exist: see PG-F-022.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-X-001 | **`READ COMMITTED` and `REPEATABLE READ`**: every transaction is serializable and can fail with `40001`; `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` is accepted and `SHOW transaction_isolation` says `serializable`; `default_transaction_isolation` is not a setting | silently different (stronger isolation, retries needed); `42704 unrecognized configuration parameter "default_transaction_isolation"` | a retry loop around every transaction | P1 | XL | V | — |
-| PG-X-002 | **Transaction modes on `BEGIN` / `START TRANSACTION`**: `BEGIN ISOLATION LEVEL ...`, `BEGIN READ ONLY`, `START TRANSACTION READ ONLY` (pgx sends `begin isolation level ... read only` for `TxOptions`; `database/sql` read-only transactions) | `42601 syntax error: unexpected "isolation" / "read" after statement` | `BEGIN` then `SET TRANSACTION ...` (works) | P1 | S | V | — |
 | PG-X-003 | **Advisory locks** (`pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_xact_lock`, `pg_advisory_unlock[_all]`) — Rails and Prisma migrations, golang-migrate, Flyway, job queues | `42883 unknown function "pg_advisory_lock"` | a lock row and `SELECT ... FOR UPDATE NOWAIT` | P1 | M | V | — |
 | PG-X-004 | `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`, `FOR UPDATE OF table` | `42601 expected UPDATE, found "share" / "no"`; `42601 unexpected "of"` | `FOR UPDATE` | P2 | M | V | — |
 | PG-X-005 | `LOCK TABLE` | `42601 unsupported statement "lock"` | — | P2 | M | V | — |
@@ -243,9 +240,10 @@ which do exist: see PG-F-022.
 | PG-X-007 | Concurrent inserts of one key may lose with `40001` instead of waiting and failing `23505`; `SKIP LOCKED` skips rows committed after the snapshot; `NOWAIT` can fail on a row it would have filtered (user doc) | silently different | retry `40001` | P2 | L | D | — |
 | PG-X-008 | `SET CONSTRAINTS` (needs PG-D-011) | `42601` | — | P2 | S | V | — |
 | PG-X-009 | Prepared transactions (two-phase commit): `PREPARE TRANSACTION`, `COMMIT PREPARED`, `pg_prepared_xacts` | `42601 unsupported statement "prepare"`; `42P01` for the view | — | P3 | L | V | — |
-| PG-X-010 | `DEFERRABLE` transactions (`SERIALIZABLE READ ONLY DEFERRABLE`) | `42601` (as PG-X-002) | `AS OF SYSTEM TIME` reads | P3 | S | V | — |
+| PG-X-010 | `DEFERRABLE` transactions (`SERIALIZABLE READ ONLY DEFERRABLE`) | accepted and ignored (`BEGIN ... DEFERRABLE` parses since #346) | `AS OF SYSTEM TIME` reads | P3 | S | V | — |
 | PG-X-011 | Snapshot export and import (`pg_export_snapshot`, `SET TRANSACTION SNAPSHOT`; parallel pg_dump) | `42883 unknown function "pg_export_snapshot"` | `AS OF SYSTEM TIME` at a chosen timestamp | P3 | M | V | — |
 | PG-X-012 | Unique keys are checked at the end of an `UPDATE` (so `UPDATE t SET id = id + 1` succeeds where PostgreSQL fails `23505`); a self-referencing `ON UPDATE CASCADE` that overlaps its statement is refused `0A000` | silently different (more permissive) / `0A000` | split the statement | P3 | M | D | — |
+| PG-X-013 | **Transaction-statement leftovers**: `SET TRANSACTION` with both an access mode and an isolation level applies only the access mode (datax is serializable anyway); `COMMIT WORK` / `ROLLBACK WORK` are syntax errors; `BEGIN` inside a block is an error where PostgreSQL warns; read-only refusals of DDL say "DDL" rather than the command; `nextval()` on a temporary sequence is refused in a read-only transaction | `42601`; `25001` | `COMMIT` / `ROLLBACK` | P3 | S | V | — |
 
 ### Security
 
@@ -272,14 +270,13 @@ is accepted because its type and operators are built in)`.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-E-001 | **`CREATE EXTENSION IF NOT EXISTS` for extensions whose functions datax already has**: `"uuid-ossp"` (`uuid_generate_v4` exists) and `pgcrypto` (`gen_random_uuid` exists) — the first lines of many migration histories | `0A000 extension "uuid-ossp" is not available` | delete the statement from the migration | P1 | S | V | — |
 | PG-E-002 | PostGIS: `geometry`, `geography`, `ST_*` functions, spatial indexes | `42704 type "geometry" does not exist`; `42883 unknown function "st_distance"` | — | P2 | XL | V | — |
 | PG-E-003 | `pg_trgm`: `similarity`, `%`, `word_similarity`, `gin_trgm_ops` / `gist_trgm_ops` (fuzzy search, `LIKE '%x%'` acceleration) | `42883 unknown function "similarity"`; `42704 operator class "gin_trgm_ops" does not exist for access method "gin"` | full-text search | P2 | L | V | — |
-| PG-E-004 | `pgcrypto` functions (`digest`, `hmac`, `crypt` / `gen_salt`, `gen_random_bytes`, `pgp_sym_encrypt`) and `uuid-ossp` beyond v4 (`uuid_generate_v1`, `_v3`, `_v5`; 18's `uuidv7`) | `42883 unknown function "digest"` | `sha256`, `md5`; sealed tables for encryption | P2 | M | V | — |
-| PG-E-005 | `citext` | `42704 type "citext" does not exist`; the cast is silently text and case-sensitive (PG-T-002) | `lower()` on both sides (no expression index, PG-D-004) | P2 | M | V | — |
+| PG-E-004 | `pgcrypto` functions (`digest`, `hmac`, `crypt` / `gen_salt`, `gen_random_bytes`, `pgp_sym_encrypt`) and `uuid-ossp` functions beyond `uuid_generate_v4` (`uuid_generate_v1`, `_v1mc`, `_v3`, `_v5`, `uuid_nil`, `uuid_ns_*`; 18's `uuidv7`); `CREATE EXTENSION` of both is accepted since #349 | `42883 unknown function "digest"` | `sha256`, `md5`; sealed tables for encryption | P2 | M | V | — |
+| PG-E-005 | `citext` | `42704 type "citext" does not exist`, for columns and casts | `lower()` on both sides (no expression index, PG-D-004) | P2 | M | V | — |
 | PG-E-006 | `pg_stat_statements` | `42P01 table "pg_stat_statements" does not exist` | the console's statement fingerprints and slow list | P2 | M | V | — |
 | PG-E-007 | pgvector differences: no HNSW (`0A000`), no `halfvec` / `sparsevec` / `bit` vectors, no `avg` / `sum` over vectors, ivfflat serves one query shape, no `vector[]`, no btree on vectors, `ivfflat.probes` defaults to √lists (user doc) | `0A000` | ivfflat | P2 | L | D | — |
-| PG-E-008 | `hstore` | `42704 type "hstore" does not exist`; the cast is silently text | `JSONB` | P3 | M | V | — |
+| PG-E-008 | `hstore` | `42704 type "hstore" does not exist`, for columns and casts | `JSONB` | P3 | M | V | — |
 | PG-E-009 | `unaccent`, `fuzzystrmatch` (`levenshtein`, `soundex`, `metaphone`), `btree_gin` / `btree_gist`, `intarray`, `ltree`, `tablefunc` (`crosstab`), `pg_cron`, `pg_partman` | `42883 unknown function "unaccent"` (and likewise) | — | P3 | L | V | — |
 | PG-E-010 | Foreign data wrappers: `postgres_fdw`, `dblink`, `file_fdw`; `CREATE SERVER`, `USER MAPPING`, `FOREIGN TABLE` (the `pg_foreign_*` catalogs are empty stubs) | `0A000` for the extension; `42601` for the DDL | — | P3 | XL | D | — |
 | PG-E-011 | TimescaleDB-style features beyond datax's time-series tables (which have shards, retention and online re-shard): continuous aggregates, `time_bucket` (and PostgreSQL's own `date_bin`, PG-F-006), compression, gap filling | absent | `date_trunc` | P3 | L | D | — |
@@ -301,7 +298,7 @@ SCRAM-SHA-256-PLUS with `tls-server-end-point` channel binding, and
 | PG-W-004 | Fast-path function calls other than the large-object functions | `0A000` | SQL calls | P3 | S | D | — |
 | PG-W-005 | GSSAPI encryption (`GSSENCRequest`) | declined: psql `gssencmode=require` fails with "GSSAPI encryption required but was impossible" | TLS | P3 | M | V | — |
 | PG-W-006 | Protocol version 3.2 (PostgreSQL 18: longer cancel keys) and `NegotiateProtocolVersion` | not offered | protocol 3.0 | P3 | S | D | — |
-| PG-W-007 | Few NOTICEs: no `RAISE` (no PL/pgSQL), no "skipping" notices for `IF [NOT] EXISTS` no-ops (PG-Q-030); `client_min_messages` is not a setting | `42704 unrecognized configuration parameter "client_min_messages"` | — | P3 | S | V | — |
+| PG-W-007 | Few NOTICEs: no `RAISE` (no PL/pgSQL), no "skipping" notices for `IF [NOT] EXISTS` no-ops (PG-Q-030) | silently different (no notice) | — | P3 | S | V | — |
 
 ### System catalogs and introspection
 
@@ -348,7 +345,7 @@ the empty list commands all render.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-O-001 | **Settings coverage**: `SET` of a PostgreSQL setting datax does not know fails, including those frameworks send on every connection — Rails' `SET client_min_messages TO 'warning'` and `SET intervalstyle = iso_8601`, pg_dump's `SET check_function_bodies`, `xmloption`, `default_tablespace`, `row_security`, and `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `random_page_cost`, `extra_float_digits`, `lc_messages`, `default_transaction_isolation`, `default_int_size`; `SHOW server_version_num` / `max_identifier_length` | `42704 unrecognized configuration parameter "client_min_messages"` | none at the server; patch the client | P1 | M | V | — |
+| PG-O-001 | **Settings leftovers** (the common settings were added in #345): `IntervalStyle` and `bytea_output` change only top-level text columns on the wire, not `::text`, arrays, records or JSON; `SHOW statement_timeout` (and the other timeouts) gives `5000` where PostgreSQL gives `5s`; error HINTs are missing; `pg_settings` has no `enumvals`, `min_val` or `max_val`; `lc_messages` and `session_replication_role` need no superuser | silently different | — | P3 | S | D | — |
 | PG-O-002 | **pg_dump / pg_restore**: pg_dump 16 fails on its first query; past it, it would need `COPY TO`, `pg_depend`, `row_security`, several settings, `SET TRANSACTION SNAPSHOT`, multi-action `ALTER TABLE`; restoring a PostgreSQL dump needs schemas, functions, `ALTER TABLE ONLY ... ADD CONSTRAINT`, sequences' `setval` (works) | `pg_dump: error: query failed: ERROR: unknown function "pg_is_in_recovery"` | `datax backup` / `restore`; `\copy ... from` | P1 | L | V | — |
 | PG-O-003 | `VACUUM` (all forms, including `VACUUM ANALYZE`) | `42601 unsupported statement "vacuum"` | none needed for space (MVCC GC, `ALTER TABLE ... PURGE`); `ANALYZE` | P2 | S | V | — |
 | PG-O-004 | Logical replication: `CREATE PUBLICATION`, `CREATE SUBSCRIPTION` (the catalogs are empty stubs) | `42601` | backup / restore; LISTEN/NOTIFY | P2 | XL | V | — |
@@ -535,11 +532,19 @@ Useful context when weighing gaps; none of these is a gap.
 ## Closed
 
 Gaps closed recently, newest first. From CHANGELOG 0.58.0 and the merged
-PRs #317–#334 (issue numbers in the changelog are given where the PR
+PRs #317–#341 (issue numbers in the changelog are given where the PR
 carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| `jsonb \|\| jsonb` merges (was PG-F-004) | PR (this branch) (#342) |
+| Casts to unknown types fail with `42704`; multi-word type names in casts (was PG-T-002; leftovers are PG-T-028) | PR (this branch) (#343) |
+| `length`, `octet_length`, `substring`, `position` and `md5` of `bytea` work on bytes (part of PG-T-003) | PR (this branch) (#344) |
+| PostgreSQL's common settings (`client_min_messages`, `IntervalStyle`, `work_mem`, `enable_*`, ...), `SHOW server_version_num`, `SET standard_conforming_strings = on` (most of PG-O-001, part of PG-W-007) | PR (this branch) (#345) |
+| Transaction modes on `BEGIN` / `START TRANSACTION`; `nextval` refused when read-only (was PG-X-002; leftovers are PG-X-013) | PR (this branch) (#346) |
+| `CREATE` / `DROP INDEX CONCURRENTLY`; unnamed indexes; `CREATE INDEX` in the block that created the table (was PG-D-005; leftovers are PG-D-029) | PR (this branch) (#347) |
+| Pattern operator classes and `COLLATE "C"` in indexes (was PG-D-006) | PR (this branch) (#348) |
+| `CREATE` / `DROP EXTENSION` of `plpgsql`, `pgcrypto`, `uuid-ossp` and `vector` (was PG-E-001) | PR (this branch) (#349) |
 | Expressions over aggregates in the select list, `HAVING` and `ORDER BY` (was PG-Q-001) | PR (this branch) (#335) |
 | `GROUP BY` expressions and output names, `ROLLUP`, `CUBE`, `GROUPING SETS`, `GROUPING()` (was PG-Q-002) | PR (this branch) (#336) |
 | `SELECT DISTINCT ON (...)` (was PG-Q-003; leftovers stay under that ID) | PR (this branch) (#337) |
@@ -574,43 +579,31 @@ carried several).
 
 ## Priorities
 
-The fifteen gaps that would most widen what runs unmodified, in order.
-Four (#335–#338, #339, #340) are in progress already.
+The gaps that would most widen what runs unmodified, in order. The
+earlier list's items 1–7 are closed (#335–#349); what is left of them is
+in the rows named above.
 
-1. **PG-Q-001 / PG-Q-002 / PG-Q-003 / PG-Q-004** — expressions over
-   aggregates, `GROUP BY` expressions, `DISTINCT ON`, `LATERAL` and
-   table functions (#335–#338, in progress): every reporting query and
-   most ORM aggregate helpers hit one of them.
-2. **PG-F-004** `jsonb || jsonb` concatenates text: silently wrong
-   data on `UPDATE`, and a small fix.
-3. **PG-T-002** casts to unknown types succeed as text: silent wrong
-   answers (`citext` comparisons) where an error is cheap.
-4. **PG-T-003** `length()` of `bytea` measures hex text: silently wrong,
-   small.
-5. **PG-O-001** unknown settings fail: Rails cannot connect
-   (`client_min_messages`, `intervalstyle`), pg_dump and pools trip over
-   others. Accept and ignore the common ones with a NOTICE.
-6. **PG-X-002** `BEGIN ISOLATION LEVEL ... / READ ONLY`: pgx with
-   `TxOptions` and `database/sql` read-only transactions fail. Small.
-7. **PG-D-005 / PG-D-006 / PG-E-001** `CONCURRENTLY`, pattern opclasses,
-   `CREATE EXTENSION "uuid-ossp"/pgcrypto`: each breaks a stock
-   migration (Django's `_like` indexes in particular) and each is a
-   matter of accepting what datax already does.
-8. **PG-X-003** advisory locks: Rails, Prisma, golang-migrate and Flyway
+1. **PG-X-003** advisory locks: Rails, Prisma, golang-migrate and Flyway
    take one before migrating; job queues depend on them.
-9. **PG-D-002** a table without a primary key is refused: join tables
+2. **PG-D-002** a table without a primary key is refused: join tables
    and imported schemas fail; CTAS already has the hidden `rowid`.
-10. **PG-Q-007 / PG-Q-005** `UPDATE ... FROM`, `DELETE ... USING`, and
-    `ORDER BY` inside aggregates: everyday SQL that ORMs and hand-written
-    queries emit.
-11. **PG-D-003 / PG-D-004** partial and expression indexes: soft-delete
-    uniqueness and `lower(email)` uniqueness are in most schemas.
-12. **PG-D-007 / PG-D-008** multi-action `ALTER TABLE` and `ADD COLUMN
-    ... DEFAULT now()`: generated migrations.
-13. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** the missing function
-    families (#339, #340 in progress for part).
-14. **PG-Q-018 / PG-O-002** `COPY TO` and pg_dump: the standard way out
+3. **PG-Q-007 / PG-Q-005** `UPDATE ... FROM`, `DELETE ... USING`, and
+   `ORDER BY` inside aggregates: everyday SQL that ORMs and hand-written
+   queries emit.
+4. **PG-F-008** `pg_get_serial_sequence`, `to_regclass`,
+   `pg_is_in_recovery` and the other system functions ORMs and pg_dump
+   call first.
+5. **PG-D-003 / PG-D-004** partial and expression indexes: soft-delete
+   uniqueness and `lower(email)` uniqueness are in most schemas.
+6. **PG-D-014** `DESC` / `NULLS` in index definitions (Rails' `order:`).
+7. **PG-D-007 / PG-D-008** multi-action `ALTER TABLE` and `ADD COLUMN
+   ... DEFAULT now()`: generated migrations.
+8. **PG-Q-006** non-equi and `ON true` joins.
+9. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
+   missing function families.
+10. **PG-Q-018 / PG-O-002** `COPY TO` and pg_dump: the standard way out
     of a PostgreSQL-compatible database.
-15. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
+11. **PG-D-029 / PG-T-003** index and `bytea` leftovers.
+12. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
     changefeeds: the large structural gaps that decide whether bigger
     applications can move at all; each is XL and wants a design first.

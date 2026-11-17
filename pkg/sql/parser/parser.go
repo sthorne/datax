@@ -401,6 +401,7 @@ func (p *parser) parseStatement() (Statement, error) {
 				if err := p.expectKeyword("EXISTS"); err != nil {
 					return nil, err
 				}
+				ce.IfNotExists = true
 			}
 			name, err := p.expectIdent()
 			if err != nil {
@@ -486,6 +487,7 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
 			p.i += 2 // DROP INDEX
 			di := &DropIndex{}
+			di.Concurrently = p.consumeIdentWord("concurrently")
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("EXISTS"); err != nil {
 					return nil, err
@@ -497,10 +499,36 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			di.Name = name
-			if !p.consumeIdentWord("cascade") {
+			if p.consumeIdentWord("cascade") {
+				di.Cascade = true
+			} else {
 				p.consumeIdentWord("restrict")
 			}
 			return di, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+			p.i += 2 // DROP EXTENSION
+			de := &DropExtension{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				de.IfExists = true
+			}
+			for {
+				name, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				de.Names = append(de.Names, strings.ToLower(name))
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return de, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
 			p.i += 2 // DROP TYPE
@@ -702,16 +730,30 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &AlterDatabase{Name: name, NewName: newName}, nil
 		}
 		return p.parseAlterTable()
-	case "BEGIN":
+	case "BEGIN", "START":
+		// BEGIN [WORK | TRANSACTION] [modes] / START TRANSACTION [modes]:
+		// the modes are SET TRANSACTION's, applied as if it ran first in
+		// the block.
 		p.i++
-		p.consumeKeyword("TRANSACTION")
-		return &Begin{}, nil
-	case "START":
-		p.i++
-		if err := p.expectKeyword("TRANSACTION"); err != nil {
+		if t.text == "START" {
+			if err := p.expectKeyword("TRANSACTION"); err != nil {
+				return nil, err
+			}
+		} else if !p.consumeKeyword("TRANSACTION") {
+			p.consumeIdentWord("work")
+		}
+		readOnly, isolation, _, err := p.parseTransactionModes(t.text)
+		if err != nil {
 			return nil, err
 		}
-		return &Begin{}, nil
+		b := &Begin{}
+		if isolation != "" {
+			b.Modes = append(b.Modes, &SetVar{Name: "transaction_isolation", Value: isolation, Local: true})
+		}
+		if readOnly != "" {
+			b.Modes = append(b.Modes, &SetVar{Name: "transaction_read_only", Value: readOnly, Local: true})
+		}
+		return b, nil
 	case "COMMIT", "END":
 		p.i++
 		p.consumeKeyword("TRANSACTION")
@@ -1719,6 +1761,59 @@ func exprContainsColumn(e Expr) bool {
 	return false
 }
 
+// parseTransactionModes parses the transaction modes of SET TRANSACTION,
+// SET SESSION CHARACTERISTICS AS TRANSACTION, BEGIN and START
+// TRANSACTION, up to the statement's end: ISOLATION LEVEL x, READ ONLY |
+// READ WRITE and [NOT] DEFERRABLE, separated by commas or whitespace.
+// readOnly is "on", "off" or "" (not given); isolation is the lower-cased
+// level or ""; deferrable is "on", "off" or "". what names the
+// statement in errors.
+func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferrable string, err error) {
+	for !p.atStatementEnd() {
+		switch {
+		case p.consumeIdentWord("isolation"):
+			if !p.consumeIdentWord("level") {
+				return "", "", "", p.errf("expected LEVEL after ISOLATION")
+			}
+			var words []string
+			for !p.atStatementEnd() {
+				t := p.peek()
+				if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
+					break
+				}
+				words = append(words, strings.ToLower(t.text))
+				p.i++
+				if len(words) == 2 || words[0] == "serializable" {
+					break
+				}
+			}
+			isolation = strings.Join(words, " ")
+			switch isolation {
+			case "serializable", "repeatable read", "read committed", "read uncommitted":
+			default:
+				return "", "", "", p.errf("expected an isolation level, found %q", isolation)
+			}
+		case p.peekIdentSeq("read", "only"):
+			p.i += 2
+			readOnly = "on"
+		case p.peekIdentSeq("read", "write"):
+			p.i += 2
+			readOnly = "off"
+		case p.consumeKeyword("NOT"):
+			if !p.consumeIdentWord("deferrable") {
+				return "", "", "", p.errf("expected DEFERRABLE after NOT")
+			}
+			deferrable = "off"
+		case p.consumeIdentWord("deferrable"):
+			deferrable = "on"
+		case p.consumeOp(","):
+		default:
+			return "", "", "", p.errf("unexpected %q in %s", p.peek().text, what)
+		}
+	}
+	return readOnly, isolation, deferrable, nil
+}
+
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
 // parseSet parses SET [SESSION | LOCAL] name {TO | =} value [, ...], SET
 // TIME ZONE value, SET NAMES value, SET [SESSION CHARACTERISTICS AS]
@@ -1745,52 +1840,21 @@ func (p *parser) parseSet() (Statement, error) {
 		if !characteristics {
 			sv.Local = true
 		}
-		var readOnly, isolation string
-		for !p.atStatementEnd() {
-			switch {
-			case p.consumeIdentWord("isolation"):
-				if !p.consumeIdentWord("level") {
-					return nil, p.errf("expected LEVEL after ISOLATION")
-				}
-				var words []string
-				for !p.atStatementEnd() {
-					t := p.peek()
-					if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
-						break
-					}
-					words = append(words, strings.ToLower(t.text))
-					p.i++
-					if len(words) == 2 {
-						break
-					}
-				}
-				if len(words) == 1 && words[0] != "serializable" {
-					return nil, p.errf("expected an isolation level, found %q", words[0])
-				}
-				isolation = strings.Join(words, " ")
-			case p.peekIdentSeq("read", "only"):
-				p.i += 2
-				readOnly = "on"
-			case p.peekIdentSeq("read", "write"):
-				p.i += 2
-				readOnly = "off"
-			case p.consumeKeyword("NOT"):
-				if !p.consumeIdentWord("deferrable") {
-					return nil, p.errf("expected DEFERRABLE after NOT")
-				}
-			case p.consumeIdentWord("deferrable"):
-			case p.consumeOp(","):
-			default:
-				return nil, p.errf("unexpected %q in SET TRANSACTION", p.peek().text)
-			}
+		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
+		if err != nil {
+			return nil, err
 		}
 		switch {
 		case readOnly != "" && characteristics:
 			sv.Name, sv.Value = "default_transaction_read_only", readOnly
 		case readOnly != "":
 			sv.Name, sv.Value = "transaction_read_only", readOnly
+		case isolation != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_isolation", isolation
 		case isolation != "":
 			sv.Name, sv.Value = "transaction_isolation", isolation
+		case deferrable != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_deferrable", deferrable
 		default:
 			return nil, p.errf("SET TRANSACTION needs a characteristic (READ ONLY, READ WRITE, ISOLATION LEVEL ...)")
 		}
@@ -2100,6 +2164,10 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectKeyword("INDEX"); err != nil {
 		return nil, err
 	}
+	// CONCURRENTLY: every index build is online, so it asks for what
+	// happens anyway; the executor keeps PostgreSQL's refusal inside a
+	// transaction block.
+	ci.Concurrently = p.consumeIdentWord("concurrently")
 	if p.consumeKeyword("IF") {
 		if err := p.expectKeyword("NOT"); err != nil {
 			return nil, err
@@ -2109,11 +2177,15 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 		ci.IfNotExists = true
 	}
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
+	// The name may be left out (CREATE INDEX ON t (c)): the executor
+	// picks one as PostgreSQL does. IF NOT EXISTS needs a name.
+	if t := p.peek(); !(t.kind == tkKeyword && t.text == "ON") || ci.IfNotExists {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ci.Name = name
 	}
-	ci.Name = name
 	if err := p.expectKeyword("ON"); err != nil {
 		return nil, err
 	}
@@ -2144,6 +2216,7 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			ci.ExprFunc, ci.ExprArg = fn, arg
 			ci.Columns = append(ci.Columns, col)
 			ci.OpClasses = append(ci.OpClasses, "")
+			ci.Collations = append(ci.Collations, "")
 			if p.consumeOp(",") {
 				return nil, p.errf("an index on an expression takes that one expression and nothing else")
 			}
@@ -2154,23 +2227,37 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			return nil, err
 		}
 		ci.Columns = append(ci.Columns, col)
-		// An operator class after the column: (doc jsonb_ops).
+		// A collation, then an operator class after the column:
+		// (name COLLATE "C"), (doc jsonb_ops), (name text_pattern_ops).
+		collation := ""
+		if p.consumeIdentWord("collate") {
+			if collation, err = p.parseQualifiedWord(); err != nil {
+				return nil, err
+			}
+		}
+		ci.Collations = append(ci.Collations, collation)
 		opclass := ""
 		if p.peek().kind == tkIdent {
-			opclass = strings.ToLower(p.peek().text)
-			p.i++
+			if opclass, err = p.parseQualifiedWord(); err != nil {
+				return nil, err
+			}
+			opclass = strings.ToLower(opclass)
 		}
 		ci.OpClasses = append(ci.OpClasses, opclass)
 		if !p.consumeOp(",") {
 			break
 		}
 	}
-	named := false
-	for _, oc := range ci.OpClasses {
-		named = named || oc != ""
+	named, collated := false, false
+	for i := range ci.OpClasses {
+		named = named || ci.OpClasses[i] != ""
+		collated = collated || ci.Collations[i] != ""
 	}
 	if !named {
 		ci.OpClasses = nil
+	}
+	if !collated {
+		ci.Collations = nil
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
@@ -2212,6 +2299,22 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 	}
 	return ci, nil
+}
+
+// parseQualifiedWord reads an identifier that may carry a schema
+// (pg_catalog.text_pattern_ops, pg_catalog."C") and returns its last
+// part: there is one schema of each, so the qualifier names nothing.
+func (p *parser) parseQualifiedWord() (string, error) {
+	word, err := p.expectIdent()
+	if err != nil {
+		return "", err
+	}
+	for p.consumeOp(".") {
+		if word, err = p.expectIdent(); err != nil {
+			return "", err
+		}
+	}
+	return word, nil
 }
 
 // parseIndexExpr reads an index key written as an expression,
@@ -4691,10 +4794,11 @@ func (p *parser) parseBoolFactor() (boolNode, error) {
 	if sub, ok, err := p.parseSubquery(); err != nil {
 		return boolNode{}, err
 	} else if ok {
-		e := Expr{Sub: sub}
-		if err := p.skipCasts(); err != nil {
+		casts, err := p.parseCasts()
+		if err != nil {
 			return boolNode{}, err
 		}
+		e := castChain(Expr{Sub: sub}, casts)
 		if op, ok := p.parseCmpOp(); ok {
 			cmp, err := p.finishComparison(Comparison{Expr: &e}, op)
 			if err != nil {
@@ -5476,11 +5580,6 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	return p.applyCasts(e)
 }
 
-func (p *parser) skipCasts() error {
-	_, err := p.parseCasts()
-	return err
-}
-
 // parseCasts reads a chain of ::type casts.
 func (p *parser) parseCasts() ([]string, error) {
 	var casts []string
@@ -5556,7 +5655,11 @@ func castChain(e Expr, casts []string) Expr {
 }
 
 // skipTypeName absorbs a type name: [schema.]name, an optional (typmod)
-// and array brackets. Type keywords (e.g. INT) lex as keywords.
+// and array brackets. Type keywords (e.g. INT) lex as keywords. The
+// multi-word spellings (DOUBLE PRECISION, CHARACTER VARYING, TIME[STAMP]
+// WITH[OUT] TIME ZONE) are read whole, and _T (PostgreSQL's name of
+// T's array type) is T[] for a built-in T. Whether the name is a type
+// at all is the executor's question: it may name a user-defined type.
 func (p *parser) skipTypeName() (string, error) {
 	var name string
 	if t := p.peek(); t.kind == tkIdent || t.kind == tkKeyword {
@@ -5570,7 +5673,17 @@ func (p *parser) skipTypeName() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		name = n
+		name = strings.ToLower(n)
+	}
+	switch name {
+	case "double":
+		if p.consumeIdentWord("precision") {
+			name = "double precision"
+		}
+	case "character", "char":
+		if p.consumeIdentWord("varying") {
+			name = "varchar"
+		}
 	}
 	if p.consumeOp("(") {
 		// The typmod: kept for the types where it changes the value
@@ -5591,6 +5704,18 @@ func (p *parser) skipTypeName() (string, error) {
 				name += "(" + strings.Join(mods, ",") + ")"
 			}
 		}
+	}
+	if name == "time" || name == "timestamp" {
+		switch {
+		case p.peekIdentSeq("with", "time", "zone"):
+			p.i += 3
+			name += "tz"
+		case p.peekIdentSeq("without", "time", "zone"):
+			p.i += 3
+		}
+	}
+	if len(name) > 1 && name[0] == '_' && builtins.KnownCastType(name[1:]) {
+		name = name[1:] + "[]"
 	}
 	for p.consumeOp("[") {
 		if err := p.expectOp("]"); err != nil {
