@@ -118,7 +118,15 @@ func TestViewDependencyRecords(t *testing.T) {
 	execSQL(t, ctx, s, `DROP TABLE t`)
 	for name, id := range ids {
 		lo, hi := keys.ViewDependencySpan(id)
-		kvs, err := n.DB().Scan(ctx, lo, hi, 0)
+		// In a transaction: the DROPs' intents on these keys may not be
+		// resolved yet, and a plain scan refuses an intent where a
+		// transactional one pushes it.
+		var kvs []kvpb.KeyValue
+		err := n.DB().RunTxn(ctx, "view-deps-check", func(ctx context.Context, txn *kvclient.Txn) error {
+			var err error
+			kvs, err = txn.Scan(ctx, lo, hi, 0)
+			return err
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
