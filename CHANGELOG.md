@@ -1189,6 +1189,19 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **Running a request as a stopper task costs less** (#331). Every gRPC
+  call, raft message, HTTP request and SQL connection has been a stopper
+  task since #324, and each took the stopper's one mutex twice, updated
+  a shared map of names and registered with the stopper's context. Tasks
+  are now tracked in 32 shards, each with its own lock, and Stop cancels
+  them itself. A task costs 175-250 ns and 2 allocations where it cost
+  450-500 ns and 4 serially, and about 180 ns where it cost 0.8-1 µs
+  with four cores starting tasks at once; its share of a node's CPU
+  under `kv-50-50` on three nodes fell from 2.2 % to 1.3 %. Throughput
+  and p99 of that workload did not move beyond run-to-run noise either
+  way. The guarantees are those of #324: no task is admitted once a
+  stop begins, none is running when the closers run, the wait is
+  bounded, and a task still running at the bound is logged by name.
 - **A unique index takes NULLs, as in PostgreSQL** (#322). A row with a NULL
   in any column of a unique index has no entry in it and conflicts with no
   other row (NULLS DISTINCT, PostgreSQL's default), on every path: `INSERT`,
