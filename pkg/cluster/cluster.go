@@ -158,8 +158,11 @@ func LoadPersistedRegistry(eng *storage.Engine) ([]kvpb.NodeDescriptor, error) {
 // address may have changed: no ID is allocated, the receiver just adopts
 // the address into its registry and returns the current node list.
 type JoinRequest struct {
-	Address  string        `json:"address"`
-	Locality base.Locality `json:"locality"`
+	Address string `json:"address"`
+	// LocalityAddresses are the sender's --locality-advertise entries
+	// (absent from binaries that predate them).
+	LocalityAddresses []base.LocalityAddress `json:"locality_addresses,omitempty"`
+	Locality          base.Locality          `json:"locality"`
 	// NodeID + ClusterID identify a re-announcing node.
 	NodeID    base.NodeID `json:"node_id,omitempty"`
 	ClusterID uuid.UUID   `json:"cluster_id,omitempty"`
@@ -187,6 +190,9 @@ type Registry struct {
 	mu    sync.Mutex
 	nodes map[base.NodeID]kvpb.NodeDescriptor
 	now   func() int64 // wall clock for piggybacked-address liveness; may be nil
+	// local is this node's own locality, against which a peer's
+	// --locality-advertise entries are matched (ResolveLocality).
+	local base.Locality
 }
 
 func NewRegistry() *Registry {
@@ -199,6 +205,26 @@ func (r *Registry) SetClock(now func() int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.now = now
+}
+
+// SetLocality records this node's own locality, which ResolveLocality
+// matches peers' --locality-advertise entries against.
+func (r *Registry) SetLocality(loc base.Locality) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.local = loc
+}
+
+// SetLocalityAddresses replaces a known node's --locality-advertise
+// entries (a re-announce carries them; its row follows with the node's
+// next heartbeat). An unknown node is left unknown.
+func (r *Registry) SetLocalityAddresses(id base.NodeID, las []base.LocalityAddress) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.nodes[id]; ok {
+		cur.LocalityAddresses = las
+		r.nodes[id] = cur
+	}
 }
 
 // Upsert keeps the freshest descriptor per node. Strictly-newer wins: an
@@ -254,11 +280,30 @@ func (r *Registry) All() []kvpb.NodeDescriptor {
 	return out
 }
 
-// Resolve implements rpc.Resolver.
+// Resolve implements rpc.Resolver: the node's public address.
 func (r *Registry) Resolve(id base.NodeID) (string, error) {
 	nd, ok := r.Get(id)
 	if !ok {
 		return "", fmt.Errorf("unknown node %s", id)
 	}
 	return nd.Address, nil
+}
+
+// ResolveLocality is the address to prefer for node id over its public
+// one: its first --locality-advertise entry whose tier is one of this
+// node's (SetLocality), or "" when none is (or the entry names the
+// public address anyway).
+func (r *Registry) ResolveLocality(id base.NodeID) string {
+	r.mu.Lock()
+	nd, ok := r.nodes[id]
+	local := r.local
+	r.mu.Unlock()
+	if !ok {
+		return ""
+	}
+	addr, ok := base.SelectLocalityAddress(nd.LocalityAddresses, local)
+	if !ok || addr == nd.Address {
+		return ""
+	}
+	return addr
 }

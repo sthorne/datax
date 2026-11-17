@@ -53,7 +53,11 @@ type Config struct {
 	Join          string
 	BootstrapSelf bool
 	Locality      base.Locality
-	MaxOffset     time.Duration
+	// LocalityAddresses (--locality-advertise) are the addresses peers
+	// sharing one of Locality's tiers dial this node at instead of its
+	// advertised address; every entry's tier must be one of Locality's.
+	LocalityAddresses []base.LocalityAddress
+	MaxOffset         time.Duration
 	// UpreplicationInterval is how often the repair loop scans for
 	// under-replicated ranges (default 3s).
 	UpreplicationInterval time.Duration
@@ -598,6 +602,11 @@ func Start(cfg Config) (*Node, error) {
 }
 
 func (n *Node) start() error {
+	for _, la := range n.cfg.LocalityAddresses {
+		if !n.cfg.Locality.HasTier(la.Tier) {
+			return fmt.Errorf("locality address %s: tier %s=%s is not one of this node's locality tiers (%s)", la, la.Tier.Key, la.Tier.Value, n.cfg.Locality)
+		}
+	}
 	if n.cfg.MaxOffset == 0 {
 		n.cfg.MaxOffset = base.DefaultMaxClockOffset
 	}
@@ -707,7 +716,9 @@ func (n *Node) start() error {
 
 	n.registry = cluster.NewRegistry()
 	n.registry.SetClock(func() int64 { return n.clock.Now().WallTime })
+	n.registry.SetLocality(n.cfg.Locality)
 	n.trans = rpc.NewTransport(n.clock, n.stopper, n.registry.Resolve)
+	n.trans.SetLocalityResolver(n.registry.ResolveLocality)
 	n.stopper.AddCloser(n.trans.Close)
 	if n.cfg.CertsDir != "" {
 		n.tlsCfgs, err = security.LoadNodeTLS(n.cfg.CertsDir)
@@ -969,7 +980,8 @@ func (n *Node) start() error {
 
 	n.registry.Upsert(kvpb.NodeDescriptor{
 		NodeID: n.ident.NodeID, Address: n.addr, Locality: n.cfg.Locality,
-		LivenessTime: n.clock.Now().WallTime,
+		LocalityAddresses: n.cfg.LocalityAddresses,
+		LivenessTime:      n.clock.Now().WallTime,
 	})
 	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 		log.Warnf("persisting registry: %v", err)
@@ -1066,38 +1078,44 @@ func loadLocalRange1(eng *storage.Engine) (kvpb.RangeDescriptor, bool, error) {
 
 // reannounce advertises this (already-initialized) node's identity and
 // current address to the configured join target and every persisted-registry
-// peer, in parallel, best-effort. Successful responses carry the fresh node
+// peer (at its locality address where the two share a tier), in parallel,
+// best-effort. Successful responses carry the fresh node
 // list the peer holds — including addresses of other nodes that also moved
 // — which is what re-forms a cluster restarted entirely on new addresses.
 func (n *Node) reannounce() {
-	targets := make(map[string]struct{})
-	if n.cfg.Join != "" {
-		targets[n.cfg.Join] = struct{}{}
+	// Keyed by the address as given (the join target) or the peer's
+	// public address; the address dialed is chosen in the announcing
+	// goroutine, since proving a peer's locality address takes a dial.
+	targets := make(map[string]func() string)
+	if join := n.cfg.Join; join != "" {
+		targets[join] = func() string { return join }
 	}
 	for _, nd := range n.registry.All() {
-		if nd.NodeID != n.ident.NodeID && nd.Address != "" && nd.Address != n.addr {
-			targets[nd.Address] = struct{}{}
+		if _, dup := targets[nd.Address]; !dup && nd.NodeID != n.ident.NodeID && nd.Address != "" && nd.Address != n.addr {
+			targets[nd.Address] = func() string { return n.peerAddr(nd) }
 		}
 	}
 	if len(targets) == 0 {
 		return
 	}
 	req := cluster.JoinRequest{
-		Address:       n.addr,
-		Locality:      n.cfg.Locality,
-		NodeID:        n.ident.NodeID,
-		ClusterID:     n.ident.ClusterID,
-		BinaryVersion: int(n.binaryVersion()),
-		MinSupported:  int(n.minSupportedVersion()),
+		Address:           n.addr,
+		LocalityAddresses: n.cfg.LocalityAddresses,
+		Locality:          n.cfg.Locality,
+		NodeID:            n.ident.NodeID,
+		ClusterID:         n.ident.ClusterID,
+		BinaryVersion:     int(n.binaryVersion()),
+		MinSupported:      int(n.minSupportedVersion()),
 	}
 	var (
 		wg sync.WaitGroup
 		mu sync.Mutex // guards n.joinRange1 across the announce goroutines
 	)
-	for addr := range targets {
+	for _, target := range targets {
 		wg.Add(1)
-		go func(addr string) {
+		go func(target func() string) {
 			defer wg.Done()
+			addr := target()
 			ctx, cancel := context.WithTimeout(n.stopper.Ctx(), 3*time.Second)
 			defer cancel()
 			var resp cluster.JoinResponse
@@ -1120,7 +1138,7 @@ func (n *Node) reannounce() {
 			}
 			mu.Unlock()
 			log.Infof("re-announced %s at %s via %s", n.ident.NodeID, n.addr, addr)
-		}(addr)
+		}(target)
 	}
 	wg.Wait()
 	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
@@ -1163,10 +1181,11 @@ func readStoreClusterVersion(eng *storage.Engine) (version.Version, error) {
 // join contacts an existing node to obtain identity and routing bootstrap.
 func (n *Node) join() error {
 	req := cluster.JoinRequest{
-		Address:       n.addr,
-		Locality:      n.cfg.Locality,
-		BinaryVersion: int(n.binaryVersion()),
-		MinSupported:  int(n.minSupportedVersion()),
+		Address:           n.addr,
+		LocalityAddresses: n.cfg.LocalityAddresses,
+		Locality:          n.cfg.Locality,
+		BinaryVersion:     int(n.binaryVersion()),
+		MinSupported:      int(n.minSupportedVersion()),
 	}
 	var resp cluster.JoinResponse
 	ctx, cancel := context.WithTimeout(n.stopper.Ctx(), 30*time.Second)
@@ -1251,6 +1270,32 @@ func (n *Node) ClusterVersion() version.Version { return version.Version(n.clust
 // Accessors used by tests, the CLI, and later phases.
 func (n *Node) NodeID() base.NodeID { return n.ident.NodeID }
 func (n *Node) Addr() string        { return n.addr }
+
+// peerAddr is the address to dial a peer at: its --locality-advertise
+// address for a tier this node shares, while that address answers, and
+// its public address otherwise (rpc.Transport.PickAddr).
+func (n *Node) peerAddr(nd kvpb.NodeDescriptor) string {
+	loc, _ := base.SelectLocalityAddress(nd.LocalityAddresses, n.cfg.Locality)
+	return n.trans.PickAddr(nd.NodeID, nd.Address, loc)
+}
+
+// resolvePeer is peerAddr for a node of the registry.
+func (n *Node) resolvePeer(id base.NodeID) (string, error) {
+	nd, ok := n.registry.Get(id)
+	if !ok {
+		return "", fmt.Errorf("unknown node %s", id)
+	}
+	return n.peerAddr(nd), nil
+}
+
+// PeerConnAddr is the address this node's connection to a peer uses (""
+// before there is one): the peer's locality address or its public one.
+func (n *Node) PeerConnAddr(id base.NodeID) string { return n.trans.ConnAddr(id) }
+
+// LocalityDialStats counts this node's dials to peers' locality
+// addresses and the fallbacks to a public address when one did not
+// answer.
+func (n *Node) LocalityDialStats() (dials, fallbacks int64) { return n.trans.LocalityStats() }
 
 // SQLAddr is the SQL listener address (real listener from Phase 6 on).
 func (n *Node) SQLAddr() string {

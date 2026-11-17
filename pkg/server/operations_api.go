@@ -174,7 +174,7 @@ func mergeOperations(running, done []ClusterOperation, limit int) ([]ClusterOper
 // peerNodeDetail asks one node for its /api/node document over the
 // internode admin RPC, within peerAnswerTimeout.
 func (n *Node) peerNodeDetail(ctx context.Context, id base.NodeID) (NodeDetail, error) {
-	addr, err := n.registry.Resolve(id)
+	addr, err := n.resolvePeer(id)
 	if err != nil {
 		return NodeDetail{}, err
 	}

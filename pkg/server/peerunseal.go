@@ -81,6 +81,12 @@ func (n *Node) writeSealIdentity() {
 	for _, nd := range n.registry.All() {
 		if nd.NodeID != n.ident.NodeID && nd.Address != "" {
 			id.Peers = append(id.Peers, nd.Address)
+			// Its locality address too, where the two share a tier: a
+			// sealed node asks each peer address in turn, so the public
+			// one still answers if the private network does not.
+			if loc, ok := base.SelectLocalityAddress(nd.LocalityAddresses, n.cfg.Locality); ok && loc != nd.Address {
+				id.Peers = append(id.Peers, loc)
+			}
 		}
 	}
 	sort.Strings(id.Peers)

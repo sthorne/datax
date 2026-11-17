@@ -84,7 +84,8 @@ function matchesNode(n) {
   if (!nodeFilter) return true;
   return ("n" + n.node_id).includes(nodeFilter) ||
     (n.locality || "").toLowerCase().includes(nodeFilter) ||
-    (n.address || "").toLowerCase().includes(nodeFilter);
+    (n.address || "").toLowerCase().includes(nodeFilter) ||
+    (n.locality_addresses || "").toLowerCase().includes(nodeFilter);
 }
 // How each sortable column of the nodes table reads a node. A ratio is
 // sorted as the ratio the cell shows — memory in use of total, load per
@@ -107,7 +108,7 @@ function renderNodesTable(d) {
     return { key: "n" + n.node_id, html: `<tr data-key="n${n.node_id}">
       <td data-label="node"><a href="${routeTo("node/" + n.node_id)}">n${n.node_id}</a></td>
       <td data-label="status">${statusCell(n)}</td>
-      <td class="key" data-label="address">${esc(n.address)}${copyBtn("n" + n.node_id + "'s address", n.address)}</td>
+      <td class="key" data-label="address">${esc(n.address)}${copyBtn("n" + n.node_id + "'s address", n.address)}${n.locality_addresses ? `<div class="muted" title="--locality-advertise: the addresses peers sharing a tier dial">${esc(n.locality_addresses)}</div>` : ""}</td>
       <td data-label="locality">${esc(n.locality || "—")}</td>
       <td class="num" data-label="cpu">${m ? pct(m.cpu_percent) : "—"}</td>
       <td class="num" data-label="load">${m && m.cores ? loadCell(m.load1, m.cores) : "—"}</td>

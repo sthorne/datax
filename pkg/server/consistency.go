@@ -101,7 +101,7 @@ func (n *Node) collectAndCompare(ctx context.Context, probe *kvserver.Consistenc
 		req := cluster.AdminRequest{Op: "collect-checksum", RangeID: probe.RangeID, CheckID: probe.CheckID}
 		var resp cluster.AdminResponse
 		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := n.trans.Call(cctx, nd.Address, "admin", req, &resp)
+		err := n.trans.Call(cctx, n.peerAddr(nd), "admin", req, &resp)
 		cancel()
 		if err != nil || resp.Error != "" {
 			// A lagging or dead replica is a liveness problem, not proof of
@@ -142,7 +142,7 @@ func (n *Node) waitForApplication(ctx context.Context, nodeID base.NodeID, range
 	}
 	req := cluster.AdminRequest{Op: "wait-applied", RangeID: rangeID, Index: index}
 	var resp cluster.AdminResponse
-	if err := n.trans.Call(ctx, nd.Address, "admin", req, &resp); err != nil {
+	if err := n.trans.Call(ctx, n.peerAddr(nd), "admin", req, &resp); err != nil {
 		return err
 	}
 	if resp.Error != "" {

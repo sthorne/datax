@@ -25,6 +25,7 @@ type serverFlags struct {
 	pgListen      string
 	join          string
 	locality      string
+	localityAddrs string
 	maxOffset     time.Duration
 	advertise     string
 	certsDir      string
@@ -63,6 +64,9 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.StringVar(&f.locality, "locality", "", "ordered failure-domain tiers, e.g. region=r1,rack=a")
 	f.fs.DurationVar(&f.maxOffset, "max-offset", base.DefaultMaxClockOffset, "maximum tolerated clock offset between nodes")
 	f.fs.StringVar(&f.advertise, "advertise", "", "address other nodes should use to reach this node (default: resolved listen address)")
+	const locAdvUsage = "addresses peers sharing a --locality tier with this node use to reach it instead of --advertise, e.g. a private intra-region network: a comma-separated list of key=value@host:port, each key=value one of this node's --locality tiers; a peer dials the first entry whose tier it has too, and the public address when that one does not answer"
+	f.fs.StringVar(&f.localityAddrs, "locality-advertise", "", locAdvUsage)
+	f.fs.StringVar(&f.localityAddrs, "locality-advertise-addr", "", "alias of --locality-advertise")
 	f.fs.StringVar(&f.certsDir, "certs-dir", "", "certificate directory; enables mutual internode TLS and SQL TLS+SCRAM (empty = insecure)")
 	f.fs.StringVar(&f.rootPw, "root-password", "", "secure mode: seed the root SQL user's password at startup if unset")
 	f.fs.StringVar(&f.httpListen, "http-listen", "", "observability address serving /metrics and /status (empty = disabled)")
@@ -95,6 +99,10 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	loc, err := base.ParseLocality(f.locality)
 	if err != nil {
 		return server.Config{}, err
+	}
+	locAddrs, err := base.ParseLocalityAddresses(f.localityAddrs, loc)
+	if err != nil {
+		return server.Config{}, fmt.Errorf("--locality-advertise: %v", err)
 	}
 	prof, err := storage.ParseProfile(f.profile)
 	if err != nil {
@@ -133,6 +141,7 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		Join:                     f.join,
 		BootstrapSelf:            bootstrap,
 		Locality:                 loc,
+		LocalityAddresses:        locAddrs,
 		MaxOffset:                f.maxOffset,
 		AdvertiseAddr:            f.advertise,
 		CertsDir:                 f.certsDir,

@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/metrics"
@@ -86,6 +87,15 @@ func (n *Node) startHTTP() error {
 			}
 			return float64(total)
 		}),
+		// --locality-advertise: dials to peers at their locality address,
+		// and the times one did not answer and the public address was
+		// used instead (a misconfigured private network).
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "datax_rpc_locality_dials_total", Help: "Connections to a peer made at its locality address (--locality-advertise) rather than its public one.",
+		}, func() float64 { d, _ := n.trans.LocalityStats(); return float64(d) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "datax_rpc_locality_fallbacks_total", Help: "Times a peer's locality address did not answer and its public address was dialed instead.",
+		}, func() float64 { _, f := n.trans.LocalityStats(); return float64(f) }),
 	)
 	// The host: the standard Go and process collectors (goroutines, heap,
 	// GC, process CPU seconds, RSS, open fds) plus datax gauges for what
@@ -596,14 +606,17 @@ type RangeStatus struct {
 
 // NodeStatus is the /status document.
 type NodeStatus struct {
-	NodeID    int           `json:"node_id"`
-	Address   string        `json:"address"`
-	SQLAddr   string        `json:"sql_address,omitempty"`
-	Locality  string        `json:"locality,omitempty"`
-	Ranges    []RangeStatus `json:"ranges"`
-	LeaderOf  int           `json:"leader_of"`
-	Quiescent int           `json:"quiescent_ranges"`
-	LiveNodes int           `json:"live_nodes"`
+	NodeID   int    `json:"node_id"`
+	Address  string `json:"address"`
+	SQLAddr  string `json:"sql_address,omitempty"`
+	Locality string `json:"locality,omitempty"`
+	// LocalityAddresses are the node's --locality-advertise entries, as
+	// the flag spells them.
+	LocalityAddresses string        `json:"locality_addresses,omitempty"`
+	Ranges            []RangeStatus `json:"ranges"`
+	LeaderOf          int           `json:"leader_of"`
+	Quiescent         int           `json:"quiescent_ranges"`
+	LiveNodes         int           `json:"live_nodes"`
 	// Machine is the node's latest host sample (CPU, memory, the store
 	// disk, network, file descriptors, Go runtime); nil before the first
 	// sample.
@@ -664,12 +677,14 @@ func (n *Node) statusSummary() NodeStatus { return n.statusSummaryFor(allKeysVie
 func (n *Node) statusSummaryFor(v keyViewer) NodeStatus {
 	ranges := n.rangeStatusesFor(v)
 	st := NodeStatus{
-		NodeID:    int(n.ident.NodeID),
-		Address:   n.addr,
-		SQLAddr:   n.SQLAddr(),
-		Locality:  n.cfg.Locality.String(),
-		Ranges:    ranges,
-		LiveNodes: len(n.registry.All()),
+		NodeID:   int(n.ident.NodeID),
+		Address:  n.addr,
+		SQLAddr:  n.SQLAddr(),
+		Locality: n.cfg.Locality.String(),
+		Ranges:   ranges,
+		// The node's own entries: its peers' are in /api/cluster.
+		LocalityAddresses: base.FormatLocalityAddresses(n.cfg.LocalityAddresses),
+		LiveNodes:         len(n.registry.All()),
 	}
 	if n.sys != nil {
 		if m := n.sys.Latest(); !m.At.IsZero() {

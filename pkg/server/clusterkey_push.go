@@ -148,8 +148,9 @@ func (n *Node) pushClusterKeys(ctx context.Context, nd kvpb.NodeDescriptor, ks [
 	cctx, cancel := context.WithTimeout(ctx, clusterKeyCall)
 	defer cancel()
 	var offer cluster.AdminResponse
-	if err := n.trans.Call(cctx, nd.Address, "admin", cluster.AdminRequest{Op: "cluster-key-offer", ClusterKey: &cluster.ClusterKeyRequest{ClusterID: clusterID, NodeID: nd.NodeID}}, &offer); err != nil {
-		return fmt.Errorf("n%d at %s: %w", nd.NodeID, nd.Address, err)
+	addr := n.peerAddr(nd)
+	if err := n.trans.Call(cctx, addr, "admin", cluster.AdminRequest{Op: "cluster-key-offer", ClusterKey: &cluster.ClusterKeyRequest{ClusterID: clusterID, NodeID: nd.NodeID}}, &offer); err != nil {
+		return fmt.Errorf("n%d at %s: %w", nd.NodeID, addr, err)
 	}
 	if offer.Error != "" {
 		return fmt.Errorf("n%d: %s", nd.NodeID, offer.Error)
@@ -162,10 +163,10 @@ func (n *Node) pushClusterKeys(ctx context.Context, nd kvpb.NodeDescriptor, ks [
 		return err
 	}
 	var ack cluster.AdminResponse
-	if err := n.trans.Call(cctx, nd.Address, "admin", cluster.AdminRequest{Op: "cluster-key-install", ClusterKey: &cluster.ClusterKeyRequest{
+	if err := n.trans.Call(cctx, addr, "admin", cluster.AdminRequest{Op: "cluster-key-install", ClusterKey: &cluster.ClusterKeyRequest{
 		Nonce: offer.ClusterKey.Nonce, Giver: pub, Sealed: sealed,
 	}}, &ack); err != nil {
-		return fmt.Errorf("n%d at %s: %w", nd.NodeID, nd.Address, err)
+		return fmt.Errorf("n%d at %s: %w", nd.NodeID, addr, err)
 	}
 	if ack.Error != "" {
 		return fmt.Errorf("n%d: %s", nd.NodeID, ack.Error)

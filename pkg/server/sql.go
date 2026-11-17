@@ -50,7 +50,7 @@ func (n *Node) startSQL() error {
 		AuthTimeout: n.cfg.AuthTimeout, MaxPendingAuth: n.cfg.SQLMaxPendingAuth,
 	}
 	opts.Forward = func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error) {
-		addr, err := n.registry.Resolve(base.NodeID(node))
+		addr, err := n.resolvePeer(base.NodeID(node))
 		if err != nil {
 			return false, nil // no such node: no such session
 		}

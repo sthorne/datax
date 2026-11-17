@@ -13,6 +13,7 @@ import (
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -27,6 +28,11 @@ import (
 
 // Resolver maps a node ID to its RPC address.
 type Resolver func(base.NodeID) (string, error)
+
+// LocalityResolver maps a node ID to the address to prefer over its
+// public one because the two nodes share a locality tier the peer
+// advertised an address for (--locality-advertise); "" for none.
+type LocalityResolver func(base.NodeID) string
 
 // Transport is the client side of internode RPC: cached connections, one
 // buffered Raft stream per destination node, and unary helpers for
@@ -54,6 +60,17 @@ type Transport struct {
 	healthProv  atomic.Pointer[func() *rpcpb.StorageHealth]
 	healthCache atomic.Pointer[cachedHealth]
 
+	// locResolver, when set, names a peer's locality address (see
+	// LocalityResolver); loc tracks, per peer, whether that address has
+	// failed and is being avoided for the public one (see PickAddr).
+	locResolver atomic.Pointer[LocalityResolver]
+	loc         struct {
+		sync.Mutex
+		peers map[base.NodeID]*localityPeer
+	}
+	localityDials     atomic.Int64
+	localityFallbacks atomic.Int64
+
 	mu struct {
 		sync.Mutex
 		conns map[base.NodeID]*conn
@@ -70,6 +87,7 @@ func NewTransport(clock *hlc.Clock, stopper *stop.Stopper, resolver Resolver) *T
 	t := &Transport{clock: clock, stopper: stopper, resolver: resolver}
 	t.mu.conns = make(map[base.NodeID]*conn)
 	t.mu.raftQ = make(map[base.NodeID]chan *rpcpb.RaftEnvelope)
+	t.loc.peers = make(map[base.NodeID]*localityPeer)
 	return t
 }
 
@@ -134,9 +152,11 @@ func (t *Transport) now() *rpcpb.Hlc {
 }
 
 // Dial returns a (cached) connection to the node, redialing if the node's
-// address changed.
+// address changed. The address is the node's locality address when it
+// has one for a tier this node shares and that address answers, its
+// public address otherwise (see Addr).
 func (t *Transport) Dial(nodeID base.NodeID) (*grpc.ClientConn, error) {
-	addr, err := t.resolver(nodeID)
+	addr, err := t.Addr(nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +175,155 @@ func (t *Transport) Dial(nodeID base.NodeID) (*grpc.ClientConn, error) {
 	}
 	t.mu.conns[nodeID] = &conn{addr: addr, cc: cc}
 	return cc, nil
+}
+
+// SetLocalityResolver installs the source of peers' locality addresses
+// (nil: every peer is dialed at its public address).
+func (t *Transport) SetLocalityResolver(fn LocalityResolver) {
+	if fn == nil {
+		t.locResolver.Store(nil)
+		return
+	}
+	t.locResolver.Store(&fn)
+}
+
+// Locality-address fallback tuning: how long a dial to a locality address
+// may take to prove the address answers, how long a failed one is avoided
+// before it is tried again (in the background, while the public address
+// carries the traffic), and how often a peer's fallback is logged.
+var (
+	localityProbeTimeout = time.Second
+	localityRetryAfter   = 10 * time.Second
+	localityLogEvery     = time.Minute
+)
+
+// localityPeer is the fallback state of one peer's locality address.
+type localityPeer struct {
+	addr     string    // the locality address this state is about
+	failedAt time.Time // zero: not known to fail
+	probing  bool      // a background re-probe is running
+	loggedAt time.Time // the last fallback logged for this peer
+}
+
+// Addr is the address this node dials nodeID at: its locality address
+// (LocalityResolver) when it has one, falling back to its public address
+// (Resolver) when the locality address does not answer.
+func (t *Transport) Addr(nodeID base.NodeID) (string, error) {
+	if t.resolver == nil {
+		return "", fmt.Errorf("unknown node %s", nodeID)
+	}
+	public, err := t.resolver(nodeID)
+	if err != nil {
+		return "", err
+	}
+	var loc string
+	if fn := t.locResolver.Load(); fn != nil {
+		loc = (*fn)(nodeID)
+	}
+	return t.PickAddr(nodeID, public, loc), nil
+}
+
+// PickAddr chooses between a peer's public address and its locality
+// address (loc, "" for none). The locality address is used once a dial to
+// it — TCP, and the TLS handshake in secure mode — has succeeded within
+// localityProbeTimeout, and for as long as the connection to it is not
+// failing. A locality address that does not answer is logged (at most
+// once a localityLogEvery per peer) and avoided for localityRetryAfter,
+// the public address carrying the traffic meanwhile; then it is probed
+// again in the background and taken back once it answers. So a
+// misconfigured private network degrades a link to the public network
+// instead of partitioning the cluster.
+func (t *Transport) PickAddr(nodeID base.NodeID, public, loc string) string {
+	if loc == "" || loc == public {
+		return public
+	}
+	now := time.Now()
+	t.loc.Lock()
+	st := t.loc.peers[nodeID]
+	if st == nil || st.addr != loc {
+		st = &localityPeer{addr: loc}
+		t.loc.peers[nodeID] = st
+	}
+	if !st.failedAt.IsZero() {
+		if now.Sub(st.failedAt) >= localityRetryAfter && !st.probing {
+			st.probing = true
+			go t.reprobeLocality(nodeID, st)
+		}
+		t.loc.Unlock()
+		return public
+	}
+	t.loc.Unlock()
+
+	// A healthy connection to the locality address is kept as it is; a
+	// new one, or one gRPC reports failing, is proven first.
+	t.mu.Lock()
+	c := t.mu.conns[nodeID]
+	t.mu.Unlock()
+	if c != nil && c.addr == loc && c.cc.GetState() != connectivity.TransientFailure {
+		return loc
+	}
+	if err := t.probeLocality(loc); err != nil {
+		t.localityFailed(nodeID, st, public, err)
+		return public
+	}
+	t.localityDials.Add(1)
+	return loc
+}
+
+func (t *Transport) probeLocality(addr string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), localityProbeTimeout)
+	defer cancel()
+	return t.Probe(ctx, addr)
+}
+
+// localityFailed starts avoiding st's address for the public one.
+func (t *Transport) localityFailed(nodeID base.NodeID, st *localityPeer, public string, err error) {
+	t.localityFallbacks.Add(1)
+	now := time.Now()
+	t.loc.Lock()
+	st.failedAt = now
+	logIt := now.Sub(st.loggedAt) >= localityLogEvery
+	if logIt {
+		st.loggedAt = now
+	}
+	t.loc.Unlock()
+	if logIt {
+		log.Warnf("transport: n%d's locality address %s does not answer (%v); using its public address %s and retrying in %s (logged at most once a %s)",
+			nodeID, st.addr, err, public, localityRetryAfter, localityLogEvery)
+	}
+}
+
+// reprobeLocality is the background retry of a failed locality address.
+func (t *Transport) reprobeLocality(nodeID base.NodeID, st *localityPeer) {
+	err := t.probeLocality(st.addr)
+	t.loc.Lock()
+	defer t.loc.Unlock()
+	st.probing = false
+	if err != nil {
+		st.failedAt = time.Now()
+		return
+	}
+	st.failedAt = time.Time{}
+	if !st.loggedAt.IsZero() {
+		log.Infof("transport: n%d's locality address %s answers again; using it", nodeID, st.addr)
+	}
+}
+
+// LocalityStats counts the dials made to a peer's locality address and
+// the times one did not answer and the public address was used instead.
+func (t *Transport) LocalityStats() (dials, fallbacks int64) {
+	return t.localityDials.Load(), t.localityFallbacks.Load()
+}
+
+// ConnAddr is the address of the cached connection to nodeID ("" when
+// there is none): which of a peer's addresses this node is using.
+func (t *Transport) ConnAddr(nodeID base.NodeID) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if c, ok := t.mu.conns[nodeID]; ok {
+		return c.addr
+	}
+	return ""
 }
 
 // DialAddr opens a raw connection to an address (used for joins, before the
