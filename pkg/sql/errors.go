@@ -67,6 +67,7 @@ const (
 	CodeIdleInTransactionTimeout  = "25P03"
 	CodeReadOnlyTransaction       = "25006"
 	CodeInvalidCatalogName        = "3D000"
+	CodeInvalidSchemaName         = "3F000"
 	CodeDuplicateDatabase         = "42P04"
 	CodeDependentObjectsExist     = "2BP01"
 	CodeObjectInUse               = "55006"

@@ -11,7 +11,7 @@ import (
 // categoryOrder is the reference's section order. A category that is
 // not listed follows these — one such is in order by itself, two would
 // take the order a map happens to yield, so a new category is listed.
-var categoryOrder = []string{catControl, catString, catMath, catTime, catJSON, catSets, catTextSearch, catVector, catSession, catLargeObject, catAdvisory}
+var categoryOrder = []string{catControl, catString, catMath, catTime, catJSON, catSets, catTextSearch, catVector, catSession, catCatalog, catLargeObject, catAdvisory}
 
 // Reference renders the Functions reference (docs/user/functions.md)
 // from the registry: one section per category, one entry per canonical

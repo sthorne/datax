@@ -126,8 +126,11 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 	case "current_schema":
 		d := types.NewString(catalog.PublicSchema)
 		out.Func, out.Lit = "", &d
-	case "current_user":
+	case "current_user", "current_role", "user":
 		d := types.NewString(s.user)
+		out.Func, out.Lit = "", &d
+	case "current_catalog":
+		d := types.NewString(s.database)
 		out.Func, out.Lit = "", &d
 	case "session_user":
 		d := types.NewString(s.sessionUser)
@@ -302,6 +305,17 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		d := types.NewBool(ok)
 		out.Func, out.Args, out.Lit = "", nil, &d
+	case "pg_get_serial_sequence", "pg_is_in_recovery", "current_schemas", "to_regclass", "to_regproc", "to_regprocedure",
+		"to_regnamespace", "to_regrole", "pg_has_role", "has_table_privilege", "has_any_column_privilege", "has_column_privilege",
+		"has_sequence_privilege", "has_schema_privilege", "has_database_privilege", "has_function_privilege", "has_type_privilege",
+		"has_tablespace_privilege", "has_foreign_data_wrapper_privilege", "has_server_privilege":
+		// The system information and privilege functions (sysfuncs.go):
+		// a value, or a CASE over the objects a column argument names.
+		r, err := s.spliceSysFunc(ctx, txn, e, params, keepVolatile)
+		if err != nil {
+			return e, err
+		}
+		out.Func, out.Args, out.Lit, out.Case = "", nil, r.Lit, r.Case
 	case "pg_get_userbyid":
 		// Every object is owned by root (there is no ownership yet).
 		d := types.NewString("root")
@@ -1509,6 +1523,7 @@ var splicedFuncs = map[string]bool{
 	"now": true, "current_timestamp": true, "localtimestamp": true, "statement_timestamp": true, "transaction_timestamp": true, "current_date": true,
 	"current_time": true, "localtime": true,
 	"current_database": true, "current_schema": true, "current_user": true, "session_user": true,
+	"current_role": true, "user": true, "current_catalog": true,
 	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
@@ -1527,11 +1542,16 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
 		return n, nil
 	}
-	desc, err := s.lookup(ctx, txn, text)
+	// Read as SQL reads a name: '"Mixed"', 'public.t' and
+	// 'pg_catalog.pg_class' (PostgreSQL's own OID) as well as 't'.
+	r, err := s.lookupRelationName(ctx, txn, text)
 	if err != nil {
+		return 0, err
+	}
+	if r == nil {
 		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
 	}
-	return vtable.TableOID(desc), nil
+	return r.oid, nil
 }
 
 // descriptionOf resolves obj_description(oid, class) / col_description
@@ -1606,8 +1626,8 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 	for _, d := range all {
 		out = append(out, oidName{oid: vtable.TableOID(d), name: d.Name})
 	}
-	vtable.EachTable(func(t *vtable.Table) {
-		out = append(out, oidName{oid: vtable.TableOID(t.Descriptor()), name: t.Name})
+	vtable.EachClassOID(func(oid int64, name string) {
+		out = append(out, oidName{oid: oid, name: name})
 	})
 	return out, nil
 }

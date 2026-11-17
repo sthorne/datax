@@ -892,9 +892,14 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   (`jsonb_build_object`, `jsonb_build_array`, `to_jsonb`,
   `jsonb_typeof`, `jsonb_array_length`, `jsonb_extract_path[_text]`,
   `jsonb_set`, `jsonb_strip_nulls`, `jsonb_pretty`, ...), and the session and catalog functions tools call (`version()`,
-  `current_user`, `current_schema()`, `current_setting(name)`, `set_config`,
+  `current_user` (and the keywords `current_role`, `user`,
+  `session_user`, `current_catalog`), `current_schema()`,
+  `current_schemas(bool)`, `current_setting(name)`, `set_config`,
   `format_type`, `pg_get_indexdef`, `pg_get_constraintdef`,
-  `pg_get_expr`, `pg_typeof`, `pg_size_pretty`, `has_*_privilege`,
+  `pg_get_expr`, `pg_typeof`, `pg_size_pretty`,
+  `pg_get_serial_sequence`, `to_regclass` and the other `to_reg*`
+  lookups, `pg_is_in_recovery()`, `pg_has_role` and the
+  `has_*_privilege` family, answered from the grants and roles,
   ...) as well as the sequence and id functions `nextval`, `currval`,
   `lastval`, `setval`, `unique_rowid()`, `gen_random_uuid()` /
   `uuid_generate_v4()` ([Defaults and sequences](#defaults-serial-identity-columns-and-sequences)).

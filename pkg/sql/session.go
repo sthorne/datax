@@ -1665,7 +1665,7 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		return types.NewString("UTF8"), nil
 	case "pg_tablespace_location":
 		return types.NewString(""), nil
-	case "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible":
+	case "pg_type_is_visible", "pg_function_is_visible":
 		return types.NewBool(true), nil
 	}
 	return types.Datum{}, newErrf(CodeUndefinedFunction, "unknown function %q", e.Func)

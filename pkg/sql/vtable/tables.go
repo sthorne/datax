@@ -237,7 +237,7 @@ func init() {
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
 		for i, name := range Names() {
-			rows = append(rows, Row{i64(int64(1<<30) + int64(i)), str(name[len(PgCatalog)+1:]), i64(OIDPgCatalog), i64(0), i64(10), i64(0), i64(0), i64(0),
+			rows = append(rows, Row{i64(classOIDAt(i, name)), str(name[len(PgCatalog)+1:]), i64(OIDPgCatalog), i64(0), i64(10), i64(0), i64(0), i64(0),
 				i64(0), types.NewFloat(0), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(0),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
@@ -316,7 +316,7 @@ func init() {
 				}
 				n++
 				c := c
-				rows = append(rows, attr(int64(1<<30)+int64(i), &c, n, false))
+				rows = append(rows, attr(classOIDAt(i, name), &c, n, false))
 			}
 		}
 		return rows, nil
@@ -718,7 +718,48 @@ func init() {
 			}
 			return rows, nil
 		})
-	pg("pg_depend", []catalog.Column{col("classid", types.Int), col("objid", types.Int), col("objsubid", types.Int), col("refclassid", types.Int), col("refobjid", types.Int), col("refobjsubid", types.Int), col("deptype", types.String)}, empty)
+	// pg_depend: the one dependency tools read — a SERIAL, identity or
+	// OWNED BY sequence on its column ('a', auto; 'i', internal, for an
+	// identity column), which is how Rails and pg_dump find a column's
+	// sequence (pg_get_serial_sequence answers the same).
+	pg("pg_depend", []catalog.Column{col("classid", types.Int), col("objid", types.Int), col("objsubid", types.Int), col("refclassid", types.Int), col("refobjid", types.Int), col("refobjsubid", types.Int), col("deptype", types.String)},
+		func(ctx context.Context, env *Env) ([]Row, error) {
+			owned := map[uint64]map[catalog.ColumnID]*catalog.SequenceDescriptor{}
+			for _, sq := range env.currentSequences() {
+				if sq.OwnerTable == 0 {
+					continue
+				}
+				if owned[sq.OwnerTable] == nil {
+					owned[sq.OwnerTable] = map[catalog.ColumnID]*catalog.SequenceDescriptor{}
+				}
+				owned[sq.OwnerTable][sq.OwnerColumn] = sq
+			}
+			var rows []Row
+			for _, t := range env.currentTables() {
+				seqs := owned[t.ID]
+				if seqs == nil {
+					continue
+				}
+				n := int64(0)
+				for i := range t.Columns {
+					c := &t.Columns[i]
+					if c.Hidden {
+						continue
+					}
+					n++
+					sq := seqs[c.ID]
+					if sq == nil {
+						continue
+					}
+					deptype := "a"
+					if c.Identity != "" {
+						deptype = "i"
+					}
+					rows = append(rows, Row{i64(OIDPgClass), i64(int64(sq.ID)), i64(0), i64(OIDPgClass), i64(TableOID(t)), i64(n), str(deptype)})
+				}
+			}
+			return rows, nil
+		})
 	pg("pg_enum", []catalog.Column{col("oid", types.Int), col("enumtypid", types.Int), col("enumsortorder", types.Float), col("enumlabel", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row

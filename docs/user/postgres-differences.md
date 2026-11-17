@@ -286,7 +286,12 @@ syntax error or `0A000` feature not supported):
   schema qualifier on a cast's type is ignored (`'1'::foo.int4` is an
   `int4`). And `'t'::regclass` displays as the table's OID (a number,
   where PostgreSQL displays `t`); `oid::regclass` gives the name back
-  (`conrelid::regclass`).
+  (`conrelid::regclass`). The name is read as PostgreSQL reads one
+  (`'"Mixed"'::regclass`, `'public.t'::regclass`), and a system
+  catalog's OID is PostgreSQL's (`'pg_class'::regclass` is 1259). The
+  `to_regclass`, `to_regproc`, `to_regprocedure`, `to_regnamespace`
+  and `to_regrole` lookups return the OID the same way (`NULL` where
+  the cast would fail), not the name.
 - **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
   1 MiB) as the stream arrives, so a failure partway leaves the earlier
   chunks committed — the error names the failing row and how many rows
@@ -444,7 +449,7 @@ The rules are PostgreSQL's; these are the differences.
 |---|---|---|
 | Who is exempt | superusers and `BYPASSRLS` roles always; the owner unless `FORCE` | `root` and `BYPASSRLS` roles always; the owner **and members of `admin`** unless `FORCE` (an admin is treated as an owner of every object) |
 | `TRUNCATE` | allowed with the `TRUNCATE` privilege, ignoring policies | refused (`42501`) to a role the table's policies apply to, whatever it was granted |
-| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user`, `session_user`, `current_setting`, `current_database`, `current_schema` and the clock. They are evaluated once per statement |
+| Policy expressions | any expression, subqueries included | no subqueries; column references unqualified; of the session functions only `current_user` (also `current_role`, `user`), `session_user`, `current_setting`, `current_database` (also `current_catalog`), `current_schema` and the clock. They are evaluated once per statement |
 | Predicate order | a leakproof-function analysis decides what may run before the policy | the policy is always evaluated first; no statement predicate sees a hidden row |
 | Views | owner's rights by default, `security_invoker` to change it | owner's rights only |
 | `SET row_security = off` | makes a filtered query an error instead (used by `pg_dump`) | the same: `42501` `query would be affected by row-level security policy for table "t"`, without PostgreSQL's hint for an owner under `FORCE` |
@@ -557,10 +562,13 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `information_schema.tables` / `columns` / `table_constraints` /
   `key_column_usage`, `pg_indexes`, `pg_class` + `pg_attribute` +
   `pg_index` joins, `format_type`, `pg_get_indexdef`,
-  `pg_get_constraintdef`, `'t'::regclass` and existence checks against
-  the catalogs (`SELECT 1 FROM pg_class WHERE relname = ...`; the
-  `to_regclass()` function itself does not exist) return
-  what PostgreSQL would for a schema in the datax subset. Reads of
+  `pg_get_constraintdef`, `'t'::regclass`, `to_regclass()` and
+  existence checks against the catalogs (`SELECT 1 FROM pg_class WHERE
+  relname = ...`) return what PostgreSQL would for a schema in the
+  datax subset. A column's sequence is found as Rails and pg_dump look
+  for it: `pg_get_serial_sequence('t', 'id')` (`public.t_id_seq`, for a
+  SERIAL, identity or `OWNED BY` sequence) and the `pg_depend` rows
+  that tie each such sequence to its column. Reads of
   features datax lacks (triggers, comments) come back
   empty rather than erroring — whatever shape the tool's query takes;
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
@@ -584,6 +592,27 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `0` for a table the reader may not `SELECT` from, where PostgreSQL
   shows them to everyone, and `pg_largeobject_metadata` lists the
   reader's own large objects only.
+- **The privilege functions** (`has_table_privilege`,
+  `has_column_privilege`, `has_any_column_privilege`,
+  `has_sequence_privilege`, `has_schema_privilege`,
+  `has_database_privilege`, `has_function_privilege`,
+  `has_type_privilege`, `has_tablespace_privilege`, `pg_has_role`) take
+  every argument form PostgreSQL's do and answer from datax's grants,
+  ownership and role graph ([Functions
+  reference](functions.md#system-information-and-privileges)). Where
+  the models differ: a column's privilege is its table's (there are no
+  column grants); `REFERENCES`, `TRIGGER` and `MAINTAIN` are the
+  owner's and admins'; a sequence's `USAGE` grant also answers
+  `SELECT`, and `INSERT` / `UPDATE` / `SELECT` on the table that owns a
+  SERIAL sequence answer for the sequence, as `nextval` and `currval`
+  check them; `EXECUTE` on functions and `USAGE` on types are
+  everyone's; `TEMPORARY` on a database follows `CONNECT`; PostgreSQL's
+  predefined roles (`pg_read_all_data`, `pg_write_all_data`) answer as
+  `read_all` and `write_all`, the other `pg_*` ones as roles only
+  admins hold. A user given as an OID no role has answers as `PUBLIC`.
+  Only the object argument may name a column (`has_table_privilege(c.oid,
+  'SELECT')` over `pg_class`); a column user or privilege argument is
+  refused (`0A000`).
 - **Writes to a catalog** are refused with SQLSTATE `42501`.
 - **How many tables.** The catalogs, `SHOW TABLES` and name
   resolution cost in proportion to the current database, not to the
