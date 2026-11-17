@@ -1480,6 +1480,14 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`pg_settings` reports each setting's type and unit, and what `RESET`
+  restores** (#333). `vartype` and `unit` came from a hard-coded list
+  that had fallen behind the session's own registry of settings, so
+  `statement_memory_limit` (an integer in bytes), `ivfflat.probes`,
+  `vector_index_scan` and `inverted_index_scan` read `string` with no
+  unit. They now come from that registry. `reset_val` showed the current
+  value; it is now the value `RESET` restores, the one a new session
+  starts with.
 - **`current_setting(name)` read per row raises `42704` for a name that is
   no setting** (#329). Since #326, `current_setting(s.name)` over a column
   (psql's `\dconfig` over `pg_settings`) evaluates per row, but a row
