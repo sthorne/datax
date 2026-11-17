@@ -22,13 +22,13 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `format(text, [any], ...) → text` — Formats with %s (text), %I (an identifier, quoted when needed), %L (a literal, quoted; NULL for NULL) and %%. *immutable, handles NULL arguments*
 - `initcap(text) → text` — The first letter of each word upper-cased, the rest lower-cased. *immutable*
 - `left(text, int8) → text` — The first n characters (all but the last -n when negative). *immutable*
-- `length(text) → int8` (also `char_length`, `character_length`) — Number of characters in the string. *immutable*
+- `length(text) → int8` (also `char_length`, `character_length`) — Number of characters in the string (of bytes in a bytea). *immutable*
 - `lower(text) → text` — The string in lower case. *immutable*
 - `lpad(text, int8, [text]) → text` — Pads the string on the left to the length with the fill (spaces by default), truncating when longer. *immutable*
 - `ltrim(text, [text]) → text` — Removes the given characters (spaces by default) from the start. *immutable*
-- `md5(text) → text` — The MD5 hash as 32 hex characters. *immutable*
-- `octet_length(text) → int8` — Number of bytes in the string. *immutable*
-- `position(text, text) → int8` — 1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack)); strpos(haystack, needle) takes them the other way round. *immutable*
+- `md5(text) → text` — The MD5 hash as 32 hex characters (of a bytea's bytes). *immutable*
+- `octet_length(text) → int8` — Number of bytes in the string or bytea. *immutable*
+- `position(text, text) → int8` — 1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack); over bytea, the byte offset); strpos(haystack, needle) takes them the other way round. *immutable*
 - `quote_literal(any) → text` — The value as a quoted SQL literal. *immutable*
 - `quote_nullable(any) → text` — The value as a quoted SQL literal, or NULL unquoted. *immutable, handles NULL arguments*
 - `regexp_count(text, text, [int8], [text]) → int8` — The number of non-overlapping matches of the POSIX pattern, from the 1-based character start. *immutable*
@@ -48,7 +48,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `sha256(any) → bytes` — The SHA-256 hash, as bytes (encode(sha256(x), 'hex') for the hex text). *immutable*
 - `split_part(text, text, int8) → text` — The n-th field (1-based; negative counts from the end) after splitting on the delimiter. *immutable*
 - `starts_with(text, text) → bool` — Whether the string starts with the prefix. *immutable*
-- `substring(text, int8, [int8]) → text` (also `substr`) — The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])). *immutable*
+- `substring(text, int8, [int8]) → text` (also `substr`) — The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes. *immutable*
 - `to_hex(int8) → text` — The integer in hexadecimal. *immutable*
 - `translate(text, text, text) → text` — Replaces each character found in the second argument with the one at the same position in the third (dropped when the third is shorter). *immutable*
 - `trim(text, [text]) → text` (also `btrim`) — Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)). *immutable*

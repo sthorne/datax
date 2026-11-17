@@ -1357,8 +1357,21 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		if err != nil {
 			return types.Datum{}, err
 		}
-		if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
-			return types.Datum{}, err
+		handled := false
+		if e.BinOp == "||" {
+			// jsonb || jsonb merges (issue #342).
+			var d types.Datum
+			if d, handled, err = evalJSONBConcat(e, base, rhs); err != nil {
+				return types.Datum{}, err
+			}
+			if handled {
+				base = d
+			}
+		}
+		if !handled {
+			if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
+				return types.Datum{}, err
+			}
 		}
 	}
 	if e.Cast != "" {

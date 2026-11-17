@@ -842,7 +842,9 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   column's name (`at::date` describes as `at`).
 - **JSONB operators**: `->` / `->>` (key or array index: `j -> 0`),
   `#>` / `#>>` with a text-array path (`j #>> '{a,0,b}'`), containment
-  `@>` / `<@`, and key existence `?`, `?|`, `?&` — everywhere an
+  `@>` / `<@`, key existence `?`, `?|`, `?&`, and concatenation `||`
+  (objects merge, the right side winning; arrays concatenate; a
+  non-array is appended or prepended as an element) — everywhere an
   expression goes, including HAVING and grouped select lists.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
