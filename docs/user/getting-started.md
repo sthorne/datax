@@ -146,9 +146,12 @@ EXPLAIN SELECT email FROM users WHERE city = 'oslo';
  scan of index "by_city" (1 column prefix) + primary key join
 ```
 
-Every table needs a `PRIMARY KEY`. Rows are distributed across the cluster
-by primary-key ranges, so the PK you choose determines write scaling — a
-monotonically increasing key funnels all inserts into one range. See
+Rows are distributed across the cluster by primary-key ranges, so the PK
+you choose determines write scaling — a monotonically increasing key
+funnels all inserts into one range. A table declared without a
+`PRIMARY KEY` (a join table) gets a hidden, generated `rowid` key that
+spreads inserts across nodes; see [tables without a primary
+key](sql.md#tables-without-a-primary-key). See
 [capacity planning](operations.md#capacity-planning) and
 [timeseries tables](sql.md#timeseries-tables) for the two ways around that.
 

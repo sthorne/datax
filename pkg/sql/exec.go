@@ -204,6 +204,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if err != nil {
 		return nil, err
 	}
+	if t, err = withRowidKey(t); err != nil {
+		return nil, err
+	}
 	dbName, bare := catalog.SplitTableName(t.Name)
 	if dbName == "" {
 		dbName = s.database
@@ -285,9 +288,6 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		pkNames = colPK
 	} else if len(colPK) > 0 {
 		return nil, newErrf(CodeSyntaxError, "multiple primary key definitions")
-	}
-	if len(pkNames) == 0 {
-		return nil, newErrf(CodeFeatureNotSupported, "table %q must declare a PRIMARY KEY", t.Name)
 	}
 	if err := applyTableOptions(desc, t.Options, pkNames); err != nil {
 		return nil, err
@@ -482,6 +482,10 @@ func applyTableOptions(desc *catalog.TableDescriptor, options map[string]string,
 	// The timestamp must close the (logical) primary key so each series'
 	// rows are stored in time order and retention trims a key suffix.
 	last, ok := desc.Col(pkNames[len(pkNames)-1])
+	if ok && last.Hidden {
+		// The generated rowid of a table that declares no key (#354).
+		return newErrf(CodeFeatureNotSupported, "a timeseries table must declare a PRIMARY KEY ending in its TIMESTAMPTZ column")
+	}
 	if !ok || last.Type != types.Timestamp {
 		return newErrf(CodeFeatureNotSupported, "a timeseries table's last primary key column must be TIMESTAMPTZ")
 	}

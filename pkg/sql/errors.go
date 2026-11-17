@@ -72,6 +72,12 @@ const (
 	CodeWrongObjectType           = "42809"
 	CodeInvalidGrantOperation     = "0LP01"
 	CodeInvalidObjectDefinition   = "42P17"
+	// CodeInvalidTableDefinition: invalid_table_definition (a second
+	// primary key).
+	CodeInvalidTableDefinition = "42P16"
+	// CodeInvalidForeignKey: invalid_foreign_key (a reference to columns
+	// no primary key or unique constraint covers).
+	CodeInvalidForeignKey = "42830"
 
 	// CodeSnapshotTooOld is PostgreSQL's snapshot_too_old: a read whose
 	// timestamp lies below the history the cluster keeps.

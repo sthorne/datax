@@ -4132,8 +4132,18 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			cname, named = n, true
 		}
 		if named || p.peekKeyword("UNIQUE") || p.peekKeyword("CHECK") || p.peekKeyword("FOREIGN") || p.peekKeyword("PRIMARY") {
-			if p.peekKeyword("PRIMARY") {
-				return nil, p.errf("ADD PRIMARY KEY is not supported: the primary key is fixed at CREATE TABLE")
+			if p.consumeKeyword("PRIMARY") {
+				// Parsed so the executor can refuse it against the
+				// table (42P16 or 0A000) rather than as a syntax error.
+				if err := p.expectKeyword("KEY"); err != nil {
+					return nil, err
+				}
+				cols, err := p.parseColumnList()
+				if err != nil {
+					return nil, err
+				}
+				at.AddConstraint = &ConstraintDef{Name: cname, Kind: "primary", Columns: cols}
+				break
 			}
 			cd, err := p.parseTableConstraint(cname)
 			if err != nil {
