@@ -17,8 +17,8 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `VARCHAR(n)` | `CHARACTER VARYING(n)` | at most `n` characters: a longer value is refused (`22001`) unless the excess is spaces, which are dropped; `varchar` (OID 1043) with the typmod on the wire |
 | `CHAR(n)` | `CHARACTER(n)`; bare `CHAR` is `CHAR(1)` | fixed width: stored trimmed of trailing spaces, rendered blank-padded to `n` (`'ab'` in a `CHAR(3)` reads back as `'ab '`); `length()`, `||` and comparisons see the trimmed value; `bpchar` (OID 1042) on the wire |
 | `BOOL` | `BOOLEAN` | |
-| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | UTC; microsecond precision on the binary wire; years 1678 to 2261 (a value outside is refused) |
-| `TIMESTAMP` | `TIMESTAMP WITHOUT TIME ZONE` | wall-clock time: an offset in the input is ignored (`'2024-01-02 03:04:05+05'` stores `03:04:05`) and the output carries none; `timestamp` (OID 1114) on the wire. Expressions over it (`ts + '1 day'`, `date_trunc`) and casts (`::timestamp`) are `TIMESTAMPTZ` |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, stored as UTC; microsecond precision on the binary wire (UTC whatever the session's zone); years 1678 to 2261 (a value outside is refused). Text without an offset reads in the session's [`TimeZone`](#session-settings), text with one (`+05`, `Z`) or a zone name (`'2024-07-01 12:00 Europe/Paris'`) as it says; text output, `::text`, `::date`, `date_trunc`, `extract` and `to_char` are in the session's zone. `AT TIME ZONE` / `timezone(zone, ts)` convert to a `TIMESTAMP` in a zone and back (see [Time zones](#time-zones)) |
+| `TIMESTAMP` | `TIMESTAMP WITHOUT TIME ZONE` | wall-clock time: an offset in the input is ignored (`'2024-01-02 03:04:05+05'` stores `03:04:05`) and the output carries none; `timestamp` (OID 1114) on the wire; the session's `TimeZone` never applies to it. A `::timestamp` cast, `ts ± interval`, `date_trunc` over it and `timestamptz AT TIME ZONE zone` are timestamps too; other expressions over it are `TIMESTAMPTZ` |
 | `TIMESTAMP(p)`, `TIMESTAMPTZ(p)` | | `p` in 0–6: values round to `p` fractional digits on write (half away from zero) |
 | `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
@@ -938,7 +938,11 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
   the base or as a join member — and table functions (`unnest(array)`,
-  `pg_available_extensions()`, `pg_partition_ancestors(rel)`), which
+  `pg_available_extensions()`, `pg_partition_ancestors(rel)` and the
+  set-returning builtins: `generate_series`, `jsonb_each[_text]`,
+  `jsonb_array_elements[_text]`, `jsonb_object_keys`,
+  `regexp_split_to_table`, `regexp_matches`; see
+  [Set-returning functions](#set-returning-functions)), which
   join like tables too: `FROM unnest(array) [AS] s(x)`, `LEFT JOIN
   pg_available_extensions() ae(name, default_version, comment) ON ...`.
   **`LATERAL`**: a subquery written `LATERAL (SELECT ...)`, and any
@@ -1605,6 +1609,57 @@ What is guaranteed, and what is not:
   `LISTEN` (a syntax error) and is skipped by the others; during a
   rolling upgrade, connect listeners to upgraded nodes.
 
+## Set-returning functions
+
+`generate_series`, `jsonb_each`, `jsonb_each_text`, `jsonb_array_elements`,
+`jsonb_array_elements_text`, `jsonb_object_keys` (and their `json_`
+spellings), `regexp_split_to_table` and `regexp_matches` return rows. In
+`FROM` they are tables, with an alias and column names; in a select list
+without `FROM` each call expands into rows, several calls in lockstep
+(the shorter padded with NULLs, as in PostgreSQL 10 and later):
+
+```sql
+SELECT * FROM generate_series(1, 10, 2) AS g(n);                      -- 1 3 5 7 9
+SELECT d FROM generate_series('2024-01-01'::timestamptz, '2024-01-31', interval '1 day') AS d;
+SELECT key, value FROM jsonb_each('{"a":1,"b":[2]}');                 -- (key text, value jsonb)
+SELECT value FROM jsonb_array_elements_text('["x","y"]');
+SELECT generate_series(1, 3) AS n, 'row' AS label;                    -- three rows
+INSERT INTO t (id) SELECT n FROM generate_series(1, 1000) AS g(n);
+```
+
+Their arguments are constants or parameters: a call that reads another
+`FROM` member's columns (`FROM t, jsonb_array_elements(t.doc)`, a
+lateral reference) is refused (`0A000`), and so is one in the select
+list of a query with `FROM` (`SELECT generate_series(1, n) FROM t`).
+A two-column function (`jsonb_each`) goes in `FROM`. The rows count
+against `statement_memory_limit` as they are made.
+
+## Time zones
+
+A `TIMESTAMPTZ` is an instant; the session's `TimeZone` decides how one
+is read from text that names no offset and how its calendar fields are
+seen. `AT TIME ZONE` converts between the two kinds of timestamp in a
+named zone, whatever the session's:
+
+```sql
+SET TimeZone = 'America/New_York';
+SELECT '2024-07-01 12:00'::timestamptz;                       -- 2024-07-01 12:00:00-04 (16:00 UTC)
+SELECT now()::date, date_trunc('day', now());                 -- New York's date and midnight
+SELECT ts AT TIME ZONE 'Europe/Paris' FROM events;            -- timestamptz → Paris wall clock (timestamp)
+SELECT '2024-03-10 02:30'::timestamp AT TIME ZONE 'America/New_York';  -- timestamp → instant
+SELECT timezone('UTC', ts), ts AT LOCAL FROM events;          -- the function form; the session's zone
+```
+
+A zone is an IANA name (any letter case), a POSIX offset — `'UTC+5'`
+and `'+5'` are five hours WEST of Greenwich, as in PostgreSQL — or, for
+`AT TIME ZONE` and timestamp input only, an abbreviation (`EST`, `PST`,
+`CET`, ...) or an `INTERVAL '-08:00'`; an unknown one is `22023`. A wall
+clock a DST change skips (`02:30` on a spring-forward night) reads with
+the offset before the change, one it repeats with the offset after it,
+as PostgreSQL resolves them.
+A literal without an offset in a join's `ON` condition still reads in
+UTC; filter on it in `WHERE`.
+
 ## Session settings
 
 ```sql
@@ -1612,7 +1667,7 @@ SET statement_timeout = '5s';                 -- 57014 when a statement runs lon
 SET statement_memory_limit = '256MB';         -- 53200 when a statement holds more than this
 SET lock_timeout = 200;                       -- ms: 55P03 instead of waiting on a live intent
 SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is rolled back, the connection ended
-SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ output rendered in the zone
+SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ read and rendered in the zone
 SET application_name = 'billing';             -- shown by pg_stat_activity / SHOW SESSIONS
 SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / ROLLBACK
 SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
@@ -1636,7 +1691,7 @@ invalid value `22023`:
 | `statement_memory_limit` | bytes, or `'64MB'`, `'1GB'`, `'512kB'`; `0` = none; default `64MB` | what one statement may hold in memory on the gateway (rows it sorts, aggregates, joins or otherwise collects); past it the statement fails with `53200` instead of growing without bound. Streamed `SELECT`s are unaffected (see [Streaming](#reading)) |
 | `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`); to not wait at all, see [`FOR UPDATE NOWAIT` and `SKIP LOCKED`](#not-waiting-for-a-lock-skip-locked-and-nowait) |
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
-| `TimeZone` | an IANA name, `UTC`, `+05:30` | `TIMESTAMPTZ` text output on the wire renders in the zone (`2024-07-04 08:00:00-04`); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected |
+| `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it; storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
 | `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
 | `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY` and DDL with `25006` |

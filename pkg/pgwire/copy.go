@@ -188,7 +188,7 @@ func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "%v", derr)
 			}
 			if i < len(cols) {
-				d, cerr := types.NewString(raw).Coerce(cols[i].Type)
+				d, cerr := ci.Text(raw).Coerce(cols[i].Type)
 				if cerr != nil {
 					return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, cerr)
 				}
@@ -320,7 +320,7 @@ func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []c
 				continue
 			}
 			if i < len(cols) {
-				d, cerr := types.NewString(f.text).Coerce(cols[i].Type)
+				d, cerr := ci.Text(f.text).Coerce(cols[i].Type)
 				if cerr != nil {
 					return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, cerr)
 				}

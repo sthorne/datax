@@ -41,6 +41,23 @@ state or the internode protocol does, and an entry below says so.
   is refused with `42803`, as is an aggregate in `WHERE`. Before, an
   aggregate could only stand alone in the select list (`SUM(a) / COUNT(*)`
   was a syntax error) and `HAVING` took one comparison per conjunct.
+- **Common PostgreSQL functions** (#339): the regular-expression family —
+  `regexp_replace` (with flags, start and n), `regexp_match`,
+  `regexp_matches`, `regexp_split_to_array`, `regexp_split_to_table`,
+  `regexp_count`, `regexp_like`, `regexp_substr` (POSIX patterns run on RE2:
+  back references and lookaround are `2201B`); `generate_series` over
+  integers, numerics and timestamps with an interval step; the jsonb
+  processing functions `jsonb_each`, `jsonb_each_text`,
+  `jsonb_array_elements`, `jsonb_array_elements_text`, `jsonb_object_keys`
+  (with their `json_` spellings) and `jsonb_insert`; and `timezone(zone,
+  ts)` / `ts AT TIME ZONE zone` / `AT LOCAL` in both directions. The
+  set-returning ones are tables in `FROM` (`FROM generate_series(1, 10) AS
+  g(n)`, `FROM jsonb_each(doc)` with constant arguments) and expand into
+  rows in a select list without `FROM`, several in lockstep; `pg_proc`
+  marks them `proretset`. `key` reads as a column (jsonb_each's) where a
+  value goes. A `::timestamp` cast now yields a timestamp without time zone
+  (no offset in its text, OID 1114), as `ts ± interval` and `date_trunc` over
+  one do.
 - **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
   extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
   INDEX`, both supported, but not here): when the table already has a
@@ -1528,6 +1545,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`TimeZone` is honored** (#340). Before, a session's zone only changed
+  how `TIMESTAMPTZ` values were rendered on the wire: text without an
+  offset still read as UTC and `::text`, `::date`, `date_trunc`, `extract`,
+  `to_char` and `current_date` computed in UTC. Now input without an offset
+  (literals, text parameters, `COPY`) reads in the zone, those functions
+  and casts, `||` and day and month arithmetic (across DST) follow it, and
+  timestamp input may name a zone (`'2024-07-01 12:00 Europe/Paris'`); the
+  stored instant and the binary format stay UTC. A POSIX `TimeZone` such as
+  `'UTC+5'` or `'+05:30'` now means what it means in PostgreSQL (west of
+  Greenwich), and abbreviations are refused there (`22023`).
 - **`pg_settings` reports each setting's type and unit, and what `RESET`
   restores** (#333). `vartype` and `unit` came from a hard-coded list
   that had fallen behind the session's own registry of settings, so

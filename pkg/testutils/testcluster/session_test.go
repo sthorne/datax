@@ -85,6 +85,7 @@ func TestSessionVariables(t *testing.T) {
 	refused(`SET statement_timeout = 'soon'`, sql.CodeInvalidParameterValue)
 	refused(`SET statement_timeout = -1`, sql.CodeInvalidParameterValue)
 	refused(`SET TIME ZONE 'Mars/Olympus'`, sql.CodeInvalidParameterValue)
+	refused(`SET TimeZone = 'PST'`, sql.CodeInvalidParameterValue) // abbreviations are for AT TIME ZONE and input only
 	refused(`SET DateStyle = 'German'`, sql.CodeInvalidParameterValue)
 	refused(`SET client_encoding = 'LATIN1'`, sql.CodeInvalidParameterValue)
 	refused(`SET transaction_isolation = 'chaotic'`, sql.CodeInvalidParameterValue)
@@ -191,6 +192,9 @@ func TestSessionVariables(t *testing.T) {
 	}
 	if got := string(rows[0].Rows[0][0]); got != "2024-07-04 08:00:00-04" {
 		t.Fatalf("TIMESTAMPTZ text in America/New_York: %q", got)
+	}
+	if got := string(rows[0].Rows[0][1]); got != "2024-07-04 08:00:00-04" {
+		t.Fatalf("TIMESTAMPTZ::text in America/New_York: %q", got)
 	}
 	if got := string(rows[1].Rows[0][0]); got != "2024-01-04 12:00:00" {
 		t.Fatalf("TIMESTAMP (without time zone) is unaffected: %q", got)

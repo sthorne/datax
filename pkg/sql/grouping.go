@@ -31,6 +31,7 @@ import (
 type groupedOut struct {
 	name     string
 	typ      types.Family
+	noTZ     bool         // a TIMESTAMP without time zone, as the ungrouped paths mark it
 	groupPos int          // ≥0 → group key position; else -1
 	aggPos   int          // ≥0 → aggregate spec position; else -1
 	expr     *parser.Expr // otherwise: evaluated over the environment
@@ -43,6 +44,10 @@ type groupedQuery struct {
 	keys     []parser.Expr
 	keyCols  []catalog.Column
 	keyTypes []types.Family
+	// keyNoTZ marks a timestamp key that is without time zone, and
+	// colNoTZ tells that of an input column (result descriptions).
+	keyNoTZ []bool
+	colNoTZ func(name string) bool
 	// sets are the grouping sets, as key positions (GROUP BY without
 	// ROLLUP, CUBE or GROUPING SETS is the one set of every key).
 	sets  [][]int
@@ -77,6 +82,10 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 	colType := func(n string) (types.Family, bool) {
 		c, ok := desc.Col(n)
 		return c.Type, ok
+	}
+	gq.colNoTZ = func(n string) bool {
+		c, ok := desc.Col(stripQualifier(n))
+		return ok && c.NoTZ
 	}
 	for _, k := range t.GroupBy {
 		if isPlainRef(k) {
@@ -120,6 +129,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		gq.keys = append(gq.keys, k)
 		gq.keyCols = append(gq.keyCols, col)
 		gq.keyTypes = append(gq.keyTypes, typ)
+		gq.keyNoTZ = append(gq.keyNoTZ, typ == types.Timestamp && exprNoTZ(k, gq.colNoTZ))
 	}
 	for _, set := range t.GroupingSets {
 		for _, k := range set {
@@ -151,7 +161,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 			if name == "" {
 				name = strings.ToLower(se.Agg)
 			}
-			gq.outs = append(gq.outs, groupedOut{name: name, typ: gq.specs[pos].resultType(), groupPos: -1, aggPos: pos})
+			gq.outs = append(gq.outs, groupedOut{name: name, typ: gq.specs[pos].resultType(), noTZ: gq.specNoTZ(pos), groupPos: -1, aggPos: pos})
 		case se.Window != nil:
 			return nil, newErrf(CodeFeatureNotSupported, "window function %s() is not supported here", strings.ToLower(se.Agg))
 		default:
@@ -283,11 +293,11 @@ func (rw *groupRewriter) out(name string, e parser.Expr) groupedOut {
 	if isPlainRef(e) {
 		var i int
 		if _, err := fmt.Sscanf(e.Column, "__g%d", &i); err == nil && strings.HasPrefix(e.Column, "__g") {
-			o.groupPos, o.typ = i, rw.gq.keyTypes[i]
+			o.groupPos, o.typ, o.noTZ = i, rw.gq.keyTypes[i], rw.gq.keyNoTZ[i]
 			return o
 		}
 		if _, err := fmt.Sscanf(e.Column, "__a%d", &i); err == nil && strings.HasPrefix(e.Column, "__a") {
-			o.aggPos, o.typ = i, rw.gq.specs[i].resultType()
+			o.aggPos, o.typ, o.noTZ = i, rw.gq.specs[i].resultType(), rw.gq.specNoTZ(i)
 			return o
 		}
 	}
@@ -296,7 +306,38 @@ func (rw *groupRewriter) out(name string, e parser.Expr) groupedOut {
 	if o.typ == types.Unknown {
 		o.typ = types.String
 	}
+	o.noTZ = o.typ == types.Timestamp && exprNoTZ(e, rw.envNoTZ)
 	return o
+}
+
+// envNoTZ tells whether an environment column is a timestamp without
+// time zone: a key that is one, or a MIN / MAX over one.
+func (rw *groupRewriter) envNoTZ(name string) bool {
+	var i int
+	switch {
+	case strings.HasPrefix(name, "__g"):
+		if _, err := fmt.Sscanf(name, "__g%d", &i); err == nil && i < len(rw.gq.keyNoTZ) {
+			return rw.gq.keyNoTZ[i]
+		}
+	case strings.HasPrefix(name, "__a"):
+		if _, err := fmt.Sscanf(name, "__a%d", &i); err == nil && i < len(rw.gq.specs) {
+			return rw.gq.specNoTZ(i)
+		}
+	}
+	return false
+}
+
+// specNoTZ tells whether aggregate i yields a timestamp without time
+// zone: MIN or MAX over one.
+func (gq *groupedQuery) specNoTZ(i int) bool {
+	sp := gq.specs[i]
+	if sp.resultType() != types.Timestamp || (sp.fn != "MIN" && sp.fn != "MAX") {
+		return false
+	}
+	if sp.arg != nil {
+		return exprNoTZ(*sp.arg, gq.colNoTZ)
+	}
+	return sp.col.NoTZ
 }
 
 // isPlainRef reports whether e is a bare column reference.
@@ -544,6 +585,15 @@ func (rw *groupRewriter) conds(conds []parser.Comparison, aliases bool) ([]parse
 // ({Left: x} alone) is x. Evaluation and typing are unchanged.
 func normalizeExpr(e parser.Expr) parser.Expr {
 	out := e
+	// The session's TimeZone marking is not part of an expression's
+	// identity: a grouped expression and its select item match whether
+	// or not one of them was marked.
+	out.Zone = nil
+	if out.Lit != nil && out.Lit.Loc != nil {
+		d := *out.Lit
+		d.Loc = nil
+		out.Lit = &d
+	}
 	if e.Left != nil {
 		l := normalizeExpr(*e.Left)
 		out.Left = &l
@@ -733,10 +783,10 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 
 	res := &Result{}
 	for _, oc := range gq.outs {
-		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ})
+		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ})
 	}
 	for _, oc := range gq.hidden {
-		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ})
+		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ})
 	}
 	visible := len(gq.outs)
 	all := append(append([]groupedOut(nil), gq.outs...), gq.hidden...)

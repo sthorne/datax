@@ -257,6 +257,21 @@ func TestGroupByExpressions(t *testing.T) {
 		{sql: `SELECT n % 2 AS p, COUNT(*) FROM (SELECT * FROM events) d GROUP BY p ORDER BY p`, want: "0|2; 1|3"},
 	})
 
+	// Under a session TimeZone, a grouped zone-sensitive expression is
+	// computed in the zone and still matches its select item; the same
+	// for DISTINCT ON. The two rows share a UTC day but not a New York one.
+	execSQL(t, ctx, s, `CREATE TABLE tzev (id INT8 PRIMARY KEY, at TIMESTAMPTZ)`)
+	execSQL(t, ctx, s, `INSERT INTO tzev VALUES (1, '2024-01-01 03:00:00+00'), (2, '2024-01-01 12:00:00+00')`)
+	runGroupedCases(t, ctx, s, []groupedCase{
+		{sql: `SELECT date_trunc('day', at)::date, COUNT(*) FROM tzev GROUP BY date_trunc('day', at) ORDER BY 1`, want: "2024-01-01|2"},
+	})
+	execSQL(t, ctx, s, `SET TimeZone = 'America/New_York'`)
+	runGroupedCases(t, ctx, s, []groupedCase{
+		{sql: `SELECT date_trunc('day', at)::date, COUNT(*) FROM tzev GROUP BY date_trunc('day', at) ORDER BY 1`, want: "2023-12-31|1; 2024-01-01|1"},
+		{sql: `SELECT DISTINCT ON (date_trunc('day', at)) id FROM tzev ORDER BY date_trunc('day', at), id`, want: "1; 2"},
+	})
+	execSQL(t, ctx, s, `RESET TimeZone`)
+
 	if p := explainPlan(t, ctx, s, `SELECT kind, n % 2, COUNT(*) FROM events GROUP BY ROLLUP (kind, n % 2)`); p != "full table scan" {
 		t.Fatalf("plan: %s", p)
 	}
@@ -272,6 +287,11 @@ func TestGroupByExpressions(t *testing.T) {
 	if got := describeOIDs(t, ctx, conn, "trunc_ts", `SELECT date_trunc('day', ts), n % 2, GROUPING(kind), COUNT(*)
 		FROM events GROUP BY ROLLUP (date_trunc('day', ts), n % 2, kind)`); !sameOIDs(got, []uint32{plain[0], oidInt8, oidInt8, oidInt8}) {
 		t.Fatalf("described: %v (ts is %v)", got, plain)
+	}
+	// MIN / MAX over a TIMESTAMP keeps it without time zone, alone and
+	// inside an expression.
+	if got := describeOIDs(t, ctx, conn, "max_ts", `SELECT MAX(ts), MIN(ts) + interval '1 day' FROM events GROUP BY kind`); !sameOIDs(got, []uint32{plain[0], plain[0]}) {
+		t.Fatalf("described MAX/MIN: %v (ts is %v)", got, plain)
 	}
 	var total int64
 	if err := conn.QueryRow(ctx, `SELECT SUM(n) FROM events GROUP BY CUBE (kind) HAVING GROUPING(kind) = $1::int8`, 1).Scan(&total); err != nil || total != 15 {

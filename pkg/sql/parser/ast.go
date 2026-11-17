@@ -2,7 +2,11 @@
 // parser for the v1 grammar subset (see docs/sql.md).
 package parser
 
-import "github.com/sthorne/datax/pkg/sql/types"
+import (
+	"time"
+
+	"github.com/sthorne/datax/pkg/sql/types"
+)
 
 // Statement is any parsed SQL statement.
 type Statement interface{ stmt() }
@@ -69,6 +73,10 @@ type Expr struct {
 	// select item that is a lone aggregate call keeps the SelectExpr.Agg
 	// form instead.
 	Agg *SelectExpr `json:"agg,omitempty"`
+	// Zone is set by the session, never parsed: the TimeZone (when it is
+	// not UTC) in which this node's cast, date/time function or
+	// operator reads and renders a timestamp with time zone.
+	Zone *time.Location `json:"-"`
 }
 
 // CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
