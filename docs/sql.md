@@ -671,8 +671,11 @@ Casts are performed (`builtins.Cast`): every family pair PostgreSQL
 allows, with its text forms and error codes, `DECIMAL(p,s)` /
 `VARCHAR(n)` typmods applied on the cast, `regclass` resolved through
 the catalog, and the catalog-only pseudo types (`name`, `oid`, `regtype`,
-...) passing values through. A cast chain (`x::text::int`) applies in
-order. `typing.go` types computed outputs statically (`exprFamily`:
+...) passing values through. Before a statement runs, the session
+checks every cast's type name (`checkCastTypes`): a name that is not
+built in (`builtins.KnownCastType`) must be a user-defined type of the
+database, else `42704 type "t" does not exist`. A cast chain
+(`x::text::int`) applies in order. `typing.go` types computed outputs statically (`exprFamily`:
 arithmetic promotes INT8 → DECIMAL → FLOAT8, `^` and the float builtins
 are FLOAT8, predicates BOOL, a cast its target, a builtin its declared
 result or the family of the argument it mirrors), and `conformTo`

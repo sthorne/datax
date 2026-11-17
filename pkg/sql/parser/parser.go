@@ -4691,10 +4691,11 @@ func (p *parser) parseBoolFactor() (boolNode, error) {
 	if sub, ok, err := p.parseSubquery(); err != nil {
 		return boolNode{}, err
 	} else if ok {
-		e := Expr{Sub: sub}
-		if err := p.skipCasts(); err != nil {
+		casts, err := p.parseCasts()
+		if err != nil {
 			return boolNode{}, err
 		}
+		e := castChain(Expr{Sub: sub}, casts)
 		if op, ok := p.parseCmpOp(); ok {
 			cmp, err := p.finishComparison(Comparison{Expr: &e}, op)
 			if err != nil {
@@ -5476,11 +5477,6 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	return p.applyCasts(e)
 }
 
-func (p *parser) skipCasts() error {
-	_, err := p.parseCasts()
-	return err
-}
-
 // parseCasts reads a chain of ::type casts.
 func (p *parser) parseCasts() ([]string, error) {
 	var casts []string
@@ -5556,7 +5552,11 @@ func castChain(e Expr, casts []string) Expr {
 }
 
 // skipTypeName absorbs a type name: [schema.]name, an optional (typmod)
-// and array brackets. Type keywords (e.g. INT) lex as keywords.
+// and array brackets. Type keywords (e.g. INT) lex as keywords. The
+// multi-word spellings (DOUBLE PRECISION, CHARACTER VARYING, TIME[STAMP]
+// WITH[OUT] TIME ZONE) are read whole, and _T (PostgreSQL's name of
+// T's array type) is T[] for a built-in T. Whether the name is a type
+// at all is the executor's question: it may name a user-defined type.
 func (p *parser) skipTypeName() (string, error) {
 	var name string
 	if t := p.peek(); t.kind == tkIdent || t.kind == tkKeyword {
@@ -5570,7 +5570,17 @@ func (p *parser) skipTypeName() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		name = n
+		name = strings.ToLower(n)
+	}
+	switch name {
+	case "double":
+		if p.consumeIdentWord("precision") {
+			name = "double precision"
+		}
+	case "character", "char":
+		if p.consumeIdentWord("varying") {
+			name = "varchar"
+		}
 	}
 	if p.consumeOp("(") {
 		// The typmod: kept for the types where it changes the value
@@ -5591,6 +5601,18 @@ func (p *parser) skipTypeName() (string, error) {
 				name += "(" + strings.Join(mods, ",") + ")"
 			}
 		}
+	}
+	if name == "time" || name == "timestamp" {
+		switch {
+		case p.peekIdentSeq("with", "time", "zone"):
+			p.i += 3
+			name += "tz"
+		case p.peekIdentSeq("without", "time", "zone"):
+			p.i += 3
+		}
+	}
+	if len(name) > 1 && name[0] == '_' && builtins.KnownCastType(name[1:]) {
+		name = name[1:] + "[]"
 	}
 	for p.consumeOp("[") {
 		if err := p.expectOp("]"); err != nil {
