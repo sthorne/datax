@@ -755,7 +755,7 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
   [WHERE conjunct AND conjunct AND ...]
-  [GROUP BY col | position, ...] [HAVING ...]
+  [GROUP BY expr | position | ROLLUP (...) | CUBE (...) | GROUPING SETS (...) | (), ...] [HAVING ...]
   [WINDOW name AS (...), ...]
   [UNION | INTERSECT | EXCEPT [ALL] SELECT ... | VALUES ... | (query)]
   [ORDER BY col | position | expr [ASC|DESC] [NULLS FIRST|LAST], ...]
@@ -860,6 +860,21 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   boolean aggregate works: `HAVING bool_and(ok)`). A column that is
   neither grouped nor inside an aggregate is refused with `42803`, as
   is an aggregate in `WHERE` or nested in another aggregate.
+- **GROUP BY** takes expressions (`GROUP BY date_trunc('day', at)`,
+  `GROUP BY a % 10`), positions (`GROUP BY 1` groups by select item 1's
+  expression) and output names that are no input column (`SELECT a % 10
+  AS bucket ... GROUP BY bucket`). A select item, `HAVING` or `ORDER BY`
+  term may use a grouped expression whole or compute over it
+  (`upper(kind)` grouped, `upper(kind) || '!'` shown). `ROLLUP (a, b)`,
+  `CUBE (a, b)` and `GROUPING SETS ((a, b), (a), ())` group by each of
+  their grouping sets in turn and return the union, the keys a set leaves
+  out NULL in its rows; items combine as in PostgreSQL (`GROUP BY a,
+  ROLLUP (b, c)` is the sets `(a, b, c)`, `(a, b)`, `(a)`), and `(a, b)`
+  inside them is one element. `GROUPING(a, b)` tells a rolled-up NULL
+  from a NULL key: a bit per argument, set when the row's grouping set
+  leaves that key out (`HAVING GROUPING(a) = 1` keeps the subtotals). An
+  empty grouping set gives its row over no rows too (`COUNT(*)` 0). At
+  most 4096 grouping sets and 12 `CUBE` elements.
 - **Joins** execute left-deep in the order written — until
   [statistics](#table-statistics) exist for every joined table, at which
   point INNER joins are automatically reordered to drive from the
@@ -964,9 +979,8 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   unnamed expression (`ORDER BY 1` over `a || b`) and a column another
   item's alias also names sort as written; after a set operation it is
   the result's column n. A position at or after a `*` is accepted only
-  when the `*` is the whole select list. `GROUP BY n` groups by the
-  column select item n reads; a position that is an expression or an
-  aggregate is refused (`42601`), as grouping takes columns.
+  when the `*` is the whole select list. `GROUP BY n` groups by select
+  item n's expression; an aggregate item is refused (`42803`).
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when

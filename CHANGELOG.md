@@ -11,6 +11,16 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`GROUP BY` expressions, `ROLLUP`, `CUBE` and `GROUPING SETS`** (#336):
+  `GROUP BY` takes any expression (`date_trunc('day', ts)`, `a % 10`), a
+  position of an expression item, or an output name that is no input column;
+  select items, `HAVING` and `ORDER BY` may use a grouped expression or compute
+  over it. `ROLLUP (...)`, `CUBE (...)`, `GROUPING SETS (...)` and `()` group
+  by each grouping set and return the union, the keys a set leaves out NULL,
+  combined across items as in PostgreSQL; `GROUPING(...)` tells a rolled-up
+  NULL from a NULL key, and an empty grouping set has its row over no input.
+  Over single tables, joins and derived tables. Before, `GROUP BY` took
+  columns and positions of column items only.
 - **Expressions over aggregates** (#335): the select list, `HAVING` and
   `ORDER BY` of a grouped or aggregate query take any scalar expression over
   aggregate calls and grouping columns — `SUM(a) / COUNT(*)`, `ROUND(AVG(x),

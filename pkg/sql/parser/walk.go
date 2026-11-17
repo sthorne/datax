@@ -124,6 +124,9 @@ func (w *Walker) selectMember(m *Select) {
 	}
 	w.selectExprs(m.Exprs)
 	w.Conds(m.Where)
+	for i := range m.GroupBy {
+		w.WalkExpr(&m.GroupBy[i])
+	}
 	w.Conds(m.Having)
 	w.orderCols(m.OrderBy)
 	for i := range m.Windows {

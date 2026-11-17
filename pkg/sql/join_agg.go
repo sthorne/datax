@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -67,8 +68,16 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 		return n
 	}
 	lenient := func(name string) string {
-		if n, err := canon(name); err == nil {
+		n, err := canon(name)
+		if err == nil {
 			return n
+		}
+		var serr *Error
+		if errors.As(err, &serr) && serr.Code == CodeUndefinedColumn && !strings.Contains(name, ".") {
+			return name
+		}
+		if firstErr == nil {
+			firstErr = err
 		}
 		return name
 	}
@@ -94,13 +103,11 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 			outputs[parser.OutputName(*se)] = true
 		}
 	}
-	c.GroupBy = append([]string(nil), t.GroupBy...)
-	for i := range c.GroupBy {
-		name, err := canon(c.GroupBy[i])
-		if err != nil {
-			return nil, err
-		}
-		c.GroupBy[i] = name
+	// A GROUP BY name that is no join column may be an output name
+	// (GROUP BY parity), which the grouped resolver places.
+	c.GroupBy = make([]parser.Expr, len(t.GroupBy))
+	for i, g := range t.GroupBy {
+		c.GroupBy[i] = renameExprColumns(g, lenient)
 	}
 	c.Having = renameCondColumns(t.Having, lenient)
 	// ORDER BY over grouped output resolves by RESULT name first: a
@@ -133,6 +140,9 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 				}
 			}
 		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	// WHERE was already applied to the joined rows; the grouped executor
 	// ignores it (derived-table precedent), but clear it so no path can

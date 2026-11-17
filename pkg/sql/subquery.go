@@ -1003,9 +1003,9 @@ func derivedSelect(t *parser.Select) *parser.Select {
 		}
 	}
 	c.Where = renameCondColumns(t.Where, strip)
-	c.GroupBy = append([]string(nil), t.GroupBy...)
-	for i := range c.GroupBy {
-		c.GroupBy[i] = strip(c.GroupBy[i])
+	c.GroupBy = make([]parser.Expr, len(t.GroupBy))
+	for i, g := range t.GroupBy {
+		c.GroupBy[i] = renameExprColumns(g, strip)
 	}
 	c.Having = renameCondColumns(t.Having, strip)
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)

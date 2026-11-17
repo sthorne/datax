@@ -658,9 +658,16 @@ type Select struct {
 	// ""), "INTERSECT" or "EXCEPT". Members form a flat list in written
 	// order; INTERSECT binds tighter than the other two, which associate
 	// left to right, and the executor applies that precedence.
-	SetOp   string
-	Where   []Comparison
-	GroupBy []string
+	SetOp string
+	Where []Comparison
+	// GroupBy are the distinct grouping expressions (a plain column is
+	// Expr{Column}; GROUP BY n is the expression of select item n).
+	// GroupingSets, when set (ROLLUP, CUBE, GROUPING SETS), are the
+	// grouping sets as positions into GroupBy: the result is the union of
+	// the groupings by each set, the keys outside a set NULL in its rows;
+	// nil is the one set of every key.
+	GroupBy      []Expr
+	GroupingSets [][]int
 	// Having is the HAVING condition, a conjunction like Where's over
 	// grouping expressions and aggregate calls.
 	Having  []Comparison

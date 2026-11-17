@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func parseOneSelect(t *testing.T, sql string) *Select {
 	t.Helper()
@@ -56,4 +60,49 @@ func TestAggregateExpressionsParse(t *testing.T) {
 
 	// An aggregate in WHERE parses; the executor refuses it (42803).
 	parseOneSelect(t, `SELECT a FROM t WHERE COUNT(*) > 1`)
+}
+
+// TestGroupByParse covers issue #336: GROUP BY expressions and
+// positions of expression items, and ROLLUP, CUBE and GROUPING SETS
+// expanded to grouping sets over the distinct keys.
+func TestGroupByParse(t *testing.T) {
+	keys := func(sel *Select) string {
+		var out []string
+		for _, k := range sel.GroupBy {
+			out = append(out, FormatExpr(k))
+		}
+		return strings.Join(out, ", ")
+	}
+	sets := func(sel *Select) string { return fmt.Sprint(sel.GroupingSets) }
+	for _, c := range []struct{ sql, keys, sets string }{
+		{`SELECT x, lower(y) FROM t GROUP BY a + 1, 2, a + 1`, "a + 1, lower(y)", "[]"},
+		{`SELECT 1 FROM t GROUP BY (a * 2), date_trunc('day', ts)`, "a * 2, date_trunc('day', ts)", "[]"},
+		{`SELECT 1 FROM t GROUP BY (a, b), rollup`, "a, b, rollup", "[]"},
+		{`SELECT 1 FROM t GROUP BY ROLLUP (a, (b, c))`, "a, b, c", "[[0 1 2] [0] []]"},
+		{`SELECT 1 FROM t GROUP BY CUBE (a, b % 2)`, "a, b % 2", "[[0 1] [0] [1] []]"},
+		{`SELECT 1 FROM t GROUP BY GROUPING SETS ((a, b), a, (), ROLLUP (c))`, "a, b, c", "[[0 1] [0] [] [2] []]"},
+		{`SELECT 1 FROM t GROUP BY a, ROLLUP (b, a)`, "a, b", "[[0 1] [0 1] [0]]"},
+		{`SELECT 1 FROM t GROUP BY ()`, "", "[[]]"},
+		{`SELECT a, b FROM t GROUP BY CUBE (1, 2)`, "a, b", "[[0 1] [0] [1] []]"},
+	} {
+		sel := parseOneSelect(t, c.sql)
+		if got := keys(sel); got != c.keys {
+			t.Errorf("%s: keys %q, want %q", c.sql, got, c.keys)
+		}
+		if got := sets(sel); got != c.sets {
+			t.Errorf("%s: sets %s, want %s", c.sql, got, c.sets)
+		}
+	}
+	if sel := parseOneSelect(t, `SELECT 1 FROM t GROUP BY (a + b) * 2`); len(sel.GroupBy) != 1 || sel.GroupBy[0].BinOp != "*" || sel.GroupBy[0].Left == nil {
+		t.Errorf("parenthesized grouping expression: %+v", sel.GroupBy)
+	}
+	for _, q := range []string{
+		`SELECT 1 FROM t GROUP BY CUBE (a, b, c, d, e, f, g, h, i, j, k, l, m)`,
+		`SELECT a FROM t GROUP BY 2`,
+		`SELECT a FROM t GROUP BY ROLLUP (a`,
+	} {
+		if _, err := Parse(q); err == nil {
+			t.Errorf("%s parsed", q)
+		}
+	}
 }

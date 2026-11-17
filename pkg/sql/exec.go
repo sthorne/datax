@@ -3480,9 +3480,6 @@ func stripTableAlias(t *parser.Select) {
 		},
 	}
 	w.SelectStmt(&self)
-	for i := range t.GroupBy {
-		strip(&t.GroupBy[i])
-	}
 }
 
 // emptyCatalogSelect answers a select whose base table is an

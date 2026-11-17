@@ -414,7 +414,7 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		}
 	}
 	for _, g := range sub.GroupBy {
-		record(g, false, "GROUP BY")
+		exprColumns(g, func(n string) { record(n, false, "GROUP BY") })
 	}
 	for _, hc := range sub.Having {
 		if hc.Column != "" {

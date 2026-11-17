@@ -192,3 +192,89 @@ func TestAggregateExpressions(t *testing.T) {
 		t.Fatalf("ratio: %v %v", ratio, err)
 	}
 }
+
+// TestGroupByExpressions covers issue #336: GROUP BY expressions
+// (positions and output names of expression items too), select items
+// over grouped expressions, and ROLLUP, CUBE and GROUPING SETS with
+// GROUPING().
+func TestGroupByExpressions(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+
+	execSQL(t, ctx, s, `CREATE TABLE events (id INT8 PRIMARY KEY, ts TIMESTAMP, kind TEXT, n INT8)`)
+	execSQL(t, ctx, s, `INSERT INTO events VALUES
+		(1, '2024-01-01 10:00', 'a', 1), (2, '2024-01-01 12:00', 'b', 2), (3, '2024-01-02 09:00', 'a', 3),
+		(4, '2024-01-02 18:00', 'a', 4), (5, '2024-01-03 01:00', NULL, 5)`)
+	execSQL(t, ctx, s, `CREATE TABLE kinds (kind TEXT PRIMARY KEY, label TEXT)`)
+	execSQL(t, ctx, s, `INSERT INTO kinds VALUES ('a', 'alpha'), ('b', 'beta')`)
+
+	runGroupedCases(t, ctx, s, []groupedCase{
+		// Expressions as grouping keys, by expression, position or name.
+		{sql: `SELECT date_trunc('day', ts)::date AS day, COUNT(*) FROM events GROUP BY date_trunc('day', ts) ORDER BY day`,
+			want: "2024-01-01|2; 2024-01-02|2; 2024-01-03|1"},
+		{sql: `SELECT n % 2 AS parity, SUM(n) FROM events GROUP BY n % 2 ORDER BY 1`, want: "0|6; 1|9"},
+		{sql: `SELECT n % 2, COUNT(*) FROM events GROUP BY 1 ORDER BY 1`, want: "0|2; 1|3"},
+		{sql: `SELECT n % 2 AS parity, COUNT(*) FROM events GROUP BY parity ORDER BY parity DESC`, want: "1|3; 0|2"},
+		{sql: `SELECT (n % 2) * 10 + COUNT(*) FROM events GROUP BY n % 2 ORDER BY 1`, want: "2; 13"},
+		{sql: `SELECT upper(kind) FROM events GROUP BY upper(kind) HAVING upper(kind) <> 'B' ORDER BY upper(kind) NULLS FIRST`, want: "A"},
+		// An input column of the alias's name wins in GROUP BY.
+		{sql: `SELECT n % 2 AS n, COUNT(*) FROM events GROUP BY n ORDER BY 2, 1 LIMIT 1`, want: "0|1"},
+		// Grouped expressions over a join.
+		{sql: `SELECT lower(k.label), COUNT(*) FROM events e JOIN kinds k ON k.kind = e.kind GROUP BY lower(k.label) ORDER BY 1`,
+			want: "alpha|3; beta|1"},
+		// Not grouped: the column alone is refused (42803).
+		{sql: `SELECT n FROM events GROUP BY n % 2`, code: "42803"},
+		{sql: `SELECT n % 3 FROM events GROUP BY n % 2`, code: "42803"},
+		{sql: `SELECT COUNT(*) FROM events GROUP BY COUNT(*)`, code: "42803"},
+		{sql: `SELECT COUNT(*) FROM events GROUP BY 1`, code: "42803"},
+		// ROLLUP: the union of (kind, n % 2), (kind) and (); rolled-up
+		// keys are NULL, which GROUPING() tells from a NULL key.
+		{sql: `SELECT kind, n % 2 AS p, SUM(n), GROUPING(kind, n % 2) AS g FROM events GROUP BY ROLLUP (kind, n % 2)
+			ORDER BY g, kind NULLS LAST, p`,
+			want: "a|0|4|0; a|1|4|0; b|0|2|0; NULL|1|5|0; a|NULL|8|1; b|NULL|2|1; NULL|NULL|5|1; NULL|NULL|15|3"},
+		{sql: `SELECT COUNT(*) FROM events GROUP BY CUBE (kind, n % 2) ORDER BY 1`, want: "1; 1; 1; 1; 1; 2; 2; 3; 3; 5"},
+		{sql: `SELECT kind, n % 2, COUNT(*), GROUPING(kind), GROUPING(n % 2) FROM events
+			GROUP BY GROUPING SETS ((kind), (n % 2), ()) ORDER BY 4, 5, 1, 2`,
+			want: "a|NULL|3|0|1; b|NULL|1|0|1; NULL|NULL|1|0|1; NULL|0|2|1|0; NULL|1|3|1|0; NULL|NULL|5|1|1"},
+		{sql: `SELECT kind, n % 2, SUM(n) FROM events WHERE kind IS NOT NULL GROUP BY kind, ROLLUP (n % 2) ORDER BY 1, 2`,
+			want: "a|0|4; a|1|4; a|NULL|8; b|0|2; b|NULL|2"},
+		{sql: `SELECT kind, SUM(n) FROM events GROUP BY ROLLUP (kind) HAVING GROUPING(kind) = 1`, want: "NULL|15"},
+		{sql: `SELECT kind, COUNT(*) FROM events GROUP BY GROUPING SETS (kind, ()) ORDER BY GROUPING(kind), kind`,
+			want: "a|3; b|1; NULL|1; NULL|5"},
+		// The empty grouping set gives its row over no input, as the
+		// grand total of no rows.
+		{sql: `SELECT kind, COUNT(*) FROM events WHERE id > 100 GROUP BY ROLLUP (kind)`, want: "NULL|0"},
+		{sql: `SELECT COUNT(*) FROM events WHERE id > 100 GROUP BY kind`, want: ""},
+		// Over a join, and GROUPING() of a key that is not one: 42803.
+		{sql: `SELECT k.label, SUM(e.n) FROM events e JOIN kinds k ON k.kind = e.kind GROUP BY ROLLUP (k.label) ORDER BY 1 NULLS LAST`,
+			want: "alpha|8; beta|2; NULL|10"},
+		{sql: `SELECT GROUPING(n) FROM events GROUP BY kind`, code: "42803"},
+		// Over a derived table.
+		{sql: `SELECT d.kind, COUNT(*) FROM (SELECT * FROM events) d GROUP BY ROLLUP (d.kind) ORDER BY 1 NULLS LAST, 2`,
+			want: "a|3; b|1; NULL|1; NULL|5"},
+		{sql: `SELECT n % 2 AS p, COUNT(*) FROM (SELECT * FROM events) d GROUP BY p ORDER BY p`, want: "0|2; 1|3"},
+	})
+
+	if p := explainPlan(t, ctx, s, `SELECT kind, n % 2, COUNT(*) FROM events GROUP BY ROLLUP (kind, n % 2)`); p != "full table scan" {
+		t.Fatalf("plan: %s", p)
+	}
+
+	// Describe: a grouped expression describes as the same expression
+	// does ungrouped; GROUPING() is an integer.
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	plain := describeOIDs(t, ctx, conn, "plain_ts", `SELECT date_trunc('day', ts) FROM events`)
+	if got := describeOIDs(t, ctx, conn, "trunc_ts", `SELECT date_trunc('day', ts), n % 2, GROUPING(kind), COUNT(*)
+		FROM events GROUP BY ROLLUP (date_trunc('day', ts), n % 2, kind)`); !sameOIDs(got, []uint32{plain[0], oidInt8, oidInt8, oidInt8}) {
+		t.Fatalf("described: %v (ts is %v)", got, plain)
+	}
+	var total int64
+	if err := conn.QueryRow(ctx, `SELECT SUM(n) FROM events GROUP BY CUBE (kind) HAVING GROUPING(kind) = $1::int8`, 1).Scan(&total); err != nil || total != 15 {
+		t.Fatalf("cube total: %d %v", total, err)
+	}
+}

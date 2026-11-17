@@ -80,13 +80,21 @@ func TestParseQueryShapes(t *testing.T) {
 	// A position names the select item, never its output name (#322).
 	sel = parseOne(t, `SELECT a || 'q', id AS b, b, * FROM t GROUP BY 3 ORDER BY 1, 2, 3`).(*Select)
 	if ob := sel.OrderBy; len(ob) != 3 || ob[0].Expr == nil || ob[0].Expr.BinOp != "||" || ob[0].Column != "" ||
-		ob[1].Column != "id" || ob[2].Expr == nil || ob[2].Expr.Column != "b" || ob[2].Ordinal != 3 || len(sel.GroupBy) != 1 || sel.GroupBy[0] != "b" {
+		ob[1].Column != "id" || ob[2].Expr == nil || ob[2].Expr.Column != "b" || ob[2].Ordinal != 3 || len(sel.GroupBy) != 1 || sel.GroupBy[0].Column != "b" {
 		t.Fatalf("positions: %+v group %v", sel.OrderBy, sel.GroupBy)
 	}
-	for _, q := range []string{`SELECT a FROM t ORDER BY 2`, `SELECT a, * FROM t ORDER BY 2`, `SELECT lower(a) FROM t GROUP BY 1`, `SELECT count(*) FROM t GROUP BY 1`} {
+	for _, q := range []string{`SELECT a FROM t ORDER BY 2`, `SELECT a, * FROM t ORDER BY 2`, `SELECT a FROM t GROUP BY 2`} {
 		if _, err := Parse(q); err == nil {
 			t.Fatalf("%s parsed", q)
 		}
+	}
+	// GROUP BY n of an expression groups by the expression (#336); of an
+	// aggregate, by the call, which the executor refuses (42803).
+	if sel := parseOne(t, `SELECT lower(a), count(*) FROM t GROUP BY 1`).(*Select); len(sel.GroupBy) != 1 || sel.GroupBy[0].Func != "lower" {
+		t.Fatalf("GROUP BY expression position: %+v", sel.GroupBy)
+	}
+	if sel := parseOne(t, `SELECT count(*) FROM t GROUP BY 1`).(*Select); len(sel.GroupBy) != 1 || sel.GroupBy[0].Agg == nil {
+		t.Fatalf("GROUP BY aggregate position: %+v", sel.GroupBy)
 	}
 
 	sel = parseOne(t, `SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.aid FULL JOIN c USING (id, k) NATURAL LEFT JOIN d`).(*Select)

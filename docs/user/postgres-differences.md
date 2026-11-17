@@ -67,7 +67,7 @@ syntax error or `0A000` feature not supported):
   its spaces (PostgreSQL trims both sides) while `c = 'ab'`, `length`
   and `||` agree; expression results lose the modifier and describe
   as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
-  a `TIMESTAMP` is `TIMESTAMPTZ`, `::timestamp` yields `TIMESTAMPTZ`),
+  a `TIMESTAMP` is `TIMESTAMPTZ`, `::timestamp` yields `TIMESTAMPTZ`, `GROUPING()` is `INT8`),
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
@@ -281,8 +281,7 @@ syntax error or `0A000` feature not supported):
   expression sort never uses an index; NULLs order last ASC / first DESC
   (PostgreSQL default). Under `UNION`, output names and positions
   only. A position after a `*` that is not the whole select
-  list is refused; `GROUP BY` takes columns and positions of columns,
-  not expressions.
+  list is refused.
 - **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
   precision on the wire, nanosecond internally. `current_time` is a
   `time` (PostgreSQL's is `timetz`), and `localtimestamp` a

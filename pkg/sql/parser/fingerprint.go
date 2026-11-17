@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -193,7 +194,30 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	f.where(s.Where)
 	if len(s.GroupBy) > 0 {
 		f.kw("GROUP BY")
-		f.kw(strings.ToLower(strings.Join(s.GroupBy, ", ")))
+		for i, g := range s.GroupBy {
+			if i > 0 {
+				f.w(",")
+			}
+			f.sp()
+			f.expr(g)
+		}
+		if s.GroupingSets != nil {
+			f.kw("GROUPING SETS (")
+			for i, set := range s.GroupingSets {
+				if i > 0 {
+					f.w(",")
+				}
+				f.w("(")
+				for j, k := range set {
+					if j > 0 {
+						f.w(",")
+					}
+					f.w(strconv.Itoa(k))
+				}
+				f.w(")")
+			}
+			f.w(")")
+		}
 	}
 	if len(s.Having) > 0 {
 		f.kw("HAVING")

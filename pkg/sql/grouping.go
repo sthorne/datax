@@ -43,9 +43,15 @@ type groupedQuery struct {
 	keys     []parser.Expr
 	keyCols  []catalog.Column
 	keyTypes []types.Family
-	specs    []aggSpec // aggregates, in first-reference order
-	outs     []groupedOut
-	having   []parser.Comparison // over the environment
+	// sets are the grouping sets, as key positions (GROUP BY without
+	// ROLLUP, CUBE or GROUPING SETS is the one set of every key).
+	sets  [][]int
+	specs []aggSpec // aggregates, in first-reference order
+	// groupings are the GROUPING() calls: the key positions of their
+	// arguments.
+	groupings [][]int
+	outs      []groupedOut
+	having    []parser.Comparison // over the environment
 	// hidden are ORDER BY keys the output does not carry (an aggregate
 	// call, an unprojected grouping column, an expression), computed
 	// after outs and dropped after the sort; order is the ORDER BY
@@ -57,26 +63,75 @@ type groupedQuery struct {
 	env *catalog.TableDescriptor
 }
 
-func groupKeyName(i int) string { return fmt.Sprintf("__g%d", i) }
-func groupAggName(i int) string { return fmt.Sprintf("__a%d", i) }
+func groupKeyName(i int) string      { return fmt.Sprintf("__g%d", i) }
+func groupAggName(i int) string      { return fmt.Sprintf("__a%d", i) }
+func groupGroupingName(i int) string { return fmt.Sprintf("__x%d", i) }
 
 // resolveGrouped resolves the select list, GROUP BY, HAVING and ORDER BY
 // of a grouped/aggregate SELECT against the input descriptor.
 func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQuery, error) {
 	gq := &groupedQuery{}
-	seen := map[string]bool{}
-	for _, name := range t.GroupBy {
-		col, ok := desc.Col(name)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	colType := func(n string) (types.Family, bool) {
+		c, ok := desc.Col(n)
+		return c.Type, ok
+	}
+	for _, k := range t.GroupBy {
+		if isPlainRef(k) {
+			if _, ok := desc.Col(k.Column); !ok {
+				// A name that is no input column may be an output name
+				// (GROUP BY parity): the item's expression. An input
+				// column of the name wins, as in PostgreSQL.
+				for _, se := range t.Exprs {
+					if se.Alias == k.Column && !se.Star {
+						k = se.Expr
+						if se.Agg != "" || se.Window != nil {
+							call := se
+							call.Alias = ""
+							k = parser.Expr{Agg: &call}
+						}
+						break
+					}
+				}
+			}
 		}
-		if seen[name] {
-			continue
+		if exprHas(k, func(x parser.Expr) bool { return x.Agg != nil || x.Window != nil }) {
+			return nil, newErrf(CodeGrouping, "aggregate functions are not allowed in GROUP BY")
 		}
-		seen[name] = true
-		gq.keys = append(gq.keys, parser.Expr{Column: name})
+		var bad error
+		exprColumns(k, func(n string) {
+			if _, ok := desc.Col(n); !ok && bad == nil {
+				bad = newErrf(CodeUndefinedColumn, "column %q does not exist", n)
+			}
+		})
+		if bad != nil {
+			return nil, bad
+		}
+		var col catalog.Column
+		if isPlainRef(k) {
+			col, _ = desc.Col(k.Column)
+		}
+		typ := exprFamily(k, colType)
+		if typ == types.Unknown {
+			typ = types.String
+		}
+		gq.keys = append(gq.keys, k)
 		gq.keyCols = append(gq.keyCols, col)
-		gq.keyTypes = append(gq.keyTypes, col.Type)
+		gq.keyTypes = append(gq.keyTypes, typ)
+	}
+	for _, set := range t.GroupingSets {
+		for _, k := range set {
+			if k < 0 || k >= len(gq.keys) {
+				return nil, newErrf(CodeInternal, "grouping set names key %d of %d", k, len(gq.keys))
+			}
+		}
+	}
+	gq.sets = t.GroupingSets
+	if gq.sets == nil {
+		all := make([]int, len(gq.keys))
+		for i := range all {
+			all[i] = i
+		}
+		gq.sets = [][]int{all}
 	}
 	rw := newGroupRewriter(desc, gq)
 
@@ -188,6 +243,8 @@ func (rw *groupRewriter) envColType(name string) (types.Family, bool) {
 		if _, err := fmt.Sscanf(name, "__a%d", &i); err == nil && i < len(rw.gq.specs) {
 			return rw.gq.specs[i].resultType(), true
 		}
+	case strings.HasPrefix(name, "__x"):
+		return types.Int, true
 	}
 	return types.Unknown, false
 }
@@ -200,6 +257,9 @@ func (rw *groupRewriter) envDesc() *catalog.TableDescriptor {
 	}
 	for i, sp := range rw.gq.specs {
 		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(len(rw.gq.keyTypes) + i + 1), Name: groupAggName(i), Type: sp.resultType()})
+	}
+	for i := range rw.gq.groupings {
+		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(len(rw.gq.keyTypes) + len(rw.gq.specs) + i + 1), Name: groupGroupingName(i), Type: types.Int})
 	}
 	return d
 }
@@ -281,6 +341,37 @@ func (rw *groupRewriter) rw(e parser.Expr, aliases bool) (parser.Expr, error) {
 		return e, newErrf(CodeFeatureNotSupported, "window function %s() is not supported here", strings.ToLower(e.Window.Agg))
 	case e.Sub != nil:
 		return e, nil
+	case e.Func == "grouping":
+		// GROUPING(k, ...): a bit per argument, set where the group's
+		// grouping set leaves that key out (the first argument the most
+		// significant bit). Each argument must be a grouping key.
+		if len(e.Args) == 0 {
+			return e, newErrf(CodeSyntaxError, "GROUPING() requires an argument")
+		}
+		if len(e.Args) > 31 {
+			return e, newErrf(CodeProgramLimitExceeded, "GROUPING must have fewer than 32 arguments")
+		}
+		var keys []int
+		for _, a := range e.Args {
+			k := -1
+			for i, nk := range rw.normKeys {
+				if reflect.DeepEqual(nk, a) {
+					k = i
+					break
+				}
+			}
+			if k < 0 {
+				return e, newErrf(CodeGrouping, "arguments to GROUPING must be grouping expressions of the associated query level")
+			}
+			keys = append(keys, k)
+		}
+		for i, g := range rw.gq.groupings {
+			if reflect.DeepEqual(g, keys) {
+				return parser.Expr{Column: groupGroupingName(i)}, nil
+			}
+		}
+		rw.gq.groupings = append(rw.gq.groupings, keys)
+		return parser.Expr{Column: groupGroupingName(len(rw.gq.groupings) - 1)}, nil
 	case e.Column != "":
 		if aliases {
 			if o, ok := rw.aliases[e.Column]; ok {
@@ -552,44 +643,80 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 	}
 
 	type aggGroup struct {
-		key []types.Datum
+		key []types.Datum // the keys outside the group's set are NULL
+		set int
 		st  *aggState
 	}
 	groups := map[string]*aggGroup{}
 	var order []string // first-seen group order
+	keys := make([]types.Datum, len(gq.keys))
+	multi := len(gq.sets) > 1
 	for _, fr := range rows {
-		key := make([]types.Datum, len(gq.keys))
 		for i, col := range gq.keyCols {
 			if col.ID != 0 {
 				d, ok := fr.row[col.ID]
 				if !ok {
 					d = types.DNull
 				}
-				key[i] = d
+				keys[i] = d
 				continue
 			}
 			d, err := evalExpr(gq.keys[i], desc, fr.row, params)
 			if err != nil {
 				return nil, err
 			}
-			key[i] = d
+			keys[i] = d
 		}
-		k := encodeGroupKey(key)
-		g, ok := groups[k]
-		if !ok {
-			g = &aggGroup{key: key, st: newAggState(len(gq.specs))}
-			groups[k] = g
-			order = append(order, k)
-		}
-		if err := g.st.accumulate(gq.specs, desc, fr.row, params); err != nil {
-			return nil, err
+		// A row counts once in each grouping set, in the group of its
+		// keys that the set keeps. The set's position is part of the
+		// group's identity: a rolled-up NULL is not a NULL key.
+		for si, set := range gq.sets {
+			key := make([]types.Datum, len(keys))
+			for i := range key {
+				key[i] = types.DNull
+			}
+			for _, k := range set {
+				key[k] = keys[k]
+			}
+			ident := key
+			if multi {
+				ident = append([]types.Datum{types.NewInt(int64(si))}, key...)
+			}
+			k := encodeGroupKey(ident)
+			g, ok := groups[k]
+			if !ok {
+				g = &aggGroup{key: key, set: si, st: newAggState(len(gq.specs))}
+				groups[k] = g
+				order = append(order, k)
+			}
+			if err := g.st.accumulate(gq.specs, desc, fr.row, params); err != nil {
+				return nil, err
+			}
 		}
 	}
-	// Without GROUP BY, aggregates over zero rows still produce one row.
-	if len(gq.keys) == 0 && len(order) == 0 {
-		k := encodeGroupKey(nil)
-		groups[k] = &aggGroup{st: newAggState(len(gq.specs))}
-		order = append(order, k)
+	// An empty grouping set — no GROUP BY at all, or () in ROLLUP, CUBE
+	// or GROUPING SETS — has its row over zero input rows too (the
+	// aggregates of nothing: COUNT 0, SUM NULL).
+	if len(rows) == 0 {
+		for si, set := range gq.sets {
+			if len(set) > 0 {
+				continue
+			}
+			key := make([]types.Datum, len(gq.keys))
+			for i := range key {
+				key[i] = types.DNull
+			}
+			k := fmt.Sprintf("empty%d", si)
+			groups[k] = &aggGroup{key: key, set: si, st: newAggState(len(gq.specs))}
+			order = append(order, k)
+		}
+	}
+	inSet := make([][]bool, len(gq.sets))
+	for si, set := range gq.sets {
+		inSet[si] = make([]bool, len(gq.keys))
+		for _, k := range set {
+			inSet[si][k] = true
+		}
 	}
 
 	res := &Result{}
@@ -615,6 +742,16 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 		}
 		for i, d := range aggVals {
 			env[catalog.ColumnID(nk+i+1)] = d
+		}
+		for i, args := range gq.groupings {
+			var bits int64
+			for _, k := range args {
+				bits <<= 1
+				if !inSet[g.set][k] {
+					bits |= 1
+				}
+			}
+			env[catalog.ColumnID(nk+len(aggVals)+i+1)] = types.NewInt(bits)
 		}
 		if len(gq.having) > 0 {
 			keep, err := matchesWhere(gq.having, gq.env, env, params)
