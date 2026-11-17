@@ -356,7 +356,7 @@ func uniqueKeyOf(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 		return true
 	}
 	for i := range d.Indexes {
-		if d.Indexes[i].Unique && d.Indexes[i].Public() && same(d.Indexes[i].ColumnIDs) {
+		if d.Indexes[i].Unique && d.Indexes[i].Public() && !d.Indexes[i].Computed() && same(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}
@@ -387,7 +387,7 @@ func indexCovers(d *catalog.TableDescriptor, cols []catalog.ColumnID) bool {
 	for i := range d.Indexes {
 		// An inverted index has no key order over its column's values,
 		// and neither has a vector index.
-		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && prefix(d.Indexes[i].ColumnIDs) {
+		if !d.Indexes[i].IsInverted() && !d.Indexes[i].IsVector() && !d.Indexes[i].IsPartial() && prefix(d.Indexes[i].ColumnIDs) {
 			return true
 		}
 	}

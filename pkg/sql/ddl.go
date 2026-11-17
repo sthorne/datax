@@ -203,7 +203,8 @@ func vtableName(name string) bool {
 
 // execRenameColumn is ALTER TABLE t RENAME [COLUMN] a TO b. Indexes,
 // constraints and foreign keys reference columns by ID; the stored text
-// of CHECK constraints is rewritten.
+// of CHECK constraints, and of index expressions and predicates, is
+// rewritten.
 func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, r *parser.Rename) (*Result, error) {
 	col, ok := desc.Col(r.From)
 	if !ok || col.Hidden {
@@ -216,6 +217,11 @@ func (s *Session) execRenameColumn(ctx context.Context, txn *kvclient.Txn, desc 
 		return nil, newErrf(CodeDuplicateObject, "column %q already exists", r.To)
 	}
 	if err := s.refuseIfViewed(ctx, txn, desc, "rename column "+r.From); err != nil {
+		return nil, err
+	}
+	// The stored expressions and predicates of indexes name the column:
+	// rewritten while it still has its old name.
+	if err := renameIndexColumnRefs(desc, col, r.To); err != nil {
 		return nil, err
 	}
 	for i := range desc.Columns {

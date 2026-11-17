@@ -153,11 +153,11 @@ func checkUpdateKeys(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 		for j := range oldRows {
 			ok, _, oskip, err := rowenc.EncodeIndexEntry(desc, idx, oldRows[j])
 			if err != nil {
-				return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+				return invertedEntryErr(idx, err)
 			}
 			nk, _, nskip, err := rowenc.EncodeIndexEntry(desc, idx, newRows[j])
 			if err != nil {
-				return newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+				return invertedEntryErr(idx, err)
 			}
 			if nskip && !uniqueNullsDistinct(txn) {
 				return nullInUniqueIndex(idx)

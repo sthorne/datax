@@ -2206,28 +2206,26 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
+	exprs := false
 	for {
-		if fn, arg, col, ok, err := p.parseIndexExpr(); err != nil {
-			return nil, err
-		} else if ok {
-			if len(ci.Columns) > 0 || ci.ExprFunc != "" {
-				return nil, p.errf("an index on an expression takes that one expression and nothing else")
-			}
-			ci.ExprFunc, ci.ExprArg = fn, arg
-			ci.Columns = append(ci.Columns, col)
-			ci.OpClasses = append(ci.OpClasses, "")
-			ci.Collations = append(ci.Collations, "")
-			if p.consumeOp(",") {
-				return nil, p.errf("an index on an expression takes that one expression and nothing else")
-			}
-			break
-		}
-		col, err := p.expectIdent()
+		col, expr, err := p.parseIndexElem(ci.Using)
 		if err != nil {
 			return nil, err
 		}
+		if expr != nil && expr.Func == "to_tsvector" && ci.Using == "gin" {
+			// The text-search index, stored as an inverted kind of
+			// its own over the column: to_tsvector('config', column).
+			if fn, arg, c, ok := textSearchIndexExpr(*expr); ok {
+				ci.ExprFunc, ci.ExprArg = fn, arg
+				col, expr = c, nil
+			} else {
+				return nil, p.errf("an index on to_tsvector(...) needs the configuration written out as its first argument and a column as its second: to_tsvector('english', column)")
+			}
+		}
 		ci.Columns = append(ci.Columns, col)
-		// A collation, then an operator class after the column:
+		ci.Exprs = append(ci.Exprs, expr)
+		exprs = exprs || expr != nil
+		// A collation, then an operator class after the key:
 		// (name COLLATE "C"), (doc jsonb_ops), (name text_pattern_ops).
 		collation := ""
 		if p.consumeIdentWord("collate") {
@@ -2237,27 +2235,45 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 		ci.Collations = append(ci.Collations, collation)
 		opclass := ""
-		if p.peek().kind == tkIdent {
+		if t := p.peek(); t.kind == tkIdent && !p.atIndexNulls() {
 			if opclass, err = p.parseQualifiedWord(); err != nil {
 				return nil, err
 			}
 			opclass = strings.ToLower(opclass)
 		}
 		ci.OpClasses = append(ci.OpClasses, opclass)
+		dir, err := p.parseIndexDirection()
+		if err != nil {
+			return nil, err
+		}
+		ci.Directions = append(ci.Directions, dir)
 		if !p.consumeOp(",") {
 			break
 		}
 	}
-	named, collated := false, false
+	if ci.ExprFunc != "" && len(ci.Columns) > 1 {
+		return nil, p.errf("an index on an expression takes that one expression and nothing else")
+	}
+	if ci.ExprFunc != "" && ci.OpClasses[0] != "" {
+		return nil, p.errf("an index on %s(...) takes no operator class", ci.ExprFunc)
+	}
+	if !exprs {
+		ci.Exprs = nil
+	}
+	named, collated, directed := false, false, false
 	for i := range ci.OpClasses {
 		named = named || ci.OpClasses[i] != ""
 		collated = collated || ci.Collations[i] != ""
+		directed = directed || ci.Directions[i] != ""
 	}
 	if !named {
 		ci.OpClasses = nil
 	}
 	if !collated {
 		ci.Collations = nil
+	}
+	if !directed {
+		ci.Directions = nil
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
@@ -2298,7 +2314,104 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			return nil, err
 		}
 	}
+	// WHERE predicate: a partial index. The source text is what the
+	// descriptor keeps and the catalogs show; the lowered conjuncts are
+	// for the executor's checks.
+	if p.consumeKeyword("WHERE") {
+		start := p.peek().pos
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return nil, err
+		}
+		end := len(p.src)
+		if t := p.peek(); t.kind != tkEOF {
+			end = t.pos
+		}
+		conds, err := lowerBool(n, false)
+		if err != nil {
+			return nil, p.errf("WHERE: %v", err)
+		}
+		ci.Where = strings.TrimSpace(p.src[start:end])
+		ci.WhereConds = conds
+	}
 	return ci, nil
+}
+
+// parseIndexElem parses one key of CREATE INDEX: a column, or an
+// expression — parenthesized, ((lower(email))), (b + 1), or a function
+// call written bare, lower(email). col is set for a column, expr for an
+// expression.
+func (p *parser) parseIndexElem(using string) (col string, expr *Expr, err error) {
+	t := p.peek()
+	call := t.kind != tkOp && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "("
+	if !(t.kind == tkOp && t.text == "(") && !call {
+		col, err = p.expectIdent()
+		return col, nil, err
+	}
+	e, err := p.parseValueOrColumnExpr()
+	if err != nil {
+		return "", nil, err
+	}
+	if isPlainColumn(e) && e.Cast == "" {
+		// (col): a column in parentheses is the column.
+		return e.Column, nil, nil
+	}
+	return "", &e, nil
+}
+
+// textSearchIndexExpr recognizes to_tsvector('config'[::regconfig],
+// column), the expression a GIN index is built on.
+func textSearchIndexExpr(e Expr) (fn, arg, col string, ok bool) {
+	if e.BinOp != "" || e.Cast != "" || len(e.Args) != 2 || len(e.Path) > 0 {
+		return "", "", "", false
+	}
+	a, c := e.Args[0], e.Args[1]
+	if a.Lit == nil || a.Lit.Null || a.Lit.Fam != types.String || a.BinOp != "" || (a.Cast != "" && a.Cast != "regconfig") {
+		return "", "", "", false
+	}
+	if !isPlainColumn(c) || c.Cast != "" {
+		return "", "", "", false
+	}
+	return e.Func, a.Lit.S, c.Column, true
+}
+
+// atIndexNulls reports whether the next words are NULLS FIRST or NULLS
+// LAST (an index key's null ordering, not an operator class).
+func (p *parser) atIndexNulls() bool {
+	t := p.peek()
+	if t.kind != tkIdent || !strings.EqualFold(t.text, "nulls") || p.i+1 >= len(p.toks) {
+		return false
+	}
+	n := p.toks[p.i+1]
+	return strings.EqualFold(n.text, "first") || strings.EqualFold(n.text, "last")
+}
+
+// parseIndexDirection parses an index key's [ASC | DESC] [NULLS FIRST |
+// NULLS LAST] and returns it as pg_get_indexdef shows it: "" for the
+// default (ASC NULLS LAST), "DESC" for DESC NULLS FIRST, otherwise the
+// words that differ from the direction's default.
+func (p *parser) parseIndexDirection() (string, error) {
+	desc := false
+	if p.consumeKeyword("DESC") {
+		desc = true
+	} else {
+		p.consumeKeyword("ASC")
+	}
+	nulls := ""
+	if p.atIndexNulls() {
+		p.i++
+		nulls = strings.ToLower(p.peek().text)
+		p.i++
+	}
+	switch {
+	case !desc && nulls == "first":
+		return "NULLS FIRST", nil
+	case !desc:
+		return "", nil
+	case nulls == "last":
+		return "DESC NULLS LAST", nil
+	}
+	return "DESC", nil
 }
 
 // parseQualifiedWord reads an identifier that may carry a schema
@@ -2315,52 +2428,6 @@ func (p *parser) parseQualifiedWord() (string, error) {
 		}
 	}
 	return word, nil
-}
-
-// parseIndexExpr reads an index key written as an expression,
-// fn('constant'[::type], column), optionally inside one more pair of
-// parentheses as PostgreSQL requires of expressions that are not
-// function calls. ok is false, with nothing consumed, when the key is a
-// plain column.
-func (p *parser) parseIndexExpr() (fn, arg, col string, ok bool, err error) {
-	save := p.i
-	parens := 0
-	for p.peek().kind == tkOp && p.peek().text == "(" {
-		p.i++
-		parens++
-	}
-	name := p.peek()
-	if name.kind != tkIdent || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
-		if parens > 0 {
-			return "", "", "", false, p.errf("an index key is a column, or to_tsvector('config', column) under USING GIN")
-		}
-		p.i = save
-		return "", "", "", false, nil
-	}
-	p.i += 2
-	lit := p.peek()
-	if lit.kind != tkString {
-		return "", "", "", false, p.errf("an index on %s(...) needs the configuration written out as its first argument: %s('english', column)", name.text, name.text)
-	}
-	p.i++
-	if p.consumeOp("::") {
-		// 'english'::regconfig, as pg_dump writes it.
-		if _, err := p.expectIdent(); err != nil {
-			return "", "", "", false, err
-		}
-	}
-	if err := p.expectOp(","); err != nil {
-		return "", "", "", false, err
-	}
-	if col, err = p.expectIdent(); err != nil {
-		return "", "", "", false, err
-	}
-	for i := 0; i <= parens; i++ {
-		if err := p.expectOp(")"); err != nil {
-			return "", "", "", false, err
-		}
-	}
-	return strings.ToLower(name.text), lit.text, col, true, nil
 }
 
 func (p *parser) parseDropTable() (Statement, error) {

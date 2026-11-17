@@ -102,15 +102,19 @@ DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (
 CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
 CREATE INDEX ON t (b, c);                                -- unnamed: t_b_c_idx (t_b_c_idx1, ... when taken)
 CREATE INDEX t_b_like ON t (b text_pattern_ops);         -- also varchar_/bpchar_pattern_ops, COLLATE "C" / "POSIX" / "default"
+CREATE UNIQUE INDEX ON t ((lower(b)));                   -- an expression key: t_lower_idx (below)
+CREATE INDEX ON t (c, (a + 1));                          -- columns and expressions mixed: t_c_expr_idx
+CREATE UNIQUE INDEX ON t (b) WHERE c IS NULL;            -- partial: only the rows the predicate holds for (below)
+CREATE INDEX ON t (a, c DESC NULLS LAST);                -- a declared order per key (below)
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
 CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
 DROP INDEX [CONCURRENTLY] [IF EXISTS] by_b;             -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
-ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK/indexed columns
+ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK columns; drops the indexes that use d
 ALTER TABLE t RENAME TO t2;                             -- foreign keys and sequences follow (they use IDs)
-ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints on the column are rewritten
+ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints, index expressions and predicates are rewritten
 ALTER TABLE t RENAME CONSTRAINT t_b_key TO b_unique;    -- a UNIQUE constraint's index renames with it
 ALTER TABLE t ALTER [COLUMN] b SET DEFAULT 'y';         -- a constant or an expression (below)
 ALTER TABLE t ALTER [COLUMN] b DROP DEFAULT;
@@ -140,6 +144,70 @@ types' operator classes (`text_pattern_ops`, `varchar_pattern_ops`,
 on a key column and shown by `pg_get_indexdef`; any other collation is
 refused (`0A000`), as is an operator class of another type (`42804`).
 They do not make `LIKE 'abc%'` use the index.
+
+**Expression keys** (`(lower(email))`, `(a + 1)`, `(doc ->> 'k')`, or
+a function call written bare, `lower(email)`) may be mixed with
+columns in an ordinary index, unique or not. An expression may use the
+table's own columns, constants, arithmetic, JSON paths and the builtins
+the [Functions reference](functions.md) lists as immutable, except the
+few PostgreSQL marks stable (`concat`, `concat_ws`, `format`,
+`array_to_string`, the `to_json` / `json_build_*` family). Anything
+stable or volatile (`now()`, `random()`), and anything that
+reads the session's `TimeZone` (a cast or operator over a date or
+time, `date_trunc`, `extract`) is refused with `42P17` ("functions in
+index expression must be marked IMMUTABLE"); a subquery is `0A000`, an
+aggregate `42803`. A unique expression index compares the values: with
+`CREATE UNIQUE INDEX ON users ((lower(email)))`, two emails that differ
+only by case conflict (`23505`). A query uses the index when its WHERE
+clause compares the same expression with a constant — `=`, `<`, `<=`,
+`>`, `>=` — written in any spacing or parenthesization, and with or
+without the casts to text pg_dump adds (`lower((email)::text)`). An
+expression that fails for a row (`(n / m)` with `m = 0`) fails the
+write with its own error. `pg_get_indexdef` shows it as PostgreSQL
+does: `(lower(email))`, `((a + 1))`.
+
+**Partial indexes** (`WHERE predicate`) hold only the rows the
+predicate is true for, and a unique one holds its rule among those rows
+only — `CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL`
+lets any number of deleted rows share an email. Writes keep the index
+exact, an `UPDATE` that moves a row into or out of the predicate
+included; the backfill indexes only the matching rows. The planner uses
+a partial index only when every conjunct of the predicate appears, as
+written, among the `AND`-ed conjuncts of the query's WHERE clause
+(`WHERE email = $1 AND deleted_at IS NULL`); it does not prove
+implications (`n > 10` does not let it use an index `WHERE n > 5`). The
+predicate follows the expression rules above, and may compare a date or
+time column only with `IS [NOT] NULL` (PostgreSQL folds `created_at >
+'2024-01-01'` into a constant when the index is made; datax would read
+the literal in each writer's `TimeZone`, so it is refused, `42P17`). A
+partial unique index is not a constraint: `pg_constraint` does not list
+it and `ON CONFLICT (email)` does not infer it (`42P10`, as in
+PostgreSQL without the `WHERE` of the conflict target, which datax does
+not parse). `pg_get_indexdef`, `pg_indexes` and `\d` show the predicate
+(`WHERE (deleted_at IS NULL)`), and `pg_index.indpred` holds its text
+(`pg_get_expr(indpred, indrelid)` renders it). A GIN index may be
+partial too; an ivfflat index may not. Expression and partial indexes
+need cluster version v22, are refused on a sealed table (they would
+keep what they compute from sealed columns in plaintext), and a table
+that has one cannot be sealed.
+
+**Key order.** `ASC` / `DESC` and `NULLS FIRST` / `NULLS LAST` are
+accepted on every key of an ordinary index and shown by
+`pg_get_indexdef` (`(created_at DESC)`), but keys are always stored
+ascending: an `ORDER BY` that runs entirely the other way is served by
+scanning the index in reverse, so `WHERE user_id = $1 ORDER BY
+created_at DESC` uses an index on `(user_id, created_at DESC)` or on
+`(user_id, created_at)` alike. An `ORDER BY` that mixes directions
+(`a ASC, b DESC`) is sorted after the scan, whichever directions the
+index declares. Rows with a NULL key are not in an index (except a
+`NULLS NOT DISTINCT` one), so the declared NULLs order changes nothing.
+
+`ALTER TABLE ... DROP COLUMN` drops the indexes that use the column —
+as a key, in an expression or in a predicate — as PostgreSQL does (one
+a constraint owns is still refused, `2BP01`). `ALTER COLUMN ... TYPE`
+is refused for a column any index uses, an expression or predicate
+included. `LIKE ... INCLUDING INDEXES`, backups, restores and table
+restores carry expressions, predicates and orders.
 `DROP INDEX` names the index alone (it is found on whichever table of
 the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the

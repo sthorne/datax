@@ -492,8 +492,7 @@ func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor
 		}
 		var fam types.Family
 		if plan.hasBounds() {
-			col, _ := desc.ColByID(plan.idx.ColumnIDs[len(plan.idxVals)])
-			fam = col.Type
+			fam, _ = plan.idx.KeyFamily(desc, len(plan.idxVals))
 		}
 		start, end, err := plan.spanBounds(prefix, fam)
 		if err != nil {

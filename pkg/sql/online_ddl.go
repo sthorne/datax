@@ -44,11 +44,11 @@ import (
 // class to an inverted index kind; nil is an ordinary index. USING GIN
 // with no operator class takes the kind of the column's type.
 func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDescriptor) (inverted.Kind, error) {
+	if err := checkIndexForm(t); err != nil {
+		return nil, err
+	}
 	switch t.Using {
 	case "", "btree":
-		if t.ExprFunc != "" {
-			return nil, newErrf(CodeFeatureNotSupported, "indexes on expressions are not supported, except USING GIN (to_tsvector('config', column))")
-		}
 		// The operator classes the string types have are accepted
 		// (newIndexDescriptor checks each against its column); a
 		// column that does not exist is reported there too.
@@ -83,7 +83,7 @@ func (s *Session) invertedKindFor(t *parser.CreateIndex, desc *catalog.TableDesc
 		// inverted kind of its own over the column (pkg/sql/inverted),
 		// and serves predicates written with the same expression.
 		if t.ExprFunc != "to_tsvector" {
-			return nil, newErrf(CodeFeatureNotSupported, "indexes on expressions are not supported, except USING GIN (to_tsvector('config', column))")
+			return nil, newErrf(CodeFeatureNotSupported, "a GIN index on an expression takes to_tsvector('config', column); index other expressions USING btree")
 		}
 		cfg, err := tsearch.LookupConfig(t.ExprArg)
 		if err != nil {
@@ -146,6 +146,9 @@ const backfillChunkSize = 64
 // execCreateIndexOnline runs the state machine. The session has already
 // rejected explicit-transaction contexts.
 func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateIndex) (*Result, *Error) {
+	if err := checkIndexForm(t); err != nil {
+		return nil, ToSQLError(err)
+	}
 	if t.Name == "" {
 		// CREATE INDEX ON t (cols): the name is chosen from the table as
 		// it is now. One taken in the meantime fails the publish below

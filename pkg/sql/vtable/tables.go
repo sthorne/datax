@@ -298,6 +298,14 @@ func init() {
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				for j, id := range idx.ColumnIDs {
+					if idx.IsExprKey(j) {
+						// An expression key is an attribute of the
+						// index named as PostgreSQL names it.
+						fam, _ := idx.KeyFamily(t, j)
+						c := catalog.Column{Name: IndexExprName(idx.Exprs[j]), Type: fam}
+						rows = append(rows, attr(IndexOID(t, idx.ID), &c, int64(j+1), true))
+						continue
+					}
 					if c, ok := t.ColByID(id); ok {
 						rows = append(rows, attr(IndexOID(t, idx.ID), &c, int64(j+1), true))
 					}
@@ -409,9 +417,16 @@ func init() {
 				boolean(false), str(attnums(t, visiblePK(t))), null(), str(IndexDef(t, pk)), null()})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
+				// indpred is the predicate's text where PostgreSQL has
+				// its node tree, and pg_get_expr(indpred, indrelid)
+				// renders it.
+				pred := null()
+				if idx.IsPartial() {
+					pred = str(idx.Predicate)
+				}
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(TableOID(t)), i64(int64(len(idx.ColumnIDs))), i64(int64(len(idx.ColumnIDs))),
 					boolean(idx.Unique), boolean(idx.NullsNotDistinct), boolean(false), boolean(false), boolean(true), boolean(false), boolean(idx.Public()), boolean(true), boolean(true),
-					boolean(false), str(attnums(t, idx.ColumnIDs)), null(), str(IndexDef(t, idx)), null()})
+					boolean(false), str(attnums(t, idx.ColumnIDs)), pred, str(IndexDef(t, idx)), pred})
 			}
 		}
 		return rows, nil
@@ -748,7 +763,7 @@ func init() {
 				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t)), textOrNull(t.PKComment)})
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
-				if !idx.Unique {
+				if !IsConstraintIndex(idx) {
 					continue
 				}
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), str("u"), boolean(false), boolean(false), boolean(true),
@@ -1206,7 +1221,7 @@ func init() {
 					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name + "_pkey"), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
 				}
 				for _, idx := range t.Indexes {
-					if !idx.Unique {
+					if !IsConstraintIndex(&idx) {
 						continue
 					}
 					for i, id := range idx.ColumnIDs {
@@ -1234,7 +1249,11 @@ func init() {
 				}
 				for _, idx := range t.Indexes {
 					for i, id := range idx.ColumnIDs {
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), boolean(!idx.Unique), str(catalog.PublicSchema), str(idx.Name), i64(int64(i + 1)), str(columnName(t, id))})
+						name := columnName(t, id)
+						if idx.IsExprKey(i) {
+							name = idx.Exprs[i]
+						}
+						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), boolean(!idx.Unique), str(catalog.PublicSchema), str(idx.Name), i64(int64(i + 1)), str(name)})
 					}
 				}
 			}
@@ -1296,7 +1315,7 @@ func uniqueConstraintNameFor(t *catalog.TableDescriptor, cols []catalog.ColumnID
 		return t.Name + "_pkey"
 	}
 	for i := range t.Indexes {
-		if t.Indexes[i].Unique && same(t.Indexes[i].ColumnIDs) {
+		if IsConstraintIndex(&t.Indexes[i]) && same(t.Indexes[i].ColumnIDs) {
 			return t.Indexes[i].Name
 		}
 	}

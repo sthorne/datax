@@ -1270,7 +1270,10 @@ func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []c
 		return plan, nil
 	}
 	for i := range desc.Indexes {
-		if desc.Indexes[i].Unique && same(desc.Indexes[i].ColumnIDs) {
+		// A partial unique index is inferred only from a conflict
+		// target that repeats its predicate, which ON CONFLICT here
+		// cannot write: as in PostgreSQL, such a target matches none.
+		if desc.Indexes[i].Unique && !desc.Indexes[i].Computed() && same(desc.Indexes[i].ColumnIDs) {
 			plan.index = &desc.Indexes[i]
 			return plan, nil
 		}
@@ -1328,7 +1331,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 			}
 			ekey, _, skip, err := rowenc.EncodeIndexEntry(desc, idx, row)
 			if err != nil {
-				return false, nil, newErrf(CodeInternal, "index %q: %v", idx.Name, err)
+				return false, nil, invertedEntryErr(idx, err)
 			}
 			if skip {
 				continue
@@ -1758,8 +1761,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 		}
 		var fam types.Family
 		if plan.hasBounds() {
-			col, _ := desc.ColByID(plan.idx.ColumnIDs[len(plan.idxVals)])
-			fam = col.Type
+			fam, _ = plan.idx.KeyFamily(desc, len(plan.idxVals))
 		}
 		start, end, err := plan.spanBounds(prefix, fam)
 		if err != nil {
@@ -3199,13 +3201,30 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		if uses := policyColumnUses(desc, col.Name); len(uses) > 0 {
 			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by policy %s (drop the policy first)", t.DropCol, strings.Join(uses, ", "))
 		}
+		// The indexes that read the column — as a key, in an
+		// expression key or in a predicate — are dropped with it, as in
+		// PostgreSQL. (One a constraint owns was refused above.)
+		var keptIndexes []catalog.IndexDescriptor
+		var wipes []indexWipe
 		for _, idx := range desc.Indexes {
-			for _, id := range idx.ColumnIDs {
-				if id == col.ID {
-					return nil, newErrf(CodeFeatureNotSupported, "cannot drop column %q: used by index %q", t.DropCol, idx.Name)
-				}
+			if !indexColumnUses(&idx, col) {
+				keptIndexes = append(keptIndexes, idx)
+				continue
 			}
+			if !idx.Public() {
+				return nil, newErrf(CodeObjectInUse, "cannot drop column %q: index %q, which uses it, is still being built", t.DropCol, idx.Name)
+			}
+			if desc.Reshard != nil {
+				return nil, newErrf(CodeObjectInUse, "cannot drop column %q of table %q while a re-shard is in progress: index %q uses it", t.DropCol, desc.Name, idx.Name)
+			}
+			w := indexWipe{tableID: desc.ID, indexID: idx.ID}
+			if idx.IsVector() {
+				w.vectorBuild = idx.Vector.Build
+			}
+			wipes = append(wipes, w)
 		}
+		desc.Indexes = keptIndexes
+		s.pendingWipes = append(s.pendingWipes, wipes...)
 		kept := desc.Columns[:0]
 		for _, c := range desc.Columns {
 			if c.ID != col.ID {
@@ -3665,10 +3684,8 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 				in = append(in, desc.Name+"_pkey")
 			}
 			for _, idx := range desc.Indexes {
-				for _, id := range idx.ColumnIDs {
-					if id == c.ID {
-						in = append(in, idx.Name)
-					}
+				if indexColumnUses(&idx, *c) {
+					in = append(in, idx.Name)
 				}
 			}
 			res.Rows = append(res.Rows, []types.Datum{str(c.Name), str(vtable.FormatType(c)), types.NewBool(!c.NotNull && !desc.IsPKCol(c.ID)), def, str("{" + strings.Join(in, ",") + "}")})
@@ -3690,7 +3707,9 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		}
 		for _, idx := range desc.Indexes {
 			for j, id := range idx.ColumnIDs {
-				if c, ok := desc.ColByID(id); ok {
+				if idx.IsExprKey(j) {
+					res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(idx.Name), types.NewBool(!idx.Unique), types.NewInt(int64(j + 1)), str(idx.Exprs[j])})
+				} else if c, ok := desc.ColByID(id); ok {
 					res.Rows = append(res.Rows, []types.Datum{str(desc.Name), str(idx.Name), types.NewBool(!idx.Unique), types.NewInt(int64(j + 1)), str(c.Name)})
 				}
 			}

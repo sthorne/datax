@@ -3,6 +3,7 @@ package sql
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -271,6 +272,33 @@ type planConj struct {
 	col    catalog.Column
 	d      types.Datum
 	usable bool // comparison against a coerced, non-NULL value
+	// slot names what the conjunct constrains (colSlot, or exprSlot for
+	// a computed left-hand side an expression key may match); "" when
+	// nothing.
+	slot string
+	// exprFam is the family of a computed left-hand side, to which the
+	// value was coerced.
+	exprFam types.Family
+}
+
+// exprConj is the planner's view of a conjunct over expression e (a
+// computed left-hand side, or a column's JSON path): it constrains the
+// expression's slot, with its value coerced to the expression's family.
+func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Expr, colType func(string) (types.Family, bool), params []types.Datum) planConj {
+	pc := planConj{cmp: cmp, slot: exprSlot(parser.FormatExpr(stripTextCasts(desc, e)))}
+	switch cmp.Op {
+	case "=", "<", "<=", ">", ">=":
+		fam := exprFamily(e, colType)
+		if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil && fam != types.Unknown && !d.Null {
+			if d, cerr := d.Coerce(fam); cerr == nil {
+				pc.d, pc.usable, pc.exprFam = d, true, fam
+			}
+		}
+	case "IS NOT NULL":
+	default:
+		pc.slot = ""
+	}
+	return pc
 }
 
 // scanCandidate is one possible constrained scan while ranking paths.
@@ -426,16 +454,36 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 	// matches and un-coercible values cannot either — such conjuncts are
 	// unusable for bounds and left to the post-fetch filter.
 	conjs := make([]planConj, len(where))
+	colType := func(name string) (types.Family, bool) {
+		col, ok := desc.Col(name)
+		return col.Type, ok
+	}
 	for i, cmp := range where {
 		if cmp.Column == "" {
-			continue // constant conjuncts (TRUE/FALSE) bind no column
+			// Constant conjuncts (TRUE/FALSE) bind no column. A
+			// computed left-hand side (lower(email) = 'x') may match an
+			// expression key: its value is coerced to the expression's
+			// family, and the key column it matches must have that
+			// family too (buildCandidate).
+			if cmp.Expr != nil && len(cmp.Path) == 0 && exprKeysIn(desc) {
+				conjs[i] = exprConj(desc, cmp, *cmp.Expr, colType, params)
+			}
+			continue
+		}
+		if len(cmp.Path) > 0 && exprKeysIn(desc) {
+			// doc->>'k' = 'x' is a conjunct on that expression.
+			if _, ok := desc.Col(cmp.Column); ok {
+				conjs[i] = exprConj(desc, cmp, parser.Expr{Column: cmp.Column, Path: cmp.Path}, colType, params)
+				continue
+			}
 		}
 		col, ok := desc.Col(cmp.Column)
 		if !ok {
 			return accessPlan{}, newErrf(CodeUndefinedColumn, "column %q does not exist", cmp.Column)
 		}
-		pc := planConj{cmp: cmp, col: col}
+		pc := planConj{cmp: cmp, col: col, slot: colSlot(col.ID)}
 		if len(cmp.Path) > 0 {
+			pc.slot = ""
 			// A ->/->> conjunct constrains the extracted value, not the
 			// column itself: never usable for key bounds (and never proof
 			// the column matches anything) — post-fetch filter only.
@@ -467,12 +515,17 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 	// clause (or cannot exist). Secondary-index entries are skipped when ANY
 	// indexed column is NULL, so an index is a complete row source only for
 	// null-safe indexed columns.
-	nullSafe := func(col catalog.Column) bool {
-		if col.NotNull || desc.IsPKCol(col.ID) {
-			return true
+	// An expression key is null-safe the same way: a usable comparison
+	// or IS NOT NULL on the same expression.
+	nullSafe := func(idx *catalog.IndexDescriptor, i int, slot string) bool {
+		if !idx.IsExprKey(i) {
+			col, _ := desc.ColByID(idx.ColumnIDs[i])
+			if col.NotNull || desc.IsPKCol(col.ID) {
+				return true
+			}
 		}
 		for _, pc := range conjs {
-			if pc.col.ID != col.ID {
+			if pc.slot != slot {
 				continue
 			}
 			if pc.usable || pc.cmp.Op == "IS NOT NULL" {
@@ -482,12 +535,26 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		return false
 	}
 
-	// First usable equality value per column.
-	eq := map[catalog.ColumnID]types.Datum{}
+	// usableFor: the conjunct's value can bound key column i of idx
+	// (an expression conjunct's value was coerced to its own family,
+	// which must be the key's).
+	usableFor := func(pc planConj, idx *catalog.IndexDescriptor, i int) bool {
+		if !pc.usable {
+			return false
+		}
+		if idx != nil && idx.IsExprKey(i) {
+			fam, _ := idx.KeyFamily(desc, i)
+			return pc.exprFam == fam
+		}
+		return pc.exprFam == types.Unknown
+	}
+
+	// First usable equality value per slot.
+	eq := map[string]planConj{}
 	for _, pc := range conjs {
-		if pc.cmp.Op == "=" && pc.usable {
-			if _, dup := eq[pc.col.ID]; !dup {
-				eq[pc.col.ID] = pc.d
+		if pc.cmp.Op == "=" && pc.usable && pc.slot != "" {
+			if _, dup := eq[pc.slot]; !dup {
+				eq[pc.slot] = pc
 			}
 		}
 	}
@@ -498,13 +565,16 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		if !idx.Public() || !idx.Unique || idx.IsInverted() {
 			continue
 		}
+		if idx.IsPartial() && !predicateImplied(desc, idx, userWhere) {
+			continue // no entries for the rows outside its predicate
+		}
 		vals := make([]types.Datum, 0, len(idx.ColumnIDs))
-		for _, colID := range idx.ColumnIDs {
-			d, ok := eq[colID]
-			if !ok {
+		for k, slot := range indexSlots(idx) {
+			pc, ok := eq[slot]
+			if !ok || !usableFor(pc, idx, k) {
 				break
 			}
-			vals = append(vals, d)
+			vals = append(vals, pc.d)
 		}
 		if len(vals) == len(idx.ColumnIDs) {
 			return accessPlan{kind: planUniquePoint, idx: idx, idxVals: vals}, nil
@@ -521,21 +591,33 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 
 	// buildCandidate constrains the given key column order: an equality
 	// prefix, then range bounds on the next column.
-	buildCandidate := func(idx *catalog.IndexDescriptor, colIDs []catalog.ColumnID) scanCandidate {
+	// slotName names a key column for EXPLAIN.
+	slotName := func(slot string) string {
+		if strings.HasPrefix(slot, "e") {
+			return slot[1:]
+		}
+		for _, pc := range conjs {
+			if pc.slot == slot && pc.col.Name != "" {
+				return pc.col.Name
+			}
+		}
+		return slot
+	}
+	buildCandidate := func(idx *catalog.IndexDescriptor, slots []string) scanCandidate {
 		cand := scanCandidate{idx: idx, consumed: map[int]bool{}}
 		pinned := 0
-		for _, colID := range colIDs {
-			d, ok := eq[colID]
-			if !ok {
+		for k, slot := range slots {
+			first, ok := eq[slot]
+			if !ok || !usableFor(first, idx, k) {
 				break
 			}
-			col, _ := desc.ColByID(colID)
+			d := first.d
 			cand.eqVals = append(cand.eqVals, d)
-			cand.eqCols = append(cand.eqCols, col.Name)
+			cand.eqCols = append(cand.eqCols, slotName(slot))
 			// Every equality conjunct pinning this column to the same value
 			// is guaranteed by the span.
 			for ci, pc := range conjs {
-				if pc.cmp.Op == "=" && pc.usable && pc.col.ID == colID {
+				if pc.cmp.Op == "=" && usableFor(pc, idx, k) && pc.slot == slot {
 					if c, err := pc.d.Compare(d); err == nil && c == 0 {
 						cand.consumed[ci] = true
 					}
@@ -543,10 +625,10 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			}
 			pinned++
 		}
-		if pinned < len(colIDs) {
-			rangeID := colIDs[pinned]
+		if pinned < len(slots) {
+			rangeSlot := slots[pinned]
 			for ci, pc := range conjs {
-				if !pc.usable || pc.col.ID != rangeID {
+				if !usableFor(pc, idx, pinned) || pc.slot != rangeSlot {
 					continue
 				}
 				switch pc.cmp.Op {
@@ -564,8 +646,7 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 				cand.consumed[ci] = true
 			}
 			if cand.lo != nil || cand.hi != nil {
-				col, _ := desc.ColByID(rangeID)
-				cand.rangeCol = col.Name
+				cand.rangeCol = slotName(rangeSlot)
 			}
 		}
 		cand.score = 2 * pinned
@@ -619,7 +700,11 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 		return c
 	}
 
-	best := buildCandidate(nil, pkCols) // ties prefer the primary key (no join)
+	pkSlots := make([]string, len(pkCols))
+	for i, id := range pkCols {
+		pkSlots[i] = colSlot(id)
+	}
+	best := buildCandidate(nil, pkSlots) // ties prefer the primary key (no join)
 	bestCost := 0.0
 	if st != nil {
 		bestCost = costFor(best)
@@ -637,6 +722,13 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			// (pickVectorIndex), never a WHERE clause.
 			continue
 		}
+		if idx.IsPartial() && !predicateImplied(desc, idx, userWhere) {
+			// A partial index has no entry for the rows its predicate
+			// is not true for: a complete row source only when the
+			// WHERE clause keeps none of them.
+			continue
+		}
+		slots := indexSlots(idx)
 		{
 			// An index has no entry for rows with a NULL in ANY indexed
 			// column — a unique one included, since NULLs are distinct
@@ -644,9 +736,8 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			// rule for simplicity): it is a complete row source only when
 			// every indexed column is null-safe under this WHERE clause.
 			complete := true
-			for _, colID := range idx.ColumnIDs {
-				col, _ := desc.ColByID(colID)
-				if !nullSafe(col) {
+			for k, slot := range slots {
+				if !nullSafe(idx, k, slot) {
 					complete = false
 					break
 				}
@@ -655,7 +746,7 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 				continue
 			}
 		}
-		cand := buildCandidate(idx, idx.ColumnIDs)
+		cand := buildCandidate(idx, slots)
 		if st == nil {
 			if cand.score > best.score {
 				best = cand
@@ -799,7 +890,15 @@ func (s *Session) fetchByPrimaryKey(ctx context.Context, txn *kvclient.Txn, desc
 // invertedEntryErr turns a failure to list a row's inverted-index
 // entries into the statement's error: the one a user can cause is a
 // document with more elements than an index holds for one row.
+//
+// An expression key or a predicate is evaluated for the row, and what
+// that raises (division by zero, a bad cast) is the statement's error
+// as it is.
 func invertedEntryErr(idx *catalog.IndexDescriptor, err error) error {
+	var serr *Error
+	if errors.As(err, &serr) {
+		return serr
+	}
 	if idx.IsInverted() {
 		return newErrf(CodeProgramLimitExceeded, "index %q: %v", idx.Name, err)
 	}

@@ -52,6 +52,7 @@ func formatExpr(b *strings.Builder, e Expr) {
 	default:
 		b.WriteString("NULL")
 	}
+	formatPath(b, e.Path)
 	if e.BinOp != "" && e.Right != nil {
 		// The flat historical shape: this node's own value is the left
 		// operand.
@@ -60,6 +61,32 @@ func formatExpr(b *strings.Builder, e Expr) {
 	}
 	if e.Cast != "" {
 		b.WriteString("::" + e.Cast)
+	}
+}
+
+// formatPath renders a ->/->>/#>/#>> chain.
+func formatPath(b *strings.Builder, path []PathStep) {
+	for _, st := range path {
+		op := "->"
+		if len(st.Keys) > 0 {
+			op = "#>"
+		}
+		if st.Text {
+			op += ">"
+		}
+		b.WriteString(" " + op + " ")
+		switch {
+		case len(st.Keys) > 0:
+			b.WriteString("'{" + strings.ReplaceAll(strings.Join(st.Keys, ","), "'", "''") + "}'")
+		case st.IsIndex:
+			if st.Index < 0 {
+				b.WriteString("-" + itoa(-st.Index))
+			} else {
+				b.WriteString(itoa(st.Index))
+			}
+		default:
+			b.WriteString("'" + strings.ReplaceAll(st.Key, "'", "''") + "'")
+		}
 	}
 }
 

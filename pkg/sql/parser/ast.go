@@ -365,10 +365,22 @@ type CreateIndex struct {
 	// ExprFunc and ExprArg are set for the one expression an index may
 	// be built on, fn('constant', column) — in practice
 	// to_tsvector('english', body) under USING GIN. Columns then holds
-	// that one column. There are no expression indexes in general; the
-	// executor decides which functions it can index by.
+	// that one column. Any other expression key is in Exprs.
 	ExprFunc string
 	ExprArg  string
+	// Exprs, when any key is an expression other than that one, is
+	// parallel to Columns: the expression ((lower(email)), (b + 1)),
+	// whose Columns entry is then "", or nil for a column key.
+	Exprs []*Expr
+	// Directions, when any key declares an order, is parallel to
+	// Columns: the key's [ASC | DESC] [NULLS FIRST | LAST] as
+	// pg_get_indexdef shows it ("", "DESC", "NULLS FIRST", "DESC NULLS
+	// LAST").
+	Directions []string
+	// Where is a partial index's predicate, as written ("" = none), and
+	// WhereConds its conjuncts.
+	Where      string
+	WhereConds []Comparison
 	// With holds the WITH (name = value) storage parameters, names
 	// lower-cased (USING ivfflat ... WITH (lists = 100)).
 	With map[string]string
