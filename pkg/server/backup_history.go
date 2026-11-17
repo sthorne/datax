@@ -485,6 +485,15 @@ func tableStableAcross(prev, cur *backupManifest, t backupTable, cutoff hlc.Time
 		}
 		return nil
 	}
+	if catalog.IsSystemTableID(t.ID) {
+		// The cluster's own table (the audit log, the metrics table),
+		// made by a node inside the interval. Its definition is the
+		// binary's, not a user's, so "as what" is known, and its rows at
+		// the cut are what the history holds up to it: none if it did not
+		// exist yet. Refusing would block a point-in-time restore over a
+		// table the operator never made (issue #327).
+		return nil
+	}
 	return fmt.Errorf("cannot restore table %s to %s: it was created between %s and %s, and a backup holds a table's definition at its end only, so whether it existed at that moment, and as what, is not known. Restore to %s instead",
 		t.Name, describeBackupTS(cutoff), describeBackupTS(prev.EndTS), describeBackupTS(cur.EndTS), describeBackupTS(cur.EndTS))
 }

@@ -1467,6 +1467,18 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A point-in-time restore no longer refuses the audit table a node
+  created between two backups** (#327). A node creates `datax_audit`
+  when it first writes an audit record. When that happened between a
+  full backup and the next history incremental, a restore of everything
+  `--as-of` a moment in between was refused for that table: "it was
+  created between ... and ...". A user table created inside the
+  interval is still refused that way, because its definition at the
+  moment is unknown. The cluster's own tables are now restored with
+  their rows as of the moment, or empty if they did not exist yet, since
+  their definition comes with the binary. A restore of everything into a
+  cluster that already has tables now reports that first, before any
+  per-table check.
 - **psql's `\dd`, `\dAf`, `\dAo`, `\dAp` and `\dconfig` work** (psql 16,
   17 and 18). Each failed with an error. `\dd` read the `tableoid` system
   column, which the catalogs lacked; each catalog with OIDs now has it,

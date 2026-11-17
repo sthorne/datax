@@ -162,36 +162,6 @@ func TestRestoreSelectionFlags(t *testing.T) {
 	full, inc := filepath.Join(work, "full"), filepath.Join(work, "inc")
 	args := func(a ...string) []string { return append([]string{"--addr", n.Addr()}, a...) }
 
-	// The node makes its audit table when it first writes an audit record,
-	// in the background. Made between the full and the incremental backup
-	// below, it would be a table created inside the chain, and a restore
-	// of everything to a moment in between is refused for it before the
-	// cluster-in-use check this test expects. A backup is an audited admin
-	// operation: take one elsewhere, flush the audit buffer and wait for
-	// the table, so it predates the chain.
-	if err := runBackupCmd(args("--dest", filepath.Join(work, "warmup"))); err != nil {
-		t.Fatal(err)
-	}
-	{
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		s := sql.NewSession(n.DB(), catalog.NewAccessor())
-		stmt, err := parser.Parse(`SELECT count(*) FROM ` + catalog.AuditTableName)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for {
-			n.AuditFlush(ctx)
-			_, serr := s.Execute(ctx, stmt[0], nil)
-			if serr == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				t.Fatalf("the audit table was never made: %v", serr)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		cancel()
-	}
 	if err := runBackupCmd(args("--dest", full, "--revision-history")); err == nil || !strings.Contains(err.Error(), "a full backup has no base") {
 		t.Fatalf("a full backup with --revision-history: %v", err)
 	}
@@ -340,4 +310,91 @@ func TestSealedOpNames(t *testing.T) {
 		t.Fatalf("restore-sealed: %v %s", err, resp.Error)
 	}
 	backupTestSQL(t, dst, `SELECT * FROM op_names`)
+}
+
+// TestRestoreAsOfAcrossAuditTableCreation (issue #327): a node makes its
+// audit table when it first writes an audit record. A chain whose full
+// backup predates that, restored as of a moment inside the incremental,
+// brings the audit table back as it stood then (empty before it was
+// made) instead of refusing the whole restore over it.
+func TestRestoreAsOfAcrossAuditTableCreation(t *testing.T) {
+	// A long flush interval: the table is made only when the test flushes.
+	src, err := server.Start(server.Config{
+		Listen: "127.0.0.1:0", Dir: t.TempDir(), BootstrapSelf: true,
+		GCInterval: -1, MetricsRecordInterval: -1, AuditFlushInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(src.Stop)
+	backupTestSQL(t, src, `CREATE TABLE cli_stock (id INT8 PRIMARY KEY, n INT8)`)
+	backupTestSQL(t, src, `INSERT INTO cli_stock VALUES (1, 10)`)
+	work := t.TempDir()
+	full, inc := filepath.Join(work, "full"), filepath.Join(work, "inc")
+	args := func(a ...string) []string { return append([]string{"--addr", src.Addr()}, a...) }
+	if err := runBackupCmd(args("--dest", full)); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(full, "BACKUP.json")); err != nil || strings.Contains(string(raw), catalog.AuditTableName) {
+		t.Fatalf("the full backup already holds the audit table (%v); the test proves nothing", err)
+	}
+	moment := func() string {
+		time.Sleep(2 * time.Millisecond)
+		ts := strconv.FormatInt(src.Clock().Now().WallTime, 10)
+		time.Sleep(2 * time.Millisecond)
+		return ts
+	}
+	backupTestSQL(t, src, `UPDATE cli_stock SET n = 20`)
+	beforeAudit := moment()
+
+	// The node makes its audit table now, inside the incremental's interval.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s := sql.NewSession(src.DB(), catalog.NewAccessor())
+	count, err := parser.Parse(`SELECT count(*) FROM ` + catalog.AuditTableName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		src.AuditFlush(ctx)
+		if _, serr := s.Execute(ctx, count[0], nil); serr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("the audit table was never made")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	backupTestSQL(t, src, `UPDATE cli_stock SET n = 30`)
+	afterAudit := moment()
+	backupTestSQL(t, src, `UPDATE cli_stock SET n = 40`)
+	if err := runBackupCmd(args("--dest", inc, "--base", full, "--revision-history")); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(inc, "BACKUP.json")); err != nil || !strings.Contains(string(raw), catalog.AuditTableName) {
+		t.Fatalf("the incremental does not hold the audit table (%v); the test proves nothing", err)
+	}
+
+	for _, c := range []struct {
+		what      string
+		asOf      string
+		n         int64
+		auditRows bool
+	}{
+		{"before the audit table was made", beforeAudit, 20, false},
+		{"after the audit table was made", afterAudit, 30, true},
+	} {
+		dst := startBackupTestNode(t)
+		if err := runRestoreCmd([]string{"--addr", dst.Addr(), "--src", full + "," + inc, "--as-of", c.asOf}); err != nil {
+			t.Fatalf("restore as of a moment %s: %v", c.what, err)
+		}
+		res := backupTestSQL(t, dst, `SELECT n FROM cli_stock WHERE id = 1`)
+		if len(res.Rows) != 1 || res.Rows[0][0].I != c.n {
+			t.Fatalf("restored as of a moment %s: cli_stock %+v, want n = %d", c.what, res.Rows, c.n)
+		}
+		res = backupTestSQL(t, dst, `SELECT count(*) FROM `+catalog.AuditTableName+` WHERE node = 1 AND at <= now()`)
+		if got := res.Rows[0][0].I > 0; got != c.auditRows {
+			t.Fatalf("restored as of a moment %s: audit rows present = %v, want %v", c.what, got, c.auditRows)
+		}
+	}
 }

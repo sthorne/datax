@@ -1195,16 +1195,6 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 	if err := n.checkRestoreClusterKeys(ctx, chain); err != nil {
 		return nil, err
 	}
-	if !chain.cutoff.IsEmpty() {
-		// The cut falls inside the last backup's interval, whose manifest
-		// describes the schema at the interval's end.
-		for _, t := range final.Tables {
-			if err := tableStableAcross(mans[len(mans)-2], final, t, chain.cutoff); err != nil {
-				return nil, err
-			}
-		}
-	}
-
 	// The target must hold no user tables: restored data keys bake in the
 	// backed-up table IDs, which an existing catalog could collide with.
 	// The cluster's own metrics table does not count: it lives at a
@@ -1222,6 +1212,16 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 			return nil, fmt.Errorf("the target cluster already has tables; restore requires an empty cluster")
 		}
 	}
+	if !chain.cutoff.IsEmpty() {
+		// The cut falls inside the last backup's interval, whose manifest
+		// describes the schema at the interval's end.
+		for _, t := range final.Tables {
+			if err := tableStableAcross(mans[len(mans)-2], final, t, chain.cutoff); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// A table this cluster dropped may still have its rows under an id a
 	// restored table carries (issue #313).
 	for _, t := range final.Tables {

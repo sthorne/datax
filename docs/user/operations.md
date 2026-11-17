@@ -1129,6 +1129,15 @@ datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/bac
   interval whose incremental was taken without `--revision-history`.
   `--revision-history` on a full backup is refused too: a full backup
   is the floor of the window.
+- **A table created or redefined inside the interval** is refused at a
+  moment inside it: a backup holds each table's definition at its end
+  only, so the definition at the moment is not known. Restore to either
+  end of that interval instead. The cluster's own tables (`datax_audit`,
+  the metrics table) are the exception when a node created them inside
+  the interval. Their definition comes with the binary, so they come
+  back with their rows as of the moment, or empty if they did not exist
+  yet. A restore of everything into a cluster that already has tables
+  is refused before any of this is checked.
 - **History costs space in proportion to the write rate**: a history
   incremental holds one record per version, where a plain one holds one
   per changed key. The summary prints both (`records`, `versions`).
