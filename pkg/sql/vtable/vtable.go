@@ -634,8 +634,17 @@ func FormatTypeOID(oid int64) string {
 // IndexDef renders pg_get_indexdef() for an index.
 func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	cols := make([]string, 0, len(idx.ColumnIDs))
-	for _, id := range idx.ColumnIDs {
-		cols = append(cols, columnName(d, id))
+	for i, id := range idx.ColumnIDs {
+		key := columnName(d, id)
+		// A declared collation and operator class, as PostgreSQL prints
+		// them: (name COLLATE "C" text_pattern_ops).
+		if len(idx.Collations) == len(idx.ColumnIDs) && idx.Collations[i] != "" {
+			key += ` COLLATE "` + idx.Collations[i] + `"`
+		}
+		if len(idx.OpClasses) == len(idx.ColumnIDs) && idx.OpClasses[i] != "" {
+			key += " " + idx.OpClasses[i]
+		}
+		cols = append(cols, key)
 	}
 	if kind, ok := inverted.Lookup(idx.Inverted); ok && len(cols) == 1 {
 		if c, ok := kind.(inverted.Computed); ok {

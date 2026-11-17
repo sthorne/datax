@@ -99,11 +99,13 @@ CREATE TABLE t (
 CREATE TABLE IF NOT EXISTS t (...);
 DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
+CREATE INDEX ON t (b, c);                                -- unnamed: t_b_c_idx (t_b_c_idx1, ... when taken)
+CREATE INDEX t_b_like ON t (b text_pattern_ops);         -- also varchar_/bpchar_pattern_ops, COLLATE "C" / "POSIX" / "default"
 CREATE INDEX [IF NOT EXISTS] by_doc ON t USING GIN (doc);  -- an inverted index on a JSONB column (below)
 CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-text index on a TEXT column (below)
 CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
-DROP INDEX [IF EXISTS] by_b;                            -- entries reclaimed after the commit
+DROP INDEX [CONCURRENTLY] [IF EXISTS] by_b;             -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
 ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
 ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK/indexed columns
@@ -126,7 +128,18 @@ SHOW TABLES;
 ```
 
 `CREATE INDEX` backfills online in bounded chunks, like PostgreSQL's
-`CREATE INDEX CONCURRENTLY`; it cannot run inside an explicit transaction.
+`CREATE INDEX CONCURRENTLY`, so `CONCURRENTLY` is accepted and changes
+nothing. It cannot run inside an explicit transaction, except on a table
+created in the same transaction block (see [DDL in transaction
+blocks](#ddl)); the `CONCURRENTLY` forms of `CREATE INDEX` and `DROP
+INDEX` never can (`25001`), as in PostgreSQL. An ordinary index compares
+its keys bytewise — the order of the `C` collation — so the string
+types' operator classes (`text_pattern_ops`, `varchar_pattern_ops`,
+`bpchar_pattern_ops` and the defaults `text_ops`, `varchar_ops`,
+`bpchar_ops`) and `COLLATE "C"`, `"POSIX"` or `"default"` are accepted
+on a key column and shown by `pg_get_indexdef`; any other collation is
+refused (`0A000`), as is an operator class of another type (`42804`).
+They do not make `LIKE 'abc%'` use the index.
 `DROP INDEX` names the index alone (it is found on whichever table of
 the database carries it); an index a `UNIQUE` constraint owns is
 refused (`2BP01`) — drop the constraint. The index disappears from the
@@ -383,12 +396,19 @@ back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
 COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 `DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
 `DROP VIEW`, the sequence, database, role and ownership statements,
-`GRANT` / `REVOKE`. The multi-transaction statements — `CREATE INDEX`, `ADD
-CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN
-TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`, `ANALYZE` — publish,
-drain and sweep (or stream) in several transactions of their own and
-are refused inside a block with `25001`; so are `SPLIT AT` and
-`UNSPLIT`, range operations rather than descriptor writes.
+`GRANT` / `REVOKE`, `CREATE` / `DROP EXTENSION`. So does `CREATE INDEX`
+on a table created earlier in the same block — the table is invisible
+to everyone else until the block commits, so the index is published at
+once, filled from the block's own rows, and commits or rolls back with
+the table (a Rails or Django migration's `create_table` and `add_index`).
+After `ROLLBACK TO SAVEPOINT` the block no longer counts the tables it
+created as its own. The multi-transaction statements — `CREATE INDEX` on
+any other table, `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`,
+`ALTER COLUMN TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`,
+`ANALYZE` — publish, drain and sweep (or stream) in several transactions
+of their own and are refused inside a block with `25001`; so are `SPLIT
+AT` and `UNSPLIT`, range operations rather than descriptor writes, and
+`USING ivfflat`, whose centres are trained in transactions of their own.
 
 #### SPLIT AT and UNSPLIT
 
@@ -2037,9 +2057,11 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `pg_attrdef`,
 `pg_am`, `pg_roles`, `pg_user`, `pg_settings`, `pg_tables`, `pg_views`,
 `pg_indexes`, `pg_collation`, `pg_tablespace`, `pg_stat_user_tables`,
-`pg_policy`, `pg_policies`, `pg_description`
+`pg_policy`, `pg_policies`, `pg_description`, `pg_extension` and
+`pg_available_extensions` (the built-in extensions: `plpgsql`,
+`pgcrypto`, `uuid-ossp` and `vector`, always installed)
 (and empty stand-ins for the catalogs of features datax lacks —
-publications, extensions, functions, triggers, operator classes and
+publications, functions, triggers, operator classes and
 families, `pg_amop`, `pg_amproc`, ...), plus
 `information_schema.schemata`, `tables`, `views`, `columns`,
 `table_constraints`, `key_column_usage`, `statistics` and

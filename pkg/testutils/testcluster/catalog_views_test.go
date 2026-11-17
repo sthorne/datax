@@ -515,17 +515,18 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	// it runs per row of the members to its left.
 	eq("LATERAL table function", names(execSQL(t, ctx, root, `SELECT t.name || ':' || k.x FROM t CROSS JOIN unnest(ARRAY[t.id, t.qty]) AS k(x) ORDER BY t.id, k.x`)),
 		"Alice:1", "Alice:5", "bob:2", "bob:3", "carol:3", "carol:3")
-	if r := execSQL(t, ctx, root, `SELECT * FROM pg_available_extensions()`); len(r.Rows) != 0 || len(r.Columns) != 3 || r.Columns[0].Name != "name" || r.Columns[2].Name != "comment" {
+	// The built-in extensions (issue #349), each always installed.
+	if r := execSQL(t, ctx, root, `SELECT * FROM pg_available_extensions()`); len(r.Rows) != 4 || len(r.Columns) != 3 || r.Columns[0].Name != "name" || r.Columns[2].Name != "comment" {
 		t.Fatalf("pg_available_extensions(): %+v %+v", r.Columns, r.Rows)
 	}
-	if r := execSQL(t, ctx, root, `SELECT name, installed_version FROM pg_available_extensions`); len(r.Rows) != 0 {
-		t.Fatalf("pg_available_extensions: %+v", r.Rows)
-	}
+	eq("pg_available_extensions", names(execSQL(t, ctx, root, `SELECT name || ':' || installed_version FROM pg_available_extensions ORDER BY 1`)),
+		"pgcrypto:1.3", "plpgsql:1.0", "uuid-ossp:1.1", "vector:0.8.0")
 	if _, serr := trySQL(ctx, root, `SELECT * FROM pg_available_extensions() AS ae(a, b, c, d)`); serr == nil || serr.Code != sql.CodeInvalidColumnReference {
 		t.Fatalf("too many column aliases: %v", serr)
 	}
 	// psql 18's \dx: every installed extension beside its default version.
-	if r := execSQL(t, ctx, root, `SELECT e.extname, ae.default_version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname ORDER BY 1`); len(r.Rows) != 0 || len(r.Columns) != 2 || r.Columns[1].Name != "default_version" {
+	if r := execSQL(t, ctx, root, `SELECT e.extname, ae.default_version FROM pg_catalog.pg_extension e LEFT JOIN pg_catalog.pg_available_extensions() ae(name, default_version, comment) ON ae.name = e.extname ORDER BY 1`); len(r.Rows) != 4 || len(r.Columns) != 2 || r.Columns[1].Name != "default_version" ||
+		r.Rows[1][0].S != "plpgsql" || r.Rows[1][1].S != "1.0" {
 		t.Fatalf("\\dx's join: %+v %+v", r.Columns, r.Rows)
 	}
 	eq("CAST", names(execSQL(t, ctx, root, `SELECT CAST(qty AS text) FROM t WHERE id = 1`)), "5")

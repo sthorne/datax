@@ -88,6 +88,11 @@ const (
 	// CodeAmbiguousParameter is PostgreSQL's ambiguous_parameter: one
 	// parameter deduced as two incompatible types.
 	CodeAmbiguousParameter = "42P08"
+
+	// CodeDatatypeMismatch is PostgreSQL's datatype_mismatch: an
+	// operator class or collation that does not apply to the column's
+	// type.
+	CodeDatatypeMismatch = "42804"
 )
 
 // Error is a SQL-level error with a SQLSTATE code.

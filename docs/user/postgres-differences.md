@@ -189,9 +189,10 @@ syntax error or `0A000` feature not supported):
   vector_l2_ops | vector_cosine_ops | vector_ip_ops) WITH (lists = n)`
   with `SET ivfflat.probes` behave as in pgvector
   ([Vectors](sql.md#vectors)). What differs:
-  - *There is no extension.* `CREATE EXTENSION vector` is accepted and
-    does nothing (any other extension name is refused, `0A000`); `DROP
-    EXTENSION`, `pg_extension` and `vector_version()` do not exist. The
+  - *There is no extension to install.* `CREATE EXTENSION vector` is
+    accepted and does nothing, `DROP EXTENSION vector` too, and
+    `pg_extension` always lists it (see *Extensions* below);
+    `vector_version()` does not exist. The
     type's OID is fixed (16000) rather than assigned at install time;
     `to_regtype('vector')` returns the OID as a number, and
     `'vector'::regtype` does not resolve — look the OID up with
@@ -217,8 +218,8 @@ syntax error or `0A000` feature not supported):
     (`SET vector_index_scan = off` forces the exact scan, as `SET
     enable_indexscan = off` does in PostgreSQL).
   - *No `REINDEX`*: rebuild by creating a second index and dropping the
-    first. `CREATE INDEX` is always online (there is no `CONCURRENTLY`
-    keyword to ask for it), and an index built on little or no data
+    first. `CREATE INDEX` is always online (`CONCURRENTLY` is accepted
+    and changes nothing), and an index built on little or no data
     gets fewer lists than asked for — one, on an empty table — instead
     of pgvector's notice about low recall. `pg_indexes` shows the
     number of lists actually built.
@@ -292,8 +293,37 @@ syntax error or `0A000` feature not supported):
   rewrites is refused (`0A000`); PostgreSQL cascades after the
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
-- **`CREATE INDEX` is always online** (like `CONCURRENTLY`) and cannot run
-  inside a transaction block.
+- **`CREATE INDEX` is always online** (like `CONCURRENTLY`, which is
+  accepted and changes nothing) and cannot run inside a transaction
+  block (`25001`) — except on a table created in the same block, where
+  it is built in the block and commits or rolls back with it (a Rails or
+  Django migration's `create_table` and `add_index`). As in PostgreSQL,
+  `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are refused
+  in any block. The index name may be left out (`<table>_<columns>_idx`).
+  There is no `REINDEX`.
+- **Index keys compare bytewise**, the order of the `C` collation. The
+  string types' operator classes (`text_pattern_ops`,
+  `varchar_pattern_ops`, `bpchar_pattern_ops`, and the defaults
+  `text_ops`, `varchar_ops`, `bpchar_ops`) and `COLLATE "C"`, `"POSIX"`
+  and `"default"` are accepted on an index column and shown by
+  `pg_get_indexdef` / `pg_indexes`; Django's `..._like` index works as
+  written. Any other collation is refused in an index (`0A000`), as is
+  any other operator class on an ordinary index; `pg_index.indclass`
+  and `indcollation` are not modeled, and `pg_opclass` is empty. The
+  pattern classes do not make `LIKE 'abc%'` use the index (below).
+- **Extensions: `plpgsql`, `pgcrypto`, `uuid-ossp` and `vector` are
+  built in.** `CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s]
+  [VERSION v] [CASCADE]` accepts them and does nothing, and so does
+  `DROP EXTENSION [IF EXISTS]`: they cannot be removed. `pg_extension`
+  and `pg_available_extensions` always list all four as installed, so
+  `CREATE EXTENSION` without `IF NOT EXISTS` succeeds where PostgreSQL
+  would say the extension already exists (`42710`). What each provides
+  is limited: `pgcrypto` is `gen_random_uuid()` only — `digest`,
+  `hmac`, `crypt`, `gen_salt`, `gen_random_bytes` and the `pgp_*`
+  functions do not exist — and `uuid-ossp` is `uuid_generate_v4()` only
+  (no `uuid_generate_v1`, `v1mc`, `v3`, `v5`, `uuid_nil` or the
+  `uuid_ns_*` constants). Any other extension is refused (`0A000`);
+  `DROP EXTENSION` of one is `42704`.
 - **`ORDER BY`** takes output names, positions and expressions, but an
   expression sort never uses an index; NULLs order last ASC / first DESC
   (PostgreSQL default). Under `UNION`, output names and positions
@@ -475,7 +505,7 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   the catalogs (`SELECT 1 FROM pg_class WHERE relname = ...`; the
   `to_regclass()` function itself does not exist) return
   what PostgreSQL would for a schema in the datax subset. Reads of
-  features datax lacks (triggers, comments, extensions) come back
+  features datax lacks (triggers, comments) come back
   empty rather than erroring — whatever shape the tool's query takes;
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with

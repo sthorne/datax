@@ -401,6 +401,7 @@ func (p *parser) parseStatement() (Statement, error) {
 				if err := p.expectKeyword("EXISTS"); err != nil {
 					return nil, err
 				}
+				ce.IfNotExists = true
 			}
 			name, err := p.expectIdent()
 			if err != nil {
@@ -486,6 +487,7 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
 			p.i += 2 // DROP INDEX
 			di := &DropIndex{}
+			di.Concurrently = p.consumeIdentWord("concurrently")
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("EXISTS"); err != nil {
 					return nil, err
@@ -497,10 +499,36 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			di.Name = name
-			if !p.consumeIdentWord("cascade") {
+			if p.consumeIdentWord("cascade") {
+				di.Cascade = true
+			} else {
 				p.consumeIdentWord("restrict")
 			}
 			return di, nil
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+			p.i += 2 // DROP EXTENSION
+			de := &DropExtension{}
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				de.IfExists = true
+			}
+			for {
+				name, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				de.Names = append(de.Names, strings.ToLower(name))
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if !p.consumeIdentWord("cascade") {
+				p.consumeIdentWord("restrict")
+			}
+			return de, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
 			p.i += 2 // DROP TYPE
@@ -2100,6 +2128,10 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 	if err := p.expectKeyword("INDEX"); err != nil {
 		return nil, err
 	}
+	// CONCURRENTLY: every index build is online, so it asks for what
+	// happens anyway; the executor keeps PostgreSQL's refusal inside a
+	// transaction block.
+	ci.Concurrently = p.consumeIdentWord("concurrently")
 	if p.consumeKeyword("IF") {
 		if err := p.expectKeyword("NOT"); err != nil {
 			return nil, err
@@ -2109,11 +2141,15 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 		ci.IfNotExists = true
 	}
-	name, err := p.expectIdent()
-	if err != nil {
-		return nil, err
+	// The name may be left out (CREATE INDEX ON t (c)): the executor
+	// picks one as PostgreSQL does. IF NOT EXISTS needs a name.
+	if t := p.peek(); !(t.kind == tkKeyword && t.text == "ON") || ci.IfNotExists {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ci.Name = name
 	}
-	ci.Name = name
 	if err := p.expectKeyword("ON"); err != nil {
 		return nil, err
 	}
@@ -2144,6 +2180,7 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			ci.ExprFunc, ci.ExprArg = fn, arg
 			ci.Columns = append(ci.Columns, col)
 			ci.OpClasses = append(ci.OpClasses, "")
+			ci.Collations = append(ci.Collations, "")
 			if p.consumeOp(",") {
 				return nil, p.errf("an index on an expression takes that one expression and nothing else")
 			}
@@ -2154,23 +2191,37 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 			return nil, err
 		}
 		ci.Columns = append(ci.Columns, col)
-		// An operator class after the column: (doc jsonb_ops).
+		// A collation, then an operator class after the column:
+		// (name COLLATE "C"), (doc jsonb_ops), (name text_pattern_ops).
+		collation := ""
+		if p.consumeIdentWord("collate") {
+			if collation, err = p.parseQualifiedWord(); err != nil {
+				return nil, err
+			}
+		}
+		ci.Collations = append(ci.Collations, collation)
 		opclass := ""
 		if p.peek().kind == tkIdent {
-			opclass = strings.ToLower(p.peek().text)
-			p.i++
+			if opclass, err = p.parseQualifiedWord(); err != nil {
+				return nil, err
+			}
+			opclass = strings.ToLower(opclass)
 		}
 		ci.OpClasses = append(ci.OpClasses, opclass)
 		if !p.consumeOp(",") {
 			break
 		}
 	}
-	named := false
-	for _, oc := range ci.OpClasses {
-		named = named || oc != ""
+	named, collated := false, false
+	for i := range ci.OpClasses {
+		named = named || ci.OpClasses[i] != ""
+		collated = collated || ci.Collations[i] != ""
 	}
 	if !named {
 		ci.OpClasses = nil
+	}
+	if !collated {
+		ci.Collations = nil
 	}
 	if err := p.expectOp(")"); err != nil {
 		return nil, err
@@ -2212,6 +2263,22 @@ func (p *parser) parseCreateIndex() (Statement, error) {
 		}
 	}
 	return ci, nil
+}
+
+// parseQualifiedWord reads an identifier that may carry a schema
+// (pg_catalog.text_pattern_ops, pg_catalog."C") and returns its last
+// part: there is one schema of each, so the qualifier names nothing.
+func (p *parser) parseQualifiedWord() (string, error) {
+	word, err := p.expectIdent()
+	if err != nil {
+		return "", err
+	}
+	for p.consumeOp(".") {
+		if word, err = p.expectIdent(); err != nil {
+			return "", err
+		}
+	}
+	return word, nil
 }
 
 // parseIndexExpr reads an index key written as an expression,
