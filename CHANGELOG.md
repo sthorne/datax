@@ -1189,6 +1189,19 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **Running a request as a stopper task costs less** (#331). Every gRPC
+  call, raft message, HTTP request and SQL connection has been a stopper
+  task since #324, and each took the stopper's one mutex twice, updated
+  a shared map of names and registered with the stopper's context. Tasks
+  are now tracked in 32 shards, each with its own lock, and Stop cancels
+  them itself. A task costs 175-250 ns and 2 allocations where it cost
+  450-500 ns and 4 serially, and about 180 ns where it cost 0.8-1 µs
+  with four cores starting tasks at once; its share of a node's CPU
+  under `kv-50-50` on three nodes fell from 2.2 % to 1.3 %. Throughput
+  and p99 of that workload did not move beyond run-to-run noise either
+  way. The guarantees are those of #324: no task is admitted once a
+  stop begins, none is running when the closers run, the wait is
+  bounded, and a task still running at the bound is logged by name.
 - **A unique index takes NULLs, as in PostgreSQL** (#322). A row with a NULL
   in any column of a unique index has no entry in it and conflicts with no
   other row (NULLS DISTINCT, PostgreSQL's default), on every path: `INSERT`,
@@ -1467,6 +1480,29 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`current_setting(name)` read per row raises `42704` for a name that is
+  no setting** (#329). Since #326, `current_setting(s.name)` over a column
+  (psql's `\dconfig` over `pg_settings`) evaluates per row, but a row
+  whose name was no setting, or a custom `app.x` never `SET`, read NULL;
+  PostgreSQL raises `42704 unrecognized configuration parameter "<name>"`.
+  It now does, as the constant form `current_setting('nosuch')` already
+  did. `current_setting(name, true)` (`missing_ok`) returns NULL in both
+  forms, and `missing_ok` may be a column too. A NULL name is NULL, as in
+  PostgreSQL; the constant form raised `42704` for it. Row-security
+  policies keyed on `current_setting('app.tenant')` are unchanged: they
+  read a constant, which was and is `42704` until the setting is `SET`.
+- **`pg_settings` and `SHOW ALL` list custom settings, and
+  `foreign_key_cascade_limit` reports its source** (#330). A custom
+  setting the session has `SET` (`app.tenant`, `set_config('app.x', ...)`)
+  was missing from both, so psql's `\dconfig` never showed it. It is now
+  listed as PostgreSQL lists a placeholder variable: its value, `source =
+  'session'`, `vartype = 'string'`, no `boot_val`, `reset_val` `''`, in
+  category `Customized Options`. `SET foreign_key_cascade_limit` was kept
+  outside the session's variables, so `pg_settings` reported `source =
+  'default'` and the set value as `boot_val`; it now reports `session` and
+  the new-session value `10000`, like the other settings. Keeping it with
+  the other variables also ends a `SET LOCAL foreign_key_cascade_limit`
+  with its transaction block; before, it outlived the block.
 - **A point-in-time restore no longer refuses the audit table a node
   created between two backups** (#327). A node creates `datax_audit`
   when it first writes an audit record. When that happened between a

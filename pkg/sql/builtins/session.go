@@ -24,7 +24,7 @@ func init() {
 		{Name: "session_user", Ret: types.String, Vol: Stable, Doc: "The authenticated session user (unchanged by SET ROLE)."},
 		{Name: "current_database", Ret: types.String, Vol: Stable, Doc: "The session's database."},
 		{Name: "current_schema", Ret: types.String, Vol: Stable, Doc: "public: the only schema."},
-		{Name: "current_setting", Args: []types.Family{types.String, types.Bool}, MinArgs: 1, Ret: types.String, Vol: Stable, Doc: "The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Evaluated once per statement."},
+		{Name: "current_setting", Args: []types.Family{types.String, types.Bool}, MinArgs: 1, Ret: types.String, Vol: Stable, Doc: "The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Its arguments may name columns: the name is looked up per row."},
 		{Name: "set_config", Args: []types.Family{types.String, types.String, types.Bool}, MinArgs: 3, Ret: types.String, Vol: Volatile, Doc: "Sets a session setting, as SET does (SET LOCAL when is_local is true), and returns the value: SET with a value that can be a parameter. Evaluated once per statement: its arguments cannot name columns."},
 		{Name: "version", Ret: types.String, Vol: Stable, Doc: "The server version string (PostgreSQL 14.0 datax <release>)."},
 		{Name: "nextval", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.Int, Vol: Volatile, Doc: "Advances the sequence and returns its next value; never rolled back."},

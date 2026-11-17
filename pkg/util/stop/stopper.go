@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sthorne/datax/pkg/util/log"
@@ -36,23 +38,56 @@ type Stopper struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // workers
-	tasks  sync.WaitGroup // tasks
+
+	// Tasks are admitted and tracked in shards, each with its own
+	// mutex, so that tasks on different cores do not contend for one
+	// lock and one map (issue #331). Stop marks every shard stopped
+	// before anything else, under its lock: a task admitted to a shard
+	// before the mark is counted in left, and one asked for after it is
+	// refused.
+	shards [numTaskShards]taskShard
+	// left counts the tasks Stop is waiting for, plus one while Stop is
+	// still marking the shards; drained is closed when it reaches zero.
+	left    atomic.Int64
+	drained chan struct{}
 
 	mu           sync.Mutex
 	stopping     bool // Stop has begun: no new workers or tasks
 	closing      bool // Stop has taken the closers: a new one runs at once
 	closers      []func()
-	running      map[string]int // running tasks by name, for the drain log
 	drainTimeout time.Duration
 	onDrain      func(tasks int)
 	done         chan struct{} // closed when Stop has finished
+}
+
+// numTaskShards is the number of task shards: enough that tasks on a
+// many-core machine rarely meet on one, few enough that Stop's pass
+// over them is cheap.
+const numTaskShards = 32
+
+// taskShard is one shard of the running tasks. Its slots hold the
+// running tasks' names (for the drain log) and the cancel functions of
+// their contexts (for Stop); a free slot has a nil cancel and its index
+// in free.
+type taskShard struct {
+	mu      sync.Mutex
+	stopped bool
+	live    int
+	slots   []taskSlot
+	free    []int32
+	_       [64]byte // keep neighbouring shards' mutexes off one cache line
+}
+
+type taskSlot struct {
+	name   string
+	cancel context.CancelFunc
 }
 
 func NewStopper() *Stopper {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Stopper{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		running: make(map[string]int), drainTimeout: DefaultDrainTimeout,
+		drained: make(chan struct{}), drainTimeout: DefaultDrainTimeout,
 	}
 }
 
@@ -86,27 +121,44 @@ func (s *Stopper) RunWorker(f func(ctx context.Context)) error {
 // returns ErrStopped. name says what the task is in the log Stop writes
 // when tasks hold it up.
 func (s *Stopper) RunTask(ctx context.Context, name string, f func(ctx context.Context)) error {
-	s.mu.Lock()
-	if s.stopping {
-		s.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	sh := &s.shards[rand.Uint32()%numTaskShards]
+	sh.mu.Lock()
+	if sh.stopped {
+		sh.mu.Unlock()
+		cancel()
 		return ErrStopped
 	}
-	s.tasks.Add(1)
-	s.running[name]++
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		if s.running[name]--; s.running[name] == 0 {
-			delete(s.running, name)
-		}
-		s.mu.Unlock()
-		s.tasks.Done()
-	}()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	defer context.AfterFunc(s.ctx, cancel)()
+	var i int32
+	if n := len(sh.free); n > 0 {
+		i = sh.free[n-1]
+		sh.free = sh.free[:n-1]
+	} else {
+		i = int32(len(sh.slots))
+		sh.slots = append(sh.slots, taskSlot{})
+	}
+	sh.slots[i] = taskSlot{name: name, cancel: cancel}
+	sh.live++
+	sh.mu.Unlock()
+	defer s.endTask(sh, i)
 	f(ctx)
 	return nil
+}
+
+// endTask releases the slot of a task that has returned and, once Stop
+// has counted it, tells Stop it is no longer waiting for it.
+func (s *Stopper) endTask(sh *taskShard, i int32) {
+	sh.mu.Lock()
+	cancel := sh.slots[i].cancel
+	sh.slots[i] = taskSlot{}
+	sh.free = append(sh.free, i)
+	sh.live--
+	counted := sh.stopped
+	sh.mu.Unlock()
+	cancel()
+	if counted && s.left.Add(-1) == 0 {
+		close(s.drained)
+	}
 }
 
 // SetDrainTimeout bounds how long Stop waits for running tasks once the
@@ -162,6 +214,7 @@ func (s *Stopper) Stop() {
 	s.mu.Unlock()
 	defer close(s.done)
 
+	s.stopTasks()
 	s.cancel()
 	s.wg.Wait()
 	s.drainTasks()
@@ -176,22 +229,45 @@ func (s *Stopper) Stop() {
 	}
 }
 
+// stopTasks refuses new tasks and cancels the contexts of the running
+// ones. Every shard is marked before any context is canceled, so a task
+// that sees its context canceled and asks for another is refused.
+func (s *Stopper) stopTasks() {
+	s.left.Store(1) // held while marking: left cannot reach zero early
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		sh.stopped = true
+		s.left.Add(int64(sh.live))
+		sh.mu.Unlock()
+	}
+	if s.left.Add(-1) == 0 {
+		close(s.drained)
+	}
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for _, t := range sh.slots {
+			if t.cancel != nil {
+				t.cancel()
+			}
+		}
+		sh.mu.Unlock()
+	}
+}
+
 // drainTasks waits for the running tasks, up to the drain timeout.
 func (s *Stopper) drainTasks() {
-	s.mu.Lock()
-	n, timeout, hook := s.runningLocked(), s.drainTimeout, s.onDrain
-	s.mu.Unlock()
+	n := int(s.left.Load())
 	if n == 0 {
 		return
 	}
+	s.mu.Lock()
+	timeout, hook := s.drainTimeout, s.onDrain
+	s.mu.Unlock()
 	if hook != nil {
 		hook(n)
 	}
-	drained := make(chan struct{})
-	go func() {
-		s.tasks.Wait()
-		close(drained)
-	}()
 	var bound <-chan time.Time
 	if timeout > 0 {
 		t := time.NewTimer(timeout)
@@ -199,26 +275,27 @@ func (s *Stopper) drainTasks() {
 		bound = t.C
 	}
 	select {
-	case <-drained:
+	case <-s.drained:
 	case <-bound:
-		s.mu.Lock()
-		still := s.describeLocked()
-		s.mu.Unlock()
-		log.Errorf("stopper: tasks still running %s after the stop began, closing anyway: %s", timeout, still)
+		log.Errorf("stopper: tasks still running %s after the stop began, closing anyway: %s", timeout, s.describeTasks())
 	}
 }
 
-func (s *Stopper) runningLocked() int {
-	n := 0
-	for _, c := range s.running {
-		n += c
+// describeTasks lists the running tasks by name, with their counts.
+func (s *Stopper) describeTasks() string {
+	running := make(map[string]int)
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for _, t := range sh.slots {
+			if t.cancel != nil {
+				running[t.name]++
+			}
+		}
+		sh.mu.Unlock()
 	}
-	return n
-}
-
-func (s *Stopper) describeLocked() string {
-	names := make([]string, 0, len(s.running))
-	for name, c := range s.running {
+	names := make([]string, 0, len(running))
+	for name, c := range running {
 		names = append(names, fmt.Sprintf("%s×%d", name, c))
 	}
 	sort.Strings(names)

@@ -196,3 +196,72 @@ func TestRunTaskWithoutStop(t *testing.T) {
 		t.Fatal("RunTask did not run the task")
 	}
 }
+
+// TestNoTaskAfterClosersUnderLoad (issue #331): with tasks started from
+// many goroutines while Stop runs, every task admitted has returned
+// before the first closer runs, and every task refused never ran.
+func TestNoTaskAfterClosersUnderLoad(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		s := NewStopper()
+		var closing atomic.Bool
+		var inFlight atomic.Int64
+		var bad atomic.Int64
+		s.AddCloser(func() {
+			closing.Store(true)
+			if n := inFlight.Load(); n != 0 {
+				bad.Add(n)
+			}
+		})
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					err := s.RunTask(context.Background(), "load", func(ctx context.Context) {
+						inFlight.Add(1)
+						if closing.Load() {
+							bad.Add(1)
+						}
+						inFlight.Add(-1)
+					})
+					if err == ErrStopped {
+						return
+					}
+				}
+			}()
+		}
+		time.Sleep(time.Millisecond)
+		s.Stop()
+		wg.Wait()
+		if n := bad.Load(); n != 0 {
+			t.Fatalf("iteration %d: %d tasks ran while or after the closers ran", iter, n)
+		}
+	}
+}
+
+// TestDrainLogNamesTasks (issue #331): the tasks still running at the
+// drain bound are listed by name with their counts.
+func TestDrainLogNamesTasks(t *testing.T) {
+	s := NewStopper()
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	for _, name := range []string{"raft", "raft", "http /x"} {
+		started.Add(1)
+		go func() {
+			_ = s.RunTask(context.Background(), name, func(context.Context) {
+				started.Done()
+				<-release
+			})
+		}()
+	}
+	started.Wait()
+	if got, want := s.describeTasks(), "http /x×1, raft×2"; got != want {
+		t.Fatalf("describeTasks() = %q, want %q", got, want)
+	}
+	close(release)
+	s.Stop()
+	if got := s.describeTasks(); got != "" {
+		t.Fatalf("describeTasks() after Stop = %q, want none", got)
+	}
+}

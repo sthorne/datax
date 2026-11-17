@@ -1613,8 +1613,10 @@ policy learns which tenant a connection is working for.
 `set_config(name, value, is_local)` sets one from an expression or a
 parameter (`is_local` true is `SET LOCAL`). A custom setting does not
 exist until it is first set: reading it before is `42704`, or NULL with
-`current_setting(name, true)`. `RESET` leaves it set and empty. It
-belongs to the session, so a pooled connection must set it again (or
+`current_setting(name, true)`, as in PostgreSQL. Once set it is listed in
+`pg_settings` and `SHOW ALL` (`source` `session`, `vartype` `string`, no
+`boot_val`), so psql's `\dconfig` shows it. `RESET` leaves it set and
+empty. It belongs to the session, so a pooled connection must set it again (or
 `SET LOCAL` it per transaction) for each request.
 
 `SET LOCAL` and `SET TRANSACTION` apply to the current block and end
