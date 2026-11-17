@@ -244,6 +244,9 @@ type Session struct {
 	// selects it runs underneath (WITH members, derived tables, set
 	// members, subqueries) materialize as they must.
 	streamTop bool
+	// dmlJoin, while an UPDATE ... FROM or DELETE ... USING runs its
+	// join, receives the joined rows (dmlfrom.go).
+	dmlJoin *dmlJoin
 
 	// lo is the session's large-object state: the descriptors open in
 	// its transaction (largeobject.go), made on first use.

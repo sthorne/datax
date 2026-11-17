@@ -637,8 +637,12 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 		if err != nil {
 			return nil, err
 		}
-		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
-			return nil, err
+		// An UPDATE's or DELETE's target, joined with its FROM list,
+		// needs that statement's privilege only (checked by it).
+		if t.DMLTarget == "" || t.Joins[i].Alias != t.DMLTarget {
+			if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+				return nil, err
+			}
 		}
 		innerDescs[i] = desc
 	}
@@ -913,6 +917,11 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 			return nil, err
 		}
 		res.Rows = append(res.Rows, out)
+	}
+	if t.DMLTarget != "" && s.dmlJoin != nil && s.dmlJoin.sides == nil {
+		// The join of an UPDATE ... FROM or DELETE ... USING: its rows,
+		// one select-list row each, go back to the statement.
+		s.dmlJoin.sides, s.dmlJoin.joined, s.dmlJoin.out = sides, joined, res.Rows
 	}
 	if t.Distinct && len(t.DistinctOn) == 0 {
 		res.Rows = dedupeRows(res.Rows)

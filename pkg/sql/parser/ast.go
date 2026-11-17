@@ -737,6 +737,12 @@ type Select struct {
 	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
 	// ForUpdate.
 	LockWait LockWait
+	// DMLTarget is never set by the parser. It marks the select an
+	// UPDATE ... FROM or DELETE ... USING runs to join its target with
+	// the FROM list, naming the member (by alias) that is the target:
+	// the executor hands that select's joined rows back to the
+	// statement, and the target needs no SELECT privilege of its own.
+	DMLTarget string
 }
 
 // LockWait is the wait policy of a FOR UPDATE clause.
@@ -749,9 +755,18 @@ const (
 )
 
 type Update struct {
-	With      []CTE
-	Table     string
-	Set       []SetClause
+	With  []CTE
+	Table string
+	// Alias is the target's alias (UPDATE t [AS] a SET ...), "" when
+	// none was written.
+	Alias string
+	Set   []SetClause
+	// From is the FROM list of UPDATE ... FROM, as join members in
+	// written order: the first is a CROSS member (its Table, Alias,
+	// Derived or FuncTable set as a join member's are), the rest are
+	// joined to it as written — a comma is a CROSS member, a JOIN keeps
+	// its kind and ON / USING. Nil without a FROM clause.
+	From      []JoinClause
 	Where     []Comparison
 	Returning []SelectExpr
 }
@@ -854,8 +869,12 @@ type SetDefault struct {
 }
 
 type Delete struct {
-	With      []CTE
-	Table     string
+	With  []CTE
+	Table string
+	// Alias is the target's alias (DELETE FROM t [AS] a ...).
+	Alias string
+	// Using is the USING list of DELETE ... USING, shaped as Update.From.
+	Using     []JoinClause
 	Where     []Comparison
 	Returning []SelectExpr
 }

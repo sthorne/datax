@@ -361,9 +361,9 @@ func stmtReferences(stmt parser.Statement, name string) bool {
 	case *parser.Insert:
 		return strings.EqualFold(t.Table, name) || (t.Select != nil && sel(t.Select))
 	case *parser.Update:
-		return strings.EqualFold(t.Table, name) || conds(t.Where)
+		return strings.EqualFold(t.Table, name) || conds(t.Where) || len(t.From) > 0 && sel(&parser.Select{Joins: t.From})
 	case *parser.Delete:
-		return strings.EqualFold(t.Table, name) || conds(t.Where)
+		return strings.EqualFold(t.Table, name) || conds(t.Where) || len(t.Using) > 0 && sel(&parser.Select{Joins: t.Using})
 	}
 	return false
 }
