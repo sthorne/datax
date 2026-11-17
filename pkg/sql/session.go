@@ -1560,6 +1560,23 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		"pg_get_function_result", "pg_get_function_arguments", "pg_get_function_identity_arguments",
 		"pg_get_functiondef", "pg_get_triggerdef", "pg_get_ruledef":
 		return types.DNull, nil
+	case unrecognizedSettingFunc:
+		// current_setting(name [, missing_ok]) per row, for a name that
+		// is none of the session's settings: NULL for a NULL name or
+		// with missing_ok, else 42704 as PostgreSQL raises it.
+		if args[0].Null {
+			return types.DNull, nil
+		}
+		if len(args) == 2 && !args[1].Null {
+			missingOK, err := args[1].Coerce(types.Bool)
+			if err != nil {
+				return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "current_setting: missing_ok: %v", err)
+			}
+			if !missingOK.Null && missingOK.B {
+				return types.DNull, nil
+			}
+		}
+		return types.Datum{}, newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", args[0].Text())
 	case "pg_char_to_encoding":
 		return types.NewInt(6), nil // UTF8
 	case "getdatabaseencoding":

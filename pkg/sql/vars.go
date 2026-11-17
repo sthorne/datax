@@ -224,6 +224,13 @@ func (s *Session) settingDefaults() map[string]string {
 	return out
 }
 
+// unrecognizedSettingFunc is the function a per-row current_setting()
+// falls to when the row's name is none of the session's settings (see
+// resolveValueExprOpts): it raises 42704, or returns NULL with
+// missing_ok. A query that names it ("current_setting:unrecognized"(x))
+// gets just that, which is harmless.
+const unrecognizedSettingFunc = "current_setting:unrecognized"
+
 // setting resolves a SHOW name to the setting's canonical name and value.
 func (s *Session) setting(name string) (string, string, bool) {
 	if isCustomVar(name) {

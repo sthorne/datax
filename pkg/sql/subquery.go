@@ -134,17 +134,23 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		if len(e.Args) < 1 || len(e.Args) > 2 {
 			return e, newErrf(CodeSyntaxError, "current_setting() takes a name and an optional missing_ok")
 		}
-		if exprHasColumn(e.Args[0]) {
+		if exprHasColumn(e.Args[0]) || len(e.Args) == 2 && exprHasColumn(e.Args[1]) {
 			// A name read from the row (current_setting(s.name) over
 			// pg_settings, psql's \dconfig): a CASE over every setting
-			// the session has, matched case-insensitively as SHOW
-			// matches. A name that is none of them is NULL, as with
-			// missing_ok.
-			arg, err := s.resolveValueExprOpts(ctx, txn, e.Args[0], params, keepVolatile)
-			if err != nil {
-				return e, err
+			// the session has, custom ones included, matched
+			// case-insensitively as SHOW matches. A name that is none
+			// of them falls to unrecognizedSettingFunc, which is 42704
+			// for that row unless missing_ok, then NULL — what the
+			// constant form below does.
+			args := make([]parser.Expr, len(e.Args))
+			for i, a := range e.Args {
+				r, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
+				if err != nil {
+					return e, err
+				}
+				args[i] = r
 			}
-			ce := &parser.CaseExpr{Operand: &parser.Expr{Func: "lower", Args: []parser.Expr{arg}}}
+			ce := &parser.CaseExpr{Operand: &parser.Expr{Func: "lower", Args: []parser.Expr{args[0]}}}
 			add := func(name, value string) {
 				n, v := types.NewString(strings.ToLower(name)), types.NewString(value)
 				ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &n}, Result: parser.Expr{Lit: &v}})
@@ -160,8 +166,7 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 			for _, name := range custom {
 				add(name, s.vars.custom[name])
 			}
-			null := types.DNull
-			ce.Else = &parser.Expr{Lit: &null}
+			ce.Else = &parser.Expr{Func: unrecognizedSettingFunc, Args: args}
 			return parser.Expr{Case: ce}, nil
 		}
 		nameArg, err := evalExpr(e.Args[0], nil, nil, params)
@@ -179,6 +184,8 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		_, value, ok := s.setting(nameArg.Text())
 		var d types.Datum
 		switch {
+		case nameArg.Null:
+			d = types.DNull // strict, as in PostgreSQL
 		case ok:
 			d = types.NewString(value)
 		case missingOK:
