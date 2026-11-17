@@ -11,6 +11,66 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax start --locality-advertise=key=value@host:port[,...]`** (#350;
+  alias `--locality-advertise-addr`): a node that shares the locality tier
+  `key=value` with this node dials it at that address, for example over a
+  private network inside a region, instead of at its `--advertise` address.
+  Each tier must be one of the node's `--locality` tiers. A locality address
+  is used once a dial to it succeeds within 1s; if it does not answer, peers
+  fall back to the public address (logged at most once a minute per peer)
+  and try the locality address again every 10s. `--join` addresses are
+  dialed as given. The entries travel in the node descriptor (older nodes
+  ignore them), and show in `/api/node`, `/api/cluster`, `/status`, the
+  console's node list and node page and `datax debug nodes`. New metrics
+  `datax_rpc_locality_dials_total` and `datax_rpc_locality_fallbacks_total`.
+- **Transaction modes on `BEGIN` / `START TRANSACTION`** (#346):
+  `BEGIN [WORK | TRANSACTION]` and `START TRANSACTION` take `SET
+  TRANSACTION`'s modes (`ISOLATION LEVEL ...`, `READ ONLY` / `READ WRITE`,
+  `[NOT] DEFERRABLE`), so pgx `BeginTx` with `TxOptions` and `database/sql`
+  read-only transactions work. `READ ONLY` refuses writes with `25006`;
+  isolation stays serializable. A read-only transaction now also refuses
+  `nextval()` and `setval()`. An unknown isolation level is `42601`, not
+  `22023`. Before, the modes were a syntax error.
+- **PostgreSQL's common session settings** (#345): `client_min_messages`,
+  `IntervalStyle`, `work_mem`, `maintenance_work_mem`, `synchronous_commit`,
+  `jit`, the planner's `enable_*`, `random_page_cost`, `lc_*`,
+  `default_transaction_isolation`, `default_transaction_deferrable`,
+  `check_function_bodies`, `xmloption`, `default_tablespace`, `row_security`,
+  `bytea_output`, `extra_float_digits` and more are recognised instead of
+  failing with `42704`, with PostgreSQL 18's defaults, units and value
+  checks, in `SHOW`, `current_setting()` and `pg_settings`. Most have no
+  effect (listed in `docs/user/postgres-differences.md`); these do:
+  `IntervalStyle` (`iso_8601`, as Rails sets, `sql_standard`,
+  `postgres_verbose`) and `bytea_output = escape` change the text format of
+  interval and bytea columns on the wire, and `IntervalStyle` is reported as
+  a parameter status; `client_min_messages = warning` / `error` stops
+  NOTICEs; `row_security = off` makes a query that row-level security would
+  filter fail with `42501`, as pg_dump expects. `SHOW server_version_num` and
+  `max_identifier_length` work, and `SET standard_conforming_strings = on`
+  (the first line of a pg_dump script) is accepted. Unknown names still fail
+  with `42704`.
+- **`CREATE INDEX CONCURRENTLY`, pattern operator classes and the built-in
+  extensions** (#347, #348, #349):
+  - `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are accepted
+    (every index build is already online) and refused inside a transaction
+    block (`25001`), as in PostgreSQL. `CREATE INDEX` may leave out the
+    index name, which is chosen as PostgreSQL does.
+  - `CREATE INDEX` runs inside a transaction block when the same block
+    created the table, as Rails and Django migrations do; on other tables it
+    is still refused (`25001`), and now aborts the block.
+  - Index columns accept `text_pattern_ops`, `varchar_pattern_ops`,
+    `bpchar_pattern_ops` and the default `*_ops`, and `COLLATE "C"`,
+    `"POSIX"` and `"default"`; `pg_get_indexdef` and `\d` show them. Other
+    collations are refused (`0A000`). Django's `_like` indexes work.
+  - `CREATE EXTENSION` and the new `DROP EXTENSION` accept `plpgsql`,
+    `pgcrypto` (only `gen_random_uuid`), `uuid-ossp` (only
+    `uuid_generate_v4`) and `vector` as no-ops, and `pg_extension` and
+    `pg_available_extensions` list them as installed. Other extensions are
+    still refused. `uuid_generate_v4()` now works outside a `DEFAULT`.
+- **Multi-word type names in casts** (#343): `double precision`, `character
+  varying(n)` and `timestamp/time with[out] time zone` work after `::` and
+  in `CAST`, and `_int4`-style names mean the array type. Before, the first
+  three were syntax errors and `_T` was text.
 - **`SELECT DISTINCT ON (exprs)`** (#337): of each group of rows equal on the
   expressions, the first in `ORDER BY` order is kept, before `LIMIT` and
   `OFFSET`. The `ORDER BY` must begin with the `DISTINCT ON` expressions
@@ -1545,6 +1605,21 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`jsonb || jsonb` merges** (#342) as in PostgreSQL instead of joining the
+  two texts: objects merge (the right side wins), arrays concatenate, a
+  non-array is appended or prepended, and two non-arrays make a two-element
+  array. An untyped literal or parameter beside a jsonb is read as jsonb, so
+  `UPDATE t SET j = j || '{"k":1}'` stores the merged document; the result
+  describes as jsonb. `json || json` on `::json` values and `jsonb ||
+  <non-text scalar>` are refused with `42883`.
+- **Casts to a type datax does not have fail** (#343) with PostgreSQL's
+  `42704 type "..." does not exist`: `'a'::citext`, `::money`, `::inet`,
+  `::hstore`, `::xml`, `::pg_lsn`, range types and any unknown name, in
+  every statement kind, checked before anything is read. Before, the value
+  silently passed through as text.
+- **`length`, `octet_length`, `substring`/`substr`, `position`/`strpos` and
+  `md5` of a bytea work on its bytes** (#344), not its `\x` hex text:
+  `length('\x0102'::bytea)` is 2, and `substring` of a bytea is a bytea.
 - **`TimeZone` is honored** (#340). Before, a session's zone only changed
   how `TIMESTAMPTZ` values were rendered on the wire: text without an
   offset still read as UTC and `::text`, `::date`, `date_trunc`, `extract`,
