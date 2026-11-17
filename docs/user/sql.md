@@ -1421,7 +1421,7 @@ vector scan of index "items_embedding" (ivfflat, <->: the nearest 10 of 100 list
 ## Transactions and retries
 
 ```sql
-BEGIN;                                   -- or START TRANSACTION
+BEGIN;                                   -- or START TRANSACTION; BEGIN READ ONLY etc. take SET TRANSACTION's modes
 UPDATE accounts SET balance = balance - 10 WHERE id = 1;
 UPDATE accounts SET balance = balance + 10 WHERE id = 2;
 COMMIT;                                  -- ROLLBACK / ABORT to abandon
@@ -1670,7 +1670,7 @@ SET idle_in_transaction_session_timeout = '1min'; -- 25P03: the idle block is ro
 SET TIME ZONE 'America/New_York';             -- TIMESTAMPTZ read and rendered in the zone
 SET application_name = 'billing';             -- shown by pg_stat_activity / SHOW SESSIONS
 SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / ROLLBACK
-SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006)
+SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006); BEGIN READ ONLY does the same
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;   -- source 'session' where this session changed it (psql's \dconfig)
@@ -1694,8 +1694,8 @@ invalid value `22023`:
 | `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it; storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
 | `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
-| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY` and DDL with `25006` |
-| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
+| `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` (also as `BEGIN` / `START TRANSACTION` modes) | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY`, DDL, `nextval()` and `setval()` with `25006` |
+| `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` (also as a `BEGIN` / `START TRANSACTION` mode) | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
 | `foreign_key_cascade_limit` | a positive integer | the per-statement cascade cap |
 | `inverted_index_scan` | `auto` (default), `on`, `off` | whether the planner may, must (when the query allows it) or must not read a GIN index |

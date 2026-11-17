@@ -931,7 +931,13 @@ type AlterDefaultPrivileges struct {
 	GrantOption bool
 }
 
-type Begin struct{}
+// Begin is BEGIN [WORK | TRANSACTION] / START TRANSACTION. Modes are its
+// transaction modes as the SET TRANSACTION statements they stand for
+// (transaction-scoped SetVars), run once the block is open.
+type Begin struct {
+	Modes []*SetVar
+}
+
 type Commit struct{}
 type Rollback struct{}
 

@@ -702,16 +702,30 @@ func (p *parser) parseStatement() (Statement, error) {
 			return &AlterDatabase{Name: name, NewName: newName}, nil
 		}
 		return p.parseAlterTable()
-	case "BEGIN":
+	case "BEGIN", "START":
+		// BEGIN [WORK | TRANSACTION] [modes] / START TRANSACTION [modes]:
+		// the modes are SET TRANSACTION's, applied as if it ran first in
+		// the block.
 		p.i++
-		p.consumeKeyword("TRANSACTION")
-		return &Begin{}, nil
-	case "START":
-		p.i++
-		if err := p.expectKeyword("TRANSACTION"); err != nil {
+		if t.text == "START" {
+			if err := p.expectKeyword("TRANSACTION"); err != nil {
+				return nil, err
+			}
+		} else if !p.consumeKeyword("TRANSACTION") {
+			p.consumeIdentWord("work")
+		}
+		readOnly, isolation, err := p.parseTransactionModes(t.text)
+		if err != nil {
 			return nil, err
 		}
-		return &Begin{}, nil
+		b := &Begin{}
+		if isolation != "" {
+			b.Modes = append(b.Modes, &SetVar{Name: "transaction_isolation", Value: isolation, Local: true})
+		}
+		if readOnly != "" {
+			b.Modes = append(b.Modes, &SetVar{Name: "transaction_read_only", Value: readOnly, Local: true})
+		}
+		return b, nil
 	case "COMMIT", "END":
 		p.i++
 		p.consumeKeyword("TRANSACTION")
@@ -1719,6 +1733,57 @@ func exprContainsColumn(e Expr) bool {
 	return false
 }
 
+// parseTransactionModes parses the transaction modes of SET TRANSACTION,
+// SET SESSION CHARACTERISTICS AS TRANSACTION, BEGIN and START
+// TRANSACTION, up to the statement's end: ISOLATION LEVEL x, READ ONLY |
+// READ WRITE and [NOT] DEFERRABLE, separated by commas or whitespace.
+// readOnly is "on", "off" or "" (not given); isolation is the lower-cased
+// level or "". DEFERRABLE is accepted and ignored. what names the
+// statement in errors.
+func (p *parser) parseTransactionModes(what string) (readOnly, isolation string, err error) {
+	for !p.atStatementEnd() {
+		switch {
+		case p.consumeIdentWord("isolation"):
+			if !p.consumeIdentWord("level") {
+				return "", "", p.errf("expected LEVEL after ISOLATION")
+			}
+			var words []string
+			for !p.atStatementEnd() {
+				t := p.peek()
+				if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
+					break
+				}
+				words = append(words, strings.ToLower(t.text))
+				p.i++
+				if len(words) == 2 || words[0] == "serializable" {
+					break
+				}
+			}
+			isolation = strings.Join(words, " ")
+			switch isolation {
+			case "serializable", "repeatable read", "read committed", "read uncommitted":
+			default:
+				return "", "", p.errf("expected an isolation level, found %q", isolation)
+			}
+		case p.peekIdentSeq("read", "only"):
+			p.i += 2
+			readOnly = "on"
+		case p.peekIdentSeq("read", "write"):
+			p.i += 2
+			readOnly = "off"
+		case p.consumeKeyword("NOT"):
+			if !p.consumeIdentWord("deferrable") {
+				return "", "", p.errf("expected DEFERRABLE after NOT")
+			}
+		case p.consumeIdentWord("deferrable"):
+		case p.consumeOp(","):
+		default:
+			return "", "", p.errf("unexpected %q in %s", p.peek().text, what)
+		}
+	}
+	return readOnly, isolation, nil
+}
+
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
 // parseSet parses SET [SESSION | LOCAL] name {TO | =} value [, ...], SET
 // TIME ZONE value, SET NAMES value, SET [SESSION CHARACTERISTICS AS]
@@ -1745,44 +1810,9 @@ func (p *parser) parseSet() (Statement, error) {
 		if !characteristics {
 			sv.Local = true
 		}
-		var readOnly, isolation string
-		for !p.atStatementEnd() {
-			switch {
-			case p.consumeIdentWord("isolation"):
-				if !p.consumeIdentWord("level") {
-					return nil, p.errf("expected LEVEL after ISOLATION")
-				}
-				var words []string
-				for !p.atStatementEnd() {
-					t := p.peek()
-					if (t.kind != tkIdent && t.kind != tkKeyword) || t.text == "read" && len(words) > 0 && (p.peekIdentSeq("read", "only") || p.peekIdentSeq("read", "write")) {
-						break
-					}
-					words = append(words, strings.ToLower(t.text))
-					p.i++
-					if len(words) == 2 {
-						break
-					}
-				}
-				if len(words) == 1 && words[0] != "serializable" {
-					return nil, p.errf("expected an isolation level, found %q", words[0])
-				}
-				isolation = strings.Join(words, " ")
-			case p.peekIdentSeq("read", "only"):
-				p.i += 2
-				readOnly = "on"
-			case p.peekIdentSeq("read", "write"):
-				p.i += 2
-				readOnly = "off"
-			case p.consumeKeyword("NOT"):
-				if !p.consumeIdentWord("deferrable") {
-					return nil, p.errf("expected DEFERRABLE after NOT")
-				}
-			case p.consumeIdentWord("deferrable"):
-			case p.consumeOp(","):
-			default:
-				return nil, p.errf("unexpected %q in SET TRANSACTION", p.peek().text)
-			}
+		readOnly, isolation, err := p.parseTransactionModes("SET TRANSACTION")
+		if err != nil {
+			return nil, err
 		}
 		switch {
 		case readOnly != "" && characteristics:

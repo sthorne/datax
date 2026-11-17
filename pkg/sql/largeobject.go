@@ -1096,7 +1096,7 @@ func (s *Session) evalLargeObjectFunc(ctx context.Context, txn *kvclient.Txn, na
 	if largeObjectWrites[name] {
 		// The statement is a SELECT, which a read-only transaction lets
 		// through; what it calls is not a read.
-		if s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly) {
+		if s.readOnly() {
 			return types.Datum{}, newErrf(CodeReadOnlyTransaction, "cannot execute %s() in a read-only transaction", name)
 		}
 	}

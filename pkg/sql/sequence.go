@@ -309,6 +309,9 @@ func (s *Session) nextval(ctx context.Context, txn *kvclient.Txn, name string) (
 	if err := s.checkSequencePriv(ctx, txn, d, catalog.PrivUsage); err != nil {
 		return 0, err
 	}
+	if s.readOnly() {
+		return 0, newErrf(CodeReadOnlyTransaction, "cannot execute nextval() in a read-only transaction")
+	}
 	seqBlocks.Lock()
 	defer seqBlocks.Unlock()
 	key := seqBlockKey{s.db, d.ID}
@@ -406,6 +409,9 @@ func (s *Session) setval(ctx context.Context, txn *kvclient.Txn, name string, v 
 	}
 	if err := s.checkSequencePriv(ctx, txn, d, "UPDATE"); err != nil {
 		return 0, err
+	}
+	if s.readOnly() {
+		return 0, newErrf(CodeReadOnlyTransaction, "cannot execute setval() in a read-only transaction")
 	}
 	if v < d.MinValue || v > d.MaxValue {
 		return 0, newErrf(CodeInvalidParameter, "setval: value %d is out of bounds for sequence %q (%d..%d)", v, d.Name, d.MinValue, d.MaxValue)
