@@ -3785,24 +3785,39 @@ var notBareColumnLabel = map[string]bool{
 
 // parseOptColumnAlias consumes a select-list item's optional alias:
 // AS name, or a bare name (SELECT count(*) n, (SELECT ...) "Applicable
-// types"). A bare alias is a quoted identifier or one that cannot
-// continue the statement instead (notBareColumnLabel); keywords never
-// are.
+// types"). A bare alias is a quoted identifier, one that cannot
+// continue the statement instead (notBareColumnLabel), or USER; no
+// other keyword is.
 func (p *parser) parseOptColumnAlias() (string, error) {
 	if p.consumeKeyword("AS") {
+		// Any word may follow AS, a reserved one included (SELECT
+		// current_user AS user), as in PostgreSQL.
+		if t := p.peek(); t.kind == tkKeyword {
+			p.i++
+			return strings.ToLower(t.text), nil
+		}
 		return p.expectIdent()
 	}
 	t := p.peek()
+	if t.kind == tkKeyword && t.text == "USER" {
+		// USER is one of the reserved words PostgreSQL takes as a bare
+		// label (SELECT 1 user).
+		p.i++
+		return "user", nil
+	}
 	if t.kind != tkIdent {
 		return "", nil
 	}
-	quoted := t.pos < len(p.src) && p.src[t.pos] == '"'
-	if !quoted && notBareColumnLabel[t.text] {
+	if !p.quoted(t) && notBareColumnLabel[t.text] {
 		return "", nil
 	}
 	p.i++
 	return t.text, nil
 }
+
+// quoted reports whether an identifier token was written in double
+// quotes.
+func (p *parser) quoted(t token) bool { return t.pos < len(p.src) && p.src[t.pos] == '"' }
 
 // parseOptTableAlias consumes an optional [AS] alias after a table name.
 // In the outer-table position (allowAsOf) an AS followed by the
@@ -6049,17 +6064,22 @@ var scalarFuncs = map[string]int{ // name → arity (-1 = variadic, min 1)
 	"version": 0, "current_user": 0, "session_user": 0, "pg_backend_pid": 0, "current_setting": -1, "set_config": 3, "pg_sleep": 1, "pg_cancel_backend": 1, "pg_terminate_backend": 1, "pg_notify": 2,
 	"pg_get_userbyid": 1, "pg_table_is_visible": 1, "pg_partition_ancestors": 1, "pg_encoding_to_char": 1, "obj_description": -1, "col_description": 2,
 	"array_to_string": 2, "pg_get_indexdef": -1, "pg_get_constraintdef": -1, "format_type": 2, "pg_typeof": 1, "to_regtype": 1,
-	"pg_get_expr": -1, "quote_ident": 1, "current_schemas": 1, "pg_get_viewdef": -1, "shobj_description": 2,
+	"pg_get_expr": -1, "quote_ident": 1, "pg_get_viewdef": -1, "shobj_description": 2,
 	"pg_get_statisticsobjdef_columns": 1, "pg_relation_is_publishable": 1,
 	"pg_size_pretty": 1, "pg_table_size": 1, "pg_total_relation_size": 1, "pg_relation_size": -1, "pg_database_size": 1,
-	"has_database_privilege": -1, "has_table_privilege": -1, "has_schema_privilege": -1, "pg_tablespace_location": 1,
-	"pg_type_is_visible": 1, "pg_function_is_visible": 1, "pg_get_function_result": 1, "pg_get_function_arguments": 1,
+	"pg_tablespace_location": 1,
+	"pg_type_is_visible":     1, "pg_function_is_visible": 1, "pg_get_function_result": 1, "pg_get_function_arguments": 1,
 	"pg_get_function_identity_arguments": 1, "pg_get_functiondef": 1, "pg_char_to_encoding": 1, "getdatabaseencoding": 0,
 	"pg_get_triggerdef": -1, "pg_get_ruledef": -1,
+	// The system information and privilege functions (pg_get_serial_
+	// sequence, to_regclass, pg_has_role, has_*_privilege, ...; issue
+	// #357) are absent: the session checks the argument count of each
+	// form, 42883 as PostgreSQL reports a call no form matches.
 }
 
 // bareFuncs are called without parentheses (SQL keywords in PostgreSQL).
 var bareFuncs = map[string]bool{"current_user": true, "session_user": true, "current_schema": true,
+	"current_role": true, "current_catalog": true,
 	"current_timestamp": true, "current_date": true, "localtimestamp": true, "current_time": true, "localtime": true}
 
 // precisionFuncs are the SQL-standard clock keywords that also take a
@@ -6113,6 +6133,11 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(e)
 		}
 		return p.parseValueExpr()
+	}
+	if t.kind == tkKeyword && t.text == "USER" {
+		// USER is current_user (a reserved word: never a column).
+		p.i++
+		return p.applyCasts(Expr{Func: "user"})
 	}
 	if t.kind == tkIdent || t.kind == tkKeyword {
 		// Typed literals: INTERVAL '1 day', DATE '2024-01-01', ... — a
@@ -6193,8 +6218,9 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			p.i += 2
 			t = p.peek()
 		}
-		// current_user / session_user need no parentheses.
-		if bareFuncs[t.text] && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "(" || p.toks[p.i+1].text == ".")) {
+		// current_user / session_user need no parentheses; written in
+		// double quotes, the name is a column's.
+		if bareFuncs[t.text] && !p.quoted(t) && !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "(" || p.toks[p.i+1].text == ".")) {
 			p.i++
 			e := Expr{Func: t.text}
 			return p.applyCasts(e)

@@ -145,12 +145,12 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 ## Session and system
 
-- `current_database() → text` — The session's database. *stable*
+- `current_database() → text` — The session's database (also the keyword current_catalog, without parentheses). *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
 - `current_schema() → text` — public: the only schema. *stable*
 - `current_setting(text, [bool]) → text` — The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Its arguments may name columns: the name is looked up per row. *stable*
 - `current_time() → time` (also `localtime`) — The time of day of the statement's start time, in the session's time zone. current_time, current_timestamp, localtime and localtimestamp are written without parentheses, as in PostgreSQL, and take an optional fractional-seconds precision: current_timestamp(3). *stable*
-- `current_user() → text` — The current role: the session user, or the role SET ROLE selected. *stable*
+- `current_user() → text` — The current role: the session user, or the role SET ROLE selected. Also written current_role and user; like session_user, all three are keywords written without parentheses. *stable*
 - `currval(text) → int8` — The value nextval last returned for the sequence in this session (55000 before any). *stable*
 - `gen_random_uuid() → uuid` (also `uuid_generate_v4`) — A random (version 4) UUID. *volatile*
 - `lastval() → int8` — The value nextval last returned in this session, whatever the sequence. *stable*
@@ -162,6 +162,29 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `setval(text, int8, [bool]) → int8` — Sets the sequence's counter; with is_called false the value itself is the next one handed out. *volatile*
 - `unique_rowid() → int8` — A node-local monotonic 64-bit id (48 bits of microsecond time above the node ID): unique across nodes with no coordination, spread across ranges unlike a sequence. *volatile*
 - `version() → text` — The server version string (PostgreSQL 14.0 datax <release>). *stable*
+
+## System information and privileges
+
+- `current_schemas(bool) → text[]` — The schemas of the search path: {pg_catalog,public} when the argument (include implicit schemas) is true, {public} when false. *stable*
+- `has_any_column_privilege(any, any, [text]) → bool` — has_any_column_privilege([user,] table, privilege): SELECT, INSERT, UPDATE or REFERENCES on any column of the table. datax grants on tables, so this is has_table_privilege's answer. *stable*
+- `has_column_privilege(any, any, any, [text]) → bool` — has_column_privilege([user,] table, column, privilege): SELECT, INSERT, UPDATE or REFERENCES on the column (a name, or an attribute number). datax grants on tables, so this is the table's answer. 42703 for an unknown column name, NULL for an unknown number. *stable*
+- `has_database_privilege(any, any, [text]) → bool` — has_database_privilege([user,] database, privilege): CREATE, CONNECT, or TEMPORARY (TEMP), which follows CONNECT. 3D000 for an unknown database. *stable*
+- `has_foreign_data_wrapper_privilege(any, any, [text]) → bool` — There are no foreign-data wrappers: 42704 for a name, NULL for an OID. *stable*
+- `has_function_privilege(any, any, [text]) → bool` — has_function_privilege([user,] function, privilege): EXECUTE, which every role holds on every function. The function is a pg_proc OID or name(argument types); 42883 when none matches. *stable*
+- `has_schema_privilege(any, any, [text]) → bool` — has_schema_privilege([user,] schema, privilege): USAGE or CREATE. On public, USAGE is everyone's unless revoked from PUBLIC and CREATE is what creating a table in the database takes; pg_catalog and information_schema are everyone's to use and admins' to create in. 3F000 for an unknown schema. *stable*
+- `has_sequence_privilege(any, any, [text]) → bool` — has_sequence_privilege([user,] sequence, privilege): USAGE, SELECT or UPDATE on the sequence, as nextval, currval and setval check them. 42809 when the relation is not a sequence. *stable*
+- `has_server_privilege(any, any, [text]) → bool` — There are no foreign servers: 42704 for a name, NULL for an OID. *stable*
+- `has_table_privilege(any, any, [text]) → bool` — has_table_privilege([user,] table, privilege): whether the user (the current role when omitted; a name, an OID or public) holds the privilege on the table, view or sequence (a name or an OID) — SELECT, INSERT, UPDATE, DELETE and TRUNCATE as GRANT, ownership, admin, read_all and write_all confer them; REFERENCES, TRIGGER and MAINTAIN are the owner's and admins'. A comma-separated list is true when any holds; WITH GRANT OPTION asks for the grant option. NULL for an OID that names nothing, 42P01 for an unknown name, 22023 for an unknown privilege. The schema's USAGE is not consulted, as in PostgreSQL. *stable*
+- `has_tablespace_privilege(any, any, [text]) → bool` — has_tablespace_privilege([user,] tablespace, privilege): CREATE on pg_default or pg_global, which only admins hold. 42704 for any other tablespace. *stable*
+- `has_type_privilege(any, any, [text]) → bool` — has_type_privilege([user,] type, privilege): USAGE, which every role holds on every type. 42704 for an unknown type. *stable*
+- `pg_get_serial_sequence(text, text) → text` — The sequence a SERIAL, identity or OWNED BY column draws from, as public.name (quoted where needed), or NULL when it has none. The table name is read as SQL reads one ('"Mixed"', 'public.t'); the column name is taken as written. 42P01 for no such table, 42703 for no such column. *stable*
+- `pg_has_role(any, any, [text]) → bool` — pg_has_role([user,] role, privilege): whether the user (the current role when omitted; a name or an OID) is a MEMBER of the role (directly or not), has its privileges (USAGE: membership through INHERIT), or may SET ROLE to it (SET); WITH ADMIN OPTION asks whether it may grant the role. A comma-separated list is true when any holds. Root and admins hold every role. 42704 for an unknown role name, 22023 for an unknown privilege. *stable*
+- `pg_is_in_recovery() → bool` — false: every node serves reads and writes; there is no standby mode. *stable*
+- `to_regclass(text) → int8` — The OID of the table, view, sequence or catalog so named (read as SQL reads a name), or NULL when there is none — 'name'::regclass without the error. *stable*
+- `to_regnamespace(text) → int8` — The OID of the schema (public, pg_catalog or information_schema), or NULL. *stable*
+- `to_regproc(text) → int8` — The pg_proc OID of the builtin function so named, or NULL. *stable*
+- `to_regprocedure(text) → int8` — The pg_proc OID of the builtin function named with its argument list ('lower(text)'), or NULL when there is none or it takes another number of arguments. *stable*
+- `to_regrole(text) → int8` — The OID of the role, or NULL when there is none. *stable*
 
 ## Large objects
 

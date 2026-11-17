@@ -187,8 +187,14 @@ func sessionFuncFamily(name string) types.Family {
 	case "datax_key_wrap", "datax_key_unwrap", "datax_encrypt", "datax_decrypt":
 		return types.Bytes
 	case "pg_table_is_visible", "has_database_privilege", "has_table_privilege", "has_schema_privilege", "pg_type_is_visible", "pg_function_is_visible", "pg_relation_is_publishable",
-		"pg_cancel_backend", "pg_terminate_backend":
+		"pg_cancel_backend", "pg_terminate_backend", "pg_is_in_recovery", "pg_has_role", "has_column_privilege", "has_any_column_privilege",
+		"has_sequence_privilege", "has_function_privilege", "has_type_privilege", "has_tablespace_privilege",
+		"has_foreign_data_wrapper_privilege", "has_server_privilege":
 		return types.Bool
+	case "to_regclass", "to_regproc", "to_regprocedure", "to_regnamespace", "to_regrole":
+		return types.Int
+	case "current_schemas":
+		return types.ArrayOf(types.String)
 	}
 	return types.String
 }
