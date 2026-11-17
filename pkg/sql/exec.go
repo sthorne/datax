@@ -2463,8 +2463,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
-		return nil, err
+	if t.DMLTarget == "" || t.Alias != t.DMLTarget {
+		// (An UPDATE's or DELETE's target heading its join with the
+		// FROM list needs that statement's privilege only.)
+		if err := s.checkTablePriv(ctx, txn, desc, "SELECT"); err != nil {
+			return nil, err
+		}
 	}
 	if len(t.Joins) > 0 {
 		return s.execJoinSelect(ctx, txn, desc, t, params, jc)
@@ -2704,6 +2708,12 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 		c.With = nil
 		t = &c
 	}
+	if len(t.From) > 0 {
+		return s.execUpdateFrom(ctx, txn, t, params)
+	}
+	if t.Alias != "" {
+		t = stripUpdateAlias(t)
+	}
 	corr, t2, err := s.splitCorrelatedUpdate(ctx, txn, t)
 	if err != nil {
 		return nil, err
@@ -2723,18 +2733,9 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := s.checkTablePriv(ctx, txn, desc, "UPDATE"); err != nil {
 		return nil, err
 	}
-	pkSet := false // the statement sets a primary-key column: rows may move
-	for _, set := range t.Set {
-		col, ok := desc.Col(set.Column)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", set.Column)
-		}
-		if desc.IsPKCol(col.ID) {
-			if col.Hidden {
-				return nil, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", set.Column)
-			}
-			pkSet = true
-		}
+	pkSet, err := updateSetsPK(desc, t.Set)
+	if err != nil {
+		return nil, err
 	}
 
 	var planKeyStmt parser.Statement
@@ -2780,7 +2781,70 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
-	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, reads)
+	u := updateApply{
+		desc: desc, set: t.Set, rows: rows, pkSet: pkSet, reads: reads,
+		eval: func(i, j int) (types.Datum, error) {
+			value := t.Set[j].Value
+			if exprIsVolatile(value) {
+				var err error
+				if value, err = s.spliceVolatile(ctx, txn, value, params); err != nil {
+					return types.Datum{}, err
+				}
+			}
+			return evalExpr(value, desc, rows[i].row, params)
+		},
+	}
+	if ret != nil {
+		u.retCols = ret.columns()
+		u.ret = func(_ int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error) {
+			return ret.project(desc, row, params)
+		}
+	}
+	return s.applyUpdate(ctx, txn, &u, params)
+}
+
+// updateSetsPK checks an UPDATE's SET columns against the target and
+// reports whether one is a primary-key column (rows may move).
+func updateSetsPK(desc *catalog.TableDescriptor, set []parser.SetClause) (bool, error) {
+	pkSet := false
+	for _, sc := range set {
+		col, ok := desc.Col(sc.Column)
+		if !ok {
+			return false, newErrf(CodeUndefinedColumn, "column %q of relation %q does not exist", sc.Column, desc.Name)
+		}
+		if desc.IsPKCol(col.ID) {
+			if col.Hidden {
+				return false, newErrf(CodeFeatureNotSupported, "column %q is maintained by the system and cannot be updated", sc.Column)
+			}
+			pkSet = true
+		}
+	}
+	return pkSet, nil
+}
+
+// updateApply is an UPDATE's target rows and how to compute what it
+// writes: eval gives SET clause j's value for row i (DEFAULT is handled
+// by applyUpdate), ret the RETURNING row for row i once updated.
+type updateApply struct {
+	desc  *catalog.TableDescriptor
+	set   []parser.SetClause
+	rows  []fetchedRow
+	pkSet bool
+	// reads: the statement read the table to find or compute its rows
+	// (the new rows must then pass the SELECT policies too).
+	reads   bool
+	eval    func(i, j int) (types.Datum, error)
+	ret     func(i int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error)
+	retCols []ResultColumn
+}
+
+// applyUpdate writes an UPDATE's new rows: SET values, NOT NULL and type
+// modifiers, moved primary keys, row security's WITH CHECK, unique keys
+// and foreign keys checked for the statement as a whole, then the
+// writes and RETURNING.
+func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateApply, params []types.Datum) (*Result, error) {
+	desc, rows, pkSet := u.desc, u.rows, u.pkSet
+	rowSec, err := s.rowCheckFor(ctx, txn, desc, false, true, u.reads)
 	if err != nil {
 		return nil, err
 	}
@@ -2801,7 +2865,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	for i, fr := range rows {
 		oldRow := copyRow(fr.row)
 		oldRows[i] = oldRow
-		for _, set := range t.Set {
+		for j, set := range u.set {
 			col, _ := desc.Col(set.Column)
 			var d types.Datum
 			switch {
@@ -2810,13 +2874,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 					return nil, err
 				}
 			default:
-				value := set.Value
-				if exprIsVolatile(value) {
-					if value, err = s.spliceVolatile(ctx, txn, value, params); err != nil {
-						return nil, err
-					}
-				}
-				if d, err = evalExpr(value, desc, fr.row, params); err != nil {
+				if d, err = u.eval(i, j); err != nil {
 					return nil, err
 				}
 			}
@@ -2913,8 +2971,8 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 				return nil, err
 			}
 		}
-		if ret != nil {
-			out, err := ret.project(desc, fr.row, params)
+		if u.ret != nil {
+			out, err := u.ret(i, fr.row)
 			if err != nil {
 				return nil, err
 			}
@@ -2928,8 +2986,8 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return nil, err
 	}
-	if ret != nil {
-		res.Columns = ret.columns()
+	if u.ret != nil {
+		res.Columns = u.retCols
 	}
 	res.Tag = fmt.Sprintf("UPDATE %d", len(rows))
 	return res, nil
@@ -2946,6 +3004,12 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		c := *t
 		c.With = nil
 		t = &c
+	}
+	if len(t.Using) > 0 {
+		return s.execDeleteUsing(ctx, txn, t, params)
+	}
+	if t.Alias != "" {
+		t = stripDeleteAlias(t)
 	}
 	corr, t2, err := s.splitCorrelatedDelete(ctx, txn, t)
 	if err != nil {
@@ -3006,13 +3070,28 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if err != nil {
 		return nil, err
 	}
+	var project func(int, map[catalog.ColumnID]types.Datum) ([]types.Datum, error)
+	var retCols []ResultColumn
+	if ret != nil {
+		retCols = ret.columns()
+		project = func(_ int, row map[catalog.ColumnID]types.Datum) ([]types.Datum, error) {
+			return ret.project(desc, row, params)
+		}
+	}
+	return s.applyDelete(ctx, txn, desc, rows, project, retCols)
+}
+
+// applyDelete deletes rows of desc — their foreign-key actions, index
+// entries and a re-shard's shadow copies with them — and projects
+// RETURNING (ret, nil without one) from each deleted row.
+func (s *Session) applyDelete(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, rows []fetchedRow, ret func(int, map[catalog.ColumnID]types.Datum) ([]types.Datum, error), retCols []ResultColumn) (*Result, error) {
 	guard, err := s.guard(ctx, txn, desc)
 	if err != nil {
 		return nil, err
 	}
 	res := &Result{}
 	var wb kvclient.WriteBatch
-	for _, fr := range rows {
+	for i, fr := range rows {
 		if err := guard.checkDelete(ctx, txn, fr.row, &wb); err != nil {
 			return nil, err
 		}
@@ -3028,7 +3107,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 			return nil, err
 		}
 		if ret != nil {
-			out, err := ret.project(desc, fr.row, params)
+			out, err := ret(i, fr.row)
 			if err != nil {
 				return nil, err
 			}
@@ -3039,7 +3118,7 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 		return nil, err
 	}
 	if ret != nil {
-		res.Columns = ret.columns()
+		res.Columns = retCols
 	}
 	res.Tag = fmt.Sprintf("DELETE %d", len(rows))
 	return res, nil

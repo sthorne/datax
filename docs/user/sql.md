@@ -1176,7 +1176,34 @@ INSERT INTO t (a, b, c) VALUES (1, 'x', 1)
   RETURNING c;
 INSERT INTO t (a, b) VALUES (1, 'x') ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING;
 UPSERT INTO t (a, b, c) VALUES (1, 'x', 5);                     -- ON CONFLICT (primary key) DO UPDATE SET every column
+
+UPDATE orders o SET status = s.status FROM staging s WHERE o.id = s.id;   -- values from joined rows
+DELETE FROM posts p USING users u WHERE p.uid = u.id AND u.banned;
+UPDATE t SET c = c + v.d FROM (VALUES (1, 10), (2, 20)) AS v(a, d)
+  WHERE t.a = v.a RETURNING *;                                  -- t's columns, then v's
 ```
+
+`UPDATE ... FROM` and `DELETE ... USING` join the target (with an
+optional alias, `UPDATE t [AS] x`) to a `FROM` (`USING`) list that takes
+anything a `SELECT`'s can: tables, subqueries, `VALUES` lists, `WITH`
+members, views, table functions and explicit joins. `SET`, `WHERE` and
+`RETURNING` read the list's columns, and a subquery in `SET` may
+correlate with both the target and the list. `RETURNING *` returns the
+target's columns followed by the list's. Each target row is updated or
+deleted once however many rows it joins; an `UPDATE` takes its values
+from the first joined row in the order the join reads the list (a
+table by primary key, or by the index used to look it up; a `VALUES`
+list as written) — PostgreSQL leaves that choice unspecified, so write
+the list so that a target row joins one row. The tables in the list
+need `SELECT`, and their row-security policies apply; the target's
+`SELECT` policies and the statement's own (`UPDATE`, `DELETE`) pick the
+rows that change, and constraints, foreign-key actions and primary-key
+moves apply as in any `UPDATE` or `DELETE`. The target is read once
+ahead of the list unless the `WHERE` equates the list with the leading
+column of its primary key or of one of its indexes (or the list has
+joins of its own): then it is looked up per row of the list, so an
+`UPDATE` from a small staging table into a large one reads only the
+rows it changes.
 
 `RETURNING` rows come from the values the statement already has (no
 extra read). The `ON CONFLICT` target must be the primary key or a

@@ -323,9 +323,22 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 				pt.value(set.Value, col.Type, true)
 			}
 		}
+		if len(t.From) > 0 {
+			// The join of the target with the FROM list types the WHERE,
+			// the SET values' subqueries and RETURNING, as a select's.
+			var exprs []parser.SelectExpr
+			for _, set := range t.Set {
+				if !set.Value.IsDefault {
+					exprs = append(exprs, parser.SelectExpr{Expr: set.Value})
+				}
+			}
+			exprs = append(exprs, t.Returning...)
+			pt.selectStmt(dmlFromSelect(t.Table, t.Alias, t.From, t.Where, exprs, true), parent, false)
+			break
+		}
 		c := *t
 		c.With = nil
-		pt.walk(&c, tableScope(parent, desc, t.Table, ""))
+		pt.walk(&c, tableScope(parent, desc, t.Table, t.Alias))
 	case *parser.Delete:
 		restore := pt.with(t.With, parent)
 		defer restore()
@@ -337,9 +350,18 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 			pt.walk(t, parent)
 			break
 		}
+		if len(t.Using) > 0 {
+			exprs := t.Returning
+			if len(exprs) == 0 {
+				one := types.NewInt(1)
+				exprs = []parser.SelectExpr{{Expr: parser.Expr{Lit: &one}}}
+			}
+			pt.selectStmt(dmlFromSelect(t.Table, t.Alias, t.Using, t.Where, exprs, true), parent, false)
+			break
+		}
 		c := *t
 		c.With = nil
-		pt.walk(&c, tableScope(parent, desc, t.Table, ""))
+		pt.walk(&c, tableScope(parent, desc, t.Table, t.Alias))
 	case *parser.Explain:
 		return pt.statement(t.Stmt, parent, top)
 	case *parser.CreateTable:

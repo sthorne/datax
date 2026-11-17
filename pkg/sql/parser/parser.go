@@ -2783,144 +2783,8 @@ func (p *parser) parseSelect() (Statement, error) {
 		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
 	}
 	if p.consumeKeyword("FROM") {
-		// FROM (SELECT ...) AS alias — a derived table. LATERAL is
-		// accepted ahead of the first member, which has nothing to its
-		// left to read.
-		p.consumeLateral()
-		derived := false
-		if sub, ok, err := p.parseSubquery(); err != nil {
+		if err := p.parseFromList(sel); err != nil {
 			return nil, err
-		} else if ok {
-			sel.Derived = sub
-			sel.Alias = p.parseOptTableAlias(false)
-			if sel.Alias == "" {
-				return nil, p.errf("subquery in FROM must have an alias")
-			}
-			derived = true
-		}
-		// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
-		// set-returning function as a table, joinable like any other.
-		funcTable := false
-		if !derived {
-			if fe, ok, err := p.parseFuncTable(); err != nil {
-				return nil, err
-			} else if ok {
-				sel.FuncTable = fe
-				if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
-					return nil, err
-				}
-				funcTable = true
-			}
-		}
-		if !derived && !funcTable {
-			name, err := p.parseTableName()
-			if err != nil {
-				return nil, err
-			}
-			sel.Table = name
-			sel.Alias = p.parseOptTableAlias(true)
-		}
-		// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
-		// words. Joins execute left-deep in syntactic order. A derived
-		// table joins too: it runs as a named relation.
-		for {
-			jk, join, err := p.parseJoinKind()
-			if err != nil {
-				return nil, err
-			}
-			if !join {
-				break
-			}
-			left, cross := jk.left, jk.cross
-			if len(sel.Joins) >= maxJoinTables-1 {
-				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
-			}
-			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
-			jc.Lateral = p.consumeLateral()
-			if fe, ok, err := p.parseFuncTable(); err != nil {
-				return nil, err
-			} else if ok {
-				// A table function as a join member, named by its alias
-				// (the function's name by default).
-				jc.FuncTable = fe
-				if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
-					return nil, err
-				}
-			} else if sub, ok, err := p.parseSubquery(); err != nil {
-				return nil, err
-			} else if ok {
-				jc.Derived = sub
-				jc.Alias = p.parseOptTableAlias(false)
-				if jc.Alias == "" {
-					return nil, p.errf("subquery in FROM must have an alias")
-				}
-				jc.Table = jc.Alias
-			} else if jc.Lateral {
-				return nil, p.errf("LATERAL must be followed by a subquery or a function call, found %q", p.peek().text)
-			} else {
-				jt, err := p.parseTableName()
-				if err != nil {
-					return nil, err
-				}
-				jc.Table = jt
-				jc.Alias = p.parseOptTableAlias(false)
-			}
-			jt := jc.Table
-			if jt == "" {
-				jt = jc.Alias
-			}
-			if cross || jk.natural {
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			if p.consumeIdentWord("using") {
-				if err := p.expectOp("("); err != nil {
-					return nil, err
-				}
-				for {
-					col, err := p.expectIdent()
-					if err != nil {
-						return nil, err
-					}
-					jc.Using = append(jc.Using, col)
-					if !p.consumeOp(",") {
-						break
-					}
-				}
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-				sel.Joins = append(sel.Joins, jc)
-				continue
-			}
-			if err := p.expectKeyword("ON"); err != nil {
-				return nil, err
-			}
-			// The ON clause is a full boolean expression (parentheses,
-			// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
-			// two column references are the join keys; every other
-			// conjunct is a filter evaluated per candidate match.
-			n, err := p.parseBoolOr()
-			if err != nil {
-				return nil, err
-			}
-			conds, err := lowerBool(n, false)
-			if err != nil {
-				return nil, err
-			}
-			for _, c := range conds {
-				if l, r, ok := joinEquality(c); ok {
-					jc.On = append(jc.On, JoinCond{L: l, R: r})
-					continue
-				}
-				jc.Filter = append(jc.Filter, c)
-			}
-			// A lateral member's ON may be any condition (LEFT JOIN
-			// LATERAL ... ON true): it is evaluated per candidate row.
-			if len(jc.On) == 0 && !jc.Lateral {
-				return nil, p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
-			}
-			sel.Joins = append(sel.Joins, jc)
 		}
 		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
 		// untouched; SYSTEM and TIME lex as identifiers).
@@ -2961,6 +2825,214 @@ func (p *parser) parseSelect() (Statement, error) {
 		}
 	}
 	return p.finishSelect(sel)
+}
+
+// parseDerivedTable parses a FROM-list subquery member — (SELECT ...),
+// (WITH ...) or (VALUES ...) — with its required [AS] alias and optional
+// column aliases (AS v(a, b)), which rename the query's leading output
+// columns. ok=false when the next tokens do not open one.
+func (p *parser) parseDerivedTable() (*Select, string, bool, error) {
+	var sub *Select
+	values := false
+	if t := p.peek(); t.kind == tkOp && t.text == "(" && p.toks[p.i+1].kind == tkKeyword && p.toks[p.i+1].text == "VALUES" {
+		values = true
+		p.i++ // (
+		stmt, err := p.parseValuesQuery()
+		if err != nil {
+			return nil, "", false, err
+		}
+		sub = stmt.(*Select)
+		if err := p.parseOrderLimit(sub, true); err != nil {
+			return nil, "", false, err
+		}
+		if sub.Union != nil {
+			sub.OrderBy = byOutputPosition(sub.OrderBy)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, "", false, err
+		}
+	} else {
+		s, ok, err := p.parseSubquery()
+		if err != nil || !ok {
+			return nil, "", false, err
+		}
+		sub = s
+	}
+	alias := p.parseOptTableAlias(false)
+	if alias == "" {
+		if values {
+			return nil, "", false, p.errf("VALUES in FROM must have an alias")
+		}
+		return nil, "", false, p.errf("subquery in FROM must have an alias")
+	}
+	if p.consumeOp("(") {
+		var cols []string
+		for {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, "", false, err
+			}
+			cols = append(cols, col)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, "", false, err
+		}
+		for _, se := range sub.Exprs {
+			if se.Star {
+				return nil, "", false, p.errf("column aliases on a subquery that selects * are not supported: name the columns in its select list")
+			}
+		}
+		if len(cols) > len(sub.Exprs) {
+			return nil, "", false, p.errf("table %q has %d columns available but %d columns specified", alias, len(sub.Exprs), len(cols))
+		}
+		// The head member names a set operation's columns.
+		for i, c := range cols {
+			sub.Exprs[i].Alias = c
+		}
+	}
+	return sub, alias, true, nil
+}
+
+// parseFromList parses a FROM list — the members after FROM, and after
+// UPDATE ... FROM and DELETE ... USING — into sel: the first member
+// (table, derived table or table function) in Table / Derived /
+// FuncTable, the rest in Joins.
+func (p *parser) parseFromList(sel *Select) error {
+	// FROM (SELECT ...) AS alias — a derived table. LATERAL is
+	// accepted ahead of the first member, which has nothing to its
+	// left to read.
+	p.consumeLateral()
+	derived := false
+	if sub, alias, ok, err := p.parseDerivedTable(); err != nil {
+		return err
+	} else if ok {
+		sel.Derived, sel.Alias = sub, alias
+		derived = true
+	}
+	// FROM [pg_catalog.]f(...) [AS] alias [(column, ...)] — a
+	// set-returning function as a table, joinable like any other.
+	funcTable := false
+	if !derived {
+		if fe, ok, err := p.parseFuncTable(); err != nil {
+			return err
+		} else if ok {
+			sel.FuncTable = fe
+			if sel.Alias, sel.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+				return err
+			}
+			funcTable = true
+		}
+	}
+	if !derived && !funcTable {
+		name, err := p.parseTableName()
+		if err != nil {
+			return err
+		}
+		sel.Table = name
+		sel.Alias = p.parseOptTableAlias(true)
+	}
+	// JOIN / INNER JOIN / LEFT [OUTER] JOIN chains — none are reserved
+	// words. Joins execute left-deep in syntactic order. A derived
+	// table joins too: it runs as a named relation.
+	for {
+		jk, join, err := p.parseJoinKind()
+		if err != nil {
+			return err
+		}
+		if !join {
+			break
+		}
+		left, cross := jk.left, jk.cross
+		if len(sel.Joins) >= maxJoinTables-1 {
+			return p.errf("too many joined tables (limit %d)", maxJoinTables)
+		}
+		jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
+		jc.Lateral = p.consumeLateral()
+		if fe, ok, err := p.parseFuncTable(); err != nil {
+			return err
+		} else if ok {
+			// A table function as a join member, named by its alias
+			// (the function's name by default).
+			jc.FuncTable = fe
+			if jc.Alias, jc.FuncCols, err = p.parseFuncTableAlias(fe); err != nil {
+				return err
+			}
+		} else if sub, alias, ok, err := p.parseDerivedTable(); err != nil {
+			return err
+		} else if ok {
+			jc.Derived, jc.Alias = sub, alias
+			jc.Table = jc.Alias
+		} else if jc.Lateral {
+			return p.errf("LATERAL must be followed by a subquery or a function call, found %q", p.peek().text)
+		} else {
+			jt, err := p.parseTableName()
+			if err != nil {
+				return err
+			}
+			jc.Table = jt
+			jc.Alias = p.parseOptTableAlias(false)
+		}
+		jt := jc.Table
+		if jt == "" {
+			jt = jc.Alias
+		}
+		if cross || jk.natural {
+			sel.Joins = append(sel.Joins, jc)
+			continue
+		}
+		if p.consumeIdentWord("using") {
+			if err := p.expectOp("("); err != nil {
+				return err
+			}
+			for {
+				col, err := p.expectIdent()
+				if err != nil {
+					return err
+				}
+				jc.Using = append(jc.Using, col)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return err
+			}
+			sel.Joins = append(sel.Joins, jc)
+			continue
+		}
+		if err := p.expectKeyword("ON"); err != nil {
+			return err
+		}
+		// The ON clause is a full boolean expression (parentheses,
+		// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
+		// two column references are the join keys; every other
+		// conjunct is a filter evaluated per candidate match.
+		n, err := p.parseBoolOr()
+		if err != nil {
+			return err
+		}
+		conds, err := lowerBool(n, false)
+		if err != nil {
+			return err
+		}
+		for _, c := range conds {
+			if l, r, ok := joinEquality(c); ok {
+				jc.On = append(jc.On, JoinCond{L: l, R: r})
+				continue
+			}
+			jc.Filter = append(jc.Filter, c)
+		}
+		// A lateral member's ON may be any condition (LEFT JOIN
+		// LATERAL ... ON true): it is evaluated per candidate row.
+		if len(jc.On) == 0 && !jc.Lateral {
+			return p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
+		}
+		sel.Joins = append(sel.Joins, jc)
+	}
+	return nil
 }
 
 // finishSelect parses the clauses shared by table and derived-table
@@ -3743,7 +3815,7 @@ var caseWords = map[string]bool{"then": true, "else": true, "end": true, "when":
 var tableClauseWords = map[string]bool{
 	"join": true, "inner": true, "left": true, "right": true, "full": true, "cross": true, "natural": true, "using": true,
 	"group": true, "having": true, "for": true, "union": true, "intersect": true, "except": true, "offset": true, "fetch": true,
-	"window": true, "with": true,
+	"window": true, "with": true, "returning": true,
 }
 
 // peekIdentSeq reports whether the next tokens are exactly this sequence of
@@ -4742,8 +4814,14 @@ func (p *parser) parseUpdate() (Statement, error) {
 		return nil, err
 	}
 	up.Table = name
+	up.Alias = p.parseOptTableAlias(false)
 	if up.Set, err = p.parseSetClauses(); err != nil {
 		return nil, err
+	}
+	if p.consumeKeyword("FROM") {
+		if up.From, err = p.parseDMLFromList(); err != nil {
+			return nil, err
+		}
 	}
 	up.Where, err = p.parseOptWhere()
 	if err != nil {
@@ -4766,6 +4844,12 @@ func (p *parser) parseDelete() (Statement, error) {
 		return nil, err
 	}
 	del.Table = name
+	del.Alias = p.parseOptTableAlias(false)
+	if p.consumeIdentWord("using") {
+		if del.Using, err = p.parseDMLFromList(); err != nil {
+			return nil, err
+		}
+	}
 	del.Where, err = p.parseOptWhere()
 	if err != nil {
 		return nil, err
@@ -4774,6 +4858,21 @@ func (p *parser) parseDelete() (Statement, error) {
 		return nil, err
 	}
 	return del, nil
+}
+
+// parseDMLFromList parses the FROM list of UPDATE ... FROM or the USING
+// list of DELETE ... USING into join members: the first member becomes a
+// CROSS member like a comma's, the rest keep the kinds written.
+func (p *parser) parseDMLFromList() ([]JoinClause, error) {
+	var sel Select
+	if err := p.parseFromList(&sel); err != nil {
+		return nil, err
+	}
+	first := JoinClause{Cross: true, Table: sel.Table, Alias: sel.Alias, Derived: sel.Derived, FuncTable: sel.FuncTable, FuncCols: sel.FuncCols}
+	if first.Derived != nil {
+		first.Table = first.Alias // a joined subquery's Table is its alias
+	}
+	return append([]JoinClause{first}, sel.Joins...), nil
 }
 
 func (p *parser) parseOptWhere() ([]Comparison, error) {

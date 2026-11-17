@@ -291,6 +291,7 @@ func stmtTables(stmt parser.Statement) []string {
 			for _, sc := range t.Set {
 				expr(sc.Value)
 			}
+			sel(&parser.Select{Joins: t.From})
 			conds(t.Where)
 			exprs(t.Returning)
 		case *parser.Delete:
@@ -298,6 +299,7 @@ func stmtTables(stmt parser.Statement) []string {
 				stmtf(cte.Query)
 			}
 			add(t.Table)
+			sel(&parser.Select{Joins: t.Using})
 			conds(t.Where)
 			exprs(t.Returning)
 		case *parser.Explain:

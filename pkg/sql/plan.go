@@ -321,8 +321,20 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.Insert:
 		return s.planReturning(ctx, t.Table, t.Returning)
 	case *parser.Update:
+		if len(t.From) > 0 {
+			return s.dmlReturningColumns(ctx, t.Table, t.Alias, t.From, t.Returning)
+		}
+		if t.Alias != "" {
+			t = stripUpdateAlias(t)
+		}
 		return s.planReturning(ctx, t.Table, t.Returning)
 	case *parser.Delete:
+		if len(t.Using) > 0 {
+			return s.dmlReturningColumns(ctx, t.Table, t.Alias, t.Using, t.Returning)
+		}
+		if t.Alias != "" {
+			t = stripDeleteAlias(t)
+		}
 		return s.planReturning(ctx, t.Table, t.Returning)
 
 	case *parser.Explain:

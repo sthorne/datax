@@ -296,6 +296,16 @@ syntax error or `0A000` feature not supported):
   rewrites is refused (`0A000`); PostgreSQL cascades after the
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
+- **`UPDATE ... FROM` and `DELETE ... USING`** work as in PostgreSQL
+  ([reference](sql.md#writing)), with three differences. A target row
+  that joins several rows takes its new values from the first of them
+  in the order the join reads the `FROM` list (a table by primary key,
+  or by the index it is looked up through; a `VALUES` list as
+  written), where PostgreSQL uses an unspecified one. The target needs
+  only the `UPDATE` (`DELETE`) privilege, as a plain `UPDATE ... WHERE`
+  does here; PostgreSQL also asks for `SELECT` on the target columns
+  the statement reads. And the `FROM` list's joins have a plain
+  `SELECT`'s limits (`ON` must equate columns, above).
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`, which is
   accepted and changes nothing) and cannot run inside a transaction
   block (`25001`) — except on a table created in the same block, where

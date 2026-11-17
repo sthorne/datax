@@ -49,10 +49,13 @@ var describeSamples = []struct {
 	{"Update", []describeSample{
 		{sql: `UPDATE shapes SET v = 'z' WHERE id = 5`},
 		{sql: `UPDATE shapes SET v = 'y' WHERE id = 5 RETURNING v`, rows: true},
+		{sql: `UPDATE shapes s SET v = x.v FROM (VALUES (1, 'q')) AS x(id, v) WHERE s.id = x.id`},
+		{sql: `UPDATE shapes AS s SET v = x.v || '!' FROM (VALUES (1, 'q')) AS x(id, v) WHERE s.id = x.id RETURNING s.id, x.v, s.v`, rows: true},
 	}},
 	{"Delete", []describeSample{
 		{sql: `DELETE FROM shapes WHERE id = 4`},
 		{sql: `DELETE FROM shapes WHERE id = 5 RETURNING *`, rows: true},
+		{sql: `DELETE FROM shapes s USING (VALUES (3)) AS x(id) WHERE s.id = x.id RETURNING *`, rows: true},
 	}},
 	{"Select", []describeSample{
 		{sql: `SELECT * FROM shapes ORDER BY id`, rows: true},
