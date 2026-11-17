@@ -59,7 +59,7 @@ func TestTextSearch(t *testing.T) {
 		`CREATE UNIQUE INDEX u ON articles USING GIN (v)`:                           sql.CodeFeatureNotSupported,
 		`CREATE INDEX u ON articles USING GIN (to_tsvector('klingon', body))`:       sql.CodeUndefinedObject,
 		`CREATE INDEX u ON articles USING GIN (to_tsvector('english', v))`:          sql.CodeFeatureNotSupported,
-		`CREATE INDEX u ON articles USING GIN (lower('english', body))`:             sql.CodeFeatureNotSupported,
+		`CREATE INDEX u ON articles USING GIN (lower('english', body))`:             sql.CodeSyntaxError, // wrong arity, as anywhere (issue #359)
 		`CREATE INDEX u ON articles (to_tsvector('english', body))`:                 sql.CodeFeatureNotSupported,
 		`CREATE INDEX u ON articles USING GIN (to_tsvector(body))`:                  sql.CodeSyntaxError,
 		`CREATE INDEX u ON articles USING GIN (to_tsvector('english', body), note)`: sql.CodeSyntaxError,

@@ -110,7 +110,7 @@ func (c *indexExprChecker) check(e parser.Expr) error {
 		if b, ok := builtins.Lookup(e.Func); ok && b.Rows != nil {
 			return newErrf(CodeFeatureNotSupported, "set-returning functions are not allowed in %s", plural)
 		}
-		if !immutableFunc(e.Func) {
+		if !immutableFunc(e.Func) && !explicitConfigTextSearch(e) {
 			return newErrf(CodeInvalidObjectDefinition, "functions in %s must be marked IMMUTABLE", c.what)
 		}
 	}
@@ -670,4 +670,16 @@ func stripCondTextCasts(desc *catalog.TableDescriptor, c parser.Comparison) pars
 // isBareColumn: e is a column reference and nothing else.
 func isBareColumn(e parser.Expr) bool {
 	return e.Column != "" && e.Cast == "" && e.BinOp == "" && e.Left == nil && e.Func == "" && e.Lit == nil && e.Case == nil && e.Cmp == nil && e.Sub == nil && len(e.Path) == 0
+}
+
+// explicitConfigTextSearch: a text-search constructor given its
+// configuration (to_tsvector('english', body)) is immutable, as in
+// PostgreSQL; the one-argument form reads default_text_search_config and
+// is not.
+func explicitConfigTextSearch(e parser.Expr) bool {
+	switch strings.ToLower(e.Func) {
+	case "to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery", "websearch_to_tsquery":
+		return len(e.Args) == 2
+	}
+	return false
 }
