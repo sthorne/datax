@@ -319,8 +319,9 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 		execSQL(t, ctx, h.s, `SET app.never_set = 'now set'`)
 		h.want(`SELECT current_setting(n) FROM names WHERE id = 4`, "now set")
 		// Every name pg_settings lists is one current_setting() knows
-		// (psql's \dconfig reads them so).
-		if got := h.col(`SELECT current_setting(s.name) = s.setting FROM pg_settings s`); len(got) < 15 || strings.Contains(strings.Join(got, ","), "false") {
+		// (psql's \dconfig reads them so). A memory size reads 4MB there
+		// and 4096 (kB) in pg_settings, as in PostgreSQL (issue #345).
+		if got := h.col(`SELECT current_setting(s.name) = s.setting OR s.unit IN ('kB', '8kB') FROM pg_settings s`); len(got) < 15 || strings.Contains(strings.Join(got, ","), "false") {
 			t.Fatalf("current_setting over pg_settings: %v", got)
 		}
 	})
@@ -396,6 +397,291 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 		// Every built-in setting's reset_val equals its boot_val.
 		h.want(`SELECT count(*) FROM pg_settings WHERE boot_val IS NOT NULL AND reset_val <> boot_val`, "0")
 	})
+}
+
+// TestPostgresSettings (issue #345): PostgreSQL's settings that
+// frameworks, drivers and pg_dump SET are known, with PostgreSQL 18's
+// defaults, types, units and checks; SHOW, current_setting(), pg_settings
+// and RESET agree; the read-only ones refuse a SET (55P02); and the ones
+// that change something here do: IntervalStyle and bytea_output on the
+// wire, client_min_messages for NOTICEs, the session characteristics.
+func TestPostgresSettings(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	waitForDatabases(t, ctx, sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor()))
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	one := func(stmt string) string {
+		t.Helper()
+		r := execSQL(t, ctx, s, stmt)
+		if len(r.Rows) != 1 {
+			t.Fatalf("%s: %d rows", stmt, len(r.Rows))
+		}
+		if r.Rows[0][0].Null {
+			return "NULL"
+		}
+		return r.Rows[0][0].Text()
+	}
+	refused := func(stmt, code, msg string) {
+		t.Helper()
+		if _, serr := trySQL(ctx, s, stmt); serr == nil || serr.Code != code || serr.Msg != msg {
+			t.Fatalf("%s: %v, want %s %q", stmt, serr, code, msg)
+		}
+	}
+	// pgRow is pg_settings' view of a setting.
+	pgRow := func(name string) string {
+		t.Helper()
+		return one(`SELECT setting || '|' || coalesce(unit, '') || '|' || vartype || '|' || boot_val || '|' || source || '|' || context FROM pg_settings WHERE name = '` + name + `'`)
+	}
+
+	// Each: its default (SHOW), its pg_settings row at the default, a
+	// SET and what SHOW then reports, and pg_settings' setting then.
+	for _, c := range []struct{ name, def, row, set, shown, setting string }{
+		{"client_min_messages", "notice", "notice||enum|notice|default|user", "WARNING", "warning", "warning"},
+		{"IntervalStyle", "postgres", "postgres||enum|postgres|default|user", "iso_8601", "iso_8601", "iso_8601"},
+		{"check_function_bodies", "on", "on||bool|on|default|user", "false", "off", "off"},
+		{"xmloption", "content", "content||enum|content|default|user", "document", "document", "document"},
+		{"default_tablespace", "", "||string||default|user", "pg_default", "pg_default", "pg_default"},
+		{"row_security", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"work_mem", "4MB", "4096|kB|integer|4096|default|user", "'64MB'", "64MB", "65536"},
+		{"maintenance_work_mem", "64MB", "65536|kB|integer|65536|default|user", "'1GB'", "1GB", "1048576"},
+		{"effective_cache_size", "4GB", "524288|8kB|integer|524288|default|user", "'1536MB'", "1536MB", "196608"},
+		{"synchronous_commit", "on", "on||enum|on|default|user", "local", "local", "local"},
+		{"jit", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"random_page_cost", "4", "4||real|4|default|user", "1.1", "1.1", "1.1"},
+		{"seq_page_cost", "1", "1||real|1|default|user", "0.5", "0.5", "0.5"},
+		{"extra_float_digits", "1", "1||integer|1|default|user", "3", "3", "3"},
+		{"lc_messages", "C", "C||string|C|default|superuser", "'en_US.UTF-8'", "en_US.UTF-8", "en_US.UTF-8"},
+		{"lc_monetary", "C", "C||string|C|default|user", "'en_GB'", "en_GB", "en_GB"},
+		{"lc_numeric", "C", "C||string|C|default|user", "'POSIX'", "POSIX", "POSIX"},
+		{"lc_time", "C", "C||string|C|default|user", "'de_DE'", "de_DE", "de_DE"},
+		{"default_transaction_deferrable", "off", "off||bool|off|default|user", "on", "on", "on"},
+		{"enable_seqscan", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_indexscan", "on", "on||bool|on|default|user", "no", "off", "off"},
+		{"enable_bitmapscan", "on", "on||bool|on|default|user", "0", "off", "off"},
+		{"enable_hashjoin", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_mergejoin", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_nestloop", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_sort", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_hashagg", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_material", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"enable_indexonlyscan", "on", "on||bool|on|default|user", "of", "off", "off"},
+		{"geqo", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"bytea_output", "hex", "hex||enum|hex|default|user", "escape", "escape", "escape"},
+		{"escape_string_warning", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"array_nulls", "on", "on||bool|on|default|user", "off", "off", "off"},
+		{"quote_all_identifiers", "off", "off||bool|off|default|user", "on", "on", "on"},
+		{"session_replication_role", "origin", "origin||enum|origin|default|superuser", "replica", "replica", "replica"},
+	} {
+		if got := one("SHOW " + c.name); got != c.def {
+			t.Errorf("SHOW %s = %q, want the default %q", c.name, got, c.def)
+		}
+		if got := pgRow(c.name); got != c.row {
+			t.Errorf("pg_settings %s = %q, want %q", c.name, got, c.row)
+		}
+		execSQL(t, ctx, s, "SET "+c.name+" = "+c.set)
+		if got := one("SHOW " + strings.ToUpper(c.name)); got != c.shown {
+			t.Errorf("SET %s = %s; SHOW = %q, want %q", c.name, c.set, got, c.shown)
+		}
+		if got := one(`SELECT current_setting('` + c.name + `')`); got != c.shown {
+			t.Errorf("SET %s = %s; current_setting = %q, want %q", c.name, c.set, got, c.shown)
+		}
+		if got := one(`SELECT setting || '|' || source FROM pg_settings WHERE name = '` + c.name + `'`); got != c.setting+"|session" {
+			t.Errorf("SET %s = %s; pg_settings = %q, want %q", c.name, c.set, got, c.setting+"|session")
+		}
+		execSQL(t, ctx, s, "RESET "+c.name)
+		if got := one("SHOW " + c.name); got != c.def {
+			t.Errorf("RESET %s; SHOW = %q, want %q", c.name, got, c.def)
+		}
+	}
+
+	// The values PostgreSQL refuses, with its SQLSTATEs and words.
+	refused(`SET jit = maybe`, sql.CodeInvalidParameterValue, `parameter "jit" requires a Boolean value`)
+	refused(`SET enable_seqscan = o`, sql.CodeInvalidParameterValue, `parameter "enable_seqscan" requires a Boolean value`)
+	refused(`SET client_min_messages = 'loud'`, sql.CodeInvalidParameterValue, `invalid value for parameter "client_min_messages": "loud"`)
+	refused(`SET intervalstyle = 'german'`, sql.CodeInvalidParameterValue, `invalid value for parameter "IntervalStyle": "german"`)
+	refused(`SET work_mem = '64mb'`, sql.CodeInvalidParameterValue, `invalid value for parameter "work_mem": "64mb"`)
+	refused(`SET work_mem = 'lots'`, sql.CodeInvalidParameterValue, `invalid value for parameter "work_mem": "lots"`)
+	refused(`SET work_mem = 10`, sql.CodeInvalidParameterValue, `10 kB is outside the valid range for parameter "work_mem" (64 kB .. 2147483647 kB)`)
+	refused(`SET maintenance_work_mem = '512kB'`, sql.CodeInvalidParameterValue, `512 kB is outside the valid range for parameter "maintenance_work_mem" (1024 kB .. 2147483647 kB)`)
+	refused(`SET extra_float_digits = 4`, sql.CodeInvalidParameterValue, `4 is outside the valid range for parameter "extra_float_digits" (-15 .. 3)`)
+	refused(`SET extra_float_digits = '2kB'`, sql.CodeInvalidParameterValue, `invalid value for parameter "extra_float_digits": "2kB"`)
+	refused(`SET random_page_cost = -1`, sql.CodeInvalidParameterValue, `-1 is outside the valid range for parameter "random_page_cost" (0 .. 1.79769e+308)`)
+	refused(`SET random_page_cost = 'cheap'`, sql.CodeInvalidParameterValue, `invalid value for parameter "random_page_cost": "cheap"`)
+	refused(`SET synchronous_commit = 'sometimes'`, sql.CodeInvalidParameterValue, `invalid value for parameter "synchronous_commit": "sometimes"`)
+	refused(`SET default_tablespace = 'fast_ssd'`, sql.CodeUndefinedObject, `invalid value for parameter "default_tablespace": "fast_ssd"`)
+	refused(`SET lc_numeric = 'not a locale'`, sql.CodeInvalidParameterValue, `invalid value for parameter "lc_numeric": "not a locale"`)
+	refused(`SET default_transaction_isolation = 'chaotic'`, sql.CodeInvalidParameterValue, `invalid value for parameter "default_transaction_isolation": "chaotic"`)
+	refused(`SET default_with_oids = on`, sql.CodeFeatureNotSupported, `tables declared WITH OIDS are not supported`)
+	refused(`SET server_version_num = 150000`, sql.CodeCantChangeRuntimeParam, `parameter "server_version_num" cannot be changed`)
+	refused(`RESET max_identifier_length`, sql.CodeCantChangeRuntimeParam, `parameter "max_identifier_length" cannot be changed`)
+	refused(`SET no_such_setting = on`, sql.CodeUndefinedObject, `unrecognized configuration parameter "no_such_setting"`)
+	refused(`SHOW enable_warp_drive`, sql.CodeUndefinedObject, `unrecognized configuration parameter "enable_warp_drive"`)
+
+	// PostgreSQL's other spellings: the hidden enum values, a memory
+	// size's rounding and units, set_config.
+	for _, c := range []struct{ set, name, want string }{
+		{`SET client_min_messages = debug`, "client_min_messages", "debug2"},
+		{`SET client_min_messages TO 'warning'`, "client_min_messages", "warning"},
+		{`SET synchronous_commit = true`, "synchronous_commit", "on"},
+		{`SET synchronous_commit = 0`, "synchronous_commit", "off"},
+		{`SET work_mem = 65536`, "work_mem", "64MB"},
+		{`SET work_mem = '1.5MB'`, "work_mem", "1536kB"},
+		{`SET work_mem = '100 MB'`, "work_mem", "100MB"},
+		{`SET effective_cache_size = '8kB'`, "effective_cache_size", "8kB"},
+		{`SET extra_float_digits = -3`, "extra_float_digits", "-3"},
+		{`SET random_page_cost = 1.23456789`, "random_page_cost", "1.23457"},
+		{`SET default_with_oids = false`, "default_with_oids", "off"},
+		{`SELECT set_config('work_mem', '32MB', false)`, "work_mem", "32MB"},
+		{`SET work_mem = DEFAULT`, "work_mem", "4MB"},
+	} {
+		execSQL(t, ctx, s, c.set)
+		if got := one("SHOW " + c.name); got != c.want {
+			t.Errorf("%s; SHOW %s = %q, want %q", c.set, c.name, got, c.want)
+		}
+	}
+
+	// The preset options: what the server is.
+	if got := one(`SHOW server_version_num`); got != "140000" {
+		t.Fatalf("server_version_num = %q", got)
+	}
+	if got := one(`SELECT current_setting('server_version_num')::int >= 140000`); got != "t" {
+		t.Fatalf("server_version_num as a number: %q", got)
+	}
+	if got := one(`SHOW max_identifier_length`); got != "63" {
+		t.Fatalf("max_identifier_length = %q", got)
+	}
+	if got := pgRow("max_identifier_length"); got != "63||integer|63|default|internal" {
+		t.Fatalf("pg_settings max_identifier_length = %q", got)
+	}
+	// default_with_oids is no longer listed (GUC_NO_SHOW_ALL), as in
+	// PostgreSQL 12 and later.
+	if got := one(`SELECT count(*) FROM pg_settings WHERE name = 'default_with_oids'`); got != "0" {
+		t.Fatalf("default_with_oids listed in pg_settings")
+	}
+
+	// default_transaction_isolation, like transaction_isolation, takes
+	// every level and reports serializable, the only one there is;
+	// SET SESSION CHARACTERISTICS sets it (and the deferrable default).
+	execSQL(t, ctx, s, `SET default_transaction_isolation = 'read committed'`)
+	execSQL(t, ctx, s, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ`)
+	execSQL(t, ctx, s, `SET SESSION CHARACTERISTICS AS TRANSACTION DEFERRABLE`)
+	if got := one(`SHOW default_transaction_isolation`); got != "serializable" {
+		t.Fatalf("default_transaction_isolation = %q", got)
+	}
+	if got := one(`SHOW default_transaction_deferrable`); got != "on" {
+		t.Fatalf("default_transaction_deferrable = %q", got)
+	}
+	execSQL(t, ctx, s, `BEGIN`)
+	if got := one(`SHOW transaction_isolation`); got != "serializable" {
+		t.Fatalf("transaction_isolation in a block = %q", got)
+	}
+	// SET LOCAL ends with the block.
+	execSQL(t, ctx, s, `SET LOCAL work_mem = '256MB'`)
+	if got := one(`SHOW work_mem`); got != "256MB" {
+		t.Fatalf("SET LOCAL work_mem = %q", got)
+	}
+	execSQL(t, ctx, s, `COMMIT`)
+	if got := one(`SHOW work_mem`); got != "4MB" {
+		t.Fatalf("work_mem after the block = %q", got)
+	}
+	// RESET ALL restores every one.
+	execSQL(t, ctx, s, `SET jit = off`)
+	execSQL(t, ctx, s, `RESET ALL`)
+	if got := one(`SELECT current_setting('jit') || current_setting('default_transaction_deferrable')`); got != "onoff" {
+		t.Fatalf("RESET ALL: %q", got)
+	}
+
+	// Over the wire: Rails' connection setup; IntervalStyle and
+	// bytea_output change the text format, client_min_messages hides
+	// NOTICEs.
+	cfg, _ := pgx.ParseConfig(pgURL(tc, 0))
+	var notices []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) { notices = append(notices, n.Message) }
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	pc := conn.PgConn()
+	if got := pc.ParameterStatus("IntervalStyle"); got != "postgres" {
+		t.Fatalf("startup IntervalStyle = %q", got)
+	}
+	for _, q := range []string{
+		`SET client_min_messages TO 'warning'`,
+		`SET intervalstyle = iso_8601`,
+		`SET SESSION timezone TO 'UTC'`,
+	} {
+		if _, err := pc.Exec(ctx, q).ReadAll(); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if got := pc.ParameterStatus("IntervalStyle"); got != "iso_8601" {
+		t.Fatalf("ParameterStatus IntervalStyle after SET = %q", got)
+	}
+	text := func(q string) []string {
+		t.Helper()
+		res, err := pc.Exec(ctx, q).ReadAll()
+		if err != nil || len(res) != 1 || len(res[0].Rows) != 1 {
+			t.Fatalf("%s: %v", q, err)
+		}
+		var out []string
+		for _, v := range res[0].Rows[0] {
+			out = append(out, string(v))
+		}
+		return out
+	}
+	ivq := `SELECT interval '1 year 2 months 3 days 4 hours 5 minutes 6.5 seconds', interval '0', interval '-1 days +02:00:00'`
+	if got := strings.Join(text(ivq), ","); got != "P1Y2M3DT4H5M6.5S,PT0S,P-1DT2H" {
+		t.Fatalf("intervals in iso_8601: %s", got)
+	}
+	// Binary format is the same whatever the style (pgx decodes it).
+	var d time.Duration
+	if err := conn.QueryRow(ctx, `SELECT interval '90 seconds'`).Scan(&d); err != nil || d != 90*time.Second {
+		t.Fatalf("binary interval under iso_8601: %v %v", d, err)
+	}
+	for style, want := range map[string]string{
+		"sql_standard":     "+1-2 +3 +4:05:06.5,0,+0-0 -1 +2:00:00",
+		"postgres_verbose": "@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs,@ 0,@ 1 day -2 hours ago",
+		"postgres":         "1 year 2 mons 3 days 04:05:06.5,00:00:00,-1 days +02:00:00",
+	} {
+		if _, err := pc.Exec(ctx, `SET IntervalStyle = `+style).ReadAll(); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(text(ivq), ","); got != want {
+			t.Fatalf("intervals in %s: %s, want %s", style, got, want)
+		}
+	}
+	byq := `SELECT '\x5c00ff41'::bytea`
+	if got := text(byq)[0]; got != `\x5c00ff41` {
+		t.Fatalf("bytea in hex: %s", got)
+	}
+	if _, err := pc.Exec(ctx, `SET bytea_output = 'escape'`).ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := text(byq)[0]; got != `\\\000\377A` {
+		t.Fatalf("bytea in escape: %s", got)
+	}
+	// A NOTICE (the "already exists, skipping" of ADD CONSTRAINT IF NOT
+	// EXISTS) reaches the client at notice, not at warning.
+	for _, q := range []string{
+		`CREATE TABLE noisy (id INT8 PRIMARY KEY, n INT8)`,
+		`ALTER TABLE noisy ADD CONSTRAINT n_pos CHECK (n > 0)`,
+	} {
+		if _, err := pc.Exec(ctx, q).ReadAll(); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	again := `ALTER TABLE noisy ADD CONSTRAINT IF NOT EXISTS n_pos CHECK (n > 0)`
+	if _, err := pc.Exec(ctx, again).ReadAll(); err != nil || len(notices) != 0 {
+		t.Fatalf("at warning: %v, notices %v", err, notices)
+	}
+	if _, err := pc.Exec(ctx, `SET client_min_messages = notice`).ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pc.Exec(ctx, again).ReadAll(); err != nil || len(notices) != 1 || !strings.Contains(notices[0], "already exists, skipping") {
+		t.Fatalf("at notice: %v, notices %v", err, notices)
+	}
 }
 
 // TestCancelAndTimeouts (issue #97): a CancelRequest (pgx's context

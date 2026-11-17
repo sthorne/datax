@@ -104,6 +104,13 @@ type Env struct {
 	// vartype and unit ("" for none), from the session's registry of
 	// settings (issue #333).
 	SettingTypes map[string][2]string
+	// SettingRaw renders a setting's SHOW value as pg_settings reports
+	// it, in the setting's base unit (work_mem's 4MB is 4096); nil
+	// leaves every value as SHOW has it.
+	SettingRaw func(name, shown string) string
+	// SettingContexts maps a built-in setting whose pg_settings context
+	// is not user to it (internal, superuser).
+	SettingContexts map[string]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo
 

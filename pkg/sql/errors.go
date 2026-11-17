@@ -43,12 +43,15 @@ const (
 	CodeInvalidColumnReference      = "42P10"
 	CodeSequenceLimit               = "2200H"
 	CodeObjectNotInState            = "55000"
-	CodeGeneratedAlways             = "428C9"
-	CodeDuplicateObject             = "42710"
-	CodeReservedName                = "42939"
-	CodeCheckViolation              = "23514"
-	CodeForeignKeyViolation         = "23503"
-	CodeProgramLimitExceeded        = "54000"
+	// CodeCantChangeRuntimeParam: SET of a setting that cannot be
+	// changed (server_version_num).
+	CodeCantChangeRuntimeParam = "55P02"
+	CodeGeneratedAlways        = "428C9"
+	CodeDuplicateObject        = "42710"
+	CodeReservedName           = "42939"
+	CodeCheckViolation         = "23514"
+	CodeForeignKeyViolation    = "23503"
+	CodeProgramLimitExceeded   = "54000"
 	// statement_memory_limit exceeded.
 	CodeOutOfMemory           = "53200"
 	CodeInvalidRegexp         = "2201B"

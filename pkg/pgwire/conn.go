@@ -354,6 +354,9 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	if res != nil {
 		rows = int64(len(res.Rows))
 		for _, msg := range res.Notices {
+			if !c.session.SendsNotices() {
+				break // client_min_messages above NOTICE
+			}
 			c.backend.Send(&pgproto3.NoticeResponse{Severity: "NOTICE", SeverityUnlocalized: "NOTICE", Code: "00000", Message: msg})
 		}
 	}
@@ -694,6 +697,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				{"server_encoding", "UTF8"},
 				{"client_encoding", "UTF8"},
 				{"DateStyle", "ISO"},
+				{"IntervalStyle", "postgres"},
 				{"integer_datetimes", "on"},
 				{"standard_conforming_strings", "on"},
 				{"TimeZone", "UTC"},
@@ -870,6 +874,7 @@ func (c *conn) sendDataRows(res *sql.Result, formats []int16) {
 
 // sendDataRowRange sends rows [from, to) of a materialized result.
 func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) {
+	ts := c.textStyle()
 	for _, row := range res.Rows[from:to] {
 		dr := &pgproto3.DataRow{Values: make([][]byte, len(row))}
 		for i, d := range row {
@@ -881,7 +886,7 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 			if i < len(res.Columns) {
 				col = res.Columns[i]
 			}
-			dr.Values[i] = encodeDatumIn(d, format, col, c.session.TimeZone())
+			dr.Values[i] = encodeDatumIn(d, format, col, ts)
 		}
 		c.backend.Send(dr)
 	}
@@ -892,14 +897,34 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 // described column: the column's width picks the binary integer size,
 // and its TIMESTAMP / CHAR(n) modifiers the text rendering (what
 // Describe promised, whatever hint the datum carries).
-// encodeDatumIn is encodeDatum with the session's time zone: a
-// TIMESTAMPTZ renders in it in text format (the binary form is UTC
-// microseconds whatever the zone).
-func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, loc *time.Location) []byte {
-	if format == 0 && !d.Null && d.Fam == types.Timestamp && !col.NoTZ && !d.NoTZ && loc != nil && loc != time.UTC {
-		return []byte(types.FormatTimestampIn(d.I, loc))
+// encodeDatumIn is encodeDatum with the session's text settings: a
+// TIMESTAMPTZ renders in its time zone, an INTERVAL in its IntervalStyle
+// and a BYTEA in its bytea_output, in text format (the binary forms are
+// the same whatever the settings).
+func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, ts textStyle) []byte {
+	if format == 0 && !d.Null {
+		switch {
+		case d.Fam == types.Timestamp && !col.NoTZ && !d.NoTZ && ts.loc != nil && ts.loc != time.UTC:
+			return []byte(types.FormatTimestampIn(d.I, ts.loc))
+		case d.Fam == types.IntervalFam && ts.intervalStyle != "" && ts.intervalStyle != "postgres":
+			return []byte(d.IntervalVal().Format(ts.intervalStyle))
+		case d.Fam == types.Bytes && ts.byteaEscape:
+			return []byte(types.FormatByteaEscape([]byte(d.S)))
+		}
 	}
 	return encodeDatum(d, format, col)
+}
+
+// textStyle is the session's settings that change how a value renders
+// in text format.
+type textStyle struct {
+	loc           *time.Location
+	intervalStyle string
+	byteaEscape   bool
+}
+
+func (c *conn) textStyle() textStyle {
+	return textStyle{loc: c.session.TimeZone(), intervalStyle: c.session.IntervalStyle(), byteaEscape: c.session.ByteaEscape()}
 }
 
 func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
@@ -1465,7 +1490,7 @@ func (r rawRows) Encode(dst []byte) ([]byte, error) { return append(dst, r...), 
 func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16, max int64) (sent int64, more bool, serr *sql.Error) {
 	st := res.Stream
 	var buf []byte
-	loc := c.session.TimeZone()
+	ts := c.textStyle()
 	flush := func() bool {
 		if len(buf) == 0 {
 			return true
@@ -1517,7 +1542,7 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 			if i < len(res.Columns) {
 				col = res.Columns[i]
 			}
-			dr.Values[i] = encodeDatumIn(d, format, col, loc)
+			dr.Values[i] = encodeDatumIn(d, format, col, ts)
 		}
 		buf, err = dr.Encode(buf)
 		if err != nil {

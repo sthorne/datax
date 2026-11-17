@@ -862,10 +862,21 @@ func init() {
 				if d != kv[1] {
 					source = "session"
 				}
+				setting := kv[1]
+				if env.SettingRaw != nil {
+					setting, d = env.SettingRaw(kv[0], setting), env.SettingRaw(kv[0], d)
+				}
+				category, context := "Client Connection Defaults", "user"
+				if c, ok := env.SettingContexts[kv[0]]; ok {
+					context = c
+					if c == "internal" {
+						category = "Preset Options"
+					}
+				}
 				// boot_val is what a new session starts with; reset_val is
 				// what RESET restores, which in datax is the same value
 				// (issue #333).
-				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str(source), str(d), str(d)})
+				rows = append(rows, Row{str(kv[0]), str(setting), unit, str(category), str(kv[0]), str(context), str(vartype), str(source), str(d), str(d)})
 			}
 			return rows, nil
 		})

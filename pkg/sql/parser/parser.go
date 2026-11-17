@@ -1745,7 +1745,7 @@ func (p *parser) parseSet() (Statement, error) {
 		if !characteristics {
 			sv.Local = true
 		}
-		var readOnly, isolation string
+		var readOnly, isolation, deferrable string
 		for !p.atStatementEnd() {
 			switch {
 			case p.consumeIdentWord("isolation"):
@@ -1778,7 +1778,9 @@ func (p *parser) parseSet() (Statement, error) {
 				if !p.consumeIdentWord("deferrable") {
 					return nil, p.errf("expected DEFERRABLE after NOT")
 				}
+				deferrable = "off"
 			case p.consumeIdentWord("deferrable"):
+				deferrable = "on"
 			case p.consumeOp(","):
 			default:
 				return nil, p.errf("unexpected %q in SET TRANSACTION", p.peek().text)
@@ -1789,8 +1791,12 @@ func (p *parser) parseSet() (Statement, error) {
 			sv.Name, sv.Value = "default_transaction_read_only", readOnly
 		case readOnly != "":
 			sv.Name, sv.Value = "transaction_read_only", readOnly
+		case isolation != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_isolation", isolation
 		case isolation != "":
 			sv.Name, sv.Value = "transaction_isolation", isolation
+		case deferrable != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_deferrable", deferrable
 		default:
 			return nil, p.errf("SET TRANSACTION needs a characteristic (READ ONLY, READ WRITE, ISOLATION LEVEL ...)")
 		}

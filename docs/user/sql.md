@@ -1702,6 +1702,12 @@ invalid value `22023`:
 | `default_text_search_config` | `english` (default), `simple`; `pg_catalog.` may qualify either | the configuration `to_tsvector`, `to_tsquery` and their relatives use when a call names none; reported schema-qualified (`pg_catalog.english`), as PostgreSQL does |
 | `ivfflat.probes` | `auto` (default: the square root of the index's lists) or 1 to 32768 | how many clusters of an ivfflat index a nearest-neighbour query reads: more is higher recall and slower ([Vectors](#vectors)) |
 | `vector_index_scan` | `on` (default), `off` | `off` answers every nearest-neighbour query exactly, by scanning, whatever vector index exists |
+| `IntervalStyle` | `postgres` (default), `iso_8601`, `sql_standard`, `postgres_verbose` | the text format of an `INTERVAL` column on the wire (`P1Y2M3DT4H5M6S` in `iso_8601`, as Rails expects); `::text` casts, arrays and JSON keep the `postgres` format; reported to the client as a parameter status |
+| `bytea_output` | `hex` (default), `escape` | the text format of a `BYTEA` column on the wire |
+| `client_min_messages` | `debug5` ... `debug1`, `log`, `notice` (default), `warning`, `error` | at `warning` or `error`, `NOTICE`s are not sent |
+| `row_security` | `on` (default), `off` | `off` refuses (`42501`) a query that a table's row-level security policies would filter, as `pg_dump` expects |
+| `server_version_num`, `max_identifier_length` | `140000`, `63` | read only (`55P02`) |
+| PostgreSQL's other common settings: `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `lc_*`, `default_transaction_isolation`, ... | PostgreSQL's values, checked as PostgreSQL checks them | accepted, kept and reported, with no effect: the list is in [Differences from PostgreSQL](postgres-differences.md) |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
 **Custom settings.** A name with a prefix and a dot (`app.tenant`,
