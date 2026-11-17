@@ -2865,6 +2865,10 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 	for i, fr := range rows {
 		oldRow := copyRow(fr.row)
 		oldRows[i] = oldRow
+		// Every SET is evaluated against the row as it was, and the
+		// values are written after, so SET a = b, b = a swaps as in
+		// PostgreSQL.
+		pending := make([]types.Datum, len(u.set))
 		for j, set := range u.set {
 			col, _ := desc.Col(set.Column)
 			var d types.Datum
@@ -2889,7 +2893,11 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 			if cerr2 != nil {
 				return nil, cerr2
 			}
-			fr.row[col.ID] = d
+			pending[j] = d
+		}
+		for j, set := range u.set {
+			col, _ := desc.Col(set.Column)
+			fr.row[col.ID] = pending[j]
 		}
 	}
 	// The rows' keys after the update: a row whose primary key changes

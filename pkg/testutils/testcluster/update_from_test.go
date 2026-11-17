@@ -392,3 +392,28 @@ func TestUpdateFromExtendedProtocol(t *testing.T) {
 		t.Fatalf("simple protocol: %d rows, columns %v, %v", n, names, err)
 	}
 }
+
+// TestUpdateSetReadsOldRow: every SET of a plain UPDATE reads the row as
+// it was before the statement, so SET a = b, b = a swaps and a later SET
+// sees the old value of a column an earlier one changed, as in
+// PostgreSQL.
+func TestUpdateSetReadsOldRow(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s)
+
+	execSQL(t, ctx, s, `CREATE TABLE sw (id INT PRIMARY KEY, a INT, b INT)`)
+	execSQL(t, ctx, s, `INSERT INTO sw VALUES (1, 10, 20), (2, 30, 40)`)
+	execSQL(t, ctx, s, `UPDATE sw SET a = b, b = a`)
+	execSQL(t, ctx, s, `UPDATE sw SET a = a + 1, b = a WHERE id = 2`)
+	res := execSQL(t, ctx, s, `SELECT id, a, b FROM sw ORDER BY id`)
+	var got []string
+	for _, r := range res.Rows {
+		got = append(got, r[0].Text()+"|"+r[1].Text()+"|"+r[2].Text())
+	}
+	if want := []string{"1|20|10", "2|41|40"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
