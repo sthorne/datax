@@ -750,7 +750,7 @@ gets a fresh key. One tenant's key is rotated with
 
 ```sql
 [WITH [RECURSIVE] name [(cols)] AS (query | INSERT/UPDATE/DELETE ... RETURNING ...), ...]
-SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
+SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY terms] [frame]), ...
   FROM t [AS a] | (query) AS d
   [JOIN t2 | (query) AS d2 ON b.x = a.y [AND ...] | USING (cols)]   -- INNER, LEFT | RIGHT | FULL [OUTER],
                                                                     -- CROSS, NATURAL, or "t, t2"; up to 8 tables
@@ -981,6 +981,17 @@ SELECT * | expr [[AS] alias] | func(...) OVER ([PARTITION BY exprs] [ORDER BY te
   the result's column n. A position at or after a `*` is accepted only
   when the `*` is the whole select list. `GROUP BY n` groups by select
   item n's expression; an aggregate item is refused (`42803`).
+- **DISTINCT** removes duplicate result rows. **DISTINCT ON (exprs)**
+  keeps, of each group of rows equal on the expressions (NULLs equal),
+  the first in `ORDER BY` order — `SELECT DISTINCT ON (player) player,
+  game, score FROM scores ORDER BY player, score DESC` is each player's
+  best game. The `ORDER BY` must begin with the `DISTINCT ON`
+  expressions (in any order; `42P10` otherwise) and may go on to order
+  within the groups; without `ORDER BY` the row kept is whichever comes
+  first. A position or an output name in the list stands for that select
+  item. It works over single tables, joins, derived tables and grouped
+  queries, before `LIMIT` / `OFFSET`; not with window functions
+  (`0A000`) or `FOR UPDATE`.
 - **LIMIT and OFFSET**: `LIMIT n | ALL`, `OFFSET n [ROWS]`, `FETCH
   FIRST | NEXT [n] ROWS ONLY`, on every query shape. `OFFSET` skips
   rows after they are fetched (the scan reads `LIMIT + OFFSET` rows when

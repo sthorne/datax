@@ -127,6 +127,9 @@ func (w *Walker) selectMember(m *Select) {
 	for i := range m.GroupBy {
 		w.WalkExpr(&m.GroupBy[i])
 	}
+	for i := range m.DistinctOn {
+		w.WalkExpr(&m.DistinctOn[i])
+	}
 	w.Conds(m.Having)
 	w.orderCols(m.OrderBy)
 	for i := range m.Windows {

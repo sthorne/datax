@@ -1008,6 +1008,12 @@ func derivedSelect(t *parser.Select) *parser.Select {
 		c.GroupBy[i] = renameExprColumns(g, strip)
 	}
 	c.Having = renameCondColumns(t.Having, strip)
+	if len(t.DistinctOn) > 0 {
+		c.DistinctOn = make([]parser.Expr, len(t.DistinctOn))
+		for i, e := range t.DistinctOn {
+			c.DistinctOn[i] = renameExprColumns(e, strip)
+		}
+	}
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 	for i := range c.OrderBy {
 		oc := &c.OrderBy[i]
@@ -1213,6 +1219,14 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 			return nil, err
 		}
 	}
+	if len(t.DistinctOn) > 0 {
+		var derr error
+		if rows, derr = keepFirstDistinct(rows, func(fr fetchedRow) ([]types.Datum, error) {
+			return evalExprList(t.DistinctOn, tableEnv{desc: desc, row: fr.row}, params)
+		}); derr != nil {
+			return nil, derr
+		}
+	}
 	proj, perr := resolveProjection(desc, t.Exprs)
 	if perr != nil {
 		return nil, perr
@@ -1243,7 +1257,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 		}
 		res.Rows = append(res.Rows, out)
 	}
-	if t.Distinct {
+	if t.Distinct && len(t.DistinctOn) == 0 {
 		res.Rows = dedupeRows(res.Rows)
 	}
 	res.Rows = trimRows(res.Rows, t)

@@ -278,3 +278,66 @@ func TestGroupByExpressions(t *testing.T) {
 		t.Fatalf("cube total: %d %v", total, err)
 	}
 }
+
+// TestDistinctOn covers issue #337: SELECT DISTINCT ON (exprs) keeps the
+// first row of each group in ORDER BY order; the leading ORDER BY terms
+// must be the DISTINCT ON expressions (42P10); over joins, grouped
+// queries, derived tables and with LIMIT / OFFSET.
+func TestDistinctOn(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+
+	execSQL(t, ctx, s, `CREATE TABLE scores (id INT8 PRIMARY KEY, player TEXT, game TEXT, score INT8)`)
+	execSQL(t, ctx, s, `INSERT INTO scores VALUES (1, 'ann', 'g1', 10), (2, 'ann', 'g2', 30), (3, 'bob', 'g1', 20),
+		(4, 'bob', 'g2', 5), (5, 'cy', 'g1', 7)`)
+	execSQL(t, ctx, s, `CREATE TABLE players (name TEXT PRIMARY KEY, team TEXT)`)
+	execSQL(t, ctx, s, `INSERT INTO players VALUES ('ann', 'red'), ('bob', 'blue'), ('cy', 'red')`)
+
+	runGroupedCases(t, ctx, s, []groupedCase{
+		{sql: `SELECT DISTINCT ON (player) player, game, score FROM scores ORDER BY player, score DESC`,
+			want: "ann|g2|30; bob|g1|20; cy|g1|7"},
+		{sql: `SELECT DISTINCT ON (player) player, score FROM scores ORDER BY player, score DESC LIMIT 2`, want: "ann|30; bob|20"},
+		{sql: `SELECT DISTINCT ON (player) player, score FROM scores ORDER BY player, score LIMIT 2 OFFSET 1`, want: "bob|5; cy|7"},
+		{sql: `SELECT DISTINCT ON (player) player FROM scores`, want: "ann; bob; cy"},
+		// Expressions, positions and output names.
+		{sql: `SELECT DISTINCT ON (score % 2) score % 2 AS parity, id FROM scores ORDER BY score % 2, id`, want: "0|1; 1|4"},
+		{sql: `SELECT DISTINCT ON (1) score % 2, id FROM scores ORDER BY 1, id DESC`, want: "0|3; 1|5"},
+		{sql: `SELECT DISTINCT ON (p) player AS p, score FROM scores ORDER BY p, score`, want: "ann|10; bob|5; cy|7"},
+		{sql: `SELECT DISTINCT ON (game, player) game, player, score FROM scores ORDER BY player, game, score`,
+			want: "g1|ann|10; g2|ann|30; g1|bob|20; g2|bob|5; g1|cy|7"},
+		// Over a join, a grouped query and a derived table.
+		{sql: `SELECT DISTINCT ON (p.team) p.team, s.player, s.score FROM scores s JOIN players p ON p.name = s.player
+			ORDER BY p.team, s.score DESC`, want: "blue|bob|20; red|ann|30"},
+		{sql: `SELECT DISTINCT ON (player) player, game, SUM(score) FROM scores GROUP BY player, game ORDER BY player, SUM(score)`,
+			want: "ann|g1|10; bob|g2|5; cy|g1|7"},
+		{sql: `SELECT DISTINCT ON (team) team, COUNT(*) FROM scores s JOIN players p ON p.name = s.player GROUP BY team, s.game ORDER BY team, COUNT(*) DESC, s.game`,
+			want: "blue|1; red|2"},
+		{sql: `SELECT DISTINCT ON (player) player, score FROM (SELECT * FROM scores WHERE score > 5) d ORDER BY player, score`,
+			want: "ann|10; bob|20; cy|7"},
+		// The leading ORDER BY terms must be the DISTINCT ON expressions.
+		{sql: `SELECT DISTINCT ON (player) player, score FROM scores ORDER BY score`, code: "42P10"},
+		{sql: `SELECT DISTINCT ON (player, game) player FROM scores ORDER BY player, score, game`, code: "42P10"},
+		{sql: `SELECT DISTINCT ON (s.player) s.player FROM scores s JOIN players p ON p.name = s.player ORDER BY p.team`, code: "42P10"},
+		{sql: `SELECT DISTINCT ON (player) player FROM scores ORDER BY player FOR UPDATE`, code: "0A000"},
+	})
+
+	if p := explainPlan(t, ctx, s, `SELECT DISTINCT ON (player) player, score FROM scores ORDER BY player, score LIMIT 1`); p == "" {
+		t.Fatal("empty plan")
+	}
+
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if got := describeOIDs(t, ctx, conn, "distinct_on", `SELECT DISTINCT ON (player) player, score * 2, score > 9 FROM scores ORDER BY player, score DESC`); !sameOIDs(got, []uint32{oidText, oidInt8, oidBool}) {
+		t.Fatalf("described: %v", got)
+	}
+	var player string
+	var score int64
+	if err := conn.QueryRow(ctx, `SELECT DISTINCT ON (player) player, score FROM scores WHERE player <> $1 ORDER BY player, score DESC`, "ann").Scan(&player, &score); err != nil || player != "bob" || score != 20 {
+		t.Fatalf("prepared: %s %d %v", player, score, err)
+	}
+}

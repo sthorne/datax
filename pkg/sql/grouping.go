@@ -58,6 +58,9 @@ type groupedQuery struct {
 	// rewritten onto them.
 	hidden []groupedOut
 	order  []parser.OrderCol
+	// distinctOn are the positions (among outs, then hidden) of the
+	// DISTINCT ON expressions, which are hidden columns too.
+	distinctOn []int
 	// env describes the per-group environment the rewritten
 	// expressions read: the keys, then the aggregate values.
 	env *catalog.TableDescriptor
@@ -206,6 +209,15 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		h := rw.out(fmt.Sprintf("__order%d", i), r)
 		gq.hidden = append(gq.hidden, h)
 		gq.order[i] = parser.OrderCol{Column: h.name, Desc: oc.Desc, Nulls: oc.Nulls}
+	}
+
+	for i, e := range t.DistinctOn {
+		r, err := rw.rewrite(e, true)
+		if err != nil {
+			return nil, err
+		}
+		gq.distinctOn = append(gq.distinctOn, len(gq.outs)+len(gq.hidden))
+		gq.hidden = append(gq.hidden, rw.out(fmt.Sprintf("__distinct%d", i), r))
 	}
 
 	gq.env = rw.envDesc()
@@ -784,11 +796,22 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 	}
 
 	s.note("group/aggregate: %d groups from %d rows", len(res.Rows), len(rows))
-	if t.Distinct {
+	if t.Distinct && len(gq.distinctOn) == 0 {
 		res.Rows = dedupeRowsPrefix(res.Rows, visible)
 	}
 	if len(gq.order) > 0 {
 		if err := sortResultRows(res.Columns, res.Rows, gq.order, params); err != nil {
+			return nil, err
+		}
+	}
+	if len(gq.distinctOn) > 0 {
+		if res.Rows, err = keepFirstDistinct(res.Rows, func(r []types.Datum) ([]types.Datum, error) {
+			k := make([]types.Datum, len(gq.distinctOn))
+			for i, c := range gq.distinctOn {
+				k[i] = r[c]
+			}
+			return k, nil
+		}); err != nil {
 			return nil, err
 		}
 	}

@@ -167,6 +167,16 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	f.kw("SELECT")
 	if s.Distinct {
 		f.kw("DISTINCT")
+		if len(s.DistinctOn) > 0 {
+			f.kw("ON (")
+			for i, e := range s.DistinctOn {
+				if i > 0 {
+					f.w(", ")
+				}
+				f.expr(e)
+			}
+			f.w(")")
+		}
 	}
 	for i, e := range s.Exprs {
 		if i > 0 {

@@ -2574,6 +2574,27 @@ func (p *parser) parseSelect() (Statement, error) {
 	// DISTINCT is not a reserved word — it lexes as an identifier.
 	if p.consumeIdentWord("distinct") {
 		sel.Distinct = true
+		// DISTINCT ON (expr, ...): resolved against the select list once
+		// it is parsed.
+		if t := p.peek(); t.kind == tkKeyword && t.text == "ON" {
+			p.i++
+			if err := p.expectOp("("); err != nil {
+				return nil, err
+			}
+			for {
+				e, err := p.parseValueOrBool()
+				if err != nil {
+					return nil, err
+				}
+				sel.DistinctOn = append(sel.DistinctOn, e)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for {
 		itemStart := p.i
@@ -2623,6 +2644,13 @@ func (p *parser) parseSelect() (Statement, error) {
 		if !p.consumeOp(",") {
 			break
 		}
+	}
+	for i, e := range sel.DistinctOn {
+		r, err := p.distinctOnItem(sel.Exprs, e)
+		if err != nil {
+			return nil, err
+		}
+		sel.DistinctOn[i] = r
 	}
 	if p.consumeKeyword("INTO") {
 		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
@@ -3302,6 +3330,39 @@ func (p *parser) groupByPosition(exprs []SelectExpr, text string) (Expr, error) 
 		return Expr{Agg: &call}, nil
 	}
 	return se.Expr, nil
+}
+
+// distinctOnItem resolves a DISTINCT ON expression as PostgreSQL does:
+// an integer is a position in the select list and a bare name an
+// output name before an input column, each standing for the select
+// item's expression.
+func (p *parser) distinctOnItem(exprs []SelectExpr, e Expr) (Expr, error) {
+	item := func(se SelectExpr) Expr {
+		if se.Agg != "" {
+			call := se
+			call.Alias = ""
+			if se.Window != nil {
+				return Expr{Window: &call}
+			}
+			return Expr{Agg: &call}
+		}
+		return se.Expr
+	}
+	if e.Lit != nil && e.Lit.Fam == types.Int && e.BinOp == "" && e.Cast == "" && e.Left == nil && len(e.Path) == 0 {
+		n := int(e.Lit.I)
+		if star := firstStar(exprs); n < 1 || n > len(exprs) || (star >= 0 && n > star) {
+			return e, p.errf("SELECT DISTINCT ON position %d is not in the select list", n)
+		}
+		return item(exprs[n-1]), nil
+	}
+	if isPlainColumn(e) && e.Cast == "" && !strings.Contains(e.Column, ".") {
+		for _, se := range exprs {
+			if !se.Star && se.Alias == e.Column {
+				return item(se), nil
+			}
+		}
+	}
+	return e, nil
 }
 
 // firstStar is the index of a select list's first * (bare or

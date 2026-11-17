@@ -110,6 +110,12 @@ func groupedJoinSelect(sides []joinSide, t *parser.Select) (*parser.Select, erro
 		c.GroupBy[i] = renameExprColumns(g, lenient)
 	}
 	c.Having = renameCondColumns(t.Having, lenient)
+	if len(t.DistinctOn) > 0 {
+		c.DistinctOn = make([]parser.Expr, len(t.DistinctOn))
+		for i, e := range t.DistinctOn {
+			c.DistinctOn[i] = renameExprColumns(e, lenient)
+		}
+	}
 	// ORDER BY over grouped output resolves by RESULT name first: a
 	// qualified reference to a join column whose bare name is an output
 	// name sorts by that output; any other join column keeps its

@@ -668,6 +668,11 @@ type Select struct {
 	// nil is the one set of every key.
 	GroupBy      []Expr
 	GroupingSets [][]int
+	// DistinctOn are the expressions of SELECT DISTINCT ON (...)
+	// (Distinct is set too): of each group of rows equal on them, the
+	// first in ORDER BY order is kept. A position or an output name
+	// written there is resolved to the select item's expression.
+	DistinctOn []Expr
 	// Having is the HAVING condition, a conjunction like Where's over
 	// grouping expressions and aggregate calls.
 	Having  []Comparison

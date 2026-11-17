@@ -106,3 +106,31 @@ func TestGroupByParse(t *testing.T) {
 		}
 	}
 }
+
+// TestDistinctOnParse covers issue #337: DISTINCT ON (exprs), its
+// positions and output names resolved to the select items' expressions.
+func TestDistinctOnParse(t *testing.T) {
+	sel := parseOneSelect(t, `SELECT DISTINCT ON (a, 2, p, lower(c), t.d) a, b % 2, c AS p FROM t ORDER BY a`)
+	if !sel.Distinct || len(sel.DistinctOn) != 5 {
+		t.Fatalf("DISTINCT ON: %+v", sel)
+	}
+	var got []string
+	for _, e := range sel.DistinctOn {
+		got = append(got, FormatExpr(e))
+	}
+	if s := strings.Join(got, ", "); s != "a, b % 2, c, lower(c), t.d" {
+		t.Fatalf("DISTINCT ON expressions: %s", s)
+	}
+	if sel := parseOneSelect(t, `SELECT DISTINCT a FROM t`); !sel.Distinct || sel.DistinctOn != nil {
+		t.Fatalf("plain DISTINCT: %+v", sel)
+	}
+	for _, q := range []string{
+		`SELECT DISTINCT ON (3) a, b FROM t`,
+		`SELECT DISTINCT ON a, b FROM t`,
+		`SELECT DISTINCT ON () a FROM t`,
+	} {
+		if _, err := Parse(q); err == nil {
+			t.Errorf("%s parsed", q)
+		}
+	}
+}

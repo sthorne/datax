@@ -11,6 +11,13 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`SELECT DISTINCT ON (exprs)`** (#337): of each group of rows equal on the
+  expressions, the first in `ORDER BY` order is kept, before `LIMIT` and
+  `OFFSET`. The `ORDER BY` must begin with the `DISTINCT ON` expressions
+  (`42P10` otherwise, at Describe too); positions and output names stand for
+  the select items. Over single tables, joins, derived tables and grouped
+  queries; not with window functions (`0A000`). Before, `DISTINCT ON` was a
+  syntax error.
 - **`GROUP BY` expressions, `ROLLUP`, `CUBE` and `GROUPING SETS`** (#336):
   `GROUP BY` takes any expression (`date_trunc('day', ts)`, `a % 10`), a
   position of an expression item, or an output name that is no input column;
