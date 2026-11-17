@@ -427,7 +427,8 @@ syntax error or `0A000` feature not supported):
   `lc_time` (messages, numbers, money and dates stay in the C locale;
   `C`, `POSIX` and names shaped like `en_US.UTF-8` are accepted),
   `escape_string_warning`, `array_nulls` (`off` does not make a
-  `NULL` in array input a string), `quote_all_identifiers` and
+  `NULL` in array input a string), `quote_all_identifiers`,
+  `synchronize_seqscans` (pg_dump sets it `off`) and
   `session_replication_role` (`replica` does not disable foreign keys).
   `default_with_oids` takes only `off`, as in PostgreSQL 12 and later.
   The ones that do act: `IntervalStyle` (`postgres`, `iso_8601`,

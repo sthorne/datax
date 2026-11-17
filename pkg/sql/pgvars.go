@@ -131,6 +131,7 @@ var pgVarList = []pgVar{
 	boolVar("escape_string_warning", "on"),
 	boolVar("array_nulls", "on"),
 	boolVar("quote_all_identifiers", "off"),
+	boolVar("synchronize_seqscans", "on"), // pg_dump sets it off
 	{name: "default_with_oids", vartype: "bool", boot: "off", context: "user", noShowAll: true, check: func(name, value string) *Error {
 		if value == "on" {
 			return newErrf(CodeFeatureNotSupported, "tables declared WITH OIDS are not supported")
