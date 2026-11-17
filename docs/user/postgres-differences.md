@@ -266,12 +266,15 @@ syntax error or `0A000` feature not supported):
   arguments (`0A000`); `RIGHT` / `FULL JOIN LATERAL` is refused
   (`42P10`) even when the subquery reads nothing to its left.
 - **Casts are performed** (`'42'::int`, `3.7::int8`, `x::text`,
-  [reference](sql.md#reading)), with two differences. A cast to a type
-  datax does not have — `citext`, `hstore`, `money`, `xml`, `inet`,
-  `pg_lsn`, a range type, or a name that is no type at all — is accepted
-  and yields `text`, so `'A'::citext = 'a'` is false rather than an
-  error. And `'t'::regclass` displays as the table's OID (a number, where
-  PostgreSQL displays `t`); `oid::regclass` gives the name back
+  [reference](sql.md#reading)). A cast to a type datax does not have —
+  `citext`, `hstore`, `money`, `xml`, `inet`, `pg_lsn`, a range type, or
+  a name that is no type at all — is refused as in PostgreSQL, `42704
+  type "citext" does not exist`, before the statement reads anything.
+  The catalog types tools cast to (`name`, `oid`, `regtype`, `xid`,
+  `"char"`, ...) are accepted and behave as their text or number. A
+  schema qualifier on a cast's type is ignored (`'1'::foo.int4` is an
+  `int4`). And `'t'::regclass` displays as the table's OID (a number,
+  where PostgreSQL displays `t`); `oid::regclass` gives the name back
   (`conrelid::regclass`).
 - **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
   1 MiB) as the stream arrives, so a failure partway leaves the earlier

@@ -801,7 +801,8 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   position, with PostgreSQL's text forms and error codes (`'abc'::int`
   is `22P02`), `DECIMAL(p,s)` and `VARCHAR(n)` typmods applied on the
   cast, `'name'::regclass` resolving a table name to its catalog OID
-  and `oid::regclass` on a column giving the table's name —, `E'...'`
+  and `oid::regclass` on a column giving the table's name; a cast to a
+  type that does not exist is `42704` —, `E'...'`
   escape strings, and the builtin functions: conditionals (`coalesce`,
   `nullif`, `greatest`, `least`), strings (`length`, `lower`, `upper`,
   `substring` / `substr`, `position`, `trim` / `ltrim` / `rtrim` /

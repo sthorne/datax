@@ -732,6 +732,21 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 	}
+	// A cast to a type that does not exist fails the statement before it
+	// runs (and, in a transaction block, the block).
+	{
+		var txn *kvclient.Txn
+		if s.state == StateOpen {
+			txn = s.txn
+		}
+		if serr := s.checkCastTypes(ctx, txn, stmt); serr != nil {
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
+			return nil, serr
+		}
+	}
 
 	switch t := stmt.(type) {
 	case *parser.Begin:
