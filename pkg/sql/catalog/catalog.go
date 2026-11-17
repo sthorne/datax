@@ -1090,6 +1090,12 @@ type Accessor struct {
 	idleAfter  time.Duration
 	acquiring  int
 
+	// adopting marks the keys whose lease transaction is publishing a
+	// version newer than the cached one (lease.go, acquireLease): from
+	// just before that commit until the new entry is installed, the
+	// cached entry is not handed out.
+	adopting map[string]*adoptMark
+
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
 	statsDB    *kvclient.DB
@@ -1161,8 +1167,9 @@ func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.nowWallLocked()
-	c, ok := a.cache[cacheKey(dbID, name)]
-	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration {
+	key := cacheKey(dbID, name)
+	c, ok := a.cache[key]
+	if !ok || c.desc == nil || c.desc.ID != id || c.expiration == 0 || now >= c.expiration || a.supersededLocked(key, c) {
 		return nil
 	}
 	c.handedOut = true
@@ -1187,7 +1194,14 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
 	now := a.nowWallLocked()
-	if c, ok := a.cache[key]; ok && (c.expiration == 0 || now < c.expiration) {
+	if c, ok := a.cache[key]; ok && a.supersededLocked(key, c) {
+		// A lease on a newer version is committing or has committed and
+		// its entry is not installed yet: a drain may already have seen
+		// this gateway adopt it, so the old entry must not be handed out.
+		// The statement reads the descriptor in its own transaction.
+		a.mu.Unlock()
+		return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	} else if ok && (c.expiration == 0 || now < c.expiration) {
 		// This statement plans against a descriptor it did not read in
 		// its own transaction, so its only bound is the deadline below.
 		// Mark the entry: until it expires, a drain that sees this
@@ -1227,7 +1241,8 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	// own transaction read — if that is older than the leased one,
 	// its read of the descriptor conflicts with the schema change
 	// at commit, as any stale read does.
-	ld, info, err := a.acquireLease(ctx, dbID, name, key)
+	ld, info, done, err := a.acquireLease(ctx, dbID, name, key)
+	defer done()
 	if err != nil || ld == nil {
 		// Without a lease the cache may not be trusted beyond this
 		// statement; return the descriptor uncached. d was read
