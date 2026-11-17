@@ -46,9 +46,9 @@ Open gaps by area and priority.
 
 | Area | P1 | P2 | P3 | Total |
 |---|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 8 | 16 | 6 | 30 |
-| [PG: Functions and operators](#functions-and-operators) | 7 | 12 | 4 | 23 |
-| [PG: Types](#types) | 3 | 10 | 14 | 27 |
+| [PG: Query language](#query-language) | 4 | 17 | 7 | 28 |
+| [PG: Functions and operators](#functions-and-operators) | 2 | 15 | 5 | 22 |
+| [PG: Types](#types) | 2 | 11 | 14 | 27 |
 | [PG: DDL](#ddl) | 9 | 13 | 6 | 28 |
 | [PG: Programmability](#programmability) | 2 | 3 | 2 | 7 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 3 | 5 | 4 | 12 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 4 |
-| **PostgreSQL total** | **36** | **85** | **60** | **181** |
+| **PostgreSQL total** | **26** | **90** | **62** | **178** |
 | **CockroachDB total** | **2** | **25** | **18** | **45** |
-| **All** | **38** | **110** | **78** | **226** |
+| **All** | **28** | **115** | **80** | **223** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -91,10 +91,8 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-Q-001 | Expressions over aggregates: `sum(a)/count(*)`, `coalesce(sum(a),0)`, `HAVING sum(c)*2 > 3`, an aggregate as a function argument (`pg_typeof(sum(x))`), a constant or `grouping()` in a grouped select list | `42601 syntax error: unexpected "/" after statement`; `42883 unknown function "sum"`; `0A000 grouped SELECT items must be plain columns or aggregates` | aggregate in a derived table, compute outside | P1 | L | V | [#335](https://github.com/sthorne/datax/issues/335) (in progress) |
-| PG-Q-002 | `GROUP BY` an expression or function (`GROUP BY a % 3`, `GROUP BY date_trunc('month', d)`), an output alias (`GROUP BY x`); `ROLLUP`, `CUBE`, `GROUPING SETS` | `42601 unexpected "%" / "(" after statement`; alias `42703 column "x" does not exist`; `42601 unexpected "sets"` | group a derived table's computed column; `UNION ALL` of groupings | P1 | L | V | [#336](https://github.com/sthorne/datax/issues/336) (in progress) |
-| PG-Q-003 | `SELECT DISTINCT ON (...)` | `42601 syntax error: expected value, found "ON"` | `row_number() OVER (PARTITION BY ...)` in a derived table | P1 | M | V | [#337](https://github.com/sthorne/datax/issues/337) (in progress) |
-| PG-Q-004 | `LATERAL` subqueries and functions; set-returning functions in `FROM` other than `unnest` (`generate_series`, `jsonb_each`, `jsonb_array_elements`, `json_table`); `ROWS FROM (...)`; `unnest` beside a table's columns; multi-argument `unnest` | `42601 syntax error: unexpected "(" after statement`; `unnest(arr)` beside columns `42883 unknown function "unnest"`; `42883 unnest takes one array argument` | correlated scalar subqueries; expand client-side | P1 | L | V | [#338](https://github.com/sthorne/datax/issues/338) (in progress) |
+| PG-Q-003 | `DISTINCT ON` together with window functions; `DISTINCT ON` in a select without `FROM` (ignored) | `0A000`; ignored | `row_number() OVER (PARTITION BY ...)` in a derived table | P3 | S | D | — |
+| PG-Q-004 | What `LATERAL` (#338) does not cover yet: a lateral subquery over a derived table or a set operation of its own, an outer reference in a lateral subquery's `ORDER BY` / `GROUP BY` / aggregate arguments, `RIGHT` / `FULL JOIN LATERAL` (PostgreSQL allows it when nothing to the left is read); `ROWS FROM (...)`; `json_table`; multi-argument `unnest`; a set-returning function in the select list of a query with `FROM` | `0A000 correlated subqueries are not supported`; `42P10`; `0A000` | a plain lateral select; expand in `FROM` | P2 | M | D | — |
 | PG-Q-005 | Inner `ORDER BY` in an aggregate call: `string_agg(b, ',' ORDER BY id)`, `array_agg(x ORDER BY y)`, `jsonb_agg(... ORDER BY ...)` | `42601 syntax error: expected ")", found "ORDER"` | aggregate an ordered derived table (order not guaranteed) | P1 | M | V | — |
 | PG-Q-006 | `JOIN ... ON` must equate a column with one from an earlier table: `ON true`, non-equi joins (`ON u.tid < t.id`), `OR` in `ON` | `42601 syntax error: JOIN ... ON must equate a column of u with one from an earlier table` | comma or `CROSS JOIN` with the condition in `WHERE` (works); an equality plus extra `AND` conditions works | P1 | M | V | — |
 | PG-Q-007 | `UPDATE ... FROM` and `DELETE ... USING` | `42601 unexpected "FROM" / "using" after statement` | `WHERE id IN (SELECT ...)`; per-row statements | P1 | M | V | — |
@@ -132,13 +130,12 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-F-001 | **Regex functions**: `regexp_replace`, `regexp_match`, `regexp_matches`, `regexp_split_to_array`, `regexp_split_to_table`, `regexp_count` / `regexp_instr` / `regexp_like` / `regexp_substr` (15+), `substring(s from pattern)` | `42883 unknown function "regexp_replace"`; `42883 function substring(text, text) does not exist` | `~` / `~*` filters work; transform client-side | P1 | M | V | [#339](https://github.com/sthorne/datax/issues/339) (in progress) |
-| PG-F-002 | **Set-returning functions**: `generate_series` (integer, numeric, timestamp), `generate_subscripts`, `string_to_table`, `regexp_split_to_table`, `pg_get_keywords` | `42883 unknown function "generate_series"` (in the select list); `42601 unexpected "("` (in `FROM`) | recursive CTE | P1 | M | V | [#339](https://github.com/sthorne/datax/issues/339), [#338](https://github.com/sthorne/datax/issues/338) (in progress) |
-| PG-F-003 | **JSON processing**: `jsonb_each[_text]`, `jsonb_object_keys`, `jsonb_array_elements[_text]` and the `json_*` twins, `jsonb_to_record[set]`, `jsonb_populate_record[set]`, `jsonb_insert`, `jsonb_set_lax`, `jsonb_object`, `array_to_json`, `row_to_json` | `42883 unknown function "jsonb_object_keys"` | `->`, `->>`, `#>`, `jsonb_extract_path` | P1 | M | V | [#339](https://github.com/sthorne/datax/issues/339) (in progress, part) |
+| PG-F-001 | **Regex leftovers**: `regexp_instr`; `substring(s from pattern)`; back references and lookaround (patterns run on RE2) | `42883`; `2201B` | the other `regexp_*` functions (#339) | P2 | S | D | — |
+| PG-F-002 | **Set-returning function leftovers**: `generate_subscripts`, `string_to_table`, `pg_get_keywords` | `42883` | `generate_series`, `regexp_split_to_table`, `unnest` (#339) | P3 | S | D | — |
+| PG-F-003 | **JSON processing leftovers**: `jsonb_to_record[set]`, `jsonb_populate_record[set]`, `jsonb_set_lax`, `jsonb_object`, `array_to_json`, `row_to_json` (no row type); `jsonb_each` returns keys in stored order, not PostgreSQL's length-then-bytes order | `42883`; silently different order | `jsonb_each`, `jsonb_array_elements`, `jsonb_object_keys`, `jsonb_insert` (#339) | P2 | M | D | — |
 | PG-F-004 | **`jsonb \|\| jsonb` concatenates text**: `'{"a":1}'::jsonb \|\| '{"b":2}'::jsonb` returns `{"a":1}{"b":2}`, also on a column (`j \|\| '{"z":1}'`), so `UPDATE t SET j = j \|\| ...` writes a value that is not a merged object | silently different (wrong result; PostgreSQL merges the objects) | `jsonb_set` one key at a time | P1 | S | V | — |
 | PG-F-005 | Other **jsonb operators**: `-` (delete key or index), `#-` (delete path), subscripting `j['a']` (14), ordering comparisons (`ORDER BY j`) | `0A000 unsupported operand for -: JSONB`; `42601 unexpected character '#'`; `42883 function array_subscript(jsonb, text) does not exist`; `XX000 ORDER BY: JSONB values have no order` | `jsonb_set`; `->` | P2 | S | V | — |
-| PG-F-006 | **Date/time functions**: `AT TIME ZONE`, `timezone()`, `date_bin`, `date_add` / `date_subtract` (16), `make_timestamptz(..., zone)`, `timeofday`, `to_char(interval, ...)`, `to_number` | `42601 unexpected "at" after statement`; `42883 unknown function "date_bin"`; `42601 make_timestamptz() takes 6 argument(s), got 7`; `42883 function does not exist for argument type INTERVAL` | `date_trunc`; offsets by hand | P1 | M | V | [#340](https://github.com/sthorne/datax/issues/340) (in progress, `AT TIME ZONE`) |
-| PG-F-007 | **Time-zone-dependent functions compute in UTC** whatever `TimeZone` says: `date_trunc`, `extract(hour ...)`, `to_char(..., 'TZ')`, `::date`, `current_date`. With `TimeZone = 'America/New_York'`, `date_trunc('day', '2024-01-01 10:00+00')` renders `2023-12-31 19:00:00-05` (PostgreSQL: `2024-01-01 00:00:00-05`) and `extract(hour ...)` is 10 (PostgreSQL: 5) | silently different | keep sessions in UTC | P1 | M | V | [#340](https://github.com/sthorne/datax/issues/340) (in progress) |
+| PG-F-006 | **Date/time function leftovers**: `date_bin`, `date_add` / `date_subtract` (16), `make_timestamptz(..., zone)` (and it ignores the session zone), `timeofday`, `to_char(interval, ...)`, `to_number` | `42883 unknown function "date_bin"`; `42601 make_timestamptz() takes 6 argument(s), got 7`; `42883 function does not exist for argument type INTERVAL` | `date_trunc`; `AT TIME ZONE` (#340) | P2 | M | V | — |
 | PG-F-008 | **System functions ORMs and tools call**: `pg_get_serial_sequence` (Rails, Hibernate), `to_regclass`, `pg_is_in_recovery` (pg_dump's first query), `current_schemas`, `pg_has_role`, `has_sequence_privilege`, `has_column_privilege`, the keywords `current_catalog`, `current_role`, `user` | `42883 unknown function "pg_get_serial_sequence"`; `42703 column "current_role" is not available in this context`; `42601 expected value, found "USER"` | query `pg_class`, `pg_sequences` directly | P1 | S | V | — |
 | PG-F-009 | **String functions**: `overlay`, `bit_length`, `to_ascii`, `convert_from` / `convert_to`, `unistr`, `normalize`, `parse_ident`, `sha224` / `sha384` / `sha512`, `crc32` (18), `get_byte` / `set_byte` / `get_bit`; `format()` width and flags (`%5s`, `%-3s`) | `42883 unknown function "overlay"`; `22023 unrecognized format() type specifier '5'` | `substring` + `\|\|`; `sha256` | P2 | S | V | — |
 | PG-F-010 | **Math functions**: trigonometric (`sin` ... `atan2`, the degree variants, hyperbolic), `degrees`, `radians`, `factorial`, `lcm`, `scale`, `min_scale`, `trim_scale`, `setseed`, `random(min, max)` (17), `random_normal` (16), `erf` | `42883 unknown function "sin"`; `42601 random() takes 0 argument(s), got 2` | client-side | P2 | S | V | — |
@@ -160,7 +157,7 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-T-001 | **Time zones**: `TimeZone` changes only how `timestamptz` text output is rendered. An input without an offset (`'2024-06-01 12:00:00'::timestamptz`) is read as UTC, not in the session zone; zone names in literals (`'2024-01-01 12:00 America/New_York'`) are refused; computations are UTC (PG-F-007); the binary format is UTC (as in PostgreSQL); `ParameterStatus` at startup reports `TimeZone=UTC` | silently different; `22007 invalid input syntax for type timestamp` for zone names | write offsets in literals; keep sessions in UTC | P1 | M | V | [#340](https://github.com/sthorne/datax/issues/340) (in progress) |
+| PG-T-001 | **Time-zone leftovers** after #340: a literal without an offset in a join's `ON` condition is read as UTC (`ON` conditions are not zone-resolved); `to_jsonb`, `array_to_string` and `format` render a `timestamptz` in UTC; zone abbreviations are a fixed list; whether the startup `ParameterStatus` reports the session zone is not re-checked | silently different | put such a filter in `WHERE`; write offsets in literals | P2 | S | D | — |
 | PG-T-002 | **Casts to unsupported or unknown type names are accepted and yield text**: `'a'::foo_unknown_type`, `::citext`, `::hstore`, `::money`, `::xml`, `::inet`, `::pg_lsn`, `::int4multirange` all succeed as `text`; `'A'::citext = 'a'` is false; `'12.34'::money + '1'::money` "works" | silently different (PostgreSQL: `42704 type "..." does not exist`, or the type's semantics) | — | P1 | S | V | — |
 | PG-T-003 | **`bytea` in expressions**: `length('\x0102'::bytea)` is 6 (the text's length) and `length(b)` / `octet_length(b)` over a 4-byte `bytea` column are 10 (its hex text) | silently different (PostgreSQL: 2 and 4) | measure client-side | P1 | S | V | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
@@ -543,6 +540,12 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| Expressions over aggregates in the select list, `HAVING` and `ORDER BY` (was PG-Q-001) | PR (this branch) (#335) |
+| `GROUP BY` expressions and output names, `ROLLUP`, `CUBE`, `GROUPING SETS`, `GROUPING()` (was PG-Q-002) | PR (this branch) (#336) |
+| `SELECT DISTINCT ON (...)` (was PG-Q-003; leftovers stay under that ID) | PR (this branch) (#337) |
+| `LATERAL` subqueries and table functions reading earlier `FROM` members; `unnest` beside a table's columns (part of PG-Q-004) | PR (this branch) (#338) |
+| `regexp_*` functions, `generate_series`, `jsonb_each` / `jsonb_array_elements` / `jsonb_object_keys` / `jsonb_insert`, set-returning functions in `FROM` and in a select list without `FROM` (parts of PG-F-001/002/003) | PR (this branch) (#339) |
+| `AT TIME ZONE`, `timezone()`, and `TimeZone` honored for input, `::text`, `::date`, `date_trunc`, `extract`, `to_char`, `current_date` and interval arithmetic (was PG-F-007; parts of PG-F-006, PG-T-001) | PR (this branch) (#340) |
 | `pg_settings` reports `vartype` and `unit` from the settings registry, and what `RESET` restores | PR #334 (#333) |
 | `pg_settings` and `SHOW ALL` list custom settings; `current_setting(name)` per row raises `42704` for an unknown name, as PostgreSQL does | PR #332 (#329, #330) |
 | psql's `\dd`, `\dAf`, `\dAo`, `\dAp` and `\dconfig`; `COMMENT ON CONSTRAINT`; the hidden `tableoid` column on catalogs; select-list aliases without `AS` | PR #326 |
