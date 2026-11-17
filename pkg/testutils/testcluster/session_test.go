@@ -368,6 +368,30 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 		h.want(fk, "10000|default|10000")
 		h.want(`SHOW foreign_key_cascade_limit`, "10000")
 	})
+
+	// Issue #333: vartype and unit come from the session's registry of
+	// settings, and reset_val is what RESET restores.
+	t.Run("vartype unit reset_val", func(t *testing.T) {
+		h := setup(t)
+		row := func(name string) string {
+			return `SELECT vartype || '|' || coalesce(unit, '') || '|' || reset_val FROM pg_settings WHERE name = '` + name + `'`
+		}
+		h.want(row("statement_memory_limit"), "integer|B|"+h.col(`SELECT boot_val FROM pg_settings WHERE name = 'statement_memory_limit'`)[0])
+		h.want(row("ivfflat.probes"), "integer||"+h.col(`SELECT boot_val FROM pg_settings WHERE name = 'ivfflat.probes'`)[0])
+		h.want(row("vector_index_scan"), "bool||"+h.col(`SELECT boot_val FROM pg_settings WHERE name = 'vector_index_scan'`)[0])
+		h.want(row("inverted_index_scan"), "enum||"+h.col(`SELECT boot_val FROM pg_settings WHERE name = 'inverted_index_scan'`)[0])
+		h.want(row("statement_timeout"), "integer|ms|0")
+		h.want(row("default_transaction_read_only"), "bool||off")
+		h.want(row("application_name"), "string||")
+		// After a SET, reset_val is still what RESET restores, and RESET
+		// does restore it.
+		execSQL(t, ctx, h.s, `SET statement_timeout = 5000`)
+		h.want(`SELECT setting || '|' || reset_val FROM pg_settings WHERE name = 'statement_timeout'`, "5000|0")
+		execSQL(t, ctx, h.s, `RESET statement_timeout`)
+		h.want(`SELECT setting FROM pg_settings WHERE name = 'statement_timeout'`, "0")
+		// Every built-in setting's reset_val equals its boot_val.
+		h.want(`SELECT count(*) FROM pg_settings WHERE boot_val IS NOT NULL AND reset_val <> boot_val`, "0")
+	})
 }
 
 // TestCancelAndTimeouts (issue #97): a CancelRequest (pgx's context

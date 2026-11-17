@@ -833,14 +833,16 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, kv := range env.Settings {
+				// vartype and unit come from the session's registry of
+				// settings (issue #333).
 				vartype, unit := "string", null()
-				switch kv[0] {
-				case "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout":
-					vartype, unit = "integer", str("ms")
-				case "foreign_key_cascade_limit":
-					vartype = "integer"
-				case "default_transaction_read_only", "transaction_read_only", "integer_datetimes", "standard_conforming_strings":
-					vartype = "bool"
+				if t, ok := env.SettingTypes[kv[0]]; ok {
+					if t[0] != "" {
+						vartype = t[0]
+					}
+					if t[1] != "" {
+						unit = str(t[1])
+					}
 				}
 				// source and boot_val: a setting this session changed
 				// (SET, or a connection parameter) reads 'session'
@@ -856,11 +858,14 @@ func init() {
 					rows = append(rows, Row{str(kv[0]), str(kv[1]), null(), str("Customized Options"), str("GUC placeholder variable"), str("user"), str("string"), str("session"), null(), str("")})
 					continue
 				}
-				source, boot := "default", kv[1]
+				source := "default"
 				if d != kv[1] {
-					source, boot = "session", d
+					source = "session"
 				}
-				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str(source), str(boot), str(kv[1])})
+				// boot_val is what a new session starts with; reset_val is
+				// what RESET restores, which in datax is the same value
+				// (issue #333).
+				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str(source), str(d), str(d)})
 			}
 			return rows, nil
 		})

@@ -578,6 +578,7 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	env.Roles = roles
 	env.Settings = s.settings()
 	env.SettingDefaults = s.settingDefaults()
+	env.SettingTypes = settingTypes
 	if s.SessionsHook != nil {
 		env.Sessions = s.SessionsHook()
 	}

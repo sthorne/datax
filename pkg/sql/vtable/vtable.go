@@ -100,6 +100,10 @@ type Env struct {
 	// source 'session'). A setting it lacks is a custom one the session
 	// set (app.tenant).
 	SettingDefaults map[string]string
+	// SettingTypes maps a built-in setting's name to its pg_settings
+	// vartype and unit ("" for none), from the session's registry of
+	// settings (issue #333).
+	SettingTypes map[string][2]string
 	// Sessions are this node's SQL sessions (pg_stat_activity).
 	Sessions []SessionInfo
 

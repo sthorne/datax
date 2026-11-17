@@ -116,6 +116,15 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"vector_index_scan", "bool", ""},
 }
 
+// settingTypes is varNames' vartype and unit by name, for pg_settings.
+var settingTypes = func() map[string][2]string {
+	m := make(map[string][2]string, len(varNames))
+	for _, v := range varNames {
+		m[v.name] = [2]string{v.vartype, v.unit}
+	}
+	return m
+}()
+
 // canonicalVar resolves a SET / SHOW name (case-insensitively, with the
 // spelled-out SHOW forms) to its canonical name; "" when unknown.
 func canonicalVar(name string) string {
