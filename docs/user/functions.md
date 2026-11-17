@@ -179,6 +179,20 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `loread(int8, int8) → bytes` — Reads up to the given number of bytes at the descriptor's position and advances it; fewer bytes mean the end of the object. *volatile*
 - `lowrite(int8, bytes) → int8` — Writes the bytes at the descriptor's position, advances it, and returns the number written. *volatile*
 
+## Advisory locks
+
+- `pg_advisory_lock(int8, [int8]) → text` — Takes an exclusive session-level advisory lock on a bigint key, or two int4 keys (a different lock from any bigint one), waiting until it is free (or lock_timeout, 55P03, or statement_timeout or a cancel, 57014). Locks are cluster-wide and reentrant: each call needs its own pg_advisory_unlock. Released by pg_advisory_unlock, pg_advisory_unlock_all or the session's end, not by the transaction's. Returns nothing (an empty value). *volatile*
+- `pg_advisory_lock_shared(int8, [int8]) → text` — pg_advisory_lock in shared mode: held by any number of sessions at once, it conflicts only with an exclusive hold. *volatile*
+- `pg_advisory_unlock(int8, [int8]) → bool` — Gives back one session-level exclusive hold of the lock: true, or false with a WARNING (you don't own a lock of type ExclusiveLock) when the session held none. *volatile*
+- `pg_advisory_unlock_all() → text` — Gives back every session-level advisory lock the session holds (transaction-level ones stay until the transaction ends). Returns nothing. *volatile*
+- `pg_advisory_unlock_shared(int8, [int8]) → bool` — pg_advisory_unlock for a shared hold (the warning names ShareLock). *volatile*
+- `pg_advisory_xact_lock(int8, [int8]) → text` — pg_advisory_lock held by the transaction: released when it commits or rolls back (or by a ROLLBACK TO a savepoint taken before it), and by nothing else. *volatile*
+- `pg_advisory_xact_lock_shared(int8, [int8]) → text` — pg_advisory_xact_lock in shared mode. *volatile*
+- `pg_try_advisory_lock(int8, [int8]) → bool` — pg_advisory_lock without the wait: true when the lock was taken, false at once when another session holds it. *volatile*
+- `pg_try_advisory_lock_shared(int8, [int8]) → bool` — pg_try_advisory_lock in shared mode. *volatile*
+- `pg_try_advisory_xact_lock(int8, [int8]) → bool` — pg_advisory_xact_lock without the wait: true when taken, false when another session holds the lock. *volatile*
+- `pg_try_advisory_xact_lock_shared(int8, [int8]) → bool` — pg_try_advisory_xact_lock in shared mode. *volatile*
+
 ## Arrays
 
 - `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*

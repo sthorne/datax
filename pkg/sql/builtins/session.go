@@ -13,6 +13,9 @@ const catSession = "Session and system"
 // catLargeObject is the large-object functions' section (issue #303).
 const catLargeObject = "Large objects"
 
+// catAdvisory is the advisory-lock functions' section (issue #353).
+const catAdvisory = "Advisory locks"
+
 func init() {
 	for _, b := range []*Builtin{
 		{Name: "now", Ret: types.Timestamp, Vol: Stable, Doc: "The statement's start time, the same for every row (also current_timestamp, localtimestamp, statement_timestamp(), transaction_timestamp()).",
@@ -60,4 +63,27 @@ func init() {
 		f.Session = true
 		register(f)
 	}
+	// The advisory-lock functions (pkg/sql/advisory) take one bigint key
+	// or two int4 keys, which name different locks.
+	key := "a bigint key, or two int4 keys (a different lock from any bigint one)"
+	for _, f := range []*Builtin{
+		{Name: "pg_advisory_lock", Ret: types.String, Doc: "Takes an exclusive session-level advisory lock on " + key + ", waiting until it is free (or lock_timeout, 55P03, or statement_timeout or a cancel, 57014). Locks are cluster-wide and reentrant: each call needs its own pg_advisory_unlock. Released by pg_advisory_unlock, pg_advisory_unlock_all or the session's end, not by the transaction's. Returns nothing (an empty value)."},
+		{Name: "pg_advisory_lock_shared", Ret: types.String, Doc: "pg_advisory_lock in shared mode: held by any number of sessions at once, it conflicts only with an exclusive hold."},
+		{Name: "pg_try_advisory_lock", Ret: types.Bool, Doc: "pg_advisory_lock without the wait: true when the lock was taken, false at once when another session holds it."},
+		{Name: "pg_try_advisory_lock_shared", Ret: types.Bool, Doc: "pg_try_advisory_lock in shared mode."},
+		{Name: "pg_advisory_xact_lock", Ret: types.String, Doc: "pg_advisory_lock held by the transaction: released when it commits or rolls back (or by a ROLLBACK TO a savepoint taken before it), and by nothing else."},
+		{Name: "pg_advisory_xact_lock_shared", Ret: types.String, Doc: "pg_advisory_xact_lock in shared mode."},
+		{Name: "pg_try_advisory_xact_lock", Ret: types.Bool, Doc: "pg_advisory_xact_lock without the wait: true when taken, false when another session holds the lock."},
+		{Name: "pg_try_advisory_xact_lock_shared", Ret: types.Bool, Doc: "pg_try_advisory_xact_lock in shared mode."},
+		{Name: "pg_advisory_unlock", Ret: types.Bool, Doc: "Gives back one session-level exclusive hold of the lock: true, or false with a WARNING (you don't own a lock of type ExclusiveLock) when the session held none."},
+		{Name: "pg_advisory_unlock_shared", Ret: types.Bool, Doc: "pg_advisory_unlock for a shared hold (the warning names ShareLock)."},
+	} {
+		f.Args, f.MinArgs = []types.Family{i, i}, 1
+		f.Category = catAdvisory
+		f.Vol = Volatile
+		f.Session = true
+		register(f)
+	}
+	register(&Builtin{Name: "pg_advisory_unlock_all", Ret: types.String, Category: catAdvisory, Vol: Volatile, Session: true,
+		Doc: "Gives back every session-level advisory lock the session holds (transaction-level ones stay until the transaction ends). Returns nothing."})
 }

@@ -572,6 +572,39 @@ func init() {
 			}
 			return rows, nil
 		})
+	// pg_locks: the advisory locks held across the cluster (issue #353),
+	// with PostgreSQL's columns. Row locks are not listed (they are write
+	// intents, which no catalog shows), nor are sessions waiting for an
+	// advisory lock: every row is granted.
+	pg("pg_locks", []catalog.Column{
+		col("locktype", types.String), col("database", types.Int), col("relation", types.Int), col("page", types.Int),
+		col("tuple", types.Int), col("virtualxid", types.String), col("transactionid", types.Int), col("classid", types.Int),
+		col("objid", types.Int), col("objsubid", types.Int), col("virtualtransaction", types.String), col("pid", types.Int),
+		col("mode", types.String), col("granted", types.Bool), col("fastpath", types.Bool), col("waitstart", types.Timestamp),
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		if env.AdvisoryLocks == nil {
+			return nil, nil
+		}
+		locks, err := env.AdvisoryLocks()
+		if err != nil {
+			return nil, err
+		}
+		oids := map[string]int64{}
+		for _, d := range env.Databases {
+			oids[d.Name] = DatabaseOID(d)
+		}
+		rows := make([]Row, 0, len(locks))
+		for _, l := range locks {
+			db := null()
+			if oid, ok := oids[l.Database]; ok {
+				db = i64(oid)
+			}
+			rows = append(rows, Row{str("advisory"), db, null(), null(), null(), null(), null(),
+				i64(int64(l.ClassID)), i64(int64(l.ObjID)), i64(int64(l.ObjSubID)), null(), i64(int64(l.PID)),
+				str(l.Mode), boolean(true), boolean(false), null()})
+		}
+		return rows, nil
+	})
 	// datax_keys (issue #310): the named keys' metadata. The table of the
 	// same name that holds them is readable by no session; a session that
 	// names it is given this instead, which has no column for the key

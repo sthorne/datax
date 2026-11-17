@@ -24,7 +24,7 @@ syntax error or `0A000` feature not supported):
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
 | Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
 | The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
-| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify)) |
+| Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify); so are advisory locks, `pg_advisory_lock` and its relatives, cluster-wide: [reference](sql.md#advisory-locks)) |
 
 ## Things that exist but behave differently
 
@@ -45,6 +45,16 @@ syntax error or `0A000` feature not supported):
   the statement had to read but would have filtered out. `FOR SHARE`,
   `FOR NO KEY UPDATE`, `FOR KEY SHARE` and `FOR UPDATE OF table` are
   not supported.
+- **Advisory locks** (`pg_advisory_lock`, `pg_try_advisory_lock`,
+  `pg_advisory_xact_lock`, the `_shared` variants, `pg_advisory_unlock[_all]`)
+  work cluster-wide with PostgreSQL's semantics, with four differences
+  ([details](sql.md#advisory-locks)): the locks of a node that dies are
+  released about 10 seconds after it stopped renewing its lease, and a
+  node cut off from the cluster ends its sessions that held advisory
+  locks (`57P01`) rather than let two sessions hold one lock; waiters
+  are not served in arrival order; a deadlock between advisory locks is
+  not detected (set `lock_timeout`); and the arguments must be constants
+  or parameters, evaluated once per statement (`0A000` for a column).
 - **Concurrent inserts of one key.** In PostgreSQL the second `INSERT`
   of a primary key another open transaction has just inserted waits for
   it, then fails with `23505` if it commits or succeeds if it rolls back.
@@ -513,7 +523,7 @@ are the differences ([reference](sql.md#large-objects)):
 | `40001` | serialization failure — including a transaction that read data whose history was garbage-collected under it (it ran longer than a table's `gc_ttl`, or a `PURGE` of what it reads ran meanwhile) | retry the whole transaction |
 | `72000` | snapshot too old: `AS OF SYSTEM TIME` names a moment older than the table's GC window (`gc_ttl`, default 25h), or before a `PURGE` or a dropped table's reclaim | read at a later moment; retrying the same one cannot succeed |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
-| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
+| `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait (for a row or an advisory lock) outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |
 | `23505` | unique violation | application-level conflict |
 | `54000` | program limit exceeded: a write of more than 60 MiB to one range in one piece (a huge row); more than 64 MiB written into existing large objects by one transaction; a large object past 1 TiB | store the value as a [large object](sql.md#large-objects), written in a new object inside one transaction block |
 | `55000` on a large-object call or `COMMIT` | the upload sat idle for more than 10 minutes and was reclaimed | roll back and upload again |
