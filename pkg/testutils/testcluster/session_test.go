@@ -238,10 +238,13 @@ func TestSessionVariables(t *testing.T) {
 	_ = rendered
 }
 
-// TestCurrentSettingAndPgSettings (issue #329): current_setting() on a
-// name that is no setting raises 42704 in both its constant and per-row
-// forms (a dotted custom name never SET included), and returns NULL with
-// missing_ok.
+// TestCurrentSettingAndPgSettings (issues #329, #330): current_setting()
+// on a name that is no setting raises 42704 in both its constant and
+// per-row forms (a dotted custom name never SET included), and returns
+// NULL with missing_ok; custom settings the session SET appear in
+// pg_settings and SHOW ALL as session strings; and
+// foreign_key_cascade_limit, once SET, reads source 'session' with the
+// default as boot_val, and SET LOCAL of it ends with the block.
 func TestCurrentSettingAndPgSettings(t *testing.T) {
 	tc := Start(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -316,6 +319,54 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 		if got := h.col(`SELECT current_setting(s.name) = s.setting FROM pg_settings s`); len(got) < 15 || strings.Contains(strings.Join(got, ","), "false") {
 			t.Fatalf("current_setting over pg_settings: %v", got)
 		}
+	})
+
+	t.Run("custom settings listed", func(t *testing.T) {
+		h := setup(t)
+		h.want(`SELECT name FROM pg_settings WHERE name LIKE 'app.%'`)
+		execSQL(t, ctx, h.s, `SET app.tenant = 'acme'`)
+		execSQL(t, ctx, h.s, `SELECT set_config('app.user_id', '42', false)`)
+		h.want(`SELECT name || '|' || setting || '|' || source || '|' || vartype || '|' || coalesce(boot_val, 'NULL') FROM pg_settings WHERE name LIKE 'app.%' ORDER BY name`,
+			"app.tenant|acme|session|string|NULL", "app.user_id|42|session|string|NULL")
+		all := execSQL(t, ctx, h.s, `SHOW ALL`)
+		var shown []string
+		for _, r := range all.Rows {
+			if strings.HasPrefix(r[0].Text(), "app.") {
+				shown = append(shown, r[0].Text()+"="+r[1].Text())
+			}
+		}
+		if strings.Join(shown, ",") != "app.tenant=acme,app.user_id=42" {
+			t.Fatalf("SHOW ALL custom settings: %v", shown)
+		}
+		if n := len(h.col(`SELECT name FROM pg_settings`)); n != len(all.Rows) {
+			t.Fatalf("SHOW ALL %d rows, pg_settings %d", len(all.Rows), n)
+		}
+		// \dconfig's own query lists them, values read per row.
+		h.want(`SELECT s.name || '=' || pg_catalog.current_setting(s.name) FROM pg_catalog.pg_settings s WHERE s.source <> 'default' AND s.setting IS DISTINCT FROM s.boot_val ORDER BY 1`,
+			"app.tenant=acme", "app.user_id=42")
+		// A SET LOCAL one leaves with its block.
+		execSQL(t, ctx, h.s, `BEGIN`)
+		execSQL(t, ctx, h.s, `SET LOCAL app.scratch = 'x'`)
+		h.want(`SELECT setting FROM pg_settings WHERE name = 'app.scratch'`, "x")
+		execSQL(t, ctx, h.s, `ROLLBACK`)
+		h.want(`SELECT setting FROM pg_settings WHERE name = 'app.scratch'`)
+	})
+
+	t.Run("foreign_key_cascade_limit", func(t *testing.T) {
+		h := setup(t)
+		fk := `SELECT setting || '|' || source || '|' || boot_val FROM pg_settings WHERE name = 'foreign_key_cascade_limit'`
+		h.want(fk, "10000|default|10000")
+		execSQL(t, ctx, h.s, `SET foreign_key_cascade_limit = 5`)
+		h.want(fk, "5|session|10000")
+		h.want(`SELECT current_setting('foreign_key_cascade_limit')`, "5")
+		execSQL(t, ctx, h.s, `RESET foreign_key_cascade_limit`)
+		h.want(fk, "10000|default|10000")
+		execSQL(t, ctx, h.s, `BEGIN`)
+		execSQL(t, ctx, h.s, `SET LOCAL foreign_key_cascade_limit = 7`)
+		h.want(fk, "7|session|10000")
+		execSQL(t, ctx, h.s, `ROLLBACK`)
+		h.want(fk, "10000|default|10000")
+		h.want(`SHOW foreign_key_cascade_limit`, "10000")
 	})
 }
 

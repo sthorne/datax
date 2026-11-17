@@ -3,7 +3,6 @@ package sql
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -151,20 +150,9 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 				args[i] = r
 			}
 			ce := &parser.CaseExpr{Operand: &parser.Expr{Func: "lower", Args: []parser.Expr{args[0]}}}
-			add := func(name, value string) {
-				n, v := types.NewString(strings.ToLower(name)), types.NewString(value)
-				ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &n}, Result: parser.Expr{Lit: &v}})
-			}
 			for _, kv := range s.settings() {
-				add(kv[0], kv[1])
-			}
-			custom := make([]string, 0, len(s.vars.custom))
-			for name := range s.vars.custom {
-				custom = append(custom, name)
-			}
-			sort.Strings(custom)
-			for _, name := range custom {
-				add(name, s.vars.custom[name])
+				n, v := types.NewString(strings.ToLower(kv[0])), types.NewString(kv[1])
+				ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &n}, Result: parser.Expr{Lit: &v}})
 			}
 			ce.Else = &parser.Expr{Func: unrecognizedSettingFunc, Args: args}
 			return parser.Expr{Case: ce}, nil

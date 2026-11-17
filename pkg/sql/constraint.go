@@ -586,9 +586,13 @@ func (s *Session) resolveCheck(ctx context.Context, txn *kvclient.Txn, fails []p
 	return s.resolveWhereSubs(ctx, txn, fails, nil)
 }
 
+// fkCascadeLimit is the per-statement cascade cap: SET
+// foreign_key_cascade_limit's value, kept with the session's other
+// variables (so SET LOCAL ends with its block, and pg_settings tells a
+// SET one from the default), else the default.
 func (s *Session) fkCascadeLimit() int {
-	if s.cascadeLimit > 0 {
-		return s.cascadeLimit
+	if s.vars.cascadeLimit > 0 {
+		return s.vars.cascadeLimit
 	}
 	return DefaultFKCascadeLimit
 }

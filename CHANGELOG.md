@@ -1478,6 +1478,18 @@ state or the internode protocol does, and an entry below says so.
   PostgreSQL; the constant form raised `42704` for it. Row-security
   policies keyed on `current_setting('app.tenant')` are unchanged: they
   read a constant, which was and is `42704` until the setting is `SET`.
+- **`pg_settings` and `SHOW ALL` list custom settings, and
+  `foreign_key_cascade_limit` reports its source** (#330). A custom
+  setting the session has `SET` (`app.tenant`, `set_config('app.x', ...)`)
+  was missing from both, so psql's `\dconfig` never showed it. It is now
+  listed as PostgreSQL lists a placeholder variable: its value, `source =
+  'session'`, `vartype = 'string'`, no `boot_val`, `reset_val` `''`, in
+  category `Customized Options`. `SET foreign_key_cascade_limit` was kept
+  outside the session's variables, so `pg_settings` reported `source =
+  'default'` and the set value as `boot_val`; it now reports `session` and
+  the new-session value `10000`, like the other settings. Keeping it with
+  the other variables also ends a `SET LOCAL foreign_key_cascade_limit`
+  with its transaction block; before, it outlived the block.
 - **A point-in-time restore no longer refuses the audit table a node
   created between two backups** (#327). A node creates `datax_audit`
   when it first writes an audit record. When that happened between a

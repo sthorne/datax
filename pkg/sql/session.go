@@ -211,10 +211,8 @@ type Session struct {
 	BackendPID     int32
 	BackendControl func(pid int32, terminate bool) (bool, error)
 	SessionsHook   func() []SessionInfo
-	// cascadeLimit is SET foreign_key_cascade_limit (0 = the default);
 	// pendingWipes are indexes dropped by statements of this session
 	// whose entries are reclaimed once the statement commits.
-	cascadeLimit int
 	pendingWipes []indexWipe
 	extraDDL     []string
 	// stmtNow is the statement timestamp (now(), current_timestamp):

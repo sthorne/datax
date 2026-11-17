@@ -846,8 +846,18 @@ func init() {
 				// (SET, or a connection parameter) reads 'session'
 				// beside the value a new session starts with, as psql's
 				// \dconfig lists the non-default ones.
+				d, builtin := env.SettingDefaults[kv[0]]
+				if !builtin {
+					// A custom setting (app.tenant): one a new session
+					// does not have, so this session set it. As
+					// PostgreSQL reports a placeholder variable: a
+					// string, no boot value, and '' (what RESET leaves)
+					// to reset to.
+					rows = append(rows, Row{str(kv[0]), str(kv[1]), null(), str("Customized Options"), str("GUC placeholder variable"), str("user"), str("string"), str("session"), null(), str("")})
+					continue
+				}
 				source, boot := "default", kv[1]
-				if d, ok := env.SettingDefaults[kv[0]]; ok && d != kv[1] {
+				if d != kv[1] {
 					source, boot = "session", d
 				}
 				rows = append(rows, Row{str(kv[0]), str(kv[1]), unit, str("Client Connection Defaults"), str(kv[0]), str("user"), str(vartype), str(source), str(boot), str(kv[1])})
