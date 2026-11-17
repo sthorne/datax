@@ -11,7 +11,7 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `row_to_json` and other whole-row functions; named arguments (`make_interval(days => 1)`); a set-returning function (`generate_series`, `jsonb_array_elements`, ...) in the select list of a query with `FROM`, or with arguments that read another `FROM` member (`0A000`); regular expressions with back references or lookaround (`2201B`: datax runs them on RE2); `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres`; expressions over aggregates (`SUM(a) / COUNT(*)`); user-defined functions | compute client-side or in a derived table; the regular-expression, set-returning and jsonb processing functions **are supported** ([set-returning functions](sql.md#set-returning-functions)); `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `DEFAULT` expressions referencing other columns, `ALTER TABLE ... ADD COLUMN` with an expression default, `ALTER SEQUENCE ... OWNED BY` | sequences, `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
@@ -67,7 +67,7 @@ syntax error or `0A000` feature not supported):
   its spaces (PostgreSQL trims both sides) while `c = 'ab'`, `length`
   and `||` agree; expression results lose the modifier and describe
   as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
-  a `TIMESTAMP` is `TIMESTAMPTZ`, `::timestamp` yields `TIMESTAMPTZ`),
+  a `TIMESTAMP` stays a `TIMESTAMP`, as `::timestamp` yields one),
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression/aggregate results render in
   canonical form (no declared scale), as in PostgreSQL.
@@ -283,7 +283,14 @@ syntax error or `0A000` feature not supported):
   positions only. A position after a `*` that is not the whole select
   list is refused; `GROUP BY` takes columns and positions of columns,
   not expressions.
-- **Timestamps are UTC** (`TimeZone` is always `UTC`); microsecond
+- **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
+  (input without an offset, text output, `::text`, `::date`,
+  `date_trunc`, `extract`, `to_char`, `current_date`, day and month
+  arithmetic), and `AT TIME ZONE` / `timezone()` convert both ways; the
+  differences: abbreviations are a fixed list of the common ones, a
+  join's `ON` condition reads a literal without an offset in UTC (put
+  such a filter in `WHERE`), and `to_jsonb`, `array_to_string` and
+  `format` render a `TIMESTAMPTZ` in UTC. Microsecond
   precision on the wire, nanosecond internally. `current_time` is a
   `time` (PostgreSQL's is `timetz`), and `localtimestamp` a
   `timestamptz` like `current_timestamp`.

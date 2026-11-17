@@ -274,7 +274,8 @@ func TestExpressionsScalar(t *testing.T) {
 		{expr: `12345.6::numeric(5,2)`, code: "22003"},
 		{expr: `'abcdef'::varchar(2)`, want: "ab"},
 		{expr: `'2024-01-02'::date`, want: "2024-01-02"},
-		{expr: `'2024-01-02 03:04:05'::timestamp`, want: "2024-01-02 03:04:05+00"},
+		{expr: `'2024-01-02 03:04:05'::timestamp`, want: "2024-01-02 03:04:05"}, // a timestamp without time zone (#340)
+		{expr: `'2024-01-02 03:04:05+05'::timestamp`, want: "2024-01-02 03:04:05"},
 		{expr: `'2024-01-02 03:04:05'::timestamptz::date`, want: "2024-01-02"},
 		{expr: `'not a date'::date`, code: "22007"},
 		{expr: `'1.25'::numeric + 1`, want: "2.25"},

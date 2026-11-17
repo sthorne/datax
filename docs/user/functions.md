@@ -31,6 +31,14 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `position(text, text) → int8` — 1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack)); strpos(haystack, needle) takes them the other way round. *immutable*
 - `quote_literal(any) → text` — The value as a quoted SQL literal. *immutable*
 - `quote_nullable(any) → text` — The value as a quoted SQL literal, or NULL unquoted. *immutable, handles NULL arguments*
+- `regexp_count(text, text, [int8], [text]) → int8` — The number of non-overlapping matches of the POSIX pattern, from the 1-based character start. *immutable*
+- `regexp_like(text, text, [text]) → bool` — Whether the POSIX pattern matches anywhere in the string (the ~ operator, with flags). *immutable*
+- `regexp_match(text, text, [text]) → text[]` — The first match of the POSIX pattern as a text array: its parenthesized subexpressions, or the whole match when there are none (NULL when nothing matches). *immutable*
+- `regexp_matches(text, text, [text]) → setof text[]` — One row per match of the POSIX pattern (the first only, unless the g flag is given), each a text array as regexp_match returns. *immutable*
+- `regexp_replace(text, text, text, [any], [int8], [text]) → text` — Replaces the first match of the POSIX pattern (every match with the g flag) with the replacement, in which \1 to \9 name the subexpressions and \& the whole match; regexp_replace(s, pattern, replacement, start [, n [, flags]]) begins at the character start and replaces the n-th match (every one for 0). *immutable*
+- `regexp_split_to_array(text, text, [text]) → text[]` — The string split at the matches of the POSIX pattern, as a text array. *immutable*
+- `regexp_split_to_table(text, text, [text]) → setof text` — The string split at the matches of the POSIX pattern, one row per piece. *immutable*
+- `regexp_substr(text, text, [int8], [int8], [text], [int8]) → text` — The text of the n-th match (the first by default) of the POSIX pattern from the character start, or of its subexpr-th subexpression; NULL when there is none. *immutable*
 - `repeat(text, int8) → text` — The string repeated n times. *immutable*
 - `replace(text, text, text) → text` — Replaces every occurrence of the second argument with the third. *immutable*
 - `reverse(text) → text` — The characters in reverse order. *immutable*
@@ -81,22 +89,33 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `make_interval([int8], [int8], [int8], [int8], [int8], [int8], [any]) → interval` — An interval from years, months, weeks, days, hours, minutes and seconds. *immutable*
 - `make_time(int8, int8, any) → time` — A time from hour, minute and seconds. *immutable*
 - `make_timestamp(int8, int8, int8, int8, int8, any) → timestamptz` (also `make_timestamptz`) — A timestamp from year, month, day, hour, minute and seconds. *immutable*
+- `timezone(any, any) → timestamptz` — ts AT TIME ZONE zone: a timestamp with time zone becomes the wall-clock timestamp in the zone, a timestamp without time zone the instant it names there. The zone is an IANA name, an abbreviation, a POSIX offset ('UTC+5' is five hours west) or an interval. *immutable*
 - `to_char(any, text) → text` — Formats a timestamp or date (YYYY, YY, MM, Mon, Month, DD, Dy, Day, HH24, HH12, MI, SS, MS, US, AM, TZ, ...) or a number (9, 0, ., ,, FM, S) with a pattern. *immutable*
 - `to_date(text, text) → date` — Parses text with a to_char date pattern into a date. *immutable*
 - `to_timestamp(any, [text]) → timestamptz` — to_timestamp(seconds) converts a Unix epoch; to_timestamp(text, format) parses with the to_char patterns (YYYY, MM, DD, HH24, MI, SS, ...). *immutable*
 
 ## JSON
 
+- `jsonb_array_elements(jsonb) → setof jsonb` (also `json_array_elements`) — One row per element of the array, as jsonb (22023 for a value that is not an array). *immutable*
+- `jsonb_array_elements_text(jsonb) → setof text` (also `json_array_elements_text`) — One row per element of the array, as text (strings unquoted, JSON null as NULL). *immutable*
 - `jsonb_array_length(jsonb) → int8` (also `json_array_length`) — The number of elements of a JSON array (an error for anything else). *immutable*
 - `jsonb_build_array([any], ...) → jsonb` (also `json_build_array`) — An array of the arguments. *immutable, handles NULL arguments*
 - `jsonb_build_object([any], ...) → jsonb` (also `json_build_object`) — An object from alternating keys and values. *immutable, handles NULL arguments*
+- `jsonb_each(jsonb) → setof (key text, value jsonb)` (also `json_each`) — One row per field of the object: its key and its value as jsonb (22023 for a value that is not an object). *immutable*
+- `jsonb_each_text(jsonb) → setof (key text, value text)` (also `json_each_text`) — One row per field of the object: its key and its value as text (strings unquoted, JSON null as NULL). *immutable*
 - `jsonb_extract_path(jsonb, [text], ...) → jsonb` (also `json_extract_path`) — The value at the path of keys (array indexes as text), as jsonb; NULL when absent (also the #> operator with a '{a,b}' path). *immutable*
 - `jsonb_extract_path_text(jsonb, [text], ...) → text` (also `json_extract_path_text`) — The value at the path of keys as text; NULL when absent (also the #>> operator). *immutable*
+- `jsonb_insert(jsonb, text, jsonb, [bool]) → jsonb` — The document with the value inserted at the '{a,0}' path: before the array element there (after it when the fourth argument is true), or as a new object key (an existing key is an error, 22023). *immutable*
+- `jsonb_object_keys(jsonb) → setof text` (also `json_object_keys`) — One row per key of the object (22023 for a value that is not an object). *immutable*
 - `jsonb_pretty(jsonb) → text` — The document indented for reading. *immutable*
 - `jsonb_set(jsonb, text, jsonb, [bool]) → jsonb` — The document with the value at the '{a,b}' path replaced (created when missing, unless the fourth argument is false). *immutable*
 - `jsonb_strip_nulls(jsonb) → jsonb` — The document with every object field whose value is null removed. *immutable*
 - `jsonb_typeof(jsonb) → text` (also `json_typeof`) — object, array, string, number, boolean or null. *immutable*
 - `to_jsonb(any) → jsonb` (also `to_json`) — The value as jsonb: text becomes a JSON string, numbers and booleans themselves, jsonb stays. *immutable*
+
+## Set-returning functions
+
+- `generate_series(any, any, [any]) → setof the type of its bounds` — The values from start to stop (inclusive) by step (1 by default): integers, numerics, or timestamps stepped by an interval (generate_series(start, stop, interval '1 day')). A zero step is an error (22023). *immutable*
 
 ## Full-text search
 

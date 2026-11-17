@@ -65,7 +65,11 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ}})
+		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) bool {
+			c, ok := desc.Col(stripQualifier(n))
+			return ok && c.NoTZ
+		})
+		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ, NoTZ: noTZ}})
 	}
 	return proj, nil
 }
@@ -232,6 +236,15 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 					name = "?column?"
 				}
 				fam := exprFamily(se.Expr, nil)
+				if fn, ok := selectSRF(se.Expr); ok {
+					// Named by the function, as execution names it.
+					if se.Alias == "" {
+						name = fn
+					}
+					if fn == "unnest" {
+						fam = exprFamily(se.Expr.Args[0], nil).Elem()
+					}
+				}
 				if fam == types.Unknown {
 					fam = types.String
 				}
@@ -240,7 +253,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 						fam = sc[0].Type
 					}
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam})
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
 			}
 			return cols, nil
 		}

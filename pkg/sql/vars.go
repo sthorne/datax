@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/tsearch"
@@ -517,9 +518,15 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			if strings.EqualFold(v, "default") || strings.EqualFold(v, "local") {
 				v = "UTC"
 			}
-			loc, err := loadTimeZone(v)
+			// An IANA name or a POSIX offset ('UTC+5' is five hours
+			// WEST of Greenwich, as in PostgreSQL); abbreviations are
+			// for AT TIME ZONE and timestamp input only.
+			loc, err := builtins.ParseZone(v, false)
 			if err != nil {
 				return invalid("time zone %q not recognized", v)
+			}
+			if builtins.ZoneIsUTC(loc) {
+				loc = time.UTC // the session does no zone work
 			}
 			vars.timeZone, vars.timeZoneName = loc, v
 		}
@@ -541,34 +548,6 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 		return newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", name)
 	}
 	return nil
-}
-
-// loadTimeZone resolves a TimeZone value: an IANA name, "UTC", or a
-// fixed offset ("+05:30", "-8", "UTC+2" in PostgreSQL's POSIX sense is
-// not supported).
-func loadTimeZone(v string) (*time.Location, error) {
-	if strings.EqualFold(v, "utc") || strings.EqualFold(v, "gmt") || strings.EqualFold(v, "z") {
-		return time.UTC, nil
-	}
-	if v != "" && (v[0] == '+' || v[0] == '-') {
-		sign := 1
-		if v[0] == '-' {
-			sign = -1
-		}
-		parts := strings.SplitN(v[1:], ":", 2)
-		h, err := strconv.Atoi(parts[0])
-		if err != nil {
-			return nil, err
-		}
-		m := 0
-		if len(parts) == 2 {
-			if m, err = strconv.Atoi(parts[1]); err != nil {
-				return nil, err
-			}
-		}
-		return time.FixedZone(v, sign*(h*3600+m*60)), nil
-	}
-	return time.LoadLocation(v)
 }
 
 // execSetVar runs SET / SET LOCAL / RESET.

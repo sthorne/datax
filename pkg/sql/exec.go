@@ -2362,7 +2362,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// parameter into rows).
 		res := &Result{}
 		var row []types.Datum
-		unnestAt, unnestElems := -1, []types.Datum(nil)
+		var sets []selectSet
 		for i, se := range t.Exprs {
 			if se.Star {
 				return nil, newErrf(CodeSyntaxError, "SELECT * requires a FROM clause")
@@ -2371,31 +2371,17 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if name == "" {
 				name = "?column?"
 			}
-			if se.Expr.Func == "unnest" && len(se.Expr.Args) == 1 && se.Expr.Cast == "" && len(se.Expr.Path) == 0 {
-				if unnestAt >= 0 {
-					return nil, newErrf(CodeFeatureNotSupported, "only one unnest() per select list is supported")
+			if fn, ok := selectSRF(se.Expr); ok {
+				if name == "?column?" {
+					name = fn
 				}
-				arr, err := evalExpr(se.Expr.Args[0], nil, nil, params)
+				set, col, err := s.selectSetValues(ctx, txn, se.Expr, name, params)
 				if err != nil {
 					return nil, err
 				}
-				if !arr.Null && !arr.Fam.IsArray() {
-					if arr, err = arr.Coerce(types.ArrayOf(types.String)); err != nil {
-						return nil, newErrf(CodeInvalidTextRepresentation, "unnest: %v", err)
-					}
-				}
-				fam := exprFamily(se.Expr.Args[0], nil).Elem()
-				if !arr.Null && arr.Fam.Elem() != types.Unknown {
-					fam = arr.Fam.Elem()
-				}
-				if fam == types.Unknown {
-					fam = types.String
-				}
-				if name == "?column?" {
-					name = "unnest"
-				}
-				res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
-				unnestAt, unnestElems = i, arr.A
+				set.at = i
+				res.Columns = append(res.Columns, col)
+				sets = append(sets, set)
 				row = append(row, types.DNull)
 				continue
 			}
@@ -2412,15 +2398,26 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 					fam = types.String
 				}
 			}
-			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam})
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}
-		if unnestAt >= 0 {
-			rows = make([][]types.Datum, 0, len(unnestElems))
-			for _, e := range unnestElems {
+		if len(sets) > 0 {
+			// Set-returning calls in the list run in lockstep, the
+			// shorter ones padded with NULLs (PostgreSQL 10's rule); the
+			// other items repeat on every row.
+			n := 0
+			for _, st := range sets {
+				n = max(n, len(st.vals))
+			}
+			rows = make([][]types.Datum, 0, n)
+			for k := 0; k < n; k++ {
 				r := append([]types.Datum(nil), row...)
-				r[unnestAt] = e
+				for _, st := range sets {
+					if k < len(st.vals) {
+						r[st.at] = st.vals[k]
+					}
+				}
 				rows = append(rows, r)
 			}
 		}

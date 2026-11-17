@@ -84,8 +84,18 @@ func (p *parser) errf(format string, args ...any) error {
 	return &SyntaxError{Msg: fmt.Sprintf(format, args...), Pos: p.peek().pos}
 }
 
-// tableFuncs are the set-returning functions accepted in FROM.
+// tableFuncs are the set-returning functions accepted in FROM besides
+// the registry's (builtins with Rows: generate_series, jsonb_each, ...).
 var tableFuncs = map[string]bool{"unnest": true, "pg_partition_ancestors": true, "pg_available_extensions": true}
+
+// isTableFunc reports whether name is a function FROM accepts.
+func isTableFunc(name string) bool {
+	if tableFuncs[name] {
+		return true
+	}
+	b, ok := builtins.Lookup(name)
+	return ok && b.IsSetReturning()
+}
 
 // parseFuncTable parses a FROM-clause table function call, if present.
 func (p *parser) parseFuncTable() (*Expr, bool, error) {
@@ -94,7 +104,7 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 		p.i += 2
 	}
 	t := p.peek()
-	if t.kind != tkIdent || !tableFuncs[t.text] || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
+	if t.kind != tkIdent || !isTableFunc(t.text) || p.i+1 >= len(p.toks) || p.toks[p.i+1].kind != tkOp || p.toks[p.i+1].text != "(" {
 		p.i = save
 		return nil, false, nil
 	}
@@ -5594,7 +5604,7 @@ func (p *parser) parseMulExpr() (Expr, error) {
 // parsePowExpr parses the ^ operator, which binds tighter than * / %
 // and associates to the left, as in PostgreSQL.
 func (p *parser) parsePowExpr() (Expr, error) {
-	e, err := p.parsePrimaryExpr()
+	e, err := p.parseAtTimeZone()
 	if err != nil {
 		return e, err
 	}
@@ -5604,11 +5614,39 @@ func (p *parser) parsePowExpr() (Expr, error) {
 			return e, nil
 		}
 		p.i++
-		rhs, err := p.parsePrimaryExpr()
+		rhs, err := p.parseAtTimeZone()
 		if err != nil {
 			return e, err
 		}
 		e = foldBinOp(e, "^", rhs)
+	}
+}
+
+// parseAtTimeZone parses an operand with its AT TIME ZONE zone or AT
+// LOCAL suffixes, which bind tighter than ^ and looser than :: (as in
+// PostgreSQL): x AT TIME ZONE z is the call timezone(z, x), and AT
+// LOCAL the session's TimeZone setting as the zone.
+func (p *parser) parseAtTimeZone() (Expr, error) {
+	e, err := p.parsePrimaryExpr()
+	if err != nil {
+		return e, err
+	}
+	for {
+		var zone Expr
+		switch {
+		case p.peekIdentSeq("at", "time", "zone"):
+			p.i += 3
+			if zone, err = p.parsePrimaryExpr(); err != nil {
+				return e, err
+			}
+		case p.peekIdentSeq("at") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkKeyword && p.toks[p.i+1].text == "LOCAL":
+			p.i += 2
+			name := types.NewString("TimeZone")
+			zone = Expr{Func: "current_setting", Args: []Expr{{Lit: &name}}}
+		default:
+			return e, nil
+		}
+		e = Expr{Func: "timezone", Args: []Expr{zone, e}}
 	}
 }
 
@@ -5662,6 +5700,12 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 	}
 	defer p.leave()
 	t := p.peek()
+	if t.kind == tkKeyword && t.text == "KEY" {
+		// KEY is a keyword only in key definitions; as a value it is a
+		// column, as in PostgreSQL (jsonb_each's key column).
+		p.toks[p.i] = token{kind: tkIdent, text: "key", pos: t.pos}
+		t = p.peek()
+	}
 	if t.kind == tkOp && t.text == "(" {
 		// (NOT x) / (EXISTS ...): a parenthesized boolean value.
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "NOT" || nxt.text == "EXISTS") {

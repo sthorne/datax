@@ -148,8 +148,11 @@ func DateArith(l types.Datum, op string, r types.Datum) (types.Datum, bool, erro
 		if err != nil {
 			return types.Datum{}, true, err
 		}
-		// date ± interval is a timestamp, as in PostgreSQL.
-		return tsDatum(iv.AddTo(temporalTime(l), sign)), true, nil
+		// date ± interval is a timestamp, as in PostgreSQL; a
+		// timestamp without time zone stays one.
+		out := tsDatum(iv.AddTo(temporalTime(l), sign))
+		out.NoTZ = l.NoTZ
+		return out, true, nil
 	case temporal(l) && isNum(r) && l.Fam == types.Timestamp:
 		return types.Datum{}, true, errf(CodeUndefined, "operator does not exist: timestamptz %s %s", op, strings.ToLower(r.Fam.String()))
 	}
@@ -195,144 +198,20 @@ func init() {
 	register(&Builtin{Name: "extract", Args: []types.Family{types.String, Any}, MinArgs: 2, Ret: types.Decimal, Category: catTime,
 		Doc:     "A field of a date or timestamp (also extract(field FROM x)): year, quarter, month, week, day, doy, dow, isodow, hour, minute, second, milliseconds, microseconds, epoch, century, decade, millennium.",
 		Aliases: []string{"date_part"},
-		Fn: func(a []types.Datum) (types.Datum, error) {
-			switch a[1].Fam {
-			case types.IntervalFam:
-				return extractInterval(a[0].S, a[1].IntervalVal())
-			case types.Time:
-				return extractInterval(a[0].S, Interval{Nanos: a[1].I})
-			}
-			t, _, err := toTime(a[1])
-			if err != nil {
-				return types.Datum{}, err
-			}
-			switch strings.ToLower(a[0].S) {
-			case "year", "years", "y":
-				return i64Dec(int64(t.Year())), nil
-			case "quarter":
-				return i64Dec(int64((int(t.Month())-1)/3 + 1)), nil
-			case "month", "months", "mon":
-				return i64Dec(int64(t.Month())), nil
-			case "week", "isoweek":
-				_, w := t.ISOWeek()
-				return i64Dec(int64(w)), nil
-			case "isoyear":
-				y, _ := t.ISOWeek()
-				return i64Dec(int64(y)), nil
-			case "day", "days", "d":
-				return i64Dec(int64(t.Day())), nil
-			case "doy":
-				return i64Dec(int64(t.YearDay())), nil
-			case "dow":
-				return i64Dec(int64(t.Weekday())), nil
-			case "isodow":
-				wd := int64(t.Weekday())
-				if wd == 0 {
-					wd = 7
-				}
-				return i64Dec(wd), nil
-			case "hour", "hours", "h":
-				return i64Dec(int64(t.Hour())), nil
-			case "minute", "minutes", "min", "m":
-				return i64Dec(int64(t.Minute())), nil
-			case "second", "seconds", "sec", "s":
-				return decimalText(float64(t.Second()) + float64(t.Nanosecond())/1e9), nil
-			case "milliseconds", "millisecond", "ms":
-				return decimalText(float64(t.Second())*1000 + float64(t.Nanosecond())/1e6), nil
-			case "microseconds", "microsecond", "us":
-				return i64Dec(int64(t.Second())*1000000 + int64(t.Nanosecond())/1000), nil
-			case "epoch":
-				return decimalText(float64(t.UnixNano()) / 1e9), nil
-			case "century", "centuries":
-				return i64Dec(int64((t.Year()-1)/100 + 1)), nil
-			case "decade", "decades":
-				return i64Dec(int64(t.Year() / 10)), nil
-			case "millennium", "millennia":
-				return i64Dec(int64((t.Year()-1)/1000 + 1)), nil
-			case "timezone", "timezone_hour", "timezone_minute":
-				return i64Dec(0), nil
-			}
-			return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for extract", a[0].S)
-		}})
+		Fn:      func(a []types.Datum) (types.Datum, error) { return extractIn(a, nil) },
+		ZFn:     extractIn})
 	register(&Builtin{Name: "date_trunc", Args: []types.Family{types.String, Any}, MinArgs: 2, Ret: types.Timestamp, Category: catTime,
 		Doc: "The timestamp truncated to the field: millennium, century, decade, year, quarter, month, week, day, hour, minute, second, milliseconds.",
-		Fn: func(a []types.Datum) (types.Datum, error) {
-			t, _, err := toTime(a[1])
-			if err != nil {
-				return types.Datum{}, err
-			}
-			y, m, d := t.Date()
-			switch strings.ToLower(a[0].S) {
-			case "millennium":
-				t = time.Date((y-1)/1000*1000+1, 1, 1, 0, 0, 0, 0, time.UTC)
-			case "century":
-				t = time.Date((y-1)/100*100+1, 1, 1, 0, 0, 0, 0, time.UTC)
-			case "decade":
-				t = time.Date(y/10*10, 1, 1, 0, 0, 0, 0, time.UTC)
-			case "year", "years":
-				t = time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
-			case "quarter":
-				t = time.Date(y, time.Month((int(m)-1)/3*3+1), 1, 0, 0, 0, 0, time.UTC)
-			case "month", "months":
-				t = time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
-			case "week":
-				wd := int(t.Weekday())
-				if wd == 0 {
-					wd = 7
-				}
-				t = time.Date(y, m, d-(wd-1), 0, 0, 0, 0, time.UTC)
-			case "day", "days":
-				t = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-			case "hour", "hours":
-				t = t.Truncate(time.Hour)
-			case "minute", "minutes":
-				t = t.Truncate(time.Minute)
-			case "second", "seconds":
-				t = t.Truncate(time.Second)
-			case "milliseconds", "millisecond":
-				t = t.Truncate(time.Millisecond)
-			case "microseconds", "microsecond":
-				t = t.Truncate(time.Microsecond)
-			default:
-				return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for date_trunc", a[0].S)
-			}
-			return tsDatum(t), nil
-		}})
+		Fn:  func(a []types.Datum) (types.Datum, error) { return dateTruncIn(a, nil) },
+		ZFn: dateTruncIn})
 	register(&Builtin{Name: "age", Args: []types.Family{Any, Any}, MinArgs: 1, Ret: types.IntervalFam, Vol: Stable, Category: catTime,
 		Doc: "The interval from the second timestamp (today's midnight when omitted) to the first, in years, months, days and time.",
-		Fn: func(a []types.Datum) (types.Datum, error) {
-			to, _, err := toTime(a[0])
-			if err != nil {
-				return types.Datum{}, err
-			}
-			var from time.Time
-			if len(a) > 1 {
-				if from, _, err = toTime(a[1]); err != nil {
-					return types.Datum{}, err
-				}
-			} else {
-				now := time.Now().UTC()
-				from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-			}
-			return types.NewInterval(Between(to, from)), nil
-		}})
+		Fn:  func(a []types.Datum) (types.Datum, error) { return ageIn(a, nil) },
+		ZFn: ageIn})
 	register(&Builtin{Name: "to_timestamp", Args: []types.Family{Any, types.String}, MinArgs: 1, Ret: types.Timestamp, Category: catTime,
 		Doc: "to_timestamp(seconds) converts a Unix epoch; to_timestamp(text, format) parses with the to_char patterns (YYYY, MM, DD, HH24, MI, SS, ...).",
-		Fn: func(a []types.Datum) (types.Datum, error) {
-			if len(a) == 1 {
-				f, err := numeric(a[0])
-				if err != nil {
-					return types.Datum{}, err
-				}
-				sec := math.Floor(f)
-				return tsDatum(time.Unix(int64(sec), int64((f-sec)*1e9)).UTC()), nil
-			}
-			t, err := parseWithPattern(a[0].Text(), a[1].S)
-			if err != nil {
-				return types.Datum{}, err
-			}
-			return tsDatum(t), nil
-		}})
+		Fn:  func(a []types.Datum) (types.Datum, error) { return toTimestampIn(a, nil) },
+		ZFn: toTimestampIn})
 	register(&Builtin{Name: "to_date", Args: []types.Family{types.String, types.String}, MinArgs: 2, Ret: types.Date, Category: catTime,
 		Doc: "Parses text with a to_char date pattern into a date.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
@@ -344,16 +223,8 @@ func init() {
 		}})
 	register(&Builtin{Name: "to_char", Args: []types.Family{Any, types.String}, MinArgs: 2, Ret: types.String, Category: catTime,
 		Doc: "Formats a timestamp or date (YYYY, YY, MM, Mon, Month, DD, Dy, Day, HH24, HH12, MI, SS, MS, US, AM, TZ, ...) or a number (9, 0, ., ,, FM, S) with a pattern.",
-		Fn: func(a []types.Datum) (types.Datum, error) {
-			if isNumeric(a[0]) {
-				return types.NewString(formatNumber(a[0], a[1].S)), nil
-			}
-			t, _, err := toTime(a[0])
-			if err != nil {
-				return types.Datum{}, err
-			}
-			return types.NewString(formatTime(t, a[1].S)), nil
-		}})
+		Fn:  func(a []types.Datum) (types.Datum, error) { return toCharIn(a, nil) },
+		ZFn: toCharIn})
 	register(&Builtin{Name: "make_date", Args: []types.Family{types.Int, types.Int, types.Int}, MinArgs: 3, Ret: types.Date, Category: catTime,
 		Doc: "A date from year, month and day.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
@@ -633,12 +504,20 @@ func timeField(t time.Time, p string, fm bool) string {
 			return "A.M."
 		}
 		return "P.M."
-	case "TZ":
-		return "UTC"
-	case "tz":
-		return "utc"
+	case "TZ", "tz":
+		name, off := t.Zone()
+		if t.Location() == time.UTC {
+			name = "UTC"
+		} else if name == "" || name[0] == '+' || name[0] == '-' {
+			name = offsetText(off)
+		}
+		if p == "tz" {
+			return strings.ToLower(name)
+		}
+		return name
 	case "OF":
-		return "+00"
+		_, off := t.Zone()
+		return offsetText(off)
 	case "Q":
 		return strconv.Itoa((int(t.Month())-1)/3 + 1)
 	case "J":
@@ -873,4 +752,210 @@ func formatNumber(d types.Datum, pattern string) string {
 		return strings.TrimSpace(s)
 	}
 	return s
+}
+
+func extractIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
+	switch a[1].Fam {
+	case types.IntervalFam:
+		return extractInterval(a[0].S, a[1].IntervalVal())
+	case types.Time:
+		return extractInterval(a[0].S, Interval{Nanos: a[1].I})
+	}
+	t, _, err := toTimeIn(a[1], loc)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	switch strings.ToLower(a[0].S) {
+	case "year", "years", "y":
+		return i64Dec(int64(t.Year())), nil
+	case "quarter":
+		return i64Dec(int64((int(t.Month())-1)/3 + 1)), nil
+	case "month", "months", "mon":
+		return i64Dec(int64(t.Month())), nil
+	case "week", "isoweek":
+		_, w := t.ISOWeek()
+		return i64Dec(int64(w)), nil
+	case "isoyear":
+		y, _ := t.ISOWeek()
+		return i64Dec(int64(y)), nil
+	case "day", "days", "d":
+		return i64Dec(int64(t.Day())), nil
+	case "doy":
+		return i64Dec(int64(t.YearDay())), nil
+	case "dow":
+		return i64Dec(int64(t.Weekday())), nil
+	case "isodow":
+		wd := int64(t.Weekday())
+		if wd == 0 {
+			wd = 7
+		}
+		return i64Dec(wd), nil
+	case "hour", "hours", "h":
+		return i64Dec(int64(t.Hour())), nil
+	case "minute", "minutes", "min", "m":
+		return i64Dec(int64(t.Minute())), nil
+	case "second", "seconds", "sec", "s":
+		return decimalText(float64(t.Second()) + float64(t.Nanosecond())/1e9), nil
+	case "milliseconds", "millisecond", "ms":
+		return decimalText(float64(t.Second())*1000 + float64(t.Nanosecond())/1e6), nil
+	case "microseconds", "microsecond", "us":
+		return i64Dec(int64(t.Second())*1000000 + int64(t.Nanosecond())/1000), nil
+	case "epoch":
+		return decimalText(float64(t.UnixNano()) / 1e9), nil
+	case "century", "centuries":
+		return i64Dec(int64((t.Year()-1)/100 + 1)), nil
+	case "decade", "decades":
+		return i64Dec(int64(t.Year() / 10)), nil
+	case "millennium", "millennia":
+		return i64Dec(int64((t.Year()-1)/1000 + 1)), nil
+	case "timezone", "timezone_hour", "timezone_minute":
+		off := 0
+		if a[1].Fam == types.Timestamp && !a[1].NoTZ || a[1].Fam == types.String {
+			_, off = t.Zone()
+		}
+		switch strings.ToLower(a[0].S) {
+		case "timezone_hour":
+			return i64Dec(int64(off / 3600)), nil
+		case "timezone_minute":
+			return i64Dec(int64(off % 3600 / 60)), nil
+		}
+		return i64Dec(int64(off)), nil
+	}
+	return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for extract", a[0].S)
+}
+
+func dateTruncIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
+	t, _, err := toTimeIn(a[1], loc)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	// Truncate the wall clock (in the session's zone for a timestamp
+	// with time zone), then read the result back in that zone.
+	z := t.Location()
+	y, m, d := t.Date()
+	hh, mm, ss, ns := t.Hour(), t.Minute(), t.Second(), t.Nanosecond()
+	var w time.Time
+	switch strings.ToLower(a[0].S) {
+	case "millennium":
+		w = time.Date((y-1)/1000*1000+1, 1, 1, 0, 0, 0, 0, time.UTC)
+	case "century":
+		w = time.Date((y-1)/100*100+1, 1, 1, 0, 0, 0, 0, time.UTC)
+	case "decade":
+		w = time.Date(y/10*10, 1, 1, 0, 0, 0, 0, time.UTC)
+	case "year", "years":
+		w = time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
+	case "quarter":
+		w = time.Date(y, time.Month((int(m)-1)/3*3+1), 1, 0, 0, 0, 0, time.UTC)
+	case "month", "months":
+		w = time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
+	case "week":
+		wd := int(t.Weekday())
+		if wd == 0 {
+			wd = 7
+		}
+		w = time.Date(y, m, d-(wd-1), 0, 0, 0, 0, time.UTC)
+	case "day", "days":
+		w = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	case "hour", "hours":
+		w = time.Date(y, m, d, hh, 0, 0, 0, time.UTC)
+	case "minute", "minutes":
+		w = time.Date(y, m, d, hh, mm, 0, 0, time.UTC)
+	case "second", "seconds":
+		w = time.Date(y, m, d, hh, mm, ss, 0, time.UTC)
+	case "milliseconds", "millisecond":
+		w = time.Date(y, m, d, hh, mm, ss, ns/1e6*1e6, time.UTC)
+	case "microseconds", "microsecond":
+		w = time.Date(y, m, d, hh, mm, ss, ns/1e3*1e3, time.UTC)
+	default:
+		return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for date_trunc", a[0].S)
+	}
+	if z != time.UTC {
+		return types.NewTimestamp(types.WallInZone(w.UnixNano(), z)), nil
+	}
+	out := tsDatum(w)
+	out.NoTZ = a[1].Fam == types.Timestamp && a[1].NoTZ // a timestamp stays one
+	return out, nil
+}
+
+func ageIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
+	to, _, err := toTimeIn(a[0], loc)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	var from time.Time
+	if len(a) > 1 {
+		if from, _, err = toTimeIn(a[1], loc); err != nil {
+			return types.Datum{}, err
+		}
+	} else {
+		z := loc
+		if z == nil {
+			z = time.UTC
+		}
+		now := time.Now().In(z)
+		from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, z)
+	}
+	return types.NewInterval(Between(to, from)), nil
+}
+
+func toTimestampIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
+	if len(a) == 1 {
+		f, err := numeric(a[0])
+		if err != nil {
+			return types.Datum{}, err
+		}
+		sec := math.Floor(f)
+		return tsDatum(time.Unix(int64(sec), int64((f-sec)*1e9)).UTC()), nil
+	}
+	t, err := parseWithPattern(a[0].Text(), a[1].S)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	if loc != nil {
+		// The parsed fields are a wall clock in the session's zone.
+		return types.NewTimestamp(types.WallInZone(t.UnixNano(), loc)), nil
+	}
+	return tsDatum(t), nil
+}
+
+func toCharIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
+	if isNumeric(a[0]) {
+		return types.NewString(formatNumber(a[0], a[1].S)), nil
+	}
+	t, _, err := toTimeIn(a[0], loc)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return types.NewString(formatTime(t, a[1].S)), nil
+}
+
+// toTimeIn is toTime for a timestamp with time zone read in loc (the
+// session's TimeZone; nil is UTC): its time carries the zone, so its
+// fields are the local wall clock. A timestamp without time zone and a
+// date stay as they are; text reads as a timestamp with time zone.
+func toTimeIn(d types.Datum, loc *time.Location) (time.Time, bool, error) {
+	if loc == nil || loc == time.UTC {
+		return toTime(d)
+	}
+	if d.Fam == types.String {
+		d.Loc = loc
+	}
+	t, isDate, err := toTime(d)
+	if err != nil || isDate || d.Fam == types.Timestamp && d.NoTZ {
+		return t, isDate, err
+	}
+	return t.In(loc), false, nil
+}
+
+// offsetText renders a UTC offset as PostgreSQL does: "+05", "-03:30".
+func offsetText(off int) string {
+	sign := "+"
+	if off < 0 {
+		sign, off = "-", -off
+	}
+	out := fmt.Sprintf("%s%02d", sign, off/3600)
+	if m := off % 3600 / 60; m != 0 {
+		out += fmt.Sprintf(":%02d", m)
+	}
+	return out
 }
