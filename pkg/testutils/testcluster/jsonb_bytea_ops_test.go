@@ -2,12 +2,10 @@ package testcluster
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -16,8 +14,8 @@ import (
 // TestJSONBConcatOperator (issue #342): jsonb || jsonb merges objects,
 // concatenates arrays and wraps non-arrays as PostgreSQL does — over
 // literals and columns, in an UPDATE that persists the result, with
-// NULL operands — and describes as jsonb; json || json is refused as in
-// PostgreSQL, and the other uses of || are unchanged.
+// NULL operands — and describes as jsonb; json || json merges too (json is
+// jsonb in datax, unlike PostgreSQL), and the other uses of || are unchanged.
 func TestJSONBConcatOperator(t *testing.T) {
 	tc := Start(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -49,10 +47,11 @@ func TestJSONBConcatOperator(t *testing.T) {
 		{expr: `'{"a":1}'::jsonb || NULL`, want: "NULL"},
 		{expr: `NULL || '{"a":1}'::jsonb`, want: "NULL"},
 		{expr: `NULL::jsonb || '{"a":1}'::jsonb`, want: "NULL"},
-		// json has no || operator in PostgreSQL.
-		{expr: `'{"a":1}'::json || '{"b":2}'::json`, code: "42883"},
-		{expr: `'{"a":1}'::json || '{"b":2}'::jsonb`, code: "42883"},
-		{expr: `'{"a":1}'::jsonb || '{"b":2}'::json`, code: "42883"},
+		// json is jsonb in datax, so json || json merges (PostgreSQL has
+		// no || on json: a deliberate difference).
+		{expr: `'{"a":1}'::json || '{"b":2}'::json`, want: `{"a":1,"b":2}`},
+		{expr: `'{"a":1}'::json || '{"b":2}'::jsonb`, want: `{"a":1,"b":2}`},
+		{expr: `'{"a":1}'::jsonb || '{"b":2}'::json`, want: `{"a":1,"b":2}`},
 		// jsonb || a non-text scalar has no operator either.
 		{expr: `'{"a":1}'::jsonb || 5`, code: "42883"},
 		// jsonb || text is anynonarray || text: the texts concatenate.
@@ -148,11 +147,11 @@ func TestJSONBConcatOperator(t *testing.T) {
 		t.Errorf("merged document is queryable as jsonb: %s", got)
 	}
 
-	// json || json is undefined_function, with PostgreSQL's wording.
-	_, err = conn.Exec(ctx, `SELECT '{"a":1}'::json || '{"b":2}'::json`)
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "42883" || pgErr.Message != "operator does not exist: json || json" {
-		t.Errorf("json || json: %v", err)
+	// json || json merges like jsonb: datax keeps no json/jsonb
+	// distinction in values (a deliberate difference from PostgreSQL,
+	// which has no || on json).
+	if got := cells(`SELECT '{"a":1}'::json || '{"b":2}'::json`); got != `{"a":1,"b":2}` {
+		t.Errorf("json || json: %s", got)
 	}
 }
 

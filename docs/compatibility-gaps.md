@@ -182,7 +182,7 @@ which do exist: see PG-F-022.
 | PG-T-025 | `tsvector` / `tsquery`: own parser and stemmer, no ordering, no arrays of them, `english` and `simple` only, `regconfig` is text (detailed in the user doc) | as in the user doc | — | P3 | L | D | — |
 | PG-T-026 | Expression results lose their declared typmod and describe as the family (`DECIMAL(10,2)` arithmetic is `numeric`; `a + 1` over `INT4` is `INT8`) | silently different (Describe output) | cast | P3 | M | D | — |
 | PG-T-027 | `"char"`, `name` and other internal types behave as `text` | silently different | — | P3 | S | V | — |
-| PG-T-028 | **Cast leftovers**: a schema qualifier on a cast type is ignored (`1::foo.int8` is accepted, PostgreSQL `3F000`); over the extended protocol an unknown cast type fails at Execute, not Parse; casts written in row-level security policy text are not checked when the policy is created; `foo 'lit'` for an unknown `foo` is `42601`, not `42704`; `json` and `jsonb` are one type, so `\|\|` on a `json` column merges where PostgreSQL refuses `json \|\| json` | silently different, or a different SQLSTATE | — | P3 | S | V | — |
+| PG-T-028 | **Cast leftovers**: a schema qualifier on a cast type is ignored (`1::foo.int8` is accepted, PostgreSQL `3F000`); over the extended protocol an unknown cast type fails at Execute, not Parse; casts written in row-level security policy text are not checked when the policy is created; `foo 'lit'` for an unknown `foo` is `42601`, not `42704`; `json` and `jsonb` are one type, so `json \|\| json` merges where PostgreSQL refuses it (`42883`): a deliberate difference, kept | silently different, or a different SQLSTATE | — | P3 | S | V | — |
 
 ### DDL
 

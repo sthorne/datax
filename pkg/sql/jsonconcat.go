@@ -12,15 +12,15 @@ import (
 // jsonb || jsonb to jsonb_concat, and an untyped operand (a bare string
 // literal, a parameter, NULL) beside a jsonb takes the jsonb type; a
 // text-typed operand instead picks anynonarray || text, which
-// concatenates the texts. json has no || operator at all.
+// concatenates the texts. datax keeps no json/jsonb distinction in values
+// (JSON is stored as JSONB), so json || json merges like jsonb: a
+// deliberate difference from PostgreSQL, which has no || on json.
 
 // concatOperand is what the || resolution reads about one operand: its
-// family, whether it is untyped (PostgreSQL's unknown), and whether it
-// was cast to json (as opposed to jsonb).
+// family and whether it is untyped (PostgreSQL's unknown).
 type concatOperand struct {
 	fam     types.Family
 	untyped bool
-	json    bool
 }
 
 // untypedLeaf reports whether a node's own value (before its operator,
@@ -38,7 +38,7 @@ func untypedLeaf(x parser.Expr) bool {
 // concatRight describes a whole operand expression.
 func concatRight(x parser.Expr, fam types.Family) concatOperand {
 	if x.Cast != "" {
-		return concatOperand{fam: fam, json: isJSONCast(x.Cast)}
+		return concatOperand{fam: fam}
 	}
 	if x.BinOp != "" || len(x.Path) > 0 || x.Left != nil {
 		return concatOperand{fam: fam}
@@ -58,23 +58,14 @@ func concatLeft(e parser.Expr, fam types.Family) concatOperand {
 	return concatOperand{fam: fam, untyped: untypedLeaf(e)}
 }
 
-func isJSONCast(c string) bool { return c == "json" }
-
-// isJSONB: a jsonb operand (a value cast to json is jsonb in datax, but
-// not for this operator's resolution).
-func (o concatOperand) isJSONB() bool { return o.fam == types.Jsonb && !o.json }
+// isJSONB: a json or jsonb operand (one family in datax).
+func (o concatOperand) isJSONB() bool { return o.fam == types.Jsonb }
 
 // jsonbConcatKind resolves l || r over json and jsonb operands: jsonb
 // when it is jsonb concatenation, an error when PostgreSQL has no such
 // operator, and ok false for every other || (text, arrays, tsvector),
 // which keeps its existing rules.
 func jsonbConcatKind(l, r concatOperand) (ok bool, err error) {
-	if l.json || r.json {
-		if (l.json || l.fam == types.Jsonb) && (r.json || r.fam == types.Jsonb) {
-			return true, newErrf(CodeUndefinedFunction, "operator does not exist: %s || %s", l.typeName(), r.typeName())
-		}
-		return false, nil
-	}
 	switch {
 	case l.isJSONB() && (r.isJSONB() || r.untyped):
 		return true, nil
@@ -94,9 +85,6 @@ func concatsWithJSONB(f types.Family) bool {
 }
 
 func (o concatOperand) typeName() string {
-	if o.json {
-		return "json"
-	}
 	return strings.ToLower(o.fam.String())
 }
 

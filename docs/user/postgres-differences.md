@@ -101,9 +101,9 @@ syntax error or `0A000` feature not supported):
   existence `?` / `?|` / `?&` (single-table only), equality comparison,
   and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
   `HAVING` or after a computed left-hand side. `jsonb || jsonb` merges
-  as in PostgreSQL; `json || json` is refused (`42883`) for a value cast
-  with `::json`, but a `JSON` column is stored as `JSONB`, so its `||`
-  merges. `-`, `#-` and subscripting (`j['a']`) are refused.
+  as in PostgreSQL. `json` and `jsonb` are one type in datax (a `JSON`
+  column is stored as `JSONB`), so `json || json` merges too, where
+  PostgreSQL has no `||` on `json` and refuses it (`42883`). `-`, `#-` and subscripting (`j['a']`) are refused.
 - **GIN indexes: JSONB and full-text search.** `CREATE INDEX ... USING GIN
   (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
   each value with its path (closer to PostgreSQL's `jsonb_path_ops` than
