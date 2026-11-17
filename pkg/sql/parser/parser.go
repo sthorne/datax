@@ -714,7 +714,7 @@ func (p *parser) parseStatement() (Statement, error) {
 		} else if !p.consumeKeyword("TRANSACTION") {
 			p.consumeIdentWord("work")
 		}
-		readOnly, isolation, err := p.parseTransactionModes(t.text)
+		readOnly, isolation, _, err := p.parseTransactionModes(t.text)
 		if err != nil {
 			return nil, err
 		}
@@ -1738,14 +1738,14 @@ func exprContainsColumn(e Expr) bool {
 // TRANSACTION, up to the statement's end: ISOLATION LEVEL x, READ ONLY |
 // READ WRITE and [NOT] DEFERRABLE, separated by commas or whitespace.
 // readOnly is "on", "off" or "" (not given); isolation is the lower-cased
-// level or "". DEFERRABLE is accepted and ignored. what names the
+// level or ""; deferrable is "on", "off" or "". what names the
 // statement in errors.
-func (p *parser) parseTransactionModes(what string) (readOnly, isolation string, err error) {
+func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferrable string, err error) {
 	for !p.atStatementEnd() {
 		switch {
 		case p.consumeIdentWord("isolation"):
 			if !p.consumeIdentWord("level") {
-				return "", "", p.errf("expected LEVEL after ISOLATION")
+				return "", "", "", p.errf("expected LEVEL after ISOLATION")
 			}
 			var words []string
 			for !p.atStatementEnd() {
@@ -1763,7 +1763,7 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation string,
 			switch isolation {
 			case "serializable", "repeatable read", "read committed", "read uncommitted":
 			default:
-				return "", "", p.errf("expected an isolation level, found %q", isolation)
+				return "", "", "", p.errf("expected an isolation level, found %q", isolation)
 			}
 		case p.peekIdentSeq("read", "only"):
 			p.i += 2
@@ -1773,15 +1773,17 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation string,
 			readOnly = "off"
 		case p.consumeKeyword("NOT"):
 			if !p.consumeIdentWord("deferrable") {
-				return "", "", p.errf("expected DEFERRABLE after NOT")
+				return "", "", "", p.errf("expected DEFERRABLE after NOT")
 			}
+			deferrable = "off"
 		case p.consumeIdentWord("deferrable"):
+			deferrable = "on"
 		case p.consumeOp(","):
 		default:
-			return "", "", p.errf("unexpected %q in %s", p.peek().text, what)
+			return "", "", "", p.errf("unexpected %q in %s", p.peek().text, what)
 		}
 	}
-	return readOnly, isolation, nil
+	return readOnly, isolation, deferrable, nil
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
@@ -1810,7 +1812,7 @@ func (p *parser) parseSet() (Statement, error) {
 		if !characteristics {
 			sv.Local = true
 		}
-		readOnly, isolation, err := p.parseTransactionModes("SET TRANSACTION")
+		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
 		if err != nil {
 			return nil, err
 		}
@@ -1819,8 +1821,12 @@ func (p *parser) parseSet() (Statement, error) {
 			sv.Name, sv.Value = "default_transaction_read_only", readOnly
 		case readOnly != "":
 			sv.Name, sv.Value = "transaction_read_only", readOnly
+		case isolation != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_isolation", isolation
 		case isolation != "":
 			sv.Name, sv.Value = "transaction_isolation", isolation
+		case deferrable != "" && characteristics:
+			sv.Name, sv.Value = "default_transaction_deferrable", deferrable
 		default:
 			return nil, p.errf("SET TRANSACTION needs a characteristic (READ ONLY, READ WRITE, ISOLATION LEVEL ...)")
 		}

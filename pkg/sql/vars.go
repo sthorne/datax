@@ -63,6 +63,10 @@ type sessionVars struct {
 	// noVectorScan is vector_index_scan = off: nearest-neighbour queries
 	// are answered exactly, by scanning, whatever index exists.
 	noVectorScan bool
+	// pg holds PostgreSQL's settings of pgvars.go the session changed
+	// from their defaults, by name. Replaced, never changed in place,
+	// like custom.
+	pg map[string]string
 }
 
 // isCustomVar reports whether name is a custom setting's: PostgreSQL's
@@ -90,8 +94,8 @@ func defaultVars() sessionVars {
 }
 
 // varNames are the settings in SHOW ALL order, with their pg_settings
-// vartype and unit.
-var varNames = []struct{ name, vartype, unit string }{
+// vartype and unit; PostgreSQL's of pgvars.go follow.
+var varNames = withPGVars([]struct{ name, vartype, unit string }{
 	{"application_name", "string", ""},
 	{"client_encoding", "string", ""},
 	{"database", "string", ""},
@@ -115,7 +119,7 @@ var varNames = []struct{ name, vartype, unit string }{
 	{"transaction_isolation", "string", ""},
 	{"transaction_read_only", "bool", ""},
 	{"vector_index_scan", "bool", ""},
-}
+})
 
 // settingTypes is varNames' vartype and unit by name, for pg_settings.
 var settingTypes = func() map[string][2]string {
@@ -143,6 +147,9 @@ func canonicalVar(name string) string {
 		if strings.EqualFold(v.name, name) {
 			return v.name
 		}
+	}
+	if v := lookupPGVar(strings.TrimSpace(name)); v != nil {
+		return v.name // one SHOW ALL leaves out (default_with_oids)
 	}
 	return ""
 }
@@ -202,6 +209,9 @@ func (s *Session) varValue(name string) string {
 		return "serializable" // the truth, whatever was requested
 	case "transaction_read_only":
 		return onOff(v.txnReadOnly || (s.state != StateOpen && v.defaultReadOnly))
+	}
+	if pv, ok := pgVars[name]; ok {
+		return s.showPGVar(pv)
 	}
 	return ""
 }
@@ -272,6 +282,7 @@ func (s *Session) ReportedParams() [][2]string {
 		{"client_encoding", s.vars.clientEncoding},
 		{"DateStyle", s.vars.dateStyle},
 		{"TimeZone", s.vars.timeZoneName},
+		{"IntervalStyle", s.IntervalStyle()},
 	}
 }
 
@@ -545,6 +556,9 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 			return newErrf(CodeInvalidParameterValue, "parameter %q cannot be changed", name)
 		}
 	default:
+		if pv, ok := pgVars[name]; ok {
+			return applyPGVar(vars, pv, value, reset)
+		}
 		return newErrf(CodeUndefinedObject, "unrecognized configuration parameter %q", name)
 	}
 	return nil

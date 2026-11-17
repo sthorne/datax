@@ -292,6 +292,36 @@ func TestRowSecurityReads(t *testing.T) {
 		rlsWant(t, ctx, app, []string{"50"}, `SELECT n FROM docs ORDER BY n DESC LIMIT 1`)
 	})
 
+	// Issue #345: row_security = off (pg_dump sets it) refuses a query
+	// the policies would filter, instead of returning fewer rows; it
+	// changes nothing for a role they do not apply to.
+	t.Run("row_security off", func(t *testing.T) {
+		for _, conn := range []*pgx.Conn{app, owner} {
+			if _, err := conn.Exec(ctx, `SET row_security = off`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer func() {
+			for _, conn := range []*pgx.Conn{app, owner} {
+				_, _ = conn.Exec(ctx, `RESET row_security`)
+			}
+		}()
+		for _, q := range []string{`SELECT id FROM docs`, `SELECT count(*) FROM docs WHERE id = 1`} {
+			_, err := rlsTryRows(ctx, app, q)
+			if rlsCode(err) != sql.CodeInsufficientPriv || !strings.Contains(err.Error(), `query would be affected by row-level security policy for table "docs"`) {
+				t.Fatalf("%s with row_security off: %v, want 42501", q, err)
+			}
+		}
+		if _, err := app.Exec(ctx, `UPDATE docs SET n = n WHERE id = 1`); rlsCode(err) != sql.CodeInsufficientPriv || !strings.Contains(err.Error(), "query would be affected") {
+			t.Fatalf("UPDATE with row_security off: %v, want 42501", err)
+		}
+		rlsWant(t, ctx, owner, []string{"12"}, `SELECT count(*) FROM docs`)
+		if _, err := app.Exec(ctx, `RESET row_security`); err != nil {
+			t.Fatal(err)
+		}
+		rlsWant(t, ctx, app, rlsSeq(1, 5), `SELECT id FROM docs ORDER BY id`)
+	})
+
 	t.Run("secondary, unique and inverted indexes", func(t *testing.T) {
 		planOf := func(conn *pgx.Conn, q string) string {
 			t.Helper()

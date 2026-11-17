@@ -232,6 +232,9 @@ func (s *Session) rowFilterIn(ctx context.Context, txn *kvclient.Txn, desc *cata
 	if err != nil || !active {
 		return nil, false, err
 	}
+	if err := s.rowSecurityOff(desc.Name); err != nil {
+		return nil, false, err
+	}
 	var out []parser.Comparison
 	for _, cmd := range cmds {
 		conds, err := s.policyConjuncts(ctx, txn, desc, cmd, false)
@@ -345,6 +348,9 @@ type rowCheck struct {
 func (s *Session) rowCheckFor(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, needInsert, needUpdate, needVisible bool) (*rowCheck, error) {
 	active, err := s.rowSecurityActive(ctx, txn, desc)
 	if err != nil || !active {
+		return nil, err
+	}
+	if err := s.rowSecurityOff(desc.Name); err != nil {
 		return nil, err
 	}
 	rc := &rowCheck{desc: desc}

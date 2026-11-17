@@ -579,6 +579,8 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	env.Settings = s.settings()
 	env.SettingDefaults = s.settingDefaults()
 	env.SettingTypes = settingTypes
+	env.SettingRaw = pgSettingRaw
+	env.SettingContexts = pgSettingContexts
 	if s.SessionsHook != nil {
 		env.Sessions = s.SessionsHook()
 	}

@@ -144,6 +144,170 @@ func (iv Interval) String() string {
 	return strings.Join(parts, " ")
 }
 
+// Format renders the interval in an IntervalStyle (issue #345):
+// postgres (String), postgres_verbose ("@ 1 day 2 hours ago"),
+// sql_standard ("1-2", "3 4:05:06") or iso_8601 ("P1Y2M3DT4H5M6S"), as
+// PostgreSQL's EncodeInterval writes them.
+func (iv Interval) Format(style string) string {
+	year, mon, mday := iv.Months/12, iv.Months%12, iv.Days
+	t := iv.Nanos
+	hour := t / int64(time.Hour)
+	t -= hour * int64(time.Hour)
+	min := t / int64(time.Minute)
+	t -= min * int64(time.Minute)
+	sec := t / int64(time.Second)
+	fsec := t - sec*int64(time.Second) // nanoseconds, the sign of the rest
+	abs := func(n int64) int64 {
+		if n < 0 {
+			return -n
+		}
+		return n
+	}
+	// seconds is AppendSeconds: |sec| (two digits with pad) and the
+	// fraction without its trailing zeros.
+	seconds := func(sec, fsec int64, pad bool) string {
+		out := strconv.FormatInt(abs(sec), 10)
+		if pad && len(out) < 2 {
+			out = "0" + out
+		}
+		if fsec != 0 {
+			out += strings.TrimRight(fmt.Sprintf(".%09d", abs(fsec)), "0")
+		}
+		return out
+	}
+	switch style {
+	case "iso_8601":
+		if year == 0 && mon == 0 && mday == 0 && hour == 0 && min == 0 && sec == 0 && fsec == 0 {
+			return "PT0S"
+		}
+		var b strings.Builder
+		b.WriteByte('P')
+		part := func(n int64, unit byte) {
+			if n != 0 {
+				b.WriteString(strconv.FormatInt(n, 10))
+				b.WriteByte(unit)
+			}
+		}
+		part(year, 'Y')
+		part(mon, 'M')
+		part(mday, 'D')
+		if hour != 0 || min != 0 || sec != 0 || fsec != 0 {
+			b.WriteByte('T')
+		}
+		part(hour, 'H')
+		part(min, 'M')
+		if sec != 0 || fsec != 0 {
+			if sec < 0 || fsec < 0 {
+				b.WriteByte('-')
+			}
+			b.WriteString(seconds(sec, fsec, false))
+			b.WriteByte('S')
+		}
+		return b.String()
+	case "sql_standard":
+		neg := year < 0 || mon < 0 || mday < 0 || hour < 0 || min < 0 || sec < 0 || fsec < 0
+		pos := year > 0 || mon > 0 || mday > 0 || hour > 0 || min > 0 || sec > 0 || fsec > 0
+		hasYM := year != 0 || mon != 0
+		hasDT := mday != 0 || hour != 0 || min != 0 || sec != 0 || fsec != 0
+		standard := !(neg && pos) && !(hasYM && hasDT)
+		prefix := ""
+		if neg && standard {
+			prefix = "-"
+			year, mon, mday, hour, min, sec, fsec = -year, -mon, -mday, -hour, -min, -sec, -fsec
+		}
+		switch {
+		case !neg && !pos:
+			return "0"
+		case !standard:
+			sign := func(neg bool) string {
+				if neg {
+					return "-"
+				}
+				return "+"
+			}
+			return fmt.Sprintf("%s%d-%d %s%d %s%d:%02d:%s", sign(year < 0 || mon < 0), abs(year), abs(mon),
+				sign(mday < 0), abs(mday), sign(hour < 0 || min < 0 || sec < 0 || fsec < 0), abs(hour), abs(min), seconds(sec, fsec, true))
+		case hasYM:
+			return fmt.Sprintf("%s%d-%d", prefix, year, mon)
+		case mday != 0:
+			return fmt.Sprintf("%s%d %d:%02d:%s", prefix, mday, hour, min, seconds(sec, fsec, true))
+		default:
+			return fmt.Sprintf("%s%d:%02d:%s", prefix, hour, min, seconds(sec, fsec, true))
+		}
+	case "postgres_verbose":
+		var b strings.Builder
+		b.WriteByte('@')
+		zero, before := true, false
+		part := func(n int64, unit string) {
+			if n == 0 {
+				return
+			}
+			if zero {
+				before = n < 0
+				n = abs(n)
+			} else if before {
+				n = -n
+			}
+			s := "s"
+			if n == 1 {
+				s = ""
+			}
+			fmt.Fprintf(&b, " %d %s%s", n, unit, s)
+			zero = false
+		}
+		part(year, "year")
+		part(mon, "mon")
+		part(mday, "day")
+		part(hour, "hour")
+		part(min, "min")
+		if sec != 0 || fsec != 0 {
+			b.WriteByte(' ')
+			if sec < 0 || (sec == 0 && fsec < 0) {
+				if zero {
+					before = true
+				} else if !before {
+					b.WriteByte('-')
+				}
+			} else if before {
+				b.WriteByte('-')
+			}
+			b.WriteString(seconds(sec, fsec, false))
+			if abs(sec) != 1 || fsec != 0 {
+				b.WriteString(" secs")
+			} else {
+				b.WriteString(" sec")
+			}
+			zero = false
+		}
+		if zero {
+			b.WriteString(" 0")
+		}
+		if before {
+			b.WriteString(" ago")
+		}
+		return b.String()
+	}
+	return iv.String()
+}
+
+// FormatByteaEscape renders bytes in PostgreSQL's escape format
+// (bytea_output = escape): printable ASCII as itself, a backslash
+// doubled, every other byte as \ooo (octal).
+func FormatByteaEscape(b []byte) string {
+	var out strings.Builder
+	for _, c := range b {
+		switch {
+		case c == '\\':
+			out.WriteString(`\\`)
+		case c < 0x20 || c > 0x7e:
+			fmt.Fprintf(&out, `\%03o`, c)
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
+}
+
 // FormatClock renders signed nanoseconds as [-]HH:MM:SS[.ffffff]
 // (a TIME value, or an interval's clock part), fractional digits
 // trimmed to the microsecond.
