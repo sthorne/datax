@@ -741,6 +741,13 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.txn = s.db.NewTxn("sql")
 		s.state = StateOpen
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
+		// BEGIN's modes run as the SET TRANSACTION they stand for.
+		for _, m := range t.Modes {
+			if _, serr := s.execSetVar(ctx, m); serr != nil {
+				s.rollback(ctx)
+				return nil, serr
+			}
+		}
 		return &Result{Tag: "BEGIN"}, nil
 
 	case *parser.Commit:

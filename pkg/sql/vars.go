@@ -642,10 +642,16 @@ func (s *Session) endTxnVars() {
 	s.vars.txnReadOnly = false
 }
 
+// readOnly reports whether the statement running now is in a read-only
+// transaction: SET TRANSACTION / BEGIN READ ONLY, or
+// default_transaction_read_only for an implicit or a block's start.
+func (s *Session) readOnly() bool {
+	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
+}
+
 // readOnlyViolation refuses a write in a read-only transaction (25006).
 func (s *Session) readOnlyViolation(stmt parser.Statement) *Error {
-	readOnly := s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
-	if !readOnly {
+	if !s.readOnly() {
 		return nil
 	}
 	if kind := writeKind(stmt); kind != "" {
