@@ -65,6 +65,16 @@ func (s *Session) resolveValueExpr(ctx context.Context, txn *kvclient.Txn, e par
 // resolveValueExprOpts is resolveValueExpr; keepVolatile leaves the
 // volatile row functions (nextval, ...) in place for a per-row caller.
 func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum, keepVolatile bool) (parser.Expr, error) {
+	out, err := s.resolveValueNode(ctx, txn, e, params, keepVolatile)
+	if err != nil {
+		return out, err
+	}
+	return s.zoneNode(out), nil
+}
+
+// resolveValueNode is resolveValueExprOpts before the time-zone
+// annotation (zoneNode).
+func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum, keepVolatile bool) (parser.Expr, error) {
 	out := e
 	if e.Func != "" && volatileFuncs[e.Func] && !keepVolatile {
 		// nextval() and friends outside a write's per-row path (SELECT
@@ -107,7 +117,8 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		d := types.NewTime(int64(at.Sub(midnight)))
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "current_date":
-		d := types.NewDate(s.statementTime() / (86400 * 1e9))
+		// The statement's date in the session's time zone.
+		d := types.NewDate(floorDivInt(types.InZone(s.statementTime(), s.TimeZone()), types.NanosPerDay))
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "current_database":
 		d := types.NewString(s.database)
@@ -403,6 +414,37 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 		}
 		out.Args = args
 	}
+	if e.Agg != nil {
+		// An aggregate call inside an expression: its arguments and
+		// FILTER resolve like a select item's.
+		agg := *e.Agg
+		if agg.AggArg != nil {
+			a, err := s.resolveValueExprOpts(ctx, txn, *agg.AggArg, params, keepVolatile)
+			if err != nil {
+				return e, err
+			}
+			agg.AggArg = &a
+		}
+		if len(agg.AggArgs) > 0 {
+			args := make([]parser.Expr, len(agg.AggArgs))
+			for i, a := range agg.AggArgs {
+				ra, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
+				if err != nil {
+					return e, err
+				}
+				args[i] = ra
+			}
+			agg.AggArgs = args
+		}
+		if len(agg.AggFilter) > 0 {
+			f, err := s.resolveWhereSubs(ctx, txn, agg.AggFilter, params)
+			if err != nil {
+				return e, err
+			}
+			agg.AggFilter = f
+		}
+		out.Agg = &agg
+	}
 	if e.Cmp != nil {
 		// A boolean value: its EXISTS / IN / scalar subqueries resolve
 		// like a WHERE conjunct's.
@@ -517,6 +559,77 @@ func exprHasSub(e parser.Expr) bool {
 	})
 }
 
+// needsResolve reports whether an expression holds anything the
+// resolve pass must handle: a subquery or spliced call (exprHasSub),
+// or — under a TimeZone that is not UTC — what reads or renders in the
+// zone (zoneSensitive), which the pass marks with it.
+func (s *Session) needsResolve(e parser.Expr) bool {
+	return exprHasSub(e) || s.zone() != nil && exprHas(e, zoneSensitive)
+}
+
+// zone is the session's TimeZone when it is not UTC (nil when it is).
+func (s *Session) zone() *time.Location {
+	if loc := s.vars.timeZone; loc != nil && loc != time.UTC {
+		return loc
+	}
+	return nil
+}
+
+// zoneSensitive reports whether a node reads or renders a timestamp
+// with time zone in the session's zone: a text literal (which may be
+// read as one), a cast, an operator over one, a zone-aware builtin.
+func zoneSensitive(x parser.Expr) bool {
+	if x.Lit != nil && !x.Lit.Null && x.Lit.Fam == types.String || x.Cast != "" {
+		return true
+	}
+	switch x.BinOp {
+	case "+", "-", "||":
+		return true
+	}
+	b, ok := builtins.Lookup(x.Func)
+	return ok && b.ZoneSensitive()
+}
+
+// zoneNode marks a resolved node with the session's TimeZone when it is
+// not UTC: a text literal reads in it as a timestamp with time zone,
+// and a cast, operator or zone-aware call evaluates in it.
+func (s *Session) zoneNode(out parser.Expr) parser.Expr {
+	loc := s.zone()
+	if loc == nil || !zoneSensitive(out) {
+		return out
+	}
+	if out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String && out.Lit.Loc == nil {
+		d := *out.Lit
+		d.Loc = loc
+		out.Lit = &d
+	}
+	out.Zone = loc
+	return out
+}
+
+// zoneParams marks a statement's text parameters with the session's
+// TimeZone, in which they read as timestamps with time zone.
+func (s *Session) zoneParams(params []types.Datum) []types.Datum {
+	loc := s.zone()
+	if loc == nil {
+		return params
+	}
+	var out []types.Datum
+	for i, p := range params {
+		if p.Null || p.Fam != types.String || p.Loc != nil {
+			continue
+		}
+		if out == nil {
+			out = append([]types.Datum(nil), params...)
+		}
+		out[i].Loc = loc
+	}
+	if out == nil {
+		return params
+	}
+	return out
+}
+
 // exprHasSubquery reports whether an actual (SELECT ...) appears
 // anywhere inside the expression (spliced functions do not count).
 func exprHasSubquery(e parser.Expr) bool {
@@ -580,26 +693,42 @@ func exprHas(e parser.Expr, pred func(parser.Expr) bool) bool {
 			return true
 		}
 	}
+	if e.Agg != nil {
+		// An aggregate call's arguments and FILTER (inside an expression).
+		if e.Agg.AggArg != nil && exprHas(*e.Agg.AggArg, pred) {
+			return true
+		}
+		for _, a := range e.Agg.AggArgs {
+			if exprHas(a, pred) {
+				return true
+			}
+		}
+		for _, c := range e.Agg.AggFilter {
+			if condHas(c, pred) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
 // cmpNeedsResolve reports whether a conjunct (or, recursively, an OR
 // group) contains anything the pre-execution resolve pass must handle.
-func cmpNeedsResolve(cmp parser.Comparison) bool {
-	if cmp.Sub != nil || exprHasSub(cmp.Value) {
+func (s *Session) cmpNeedsResolve(cmp parser.Comparison) bool {
+	if cmp.Sub != nil || s.needsResolve(cmp.Value) {
 		return true
 	}
-	if cmp.Expr != nil && exprHasSub(*cmp.Expr) {
+	if cmp.Expr != nil && s.needsResolve(*cmp.Expr) {
 		return true
 	}
 	for _, ve := range cmp.Values {
-		if exprHasSub(ve) {
+		if s.needsResolve(ve) {
 			return true
 		}
 	}
 	for _, d := range cmp.Or {
 		for _, inner := range d {
-			if cmpNeedsResolve(inner) {
+			if s.cmpNeedsResolve(inner) {
 				return true
 			}
 		}
@@ -612,7 +741,7 @@ func cmpNeedsResolve(cmp parser.Comparison) bool {
 func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, params []types.Datum) ([]parser.Comparison, error) {
 	changed := false
 	for _, cmp := range where {
-		if cmpNeedsResolve(cmp) {
+		if s.cmpNeedsResolve(cmp) {
 			changed = true
 			break
 		}
@@ -638,14 +767,14 @@ func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where
 			cmp.Or = or
 			continue
 		}
-		if exprHasSub(cmp.Value) {
+		if s.needsResolve(cmp.Value) {
 			v, err := s.resolveValueExpr(ctx, txn, cmp.Value, params)
 			if err != nil {
 				return nil, err
 			}
 			cmp.Value = v
 		}
-		if cmp.Expr != nil && exprHasSub(*cmp.Expr) {
+		if cmp.Expr != nil && s.needsResolve(*cmp.Expr) {
 			v, err := s.resolveValueExpr(ctx, txn, *cmp.Expr, params)
 			if err != nil {
 				return nil, err
@@ -655,7 +784,7 @@ func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where
 		switch cmp.Op {
 		case "IN", "NOT IN":
 			for j, ve := range cmp.Values {
-				if !exprHasSub(ve) {
+				if !s.needsResolve(ve) {
 					continue
 				}
 				if &cmp.Values[0] == &where[i].Values[0] {
@@ -725,7 +854,7 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 
 	for i, se := range t.Exprs {
-		if !exprHasSub(se.Expr) {
+		if !s.needsResolve(se.Expr) {
 			continue
 		}
 		v, err := s.resolveValueExpr(ctx, txn, se.Expr, params)
@@ -739,22 +868,15 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 		c.Exprs[i].Expr = v
 	}
 
-	for i, hc := range t.Having {
-		if !exprHasSub(hc.Value) {
-			continue
-		}
-		v, err := s.resolveValueExpr(ctx, txn, hc.Value, params)
-		if err != nil {
-			return nil, err
-		}
-		c := cloned()
-		if &c.Having[0] == &t.Having[0] {
-			c.Having = append([]parser.HavingCond(nil), t.Having...)
-		}
-		c.Having[i].Value = v
+	having, err := s.resolveWhereSubs(ctx, txn, t.Having, params)
+	if err != nil {
+		return nil, err
+	}
+	if len(having) > 0 && &having[0] != &t.Having[0] {
+		cloned().Having = having
 	}
 	for i, oc := range t.OrderBy {
-		if oc.Expr == nil || !exprHasSub(*oc.Expr) {
+		if oc.Expr == nil || !s.needsResolve(*oc.Expr) {
 			continue
 		}
 		v, err := s.resolveValueExpr(ctx, txn, *oc.Expr, params)
@@ -766,6 +888,37 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 		}
 		c.OrderBy[i].Expr = &v
+	}
+	// GROUP BY and DISTINCT ON expressions are resolved like the select
+	// list's, so a grouped expression (date_trunc over a timestamp under
+	// a session TimeZone) evaluates, and matches its select item, the same.
+	for i, g := range t.GroupBy {
+		if !s.needsResolve(g) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, g, params)
+		if err != nil {
+			return nil, err
+		}
+		c := cloned()
+		if &c.GroupBy[0] == &t.GroupBy[0] {
+			c.GroupBy = append([]parser.Expr(nil), t.GroupBy...)
+		}
+		c.GroupBy[i] = v
+	}
+	for i, d := range t.DistinctOn {
+		if !s.needsResolve(d) {
+			continue
+		}
+		v, err := s.resolveValueExpr(ctx, txn, d, params)
+		if err != nil {
+			return nil, err
+		}
+		c := cloned()
+		if &c.DistinctOn[0] == &t.DistinctOn[0] {
+			c.DistinctOn = append([]parser.Expr(nil), t.DistinctOn...)
+		}
+		c.DistinctOn[i] = v
 	}
 	return out, nil
 }
@@ -784,7 +937,7 @@ func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *p
 		out = &c
 	}
 	for i, set := range t.Set {
-		if !exprHasSub(set.Value) {
+		if !s.needsResolve(set.Value) {
 			continue
 		}
 		v, err := s.resolveValueExpr(ctx, txn, set.Value, params)
@@ -822,7 +975,7 @@ func (s *Session) resolveUpdateSubs(ctx context.Context, txn *kvclient.Txn, t *p
 func (s *Session) resolveReturning(ctx context.Context, txn *kvclient.Txn, exprs []parser.SelectExpr, params []types.Datum) ([]parser.SelectExpr, error) {
 	var out []parser.SelectExpr
 	for i, se := range exprs {
-		if se.Star || !exprHasSub(se.Expr) || exprHasSubquery(se.Expr) {
+		if se.Star || !s.needsResolve(se.Expr) || exprHasSubquery(se.Expr) {
 			continue
 		}
 		v, err := s.resolveValueExprOpts(ctx, txn, se.Expr, params, true)
@@ -868,7 +1021,7 @@ func (s *Session) resolveInsertSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	out := t
 	for ri, row := range t.Rows {
 		for ci, e := range row {
-			if !exprHasSub(e) {
+			if !s.needsResolve(e) {
 				continue
 			}
 			v, err := s.resolveValueExpr(ctx, txn, e, params)
@@ -899,7 +1052,7 @@ func (s *Session) resolveInsertSubs(ctx context.Context, txn *kvclient.Txn, t *p
 		// spliced as an UPDATE's SET and WHERE are.
 		var noc *parser.OnConflict
 		for i, set := range oc.Set {
-			if !exprHasSub(set.Value) {
+			if !s.needsResolve(set.Value) {
 				continue
 			}
 			v, err := s.resolveValueExpr(ctx, txn, set.Value, params)
@@ -954,33 +1107,38 @@ func stripAliasQualifier(name, alias string) string {
 // table's alias stripped from every column reference, so the synthetic
 // descriptor's bare column names resolve.
 func derivedSelect(t *parser.Select) *parser.Select {
+	strip := func(n string) string { return stripAliasQualifier(n, t.Alias) }
 	c := *t
 	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
 	for i := range c.Exprs {
-		if c.Exprs[i].Expr.Column != "" {
-			c.Exprs[i].Expr.Column = stripAliasQualifier(c.Exprs[i].Expr.Column, t.Alias)
-		}
-		if c.Exprs[i].AggCol != "" {
-			c.Exprs[i].AggCol = stripAliasQualifier(c.Exprs[i].AggCol, t.Alias)
+		if !c.Exprs[i].Star {
+			c.Exprs[i] = renameSelectExpr(c.Exprs[i], strip)
 		}
 	}
-	c.Where = append([]parser.Comparison(nil), t.Where...)
-	for i := range c.Where {
-		c.Where[i].Column = stripAliasQualifier(c.Where[i].Column, t.Alias)
+	c.Where = renameCondColumns(t.Where, strip)
+	c.GroupBy = make([]parser.Expr, len(t.GroupBy))
+	for i, g := range t.GroupBy {
+		c.GroupBy[i] = renameExprColumns(g, strip)
 	}
-	c.GroupBy = append([]string(nil), t.GroupBy...)
-	for i := range c.GroupBy {
-		c.GroupBy[i] = stripAliasQualifier(c.GroupBy[i], t.Alias)
-	}
-	c.Having = append([]parser.HavingCond(nil), t.Having...)
-	for i := range c.Having {
-		if c.Having[i].Column != "" {
-			c.Having[i].Column = stripAliasQualifier(c.Having[i].Column, t.Alias)
+	c.Having = renameCondColumns(t.Having, strip)
+	if len(t.DistinctOn) > 0 {
+		c.DistinctOn = make([]parser.Expr, len(t.DistinctOn))
+		for i, e := range t.DistinctOn {
+			c.DistinctOn[i] = renameExprColumns(e, strip)
 		}
 	}
 	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
 	for i := range c.OrderBy {
-		c.OrderBy[i].Column = stripAliasQualifier(c.OrderBy[i].Column, t.Alias)
+		oc := &c.OrderBy[i]
+		oc.Column = strip(oc.Column)
+		if oc.Expr != nil {
+			e := renameExprColumns(*oc.Expr, strip)
+			oc.Expr = &e
+		}
+		if oc.Agg != nil {
+			a := renameSelectExpr(*oc.Agg, strip)
+			oc.Agg = &a
+		}
 	}
 	return &c
 }
@@ -1025,7 +1183,11 @@ func tableFuncColumns(e parser.Expr, alias string, rename []string) ([]ResultCol
 	case "pg_available_extensions":
 		cols = []ResultColumn{{Name: "name", Type: types.String}, {Name: "default_version", Type: types.String}, {Name: "comment", Type: types.String}}
 	default:
-		return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
+		b, ok := builtins.Lookup(e.Func)
+		if !ok || !b.IsSetReturning() {
+			return nil, newErrf(CodeFeatureNotSupported, "table function %s is not supported", e.Func)
+		}
+		cols = srfColumns(b, e, alias)
 	}
 	if len(rename) > len(cols) {
 		return nil, newErrf(CodeInvalidColumnReference, "table \"%s\" has %d columns available but %d columns specified", alias, len(cols), len(rename))
@@ -1049,7 +1211,8 @@ func funcTableDesc(t *parser.Select) (*catalog.TableDescriptor, error) {
 }
 
 // isLateralFunc reports whether a table function call's arguments read
-// a column, which can only be an earlier FROM member's (LATERAL).
+// a column, which can only be an earlier FROM member's (implicitly
+// LATERAL).
 func isLateralFunc(e parser.Expr) bool {
 	lateral := false
 	exprColumns(e, func(string) { lateral = true })
@@ -1064,7 +1227,10 @@ func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parse
 		return nil, nil, err
 	}
 	if isLateralFunc(fe) {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "table function %s cannot read columns of other FROM items (LATERAL)", fe.Func)
+		// A lateral call joined to the members to its left runs per row
+		// with their values substituted (pkg/sql/lateral.go); one still
+		// reading a column has nothing to its left that has it.
+		return nil, nil, fromRefErr(fe)
 	}
 	var rows [][]types.Datum
 	switch fe.Func {
@@ -1113,8 +1279,85 @@ func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parse
 		if len(fe.Args) != 0 {
 			return nil, nil, newErrf(CodeUndefinedFunction, "pg_available_extensions takes no arguments")
 		}
+	default:
+		// A set-returning builtin (generate_series, jsonb_each, ...)
+		// over constant arguments.
+		e, err := s.resolveValueExpr(ctx, txn, fe, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		if rows, err = s.srfRows(e, params, cols); err != nil {
+			return nil, nil, err
+		}
 	}
 	return cols, rows, nil
+}
+
+// srfColumns are the columns of a set-returning builtin's call: its
+// declared names (the alias for an unnamed one, as for a function
+// returning a scalar) typed from the arguments.
+func srfColumns(b *builtins.Builtin, e parser.Expr, alias string) []ResultColumn {
+	argFams := make([]types.Family, len(e.Args))
+	for i, a := range e.Args {
+		argFams[i] = exprFamily(a, nil)
+	}
+	fams := b.ColumnFamilies(argFams)
+	cols := make([]ResultColumn, len(b.Columns))
+	for i, n := range b.Columns {
+		if n == "" {
+			n = alias
+		}
+		f := fams[i]
+		if f == types.Unknown {
+			f = types.String
+		}
+		cols[i] = ResultColumn{Name: n, Type: f}
+	}
+	// generate_series over timestamps without time zone yields them.
+	cols[0].NoTZ = cols[0].Type == types.Timestamp && len(e.Args) > 0 && exprNoTZ(e.Args[0], nil)
+	return cols
+}
+
+// srfRows evaluates a set-returning builtin call's arguments (constants
+// and parameters; the session's own functions already spliced) and
+// collects its rows, each accounted against the statement's memory
+// limit as it is made and conformed to the described column types.
+func (s *Session) srfRows(e parser.Expr, params []types.Datum, cols []ResultColumn) ([][]types.Datum, error) {
+	b, ok := builtins.Lookup(e.Func)
+	if !ok || !b.IsSetReturning() {
+		return nil, newErrf(CodeUndefinedFunction, "function %s does not return a set", e.Func)
+	}
+	args := make([]types.Datum, len(e.Args))
+	for i, a := range e.Args {
+		d, err := evalExpr(a, nil, nil, params)
+		if err != nil {
+			return nil, err
+		}
+		args[i] = d
+	}
+	next, err := b.CallRowsIn(args, e.Zone)
+	if err != nil {
+		return nil, builtinErr(err)
+	}
+	var rows [][]types.Datum
+	for {
+		row, ok, err := next()
+		if err != nil {
+			return nil, builtinErr(err)
+		}
+		if !ok {
+			return rows, nil
+		}
+		if err := s.chargeDatums(row); err != nil {
+			return nil, err
+		}
+		for i := range row {
+			if i < len(cols) {
+				row[i] = conformTo(row[i], cols[i].Type)
+			}
+		}
+		rows = append(rows, row)
+	}
 }
 
 // funcTableElem is the element family FROM unnest(array) produces, from
@@ -1174,6 +1417,14 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 			return nil, err
 		}
 	}
+	if len(t.DistinctOn) > 0 {
+		var derr error
+		if rows, derr = keepFirstDistinct(rows, func(fr fetchedRow) ([]types.Datum, error) {
+			return evalExprList(t.DistinctOn, tableEnv{desc: desc, row: fr.row}, params)
+		}); derr != nil {
+			return nil, derr
+		}
+	}
 	proj, perr := resolveProjection(desc, t.Exprs)
 	if perr != nil {
 		return nil, perr
@@ -1204,7 +1455,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 		}
 		res.Rows = append(res.Rows, out)
 	}
-	if t.Distinct {
+	if t.Distinct && len(t.DistinctOn) == 0 {
 		res.Rows = dedupeRows(res.Rows)
 	}
 	res.Rows = trimRows(res.Rows, t)
@@ -1324,4 +1575,13 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 type oidName struct {
 	oid  int64
 	name string
+}
+
+// floorDivInt is a / b rounded toward negative infinity.
+func floorDivInt(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
 }

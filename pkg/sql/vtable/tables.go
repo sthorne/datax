@@ -514,7 +514,7 @@ func init() {
 			case builtins.Volatile:
 				vol = "v"
 			}
-			rows = append(rows, Row{i64(procOIDBase + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(false),
+			rows = append(rows, Row{i64(procOIDBase + int64(i)), str(b.Name), i64(OIDPgCatalog), i64(10), i64(12), str("f"), boolean(b.IsSetReturning()),
 				i64(TypeOID(b.ResultFamily(b.Args))), i64(int64(len(b.Args))), str(strings.Join(argOIDs, " ")), null(), str(b.Name), str(vol), boolean(!b.NotStrict)})
 		}
 		return rows, nil

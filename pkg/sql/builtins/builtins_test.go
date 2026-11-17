@@ -33,8 +33,11 @@ func TestRegistryShape(t *testing.T) {
 		if !b.ArityOK(b.MinArgs) || (!b.Variadic && b.ArityOK(len(b.Args)+1)) {
 			t.Errorf("%s: arity check disagrees with the declaration", b.Name)
 		}
-		if b.Session != (b.Fn == nil) {
-			t.Errorf("%s: session functions carry no implementation, the rest must", b.Name)
+		if b.Session != (b.Fn == nil && b.Rows == nil) || (b.Fn != nil && b.Rows != nil) {
+			t.Errorf("%s: session functions carry no implementation, the rest exactly one (Fn or Rows)", b.Name)
+		}
+		if b.Rows != nil && len(b.Columns) != 1+len(b.ColFams) {
+			t.Errorf("%s: %d columns but %d further column families", b.Name, len(b.Columns), len(b.ColFams))
 		}
 		for _, a := range b.Aliases {
 			alias, ok := Lookup(a)

@@ -671,6 +671,7 @@ func (s *Session) Close(ctx context.Context) {
 // Execute runs one parsed statement with the given parameter values,
 // under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
+	params = s.zoneParams(params)
 	s.stmtNow = 0
 	s.memUsed = 0
 	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
@@ -1336,6 +1337,11 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 	case e.Sub != nil:
 		// Scalar subqueries are evaluated and spliced before execution.
 		return types.Datum{}, newErrf(CodeInternal, "unresolved scalar subquery")
+	case e.Agg != nil:
+		// The grouped executor replaces every aggregate call it computes;
+		// one reaching evaluation stands where none may (WHERE, ON, a
+		// row-by-row select list).
+		return types.Datum{}, newErrf(CodeGrouping, "aggregate function %s() is not allowed here", strings.ToLower(e.Agg.Agg))
 	default:
 		return types.Datum{}, newErrf(CodeInternal, "empty expression")
 	}
@@ -1351,22 +1357,25 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		if err != nil {
 			return types.Datum{}, err
 		}
-		if base, err = applyArith(base, e.BinOp, rhs); err != nil {
+		if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
 			return types.Datum{}, err
 		}
 	}
 	if e.Cast != "" {
-		d, err := builtins.Cast(base, e.Cast)
+		d, err := builtins.CastIn(base, e.Cast, e.Zone)
 		return d, builtinErr(err)
 	}
 	return base, nil
 }
 
-func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
+// applyArithIn evaluates l op r under the session's TimeZone (nil:
+// UTC), which timestamp-with-time-zone arithmetic and || rendering
+// follow.
+func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (types.Datum, error) {
 	if l.Null || r.Null {
 		return types.DNull, nil
 	}
-	if d, ok, err := builtins.DateArith(l, op, r); ok {
+	if d, ok, err := builtins.DateArithIn(l, op, r, loc); ok {
 		return d, builtinErr(err)
 	}
 	if l.Fam == types.Vector || r.Fam == types.Vector || builtins.IsVectorOp(op) {
@@ -1386,7 +1395,7 @@ func applyArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
 		}
 		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
 		// bpchar-to-text cast strips the padding.
-		return types.NewString(concatText(l) + concatText(r)), nil
+		return types.NewString(concatTextIn(l, loc) + concatTextIn(r, loc)), nil
 	case "%":
 		d, err := builtins.Mod(l, r)
 		return d, builtinErr(err)
@@ -1500,7 +1509,7 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		args[i] = d
 	}
 	if b, ok := builtins.Lookup(e.Func); ok && !b.Session {
-		d, err := b.Call(args)
+		d, err := b.CallIn(args, e.Zone)
 		if err != nil {
 			var be *builtins.Error
 			if errors.As(err, &be) {
@@ -2070,6 +2079,15 @@ func decodeJSONValue(s string) (any, error) {
 // SQLSTATE (nil stays nil).
 // concatText renders a || operand: a padded CHAR(n) value contributes
 // its trimmed text.
+// concatTextIn is concatText with a timestamp with time zone rendered
+// in loc.
+func concatTextIn(d types.Datum, loc *time.Location) string {
+	if d.Fam == types.Timestamp {
+		return builtins.TextIn(d, loc)
+	}
+	return concatText(d)
+}
+
 func concatText(d types.Datum) string {
 	if d.Fam == types.String {
 		return d.S

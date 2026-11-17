@@ -58,6 +58,36 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 			}
 		}, nil
 	}
+	pt.bindMember = func(sel *parser.Select, i int) (func(), error) {
+		jc := sel.Joins[i]
+		var cols []ResultColumn
+		var lateral *parser.Select
+		if isLateralMember(jc) {
+			scope, err := s.lateralScope(ctx, nil, sel, i)
+			if err != nil {
+				return nil, err
+			}
+			lateral = lateralSub(jc)
+			if cols, err = s.describeLateral(ctx, nil, lateral, []scopeLevel{scope}); err != nil {
+				return nil, err
+			}
+		} else {
+			var err error
+			if cols, err = tableFuncColumns(*jc.FuncTable, jc.Alias, jc.FuncCols); err != nil {
+				return nil, err
+			}
+		}
+		name := strings.ToLower(jc.Alias)
+		desc, err := relationDesc(name, cols, nil)
+		if err != nil {
+			return nil, err
+		}
+		prev, had := s.bindRelation(name, &relation{desc: desc, lateral: lateral})
+		if !had {
+			prev = nil
+		}
+		return func() { s.restoreRelations(map[string]*relation{name: prev}) }, nil
+	}
 	if err := pt.statement(expanded, nil, true); err != nil {
 		return nil, ToSQLError(err)
 	}
@@ -78,7 +108,11 @@ type paramTyper struct {
 	lookup   func(name string) (*catalog.TableDescriptor, error)
 	describe func(q parser.Statement) ([]ResultColumn, error)
 	bind     func(name string, cols []ResultColumn, rename []string) (func(), error)
-	err      error
+	// bindMember binds a select's join member i — a table function
+	// call, or a lateral member reading the members to its left — as a
+	// relation named by its alias (nil: such members type nothing).
+	bindMember func(sel *parser.Select, i int) (func(), error)
+	err        error
 }
 
 func newParamTyper(n int, lookup func(string) (*catalog.TableDescriptor, error)) *paramTyper {
@@ -396,7 +430,7 @@ func (pt *paramTyper) member(m *parser.Select, parent *paramScope, top bool) {
 		c.Joins = append([]parser.JoinClause(nil), m.Joins...)
 		for i := range c.Joins {
 			jc := &c.Joins[i]
-			if jc.Derived == nil {
+			if jc.Derived == nil || isLateralMember(*jc) {
 				continue
 			}
 			pt.selectStmt(jc.Derived, parent, false)
@@ -426,6 +460,20 @@ func (pt *paramTyper) member(m *parser.Select, parent *paramScope, top bool) {
 			}
 		}
 	}
+	// Table functions and lateral members bind in order, once the
+	// members to their left are; their queries stay in place for the
+	// walk below, which types a lateral subquery's parameters with the
+	// join's scope enclosing it.
+	for i := range c.Joins {
+		jc := &c.Joins[i]
+		if pt.bindMember == nil || c.Table == "" || jc.FuncTable == nil && !isLateralMember(*jc) {
+			continue
+		}
+		if r, err := pt.bindMember(&c, i); err == nil {
+			undo = append(undo, r)
+			jc.Table = strings.ToLower(jc.Alias)
+		}
+	}
 	if c.Table != "" {
 		if desc, err := pt.lookup(c.Table); err == nil {
 			if len(c.Joins) == 0 {
@@ -443,19 +491,8 @@ func (pt *paramTyper) member(m *parser.Select, parent *paramScope, top bool) {
 			pt.err = err
 		}
 	}
-	for _, h := range m.Having {
-		fam, fixed := types.Unknown, true
-		switch {
-		case h.Agg != nil && h.Agg.Agg == "COUNT":
-			fam = types.Int
-		case h.Agg != nil && (h.Agg.Agg == "MIN" || h.Agg.Agg == "MAX" || h.Agg.Agg == "SUM") && h.Agg.AggCol != "":
-			fam, _ = sc.column(h.Agg.AggCol)
-			fixed = false
-		case h.Agg == nil && h.Column != "":
-			fam, _ = sc.column(h.Column)
-		}
-		pt.value(h.Value, fam, fixed)
-	}
+	// HAVING's conjuncts type like WHERE's, an aggregate call on the
+	// left by its result type (exprFamily).
 	pt.walkSelect(&c, sc)
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -166,6 +167,16 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	f.kw("SELECT")
 	if s.Distinct {
 		f.kw("DISTINCT")
+		if len(s.DistinctOn) > 0 {
+			f.kw("ON (")
+			for i, e := range s.DistinctOn {
+				if i > 0 {
+					f.w(", ")
+				}
+				f.expr(e)
+			}
+			f.w(")")
+		}
 	}
 	for i, e := range s.Exprs {
 		if i > 0 {
@@ -193,24 +204,34 @@ func (f *fingerprinter) selectStmt(s *Select) {
 	f.where(s.Where)
 	if len(s.GroupBy) > 0 {
 		f.kw("GROUP BY")
-		f.kw(strings.ToLower(strings.Join(s.GroupBy, ", ")))
+		for i, g := range s.GroupBy {
+			if i > 0 {
+				f.w(",")
+			}
+			f.sp()
+			f.expr(g)
+		}
+		if s.GroupingSets != nil {
+			f.kw("GROUPING SETS (")
+			for i, set := range s.GroupingSets {
+				if i > 0 {
+					f.w(",")
+				}
+				f.w("(")
+				for j, k := range set {
+					if j > 0 {
+						f.w(",")
+					}
+					f.w(strconv.Itoa(k))
+				}
+				f.w(")")
+			}
+			f.w(")")
+		}
 	}
 	if len(s.Having) > 0 {
 		f.kw("HAVING")
-		for i, h := range s.Having {
-			if i > 0 {
-				f.kw("AND")
-			}
-			f.sp()
-			if h.Agg != nil {
-				f.selectExpr(*h.Agg)
-			} else {
-				f.w(strings.ToLower(h.Column))
-			}
-			f.kw(strings.ToUpper(h.Op))
-			f.sp()
-			f.expr(h.Value)
-		}
+		f.comparisons(s.Having)
 	}
 	f.orderBy(s.OrderBy)
 	// The presence of LIMIT/OFFSET is a shape; the number is a value.
@@ -260,6 +281,9 @@ func (f *fingerprinter) join(j JoinClause) {
 		f.kw("NATURAL")
 	}
 	f.kw("JOIN")
+	if j.Lateral {
+		f.kw("LATERAL")
+	}
 	if j.Table != "" {
 		f.table(j.Table)
 		f.kw(strings.ToLower(j.Table))
@@ -499,6 +523,8 @@ func (f *fingerprinter) atom(e Expr) {
 		f.w(")")
 	case e.Window != nil:
 		f.selectExpr(*e.Window)
+	case e.Agg != nil:
+		f.selectExpr(*e.Agg)
 	case e.Column != "":
 		f.w(strings.ToLower(e.Column))
 		for range e.Path {

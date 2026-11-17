@@ -148,7 +148,7 @@ func TestJoinChains(t *testing.T) {
 	if len(sel.Joins[1].On) != 2 {
 		t.Fatalf("second join ON: %+v", sel.Joins[1].On)
 	}
-	if len(sel.GroupBy) != 1 || sel.GroupBy[0] != "r.name" {
+	if len(sel.GroupBy) != 1 || sel.GroupBy[0].Column != "r.name" {
 		t.Fatalf("qualified GROUP BY: %+v", sel.GroupBy)
 	}
 	if sel.Exprs[1].AggCol != "o.total" {

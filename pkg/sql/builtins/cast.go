@@ -82,14 +82,32 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 	case "bool", "boolean":
 		return toBool(d)
 	case "timestamp", "timestamptz", "timestamp with time zone", "timestamp without time zone":
+		// A timestamp WITHOUT time zone is the same wall-clock count
+		// marked for display without an offset (the session's zone is
+		// UTC, so the two convert into each other unchanged); text
+		// input to it ignores any offset written, as in PostgreSQL.
+		noTZ := name == "timestamp" || name == "timestamp without time zone"
 		switch d.Fam {
 		case types.Timestamp:
+			d.NoTZ = noTZ
 			return d, nil
-		case types.Date, types.String:
+		case types.String:
+			if noTZ {
+				n, err := types.ParseTimestampNoTZ(d.S)
+				if err != nil {
+					return types.Datum{}, timestampErr(err, d.Text())
+				}
+				v := types.NewTimestamp(n)
+				v.NoTZ = true
+				return v, nil
+			}
+			fallthrough
+		case types.Date:
 			v, err := d.Coerce(types.Timestamp)
 			if err != nil {
 				return types.Datum{}, timestampErr(err, d.Text())
 			}
+			v.NoTZ = noTZ
 			return v, nil
 		}
 	case "interval":

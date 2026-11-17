@@ -261,7 +261,7 @@ func innerSubShape(sub *parser.Select) bool {
 		}
 	}
 	for _, hc := range sub.Having {
-		if exprHasSubquery(hc.Value) {
+		if condHas(hc, func(x parser.Expr) bool { return x.Sub != nil }) {
 			return false
 		}
 	}
@@ -287,8 +287,9 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		}
 		defer restore()
 	}
+	orig := sub
 	if hasDerivedJoin(sub) {
-		bound, restore, err := s.bindJoinedDerived(ctx, txn, sub, nil, true)
+		bound, restore, err := s.bindJoinedDerivedIn(ctx, txn, sub, nil, true, outers)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -307,7 +308,7 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		innerDesc = &catalog.TableDescriptor{}
 	default:
 		var err error
-		if innerDesc, err = s.lookup(ctx, txn, sub.Table); err != nil {
+		if innerDesc, err = s.lookupMaybePlan(ctx, txn, sub.Table); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -322,7 +323,7 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	}
 	node := &scopeNode{scope: corrScope{inner: inner, outers: outers}}
 	for _, jc := range sub.Joins {
-		jd, err := s.lookup(ctx, txn, jc.Table)
+		jd, err := s.lookupMaybePlan(ctx, txn, jc.Table)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -393,6 +394,22 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		// unnest(outer.col): the argument may reference enclosing rows.
 		exprColumns(*sub.FuncTable, func(n string) { record(n, true, "FROM") })
 	}
+	// A lateral member of the subquery's own FROM list may read the
+	// enclosing rows too: a table function's arguments directly, a
+	// LATERAL subquery as a nested subquery over the members to its
+	// left (and, in this coarser analysis, its right: execution checks
+	// the order when the substituted subquery runs).
+	for _, jc := range orig.Joins {
+		switch {
+		case !isLateralMember(jc):
+		case jc.FuncTable != nil:
+			exprColumns(*jc.FuncTable, func(n string) { record(n, true, "FROM") })
+		default:
+			if err := analyzeNested([]*parser.Select{jc.Derived}); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 	conds := append([]parser.Comparison(nil), sub.Where...)
 	for _, jc := range sub.Joins {
 		conds = append(conds, jc.Filter...)
@@ -414,13 +431,19 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 		}
 	}
 	for _, g := range sub.GroupBy {
-		record(g, false, "GROUP BY")
+		exprColumns(g, func(n string) { record(n, false, "GROUP BY") })
 	}
 	for _, hc := range sub.Having {
 		if hc.Column != "" {
 			record(hc.Column, false, "HAVING")
 		}
+		if hc.Expr != nil {
+			exprColumns(*hc.Expr, func(n string) { record(n, false, "HAVING") })
+		}
 		exprColumns(hc.Value, func(n string) { record(n, true, "HAVING") })
+		for _, v := range hc.Values {
+			exprColumns(v, func(n string) { record(n, true, "HAVING") })
+		}
 	}
 	for _, oc := range sub.OrderBy {
 		record(oc.Column, false, "ORDER BY")
@@ -758,6 +781,23 @@ func substituteSub(sub *parser.Select, node *scopeNode, row map[catalog.ColumnID
 	if len(sub.Joins) > 0 {
 		c.Joins = append([]parser.JoinClause(nil), sub.Joins...)
 		for i := range c.Joins {
+			// A lateral member reads the bound row too.
+			if ft := sub.Joins[i].FuncTable; ft != nil {
+				e, err := substituteExpr(*ft, node, row, params)
+				if err != nil {
+					return nil, err
+				}
+				c.Joins[i].FuncTable = &e
+			}
+			if d := sub.Joins[i].Derived; d != nil {
+				if child := node.children[d]; child != nil {
+					nd, err := substituteSub(d, child, row, params)
+					if err != nil {
+						return nil, err
+					}
+					c.Joins[i].Derived = nd
+				}
+			}
 			if len(c.Joins[i].Filter) == 0 {
 				continue
 			}
@@ -775,11 +815,8 @@ func substituteSub(sub *parser.Select, node *scopeNode, row map[catalog.ColumnID
 		}
 	}
 	if len(sub.Having) > 0 {
-		c.Having = append([]parser.HavingCond(nil), sub.Having...)
-		for i := range c.Having {
-			if c.Having[i].Value, err = substituteExpr(c.Having[i].Value, node, row, params); err != nil {
-				return nil, err
-			}
+		if c.Having, err = substituteConds(sub.Having, node, row, params); err != nil {
+			return nil, err
 		}
 	}
 	return &c, nil

@@ -105,23 +105,28 @@ func TestInterNodeLatency(t *testing.T) {
 	}
 
 	// n3's clock runs 100 ms ahead: its peers see +100 ms, it sees -100 ms.
-	within := func(got, want time.Duration) bool {
+	// An offset estimated from a ping is uncertain by up to half its round
+	// trip, which on a loaded machine (CI under -race) can exceed the fixed
+	// margin, so the bound adds half the pair's p99 round trip.
+	within := func(l kvpb.PeerLatency, want time.Duration) bool {
+		got := time.Duration(l.OffsetMicros) * time.Microsecond
+		tol := 40*time.Millisecond + time.Duration(l.P99Micros)*time.Microsecond/2
 		d := got - want
-		return d > -40*time.Millisecond && d < 40*time.Millisecond
+		return d > -tol && d < tol
 	}
 	for _, id := range []int{1, 2} {
 		l := rowOf(doc, id)[3]
-		if !within(time.Duration(l.OffsetMicros)*time.Microsecond, skew) {
-			t.Fatalf("n%d measures n3's offset as %dµs, want about +%s", id, l.OffsetMicros, skew)
+		if !within(l, skew) {
+			t.Fatalf("n%d measures n3's offset as %dµs (p99 rtt %dµs), want about +%s", id, l.OffsetMicros, l.P99Micros, skew)
 		}
 		back := rowOf(doc, 3)[base.NodeID(id)]
-		if !within(time.Duration(back.OffsetMicros)*time.Microsecond, -skew) {
-			t.Fatalf("n3 measures n%d's offset as %dµs, want about -%s", id, back.OffsetMicros, skew)
+		if !within(back, -skew) {
+			t.Fatalf("n3 measures n%d's offset as %dµs (p99 rtt %dµs), want about -%s", id, back.OffsetMicros, back.P99Micros, skew)
 		}
 	}
 	// Two nodes on the same clock see each other within the noise.
-	if l := rowOf(doc, 1)[2]; !within(time.Duration(l.OffsetMicros)*time.Microsecond, 0) {
-		t.Fatalf("n1 measures n2's offset as %dµs, want about 0", l.OffsetMicros)
+	if l := rowOf(doc, 1)[2]; !within(l, 0) {
+		t.Fatalf("n1 measures n2's offset as %dµs (p99 rtt %dµs), want about 0", l.OffsetMicros, l.P99Micros)
 	}
 
 	// Partition n1 → n3: n1's row marks n3 unreachable; n3 still reaches

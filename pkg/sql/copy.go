@@ -50,6 +50,17 @@ type CopyIn struct {
 	committed int64
 }
 
+// Text returns a COPY field's text as a datum to coerce to its column:
+// it reads in the session's TimeZone when it is a timestamp with time
+// zone that names no offset.
+func (ci *CopyIn) Text(v string) types.Datum {
+	d := types.NewString(v)
+	if loc := ci.s.zone(); loc != nil {
+		d.Loc = loc
+	}
+	return d
+}
+
 // BeginCopy validates a COPY FROM statement (table, columns, privilege)
 // and returns the copy-in state machine. Refused inside an explicit
 // transaction block: COPY commits per chunk.

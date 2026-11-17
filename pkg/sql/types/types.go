@@ -180,6 +180,11 @@ type Datum struct {
 	// A holds an array's elements (Fam is ArrayOf(elem)); a NULL element
 	// is a Null datum.
 	A []Datum `json:"a,omitempty"`
+	// Loc is a READ hint, never stored: a String datum the session took
+	// from a statement's literal or text parameter carries the
+	// session's TimeZone, in which it reads as a TIMESTAMPTZ when its
+	// text names no offset. nil is UTC.
+	Loc *time.Location `json:"-"`
 }
 
 var DNull = Datum{Null: true}
@@ -260,18 +265,9 @@ var (
 	ErrTimestampRange = errors.New("timestamp out of range")
 )
 
-// ParseTimestamp parses a timestamp string to UTC Unix nanoseconds.
-func ParseTimestamp(s string) (int64, error) {
-	for _, f := range timestampFormats {
-		if t, err := time.ParseInLocation(f, s, time.UTC); err == nil {
-			if t.Before(minTimestamp) || !t.Before(maxTimestamp) {
-				return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
-			}
-			return t.UTC().UnixNano(), nil
-		}
-	}
-	return 0, fmt.Errorf("could not parse %q as TIMESTAMPTZ", s)
-}
+// ParseTimestamp parses a timestamp string to UTC Unix nanoseconds (a
+// text without an offset is UTC; ParseTimestampIn reads it in a zone).
+func ParseTimestamp(s string) (int64, error) { return ParseTimestampIn(s, nil) }
 
 // ParseTimestampNoTZ parses a TIMESTAMP (without time zone) input: the
 // same layouts as ParseTimestamp, but an offset in the text is ignored
@@ -456,7 +452,7 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		}
 		return NewBool(b), nil
 	case d.Fam == String && target == Timestamp:
-		n, err := ParseTimestamp(d.S)
+		n, err := ParseTimestampIn(d.S, d.Loc)
 		if err != nil {
 			return Datum{}, err
 		}

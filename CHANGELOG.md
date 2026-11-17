@@ -11,6 +11,53 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`SELECT DISTINCT ON (exprs)`** (#337): of each group of rows equal on the
+  expressions, the first in `ORDER BY` order is kept, before `LIMIT` and
+  `OFFSET`. The `ORDER BY` must begin with the `DISTINCT ON` expressions
+  (`42P10` otherwise, at Describe too); positions and output names stand for
+  the select items. Over single tables, joins, derived tables and grouped
+  queries; not with window functions (`0A000`). Before, `DISTINCT ON` was a
+  syntax error.
+- **`GROUP BY` expressions, `ROLLUP`, `CUBE` and `GROUPING SETS`** (#336):
+  `GROUP BY` takes any expression (`date_trunc('day', ts)`, `a % 10`), a
+  position of an expression item, or an output name that is no input column;
+  select items, `HAVING` and `ORDER BY` may use a grouped expression or compute
+  over it. `ROLLUP (...)`, `CUBE (...)`, `GROUPING SETS (...)` and `()` group
+  by each grouping set and return the union, the keys a set leaves out NULL,
+  combined across items as in PostgreSQL; `GROUPING(...)` tells a rolled-up
+  NULL from a NULL key, and an empty grouping set has its row over no input.
+  Over single tables, joins and derived tables. Before, `GROUP BY` took
+  columns and positions of column items only.
+- **Expressions over aggregates** (#335): the select list, `HAVING` and
+  `ORDER BY` of a grouped or aggregate query take any scalar expression over
+  aggregate calls and grouping columns — `SUM(a) / COUNT(*)`, `ROUND(AVG(x),
+  2)`, `COALESCE(MAX(x), 0)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`,
+  `CASE WHEN COUNT(*) > 1 ...`, casts — with or without `GROUP BY` and over
+  joins; an aggregate keeps its `DISTINCT` and `FILTER` inside an expression.
+  `HAVING` is a full boolean condition (`OR`, `NOT`, `IN`, `LIKE`, an
+  aggregate on either side). The aggregates are computed per group and the
+  expression is evaluated over them, and the extended protocol describes the
+  result with its real type. A column that is neither grouped nor aggregated
+  is refused with `42803`, as is an aggregate in `WHERE`. Before, an
+  aggregate could only stand alone in the select list (`SUM(a) / COUNT(*)`
+  was a syntax error) and `HAVING` took one comparison per conjunct.
+- **Common PostgreSQL functions** (#339): the regular-expression family —
+  `regexp_replace` (with flags, start and n), `regexp_match`,
+  `regexp_matches`, `regexp_split_to_array`, `regexp_split_to_table`,
+  `regexp_count`, `regexp_like`, `regexp_substr` (POSIX patterns run on RE2:
+  back references and lookaround are `2201B`); `generate_series` over
+  integers, numerics and timestamps with an interval step; the jsonb
+  processing functions `jsonb_each`, `jsonb_each_text`,
+  `jsonb_array_elements`, `jsonb_array_elements_text`, `jsonb_object_keys`
+  (with their `json_` spellings) and `jsonb_insert`; and `timezone(zone,
+  ts)` / `ts AT TIME ZONE zone` / `AT LOCAL` in both directions. The
+  set-returning ones are tables in `FROM` (`FROM generate_series(1, 10) AS
+  g(n)`, `FROM jsonb_each(doc)` with constant arguments) and expand into
+  rows in a select list without `FROM`, several in lockstep; `pg_proc`
+  marks them `proretset`. `key` reads as a column (jsonb_each's) where a
+  value goes. A `::timestamp` cast now yields a timestamp without time zone
+  (no offset in its text, OID 1114), as `ts ± interval` and `date_trunc` over
+  one do.
 - **`ALTER TABLE ... ADD CONSTRAINT IF NOT EXISTS name ...`** (#322), a datax
   extension (PostgreSQL has `IF NOT EXISTS` on `ADD COLUMN` and `CREATE
   INDEX`, both supported, but not here): when the table already has a
@@ -709,6 +756,24 @@ state or the internode protocol does, and an entry below says so.
   statements and roles it applies to, its `USING` and `WITH CHECK`
   expressions — and the reconstructed DDL reproduces them. `/api/schema`
   gains `row_security`, `force_row_security` and `policies` per table.
+- **`LATERAL` subqueries and table functions that read other `FROM`
+  members** (#338). `FROM t, LATERAL (SELECT ...) l`, `CROSS JOIN LATERAL`,
+  `JOIN LATERAL ... ON cond` and `LEFT JOIN LATERAL ... ON true` (a miss
+  NULL-extends) run the subquery once per row of the members to its left,
+  reading their columns: top-N per group (`FROM users u, LATERAL (SELECT *
+  FROM orders o WHERE o.user_id = u.id ORDER BY created DESC LIMIT 3) o`),
+  per-row aggregates, chained and nested laterals. A table function call in
+  `FROM` is implicitly lateral, as in PostgreSQL: `FROM t, unnest(t.tags)
+  AS tag` works (before, it was refused with `0A000`). Execution is a
+  correlated nested loop memoized on the referenced values, and works with
+  `WHERE`, `ORDER BY`, `LIMIT`, aggregates over the result, `EXPLAIN`,
+  Describe and prepared statements. A reference to a member further right
+  is `42P01`, and a `RIGHT` or `FULL JOIN LATERAL` is refused (`42P10`).
+  The lateral subquery must be a plain select (not itself over a derived
+  table or a set operation), and cannot read the outer row in its `ORDER
+  BY`, `GROUP BY` or aggregate arguments. A view may now join a subquery
+  (`CREATE VIEW v AS SELECT ... JOIN (SELECT ...) d ON ...` was refused with
+  `42P01`).
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
@@ -1480,6 +1545,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`TimeZone` is honored** (#340). Before, a session's zone only changed
+  how `TIMESTAMPTZ` values were rendered on the wire: text without an
+  offset still read as UTC and `::text`, `::date`, `date_trunc`, `extract`,
+  `to_char` and `current_date` computed in UTC. Now input without an offset
+  (literals, text parameters, `COPY`) reads in the zone, those functions
+  and casts, `||` and day and month arithmetic (across DST) follow it, and
+  timestamp input may name a zone (`'2024-07-01 12:00 Europe/Paris'`); the
+  stored instant and the binary format stay UTC. A POSIX `TimeZone` such as
+  `'UTC+5'` or `'+05:30'` now means what it means in PostgreSQL (west of
+  Greenwich), and abbreviations are refused there (`22023`).
 - **`pg_settings` reports each setting's type and unit, and what `RESET`
   restores** (#333). `vartype` and `unit` came from a hard-coded list
   that had fallen behind the session's own registry of settings, so

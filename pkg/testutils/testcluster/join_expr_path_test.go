@@ -148,13 +148,19 @@ func TestJoinExpressionsAndPaths(t *testing.T) {
 		t.Fatal("empty plan")
 	}
 
-	// Grouped joins: paths in WHERE work (pre-grouping); pathed SELECT
-	// items under GROUP BY stay 0A000; @> in join WHERE stays 0A000.
+	// Grouped joins: paths in WHERE work (pre-grouping); a pathed SELECT
+	// item over a grouping column is an expression of it (issue #335);
+	// @> in join WHERE stays 0A000.
 	if err := conn.QueryRow(ctx, `SELECT count(*) FROM orders AS o JOIN custs AS c ON c.id = o.cust
 		WHERE c.prefs ->> 'tier' = 'gold' GROUP BY o.cust`).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("grouped where path: %d, %v", n, err)
 	}
-	expectCode(t, ctx, conn, `SELECT c.prefs ->> 'tier', count(*) FROM orders AS o JOIN custs AS c ON c.id = o.cust GROUP BY c.prefs`, "0A000")
+	var topTier string
+	if err := conn.QueryRow(ctx, `SELECT c.prefs ->> 'tier', count(*) FROM orders AS o JOIN custs AS c ON c.id = o.cust
+		GROUP BY c.prefs ORDER BY count(*) DESC LIMIT 1`).Scan(&topTier, &n); err != nil || topTier != "gold" || n != 2 {
+		t.Fatalf("grouped path item: %q %d, %v", topTier, n, err)
+	}
+	expectCode(t, ctx, conn, `SELECT c.prefs ->> 'tier', count(*) FROM orders AS o JOIN custs AS c ON c.id = o.cust GROUP BY c.name`, "42803")
 	expectCode(t, ctx, conn, `SELECT o.id FROM orders AS o JOIN custs AS c ON c.id = o.cust WHERE c.prefs @> '{"tier":"gold"}'`, "0A000")
 
 	// Bad references error at resolve time with real codes.

@@ -2,7 +2,11 @@
 // parser for the v1 grammar subset (see docs/sql.md).
 package parser
 
-import "github.com/sthorne/datax/pkg/sql/types"
+import (
+	"time"
+
+	"github.com/sthorne/datax/pkg/sql/types"
+)
 
 // Statement is any parsed SQL statement.
 type Statement interface{ stmt() }
@@ -62,6 +66,17 @@ type Expr struct {
 	// expression; the executor computes it as a window item and
 	// substitutes its value.
 	Window *SelectExpr `json:"window,omitempty"`
+	// Agg is an aggregate call (no OVER) used as a value inside an
+	// expression (SUM(a) / COUNT(*), ROUND(AVG(x), 2), CASE WHEN
+	// COUNT(*) > 1 ...): the grouped executor computes it per group and
+	// evaluates the expression around it over the group's values. A
+	// select item that is a lone aggregate call keeps the SelectExpr.Agg
+	// form instead.
+	Agg *SelectExpr `json:"agg,omitempty"`
+	// Zone is set by the session, never parsed: the TimeZone (when it is
+	// not UTC) in which this node's cast, date/time function or
+	// operator reads and renders a timestamp with time zone.
+	Zone *time.Location `json:"-"`
 }
 
 // CaseExpr is CASE [operand] WHEN ... THEN ... [ELSE ...] END.
@@ -557,15 +572,6 @@ type OrderCol struct {
 	Agg *SelectExpr
 }
 
-// HavingCond is one HAVING conjunct: an aggregate call (HAVING COUNT(*) > 5)
-// or a group-column/output name (HAVING city != 'x') compared to a value.
-type HavingCond struct {
-	Agg    *SelectExpr // aggregate form; nil for the column form
-	Column string
-	Op     string
-	Value  Expr
-}
-
 // ColumnRef is a possibly-qualified column reference (t.c or c).
 type ColumnRef struct {
 	Table  string // alias or table name; "" = unqualified
@@ -602,11 +608,16 @@ type JoinClause struct {
 	// ORDINALITY] AS a(c1, c2), or LEFT JOIN f() a(c1, c2) ON ...), with
 	// the names of its leading columns; Table is empty then. A call
 	// whose arguments use no column runs once and joins as a relation;
-	// one reading an earlier member's columns (LATERAL) is parsed for
-	// the catalog queries tools send but does not execute.
+	// one reading an earlier member's columns is implicitly LATERAL and
+	// runs once per row of the members to its left.
 	FuncTable *Expr
 	FuncCols  []string
-	On        []JoinCond
+	// Lateral marks LATERAL written before a subquery or table function
+	// member: it may read the columns of the members to its left, and
+	// runs once per row of them (a correlated nested loop; see
+	// pkg/sql/lateral.go). Its ON clause may be any condition.
+	Lateral bool
+	On      []JoinCond
 	// Filter holds the ON conjuncts that are not join-key equalities
 	// (tc.relkind = 't', a.attnum > 0, NOT a.attisdropped). They are part
 	// of the join condition: a candidate match failing them is not a
@@ -660,10 +671,24 @@ type Select struct {
 	// ""), "INTERSECT" or "EXCEPT". Members form a flat list in written
 	// order; INTERSECT binds tighter than the other two, which associate
 	// left to right, and the executor applies that precedence.
-	SetOp   string
-	Where   []Comparison
-	GroupBy []string
-	Having  []HavingCond
+	SetOp string
+	Where []Comparison
+	// GroupBy are the distinct grouping expressions (a plain column is
+	// Expr{Column}; GROUP BY n is the expression of select item n).
+	// GroupingSets, when set (ROLLUP, CUBE, GROUPING SETS), are the
+	// grouping sets as positions into GroupBy: the result is the union of
+	// the groupings by each set, the keys outside a set NULL in its rows;
+	// nil is the one set of every key.
+	GroupBy      []Expr
+	GroupingSets [][]int
+	// DistinctOn are the expressions of SELECT DISTINCT ON (...)
+	// (Distinct is set too): of each group of rows equal on them, the
+	// first in ORDER BY order is kept. A position or an output name
+	// written there is resolved to the select item's expression.
+	DistinctOn []Expr
+	// Having is the HAVING condition, a conjunction like Where's over
+	// grouping expressions and aggregate calls.
+	Having  []Comparison
 	OrderBy []OrderCol
 	Limit   int64 // -1 = none
 	// Offset skips that many rows before Limit applies (0 = none).

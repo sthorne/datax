@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -74,6 +75,24 @@ type Builtin struct {
 	// Session marks a function the session evaluates itself (no Fn):
 	// listed and arity-checked here, called elsewhere.
 	Session bool
+	// Rows marks a set-returning function (in place of Fn): it yields
+	// rows of Columns, called in FROM or a FROM-less select list. A
+	// column named "" takes the FROM alias (or the function's name), as
+	// a scalar-returning PostgreSQL function's does. ColFams are the
+	// columns' families after the first, whose family is the result
+	// family (Ret, or RetOf).
+	Rows    func(args []types.Datum) (RowIter, error)
+	Columns []string
+	ColFams []types.Family
+	// ZFn and ZRows, when set, are Fn and Rows under a session TimeZone
+	// that is not UTC: they read and render timestamps with time zone
+	// in it (date_trunc, extract, to_char, generate_series, ...). A nil
+	// zone is UTC.
+	ZFn   func(args []types.Datum, loc *time.Location) (types.Datum, error)
+	ZRows func(args []types.Datum, loc *time.Location) (RowIter, error)
+	// RetOf, when set, is the result family given the argument
+	// families (generate_series yields what its bounds are).
+	RetOf func(args []types.Family) types.Family
 }
 
 // Error is an evaluation error with a SQLSTATE.
@@ -176,6 +195,9 @@ func (b *Builtin) argFamily(i int) types.Family {
 // ResultFamily is the family of the call's result given the argument
 // families (types.Unknown when it cannot be told statically).
 func (b *Builtin) ResultFamily(args []types.Family) types.Family {
+	if b.RetOf != nil {
+		return b.RetOf(args)
+	}
 	if b.Ret != Any {
 		return b.Ret
 	}
@@ -188,15 +210,87 @@ func (b *Builtin) ResultFamily(args []types.Family) types.Family {
 // Call evaluates the builtin: NULL handling for strict functions, then
 // argument coercion to the declared families (numeric families lift
 // among themselves; text parses into the others), then Fn.
-func (b *Builtin) Call(args []types.Datum) (types.Datum, error) {
-	if !b.ArityOK(len(args)) {
-		return types.Datum{}, errf(CodeUndefined, "%s() takes %s argument(s), got %d", b.Name, b.ArityText(), len(args))
+func (b *Builtin) Call(args []types.Datum) (types.Datum, error) { return b.CallIn(args, nil) }
+
+// ZoneSensitive reports whether the builtin's result depends on the
+// session's TimeZone.
+func (b *Builtin) ZoneSensitive() bool { return b.ZFn != nil || b.ZRows != nil }
+
+// CallIn is Call under the session's TimeZone (nil or UTC: Call).
+func (b *Builtin) CallIn(args []types.Datum, loc *time.Location) (types.Datum, error) {
+	if b.Rows != nil {
+		return types.Datum{}, errf(CodeNotSupported, "set-returning function %s() is only supported in FROM or in a select list without FROM", b.Name)
 	}
-	coerced := make([]types.Datum, len(args))
+	coerced, null, err := b.coerceArgs(args)
+	if err != nil || null {
+		return types.DNull, err
+	}
+	if b.ZFn != nil && loc != nil && loc != time.UTC {
+		return b.ZFn(coerced, loc)
+	}
+	return b.Fn(coerced)
+}
+
+// RowIter yields a set-returning function's rows one at a time (ok
+// false after the last), so the caller can account for each before
+// the next is made.
+type RowIter func() (row []types.Datum, ok bool, err error)
+
+// rowsOf iterates over rows already made.
+func rowsOf(rows [][]types.Datum) RowIter {
+	return func() ([]types.Datum, bool, error) {
+		if len(rows) == 0 {
+			return nil, false, nil
+		}
+		r := rows[0]
+		rows = rows[1:]
+		return r, true, nil
+	}
+}
+
+// CallRows evaluates a set-returning builtin: no rows when a strict
+// argument is NULL, else an iterator over the rows of its columns.
+func (b *Builtin) CallRows(args []types.Datum) (RowIter, error) { return b.CallRowsIn(args, nil) }
+
+// CallRowsIn is CallRows under the session's TimeZone.
+func (b *Builtin) CallRowsIn(args []types.Datum, loc *time.Location) (RowIter, error) {
+	if b.Rows == nil {
+		return nil, errf(CodeNotSupported, "function %s() does not return a set", b.Name)
+	}
+	coerced, null, err := b.coerceArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	if null {
+		return rowsOf(nil), nil
+	}
+	if b.ZRows != nil && loc != nil && loc != time.UTC {
+		return b.ZRows(coerced, loc)
+	}
+	return b.Rows(coerced)
+}
+
+// IsSetReturning reports whether the builtin yields rows (Rows) rather
+// than a value.
+func (b *Builtin) IsSetReturning() bool { return b.Rows != nil }
+
+// ColumnFamilies are a set-returning builtin's column families given
+// the argument families: the result family first, then ColFams.
+func (b *Builtin) ColumnFamilies(args []types.Family) []types.Family {
+	return append([]types.Family{b.ResultFamily(args)}, b.ColFams...)
+}
+
+// coerceArgs checks the arity and coerces the arguments to the declared
+// families; null reports a NULL argument to a strict function.
+func (b *Builtin) coerceArgs(args []types.Datum) (coerced []types.Datum, null bool, err error) {
+	if !b.ArityOK(len(args)) {
+		return nil, false, errf(CodeUndefined, "%s() takes %s argument(s), got %d", b.Name, b.ArityText(), len(args))
+	}
+	coerced = make([]types.Datum, len(args))
 	for i, a := range args {
 		if a.Null {
 			if !b.NotStrict {
-				return types.DNull, nil
+				return nil, true, nil
 			}
 			coerced[i] = a
 			continue
@@ -213,11 +307,11 @@ func (b *Builtin) Call(args []types.Datum) (types.Datum, error) {
 		}
 		c, err := a.Coerce(want)
 		if err != nil {
-			return types.Datum{}, errf(CodeUndefined, "function %s(%s) does not exist: argument %d is %s, want %s", b.Name, familiesText(args), i+1, a.Fam, want)
+			return nil, false, errf(CodeUndefined, "function %s(%s) does not exist: argument %d is %s, want %s", b.Name, familiesText(args), i+1, a.Fam, want)
 		}
 		coerced[i] = c
 	}
-	return b.Fn(coerced)
+	return coerced, false, nil
 }
 
 func familiesText(args []types.Datum) string {
@@ -249,10 +343,27 @@ func (b *Builtin) Signature() string {
 		parts = append(parts, "...")
 	}
 	ret := "any"
-	if b.Ret != Any {
+	switch {
+	case b.RetOf != nil && b.Rows != nil:
+		ret = "the type of its bounds"
+	case b.Ret != Any:
 		ret = strings.ToLower(b.Ret.String())
-	} else if b.SameAsArg < len(b.Args) {
+	case b.SameAsArg < len(b.Args):
 		ret = "the type of argument " + fmt.Sprint(b.SameAsArg+1)
+	}
+	if b.Rows != nil {
+		if len(b.Columns) > 1 {
+			cols := make([]string, len(b.Columns))
+			for i, c := range b.Columns {
+				f := b.Ret
+				if i > 0 {
+					f = b.ColFams[i-1]
+				}
+				cols[i] = c + " " + strings.ToLower(f.String())
+			}
+			ret = "(" + strings.Join(cols, ", ") + ")"
+		}
+		ret = "setof " + ret
 	}
 	return fmt.Sprintf("%s(%s) → %s", b.Name, strings.Join(parts, ", "), ret)
 }

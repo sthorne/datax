@@ -41,6 +41,8 @@ func formatExpr(b *strings.Builder, e Expr) {
 			formatExpr(b, a)
 		}
 		b.WriteString(")")
+	case e.Agg != nil:
+		formatAgg(b, *e.Agg)
 	case e.Column != "":
 		b.WriteString(e.Column)
 	case e.Param > 0:
@@ -59,6 +61,28 @@ func formatExpr(b *strings.Builder, e Expr) {
 	if e.Cast != "" {
 		b.WriteString("::" + e.Cast)
 	}
+}
+
+// formatAgg renders an aggregate call's name and arguments (a FILTER or
+// WITHIN GROUP clause is not rendered).
+func formatAgg(b *strings.Builder, se SelectExpr) {
+	b.WriteString(strings.ToLower(se.Agg) + "(")
+	if se.AggDistinct {
+		b.WriteString("DISTINCT ")
+	}
+	switch {
+	case se.AggStar:
+		b.WriteString("*")
+	case se.AggCol != "":
+		b.WriteString(se.AggCol)
+	case se.AggArg != nil:
+		formatExpr(b, *se.AggArg)
+	}
+	for _, a := range se.AggArgs {
+		b.WriteString(", ")
+		formatExpr(b, a)
+	}
+	b.WriteString(")")
 }
 
 // FormatLiteral renders a datum as a SQL literal.
