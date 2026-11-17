@@ -87,9 +87,9 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 func aggFamily(se parser.SelectExpr, colType func(name string) (types.Family, bool)) types.Family {
 	sp := aggSpec{fn: se.Agg}
 	switch {
-	case len(se.AggOrder) == 1 && se.AggOrder[0].Expr != nil:
+	case se.AggWithinGroup && len(se.AggOrder) == 1 && se.AggOrder[0].Expr != nil:
 		sp.argType = exprFamily(*se.AggOrder[0].Expr, colType)
-	case len(se.AggOrder) == 1:
+	case se.AggWithinGroup && len(se.AggOrder) == 1:
 		sp.argType = exprFamily(parser.Expr{Column: se.AggOrder[0].Column}, colType)
 	case se.AggCol != "":
 		sp.argType = exprFamily(parser.Expr{Column: se.AggCol}, colType)

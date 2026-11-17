@@ -918,10 +918,22 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
   `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
   `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
-  `json[b]_agg`, `json[b]_object_agg` — over a column or an expression
-  (`SUM(qty * price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER
-  (WHERE ...)`, whole-table or per `GROUP BY` group, including over
-  joins. The select list, `HAVING` and `ORDER BY` take any expression
+  `mode() WITHIN GROUP (ORDER BY x)`, `json[b]_agg`,
+  `json[b]_object_agg` — over a column or an expression (`SUM(qty *
+  price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER (WHERE
+  ...)`, whole-table or per `GROUP BY` group, including over joins. An
+  `ORDER BY` among the arguments sets the order an aggregate takes its
+  input in — `string_agg(name, ', ' ORDER BY created_at DESC)`,
+  `array_agg(x ORDER BY y NULLS FIRST, id)`, `jsonb_agg(row_data ORDER
+  BY pos)` — by any expression over the input rows, with `ASC` /
+  `DESC` and `NULLS FIRST | LAST` (NULLs last ascending, first
+  descending, by default); a number there is a constant, not a
+  position. With `DISTINCT`, every `ORDER BY` expression must be an
+  argument (`42P10` otherwise), and the input is sorted on the
+  arguments as in PostgreSQL, so `array_agg(DISTINCT x)` lists `x`
+  ascending, NULL last. `jsonb` values have no order in datax: ordering
+  an aggregate's input by one is refused (`0A000`), and `DISTINCT` over
+  one keeps the input order. The select list, `HAVING` and `ORDER BY` take any expression
   over aggregate calls and grouping columns: arithmetic (`SUM(a) /
   COUNT(*)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`), function
   calls (`ROUND(AVG(x), 2)`, `COALESCE(MAX(x), 0)`), `CASE`, casts and
@@ -1003,7 +1015,8 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   DESC)` works on a grouped query) and before `DISTINCT`, `ORDER BY`
   and `LIMIT`; a window aggregate is evaluated frame by frame, so a
   wide `ROWS` frame over a large partition costs its width. `DISTINCT`,
-  `FILTER` and `WITHIN GROUP` are not accepted on a window call.
+  an `ORDER BY` among the arguments and `WITHIN GROUP` are refused on
+  a window call (`0A000`), as in PostgreSQL; `FILTER` is too.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as

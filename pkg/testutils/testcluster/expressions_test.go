@@ -525,7 +525,7 @@ func TestExpressionsJSONAndAggregates(t *testing.T) {
 	check(`SELECT id, tags -> 'n' FROM o WHERE (tags ->> 'n')::int > 2 ORDER BY id`, "3|3;4|4")
 	check(`SELECT c.country, count(*), sum(o.qty * 10), string_agg(o.city || ':' || o.id::text, ' ') FILTER (WHERE o.ok) FROM o JOIN c ON o.city = c.city GROUP BY c.country ORDER BY c.country`, "IT|2|20|rome:4;NO|3|60|oslo:1 oslo:3")
 	check(`SELECT c.country FROM o JOIN c ON o.city = c.city GROUP BY c.country HAVING bool_or(o.tags @> '{"vip": true}') ORDER BY c.country`, "IT;NO")
-	if _, serr := trySQL(ctx, s, `SELECT percentile_cont(0.5) FROM o`); serr == nil || serr.Code != sql.CodeSyntaxError {
+	if _, serr := trySQL(ctx, s, `SELECT percentile_cont(0.5) FROM o`); serr == nil || serr.Code != sql.CodeUndefinedFunction {
 		t.Errorf("percentile without WITHIN GROUP: %v", serr)
 	}
 	if _, serr := trySQL(ctx, s, `SELECT sum(city) FROM o`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {

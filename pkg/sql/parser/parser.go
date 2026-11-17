@@ -3221,20 +3221,8 @@ func (p *parser) parseOrderTerms(exprs []SelectExpr, exprsKnown bool) ([]OrderCo
 				oc = OrderCol{Expr: &e}
 			}
 		}
-		if p.consumeKeyword("DESC") {
-			oc.Desc = true
-		} else {
-			p.consumeKeyword("ASC")
-		}
-		if p.consumeIdentWord("nulls") {
-			switch {
-			case p.consumeIdentWord("first"):
-				oc.Nulls = "first"
-			case p.consumeIdentWord("last"):
-				oc.Nulls = "last"
-			default:
-				return nil, p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
-			}
+		if err := p.parseSortDirection(&oc); err != nil {
+			return nil, err
 		}
 		out = append(out, oc)
 		if !p.consumeOp(",") {
@@ -3846,6 +3834,7 @@ var windowNames = map[string]bool{
 }
 
 var aggNames = map[string]bool{
+	"mode":  true,
 	"count": true, "sum": true, "avg": true, "min": true, "max": true,
 	"string_agg": true, "array_agg": true, "bool_and": true, "bool_or": true, "every": true,
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "variance": true, "var_samp": true, "var_pop": true,
@@ -3854,8 +3843,9 @@ var aggNames = map[string]bool{
 }
 
 // parseAggExpr parses an aggregate call when the next tokens form one:
-// name([DISTINCT] * | expr [, expr ...]) [WITHIN GROUP (ORDER BY expr
-// [ASC | DESC])] [FILTER (WHERE cond)]; ok=false otherwise.
+// name([DISTINCT] * | expr [, expr ...] [ORDER BY terms]) [WITHIN GROUP
+// (ORDER BY terms)] [FILTER (WHERE cond)] [OVER window]; ok=false
+// otherwise.
 func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 	t := p.peek()
 	if t.kind != tkIdent || (!aggNames[t.text] && !windowNames[t.text]) {
@@ -3870,8 +3860,9 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		se.AggDistinct = true
 	}
 	if nt := p.peek(); nt.kind == tkOp && nt.text == ")" {
-		// row_number(), rank(), ...: no arguments.
-		if !windowNames[t.text] {
+		// row_number(), rank(), ..., mode() WITHIN GROUP (...): no
+		// arguments.
+		if !windowNames[t.text] && t.text != "mode" {
 			return se, false, p.errf("%s() requires an argument", se.Agg)
 		}
 	} else if p.consumeOp("*") {
@@ -3899,11 +3890,28 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 			}
 			se.AggArgs = append(se.AggArgs, a)
 		}
+		if p.consumeKeyword("ORDER") {
+			// The aggregate's input order: agg(args ORDER BY terms).
+			if err := p.expectKeyword("BY"); err != nil {
+				return se, false, err
+			}
+			order, err := p.parseAggOrderTerms()
+			if err != nil {
+				return se, false, err
+			}
+			se.AggOrder = order
+		}
 	}
 	if err := p.expectOp(")"); err != nil {
 		return se, false, err
 	}
 	if p.peekIdentSeq("within", "group") {
+		if len(se.AggOrder) > 0 {
+			return se, false, p.errf("cannot use multiple ORDER BY clauses with WITHIN GROUP")
+		}
+		if se.AggDistinct {
+			return se, false, p.errf("cannot use DISTINCT with WITHIN GROUP")
+		}
 		p.i += 2
 		if err := p.expectOp("("); err != nil {
 			return se, false, err
@@ -3914,23 +3922,19 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		if err := p.expectKeyword("BY"); err != nil {
 			return se, false, err
 		}
-		e, err := p.parseAddExpr()
+		order, err := p.parseAggOrderTerms()
 		if err != nil {
 			return se, false, err
-		}
-		oc := OrderCol{Expr: &e}
-		if isPlainColumn(e) {
-			oc.Column, oc.Expr = e.Column, nil
-		}
-		if p.consumeKeyword("DESC") {
-			oc.Desc = true
-		} else {
-			p.consumeKeyword("ASC")
 		}
 		if err := p.expectOp(")"); err != nil {
 			return se, false, err
 		}
-		se.AggOrder = []OrderCol{oc}
+		for i, oc := range order {
+			if isPlainColumn(*oc.Expr) {
+				order[i].Column, order[i].Expr = oc.Expr.Column, nil
+			}
+		}
+		se.AggOrder, se.AggWithinGroup = order, true
 	}
 	if p.consumeIdentWord("filter") {
 		if err := p.expectOp("("); err != nil {
@@ -3962,6 +3966,49 @@ func (p *parser) parseAggExpr() (SelectExpr, bool, error) {
 		return se, false, p.errf("%s() requires an OVER clause", se.Agg)
 	}
 	return se, true, nil
+}
+
+// parseAggOrderTerms parses the ORDER BY terms of an aggregate call
+// (after BY): expressions over the aggregate's input rows, each with
+// [ASC | DESC] [NULLS FIRST | LAST]. Unlike a query's ORDER BY, a number
+// is a constant, not an output position (PostgreSQL's SQL99 rule).
+func (p *parser) parseAggOrderTerms() ([]OrderCol, error) {
+	var out []OrderCol
+	for {
+		e, err := p.parseValueOrBool()
+		if err != nil {
+			return nil, err
+		}
+		oc := OrderCol{Expr: &e}
+		if err := p.parseSortDirection(&oc); err != nil {
+			return nil, err
+		}
+		out = append(out, oc)
+		if !p.consumeOp(",") {
+			return out, nil
+		}
+	}
+}
+
+// parseSortDirection parses an ORDER BY term's [ASC | DESC] [NULLS
+// FIRST | LAST].
+func (p *parser) parseSortDirection(oc *OrderCol) error {
+	if p.consumeKeyword("DESC") {
+		oc.Desc = true
+	} else {
+		p.consumeKeyword("ASC")
+	}
+	if p.consumeIdentWord("nulls") {
+		switch {
+		case p.consumeIdentWord("first"):
+			oc.Nulls = "first"
+		case p.consumeIdentWord("last"):
+			oc.Nulls = "last"
+		default:
+			return p.errf("expected FIRST or LAST after NULLS, found %q", p.peek().text)
+		}
+	}
+	return nil
 }
 
 // parseWindowSpec parses what follows OVER: a window name, or

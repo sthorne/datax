@@ -517,16 +517,20 @@ type SelectExpr struct {
 	// AggStar marks COUNT(*); AggCol names a plain column argument, else
 	// AggArg is the argument expression. AggArgs are further arguments
 	// (string_agg's separator, jsonb_object_agg's value); AggDistinct
-	// marks DISTINCT; AggFilter is FILTER (WHERE ...); AggOrder is WITHIN
-	// GROUP (ORDER BY ...) for the ordered-set aggregates.
-	Agg         string
-	AggStar     bool
-	AggCol      string
-	AggArg      *Expr
-	AggArgs     []Expr
-	AggDistinct bool
-	AggFilter   []Comparison
-	AggOrder    []OrderCol
+	// marks DISTINCT; AggFilter is FILTER (WHERE ...). AggOrder is the
+	// aggregate's ORDER BY: written inside the argument list
+	// (string_agg(b, ',' ORDER BY id)), the order the aggregate consumes
+	// its input in, or, with AggWithinGroup, WITHIN GROUP (ORDER BY ...)
+	// for the ordered-set aggregates (percentile_cont, mode).
+	Agg            string
+	AggStar        bool
+	AggCol         string
+	AggArg         *Expr
+	AggArgs        []Expr
+	AggDistinct    bool
+	AggFilter      []Comparison
+	AggOrder       []OrderCol
+	AggWithinGroup bool
 	// Window makes the call a window function: an aggregate computed
 	// over each row's frame, or one of the window-only functions
 	// (ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST, NTILE, LAG,

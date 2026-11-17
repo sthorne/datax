@@ -86,8 +86,7 @@ syntax error or `0A000` feature not supported):
   subscript out of range is NULL as in PostgreSQL; `array_agg` over an
   untyped argument yields `text[]`; `unnest` runs in `FROM` (laterally
   too: `FROM t, unnest(t.tags) AS tag`) or in a FROM-less select list
-  (not beside a table's columns), and an aggregate call takes no inner
-  `ORDER BY`.
+  (not beside a table's columns).
 - **Intervals** compare, group and index by PostgreSQL's rule (`'30
   days' = '1 month'`), but a primary key or unique index keeps `'30
   days'` and `'1 month'` as distinct keys (the stored triple is part of
