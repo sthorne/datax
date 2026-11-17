@@ -97,6 +97,7 @@ CREATE TABLE t (
   PRIMARY KEY (a)                -- or: a INT8 PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS t (...);
+CREATE TABLE users_roles (user_id INT8 REFERENCES users, role_id INT8 REFERENCES roles);  -- no key: a hidden rowid (below)
 DROP TABLE [IF EXISTS] t;       -- space reclaimed after the table's GC window (gc_ttl, else the node's 25h)
 
 CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] by_b ON t (b);   -- online: no write outage
@@ -342,11 +343,11 @@ renames them positionally) and, unless `WITH NO DATA`, fills it: the
 query runs once, at one timestamp, and its rows stream in through the
 `COPY` chunk path, a bounded transaction per chunk — so the statement
 never holds one transaction open over a million rows and cannot run
-inside a transaction block (`25001`). A table needs a primary key, so
-a `PRIMARY KEY (cols)` clause may be written among the names
-(CockroachDB's form); without one the table gets a hidden `rowid`
-column (`unique_rowid()`, invisible to `SELECT *`) — and duplicate
-query rows are all kept. Parameters (`$1`) and views in the query
+inside a transaction block (`25001`). A `PRIMARY KEY (cols)` clause
+may be written among the names (CockroachDB's form); without one the
+table gets a hidden `rowid` key like any table declared without one
+([below](#tables-without-a-primary-key)) — and duplicate query rows
+are all kept. Parameters (`$1`) and views in the query
 work. `SELECT ... INTO t` is refused with a pointer here.
 
 **`LIKE source`** inside a column list copies the source's columns
@@ -357,7 +358,9 @@ CONSTRAINTS` the `CHECK` constraints, `INCLUDING INDEXES` the `UNIQUE`
 constraints and secondary indexes (same names), `INCLUDING ALL` every
 one; `EXCLUDING` reverses an option. The primary key is copied whenever
 the statement declares none (PostgreSQL leaves it to `INCLUDING
-INDEXES`; here a table needs one). Foreign keys are never copied.
+INDEXES`); a source keyed by a hidden `rowid` (one declared without a key)
+gives a copy with its own hidden `rowid`. Foreign keys are never
+copied.
 
 **`ALTER COLUMN c TYPE t`** rewrites the column online, in the shape of
 `CREATE INDEX`: a hidden shadow column of the new type joins the
@@ -454,6 +457,50 @@ waiting for size- and load-based splits to catch up.
   v20. On a cluster that has not finalized it, `SPLIT AT` splits as it
   always did — the boundary is not held — and the other two are refused
   with `0A000`.
+
+### Tables without a primary key
+
+A table created without a `PRIMARY KEY` — a join table, an imported
+schema, `CREATE TABLE ... AS` — is keyed by a hidden `INT8 NOT NULL`
+column named `rowid` (`rowid_1`, `rowid_2`, ... when the table has a
+column of that name), filled by `unique_rowid()`. Rows may repeat, as
+in PostgreSQL: two identical rows are two rows, and a `DELETE` or
+`UPDATE` whose `WHERE` matches both changes both.
+
+```sql
+CREATE TABLE users_roles (user_id INT8 REFERENCES users, role_id INT8 REFERENCES roles);
+INSERT INTO users_roles VALUES (1, 10), (1, 10);   -- both kept
+SELECT * FROM users_roles;                          -- user_id, role_id: no rowid
+SELECT rowid, user_id FROM users_roles;             -- by name it is there
+```
+
+The column is left out of `SELECT *`, `RETURNING *`, `COPY ... FROM`
+without a column list, `SHOW CREATE TABLE`, `information_schema`,
+`pg_attribute` (`attnum > 0`) and psql's `\d`; the catalogs show no
+primary key for the table. It cannot be inserted, updated, renamed or
+dropped, and `ADD COLUMN rowid` on such a table is refused (`42710`):
+the name is taken. Every other statement works as on a keyed table —
+`INSERT` (multi-row, `INSERT ... SELECT`), `UPDATE`, `DELETE`, `COPY`,
+`TRUNCATE`, secondary and unique indexes, `CHECK` / `NOT NULL`,
+foreign keys from the table, `ADD` / `DROP COLUMN`, `LIKE`, backup and
+restore.
+
+- *Row ids.* `unique_rowid()` is 48 bits of microsecond time above
+  15 bits of node ID: unique across the cluster with no coordination,
+  ascending on each node, so inserts from several nodes land in
+  different places. Two nodes never share a node ID; a node whose
+  clock steps back across a restart could in principle repeat an id,
+  which the insert then refuses (`23505`) rather than overwrite a row.
+- *Foreign keys to the table* need a `UNIQUE` constraint on the
+  referenced columns, as in PostgreSQL: `REFERENCES t` is refused with
+  `42830` (there is no primary key for referenced table), and so is
+  `REFERENCES t (a)` without a unique constraint on `a`.
+- *`ALTER TABLE ... ADD PRIMARY KEY`* is refused (`0A000`): the new key
+  would re-encode every row and index entry. Create a new table with
+  the key and copy the rows (`INSERT INTO t2 SELECT * FROM t`). On a
+  table that has a primary key it is `42P16`, as in PostgreSQL.
+- *Time-series tables* still declare their key: the timestamp must
+  close it.
 
 ### Defaults, SERIAL, identity columns and sequences
 

@@ -220,9 +220,11 @@ func init() {
 			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(2), i64(TableOID(t)), i64(0),
 				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
 				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(t.RowSecurity), boolean(t.ForceRowSecurity), boolean(true), str("d"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(t.Comment)})
-			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
-				i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
-				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
+			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
+				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
+					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
+					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
+			}
 			for _, idx := range t.Indexes {
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(IndexMethodOID(&idx)), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
@@ -403,10 +405,12 @@ func init() {
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		for _, t := range env.currentTables() {
-			pk := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
-			rows = append(rows, Row{i64(IndexOID(t, 1)), i64(TableOID(t)), i64(int64(len(visiblePK(t)))), i64(int64(len(visiblePK(t)))),
-				boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(true), boolean(true),
-				boolean(false), str(attnums(t, visiblePK(t))), null(), str(IndexDef(t, pk)), null()})
+			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
+				pk := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
+				rows = append(rows, Row{i64(IndexOID(t, 1)), i64(TableOID(t)), i64(int64(len(visiblePK(t)))), i64(int64(len(visiblePK(t)))),
+					boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(false), boolean(true), boolean(true), boolean(true),
+					boolean(false), str(attnums(t, visiblePK(t))), null(), str(IndexDef(t, pk)), null()})
+			}
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), i64(TableOID(t)), i64(int64(len(idx.ColumnIDs))), i64(int64(len(idx.ColumnIDs))),
@@ -744,8 +748,10 @@ func init() {
 			return "r"
 		}
 		for _, t := range env.currentTables() {
-			rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
-				i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t)), textOrNull(t.PKComment)})
+			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
+				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
+					i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t)), textOrNull(t.PKComment)})
+			}
 			for i := range t.Indexes {
 				idx := &t.Indexes[i]
 				if !idx.Unique {
@@ -946,8 +952,10 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, t := range env.currentTables() {
-				pkIdx := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
-				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(pkIdx.Name), null(), str(IndexDef(t, pkIdx))})
+				if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
+					pkIdx := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
+					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(pkIdx.Name), null(), str(IndexDef(t, pkIdx))})
+				}
 				for i := range t.Indexes {
 					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(t.Indexes[i].Name), null(), str(IndexDef(t, &t.Indexes[i]))})
 				}
@@ -1106,7 +1114,9 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, t := range env.currentTables() {
-				rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name + "_pkey"), str(env.Database), str(catalog.PublicSchema), str(t.Name), str("PRIMARY KEY"), str("NO"), str("NO")})
+				if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
+					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name + "_pkey"), str(env.Database), str(catalog.PublicSchema), str(t.Name), str("PRIMARY KEY"), str("NO"), str("NO")})
+				}
 				for _, idx := range t.Indexes {
 					if idx.Unique {
 						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(idx.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str("UNIQUE"), str("NO"), str("NO")})
@@ -1301,6 +1311,13 @@ func uniqueConstraintNameFor(t *catalog.TableDescriptor, cols []catalog.ColumnID
 		}
 	}
 	return ""
+}
+
+// hasVisiblePK reports whether the table has a primary key the catalogs
+// show: not one of a hidden rowid alone (a table created without a
+// PRIMARY KEY, issue #354), which PostgreSQL would not have.
+func hasVisiblePK(t *catalog.TableDescriptor) bool {
+	return len(visiblePK(t)) > 0
 }
 
 func visiblePK(t *catalog.TableDescriptor) []catalog.ColumnID {

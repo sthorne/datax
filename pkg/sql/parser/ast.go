@@ -165,7 +165,7 @@ type ColumnDef struct {
 // action] [ON UPDATE action]. Name is "" when the statement gave none.
 type ConstraintDef struct {
 	Name    string
-	Kind    string // "unique", "check", "foreign"
+	Kind    string // "unique", "check", "foreign"; "primary" only from ALTER TABLE ADD PRIMARY KEY, which is refused
 	Columns []string
 	// Check is the CHECK expression's source text; CheckFails the lowered
 	// negation (the row violates the constraint when it holds), for
