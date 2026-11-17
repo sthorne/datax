@@ -1610,8 +1610,9 @@ state or the internode protocol does, and an entry below says so.
   non-array is appended or prepended, and two non-arrays make a two-element
   array. An untyped literal or parameter beside a jsonb is read as jsonb, so
   `UPDATE t SET j = j || '{"k":1}'` stores the merged document; the result
-  describes as jsonb. `json || json` on `::json` values and `jsonb ||
-  <non-text scalar>` are refused with `42883`.
+  describes as jsonb. `json || json` merges the same way (datax stores
+  `json` as `jsonb`; PostgreSQL refuses it), and `jsonb || <non-text
+  scalar>` is refused with `42883`.
 - **Casts to a type datax does not have fail** (#343) with PostgreSQL's
   `42704 type "..." does not exist`: `'a'::citext`, `::money`, `::inet`,
   `::hstore`, `::xml`, `::pg_lsn`, range types and any unknown name, in
