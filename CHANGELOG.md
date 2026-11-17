@@ -1674,6 +1674,14 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A statement no longer plans against a schema a drain has written
+  off.** A gateway's lease renewal published the new version, and a
+  schema change's drain returned on seeing it, a moment before the
+  gateway's cache held the new descriptor; a statement starting on that
+  gateway in between was handed the old one (a missing new column, or a
+  write that could commit after the drain). Until the new entry is
+  installed, such a statement now reads the descriptor in its own
+  transaction.
 - **`UPDATE t SET a = b, b = a` swaps** (#355): every `SET` of a row reads
   the row as it was before the statement, as in PostgreSQL. Before, each
   value was written before the next was computed, so both columns took
