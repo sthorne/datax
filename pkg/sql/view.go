@@ -242,9 +242,14 @@ func stmtTables(stmt parser.Statement) []string {
 				expr(*m.FuncTable)
 			}
 			for _, j := range m.Joins {
-				add(j.Table)
 				if j.Derived != nil {
+					// A joined subquery's Table is its alias.
 					sel(j.Derived)
+					continue
+				}
+				add(j.Table)
+				if j.FuncTable != nil {
+					expr(*j.FuncTable)
 				}
 			}
 			exprs(m.Exprs)

@@ -82,9 +82,10 @@ syntax error or `0A000` feature not supported):
   multidimensional binary parameter is refused), cannot be indexed or
   be part of a key, have no slices (`a[1:2]`) or `JSONB[]`, and a
   subscript out of range is NULL as in PostgreSQL; `array_agg` over an
-  untyped argument yields `text[]`; `unnest` runs in `FROM` or in a
-  FROM-less select list (not beside a table's columns, and not
-  laterally), and an aggregate call takes no inner `ORDER BY`.
+  untyped argument yields `text[]`; `unnest` runs in `FROM` (laterally
+  too: `FROM t, unnest(t.tags) AS tag`) or in a FROM-less select list
+  (not beside a table's columns), and an aggregate call takes no inner
+  `ORDER BY`.
 - **Intervals** compare, group and index by PostgreSQL's rule (`'30
   days' = '1 month'`), but a primary key or unique index keeps `'30
   days'` and `'1 month'` as distinct keys (the stored triple is part of
@@ -243,14 +244,22 @@ syntax error or `0A000` feature not supported):
 - **Join order is execution order until statistics exist** — with
   statistics for every joined table (`ANALYZE` or the background
   sampler), INNER joins are cost-reordered greedily; LEFT joins,
-  self-joins, cross joins and joins carrying ON filters or correlated
-  subqueries always run in the written order, so put the most selective
-  table first there. `ON` must include an equality against an earlier
-  table (`ON true` is not accepted; use `CROSS JOIN` or `FROM a, b`).
+  self-joins, cross joins and joins carrying ON filters, correlated
+  subqueries or `LATERAL` members always run in the written order, so
+  put the most selective table first there. `ON` must include an
+  equality against an earlier table (`ON true` is not accepted; use
+  `CROSS JOIN` or `FROM a, b`), except on a `LATERAL` member, whose `ON`
+  may be any condition.
 - **Correlated subqueries are nested loops.** Each is re-run per row of
   the enclosing query (memoized on the referenced values), so a
   correlated subquery over a large outer table costs outer rows × inner
-  query. Prefer a `JOIN` when the outer side is big.
+  query. Prefer a `JOIN` when the outer side is big. A `LATERAL`
+  subquery or a table function reading another `FROM` member's columns
+  is the same nested loop. A lateral subquery must be a plain select
+  (not over a derived table or a set operation of its own) and cannot
+  read the outer row in its `ORDER BY`, `GROUP BY` or aggregate
+  arguments (`0A000`); `RIGHT` / `FULL JOIN LATERAL` is refused
+  (`42P10`) even when the subquery reads nothing to its left.
 - **Casts are absorbed.** `x::type` and `CAST(x AS type)` parse and do
   nothing (types come from the schema); the one exception is
   `'name'::regclass`, which resolves a table name to its OID. There is no

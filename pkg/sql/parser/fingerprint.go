@@ -260,6 +260,9 @@ func (f *fingerprinter) join(j JoinClause) {
 		f.kw("NATURAL")
 	}
 	f.kw("JOIN")
+	if j.Lateral {
+		f.kw("LATERAL")
+	}
 	if j.Table != "" {
 		f.table(j.Table)
 		f.kw(strings.ToLower(j.Table))

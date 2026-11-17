@@ -119,6 +119,20 @@ func (p *parser) parseFuncTable() (*Expr, bool, error) {
 	return &e, true, nil
 }
 
+// consumeLateral consumes LATERAL ahead of a FROM-list subquery or
+// table function call (a table named lateral is left alone).
+func (p *parser) consumeLateral() bool {
+	if !p.peekIdentSeq("lateral") || p.i+1 >= len(p.toks) {
+		return false
+	}
+	next := p.toks[p.i+1]
+	if next.kind == tkOp && next.text == "(" || next.kind == tkIdent && p.i+2 < len(p.toks) && p.toks[p.i+2].kind == tkOp && (p.toks[p.i+2].text == "(" || p.toks[p.i+2].text == ".") {
+		p.i++
+		return true
+	}
+	return false
+}
+
 // parseFuncTableAlias parses what follows a FROM-clause table function
 // call: [WITH ORDINALITY] [[AS] alias [(column, ...)]]. The alias
 // defaults to the function's name.
@@ -2626,7 +2640,10 @@ func (p *parser) parseSelect() (Statement, error) {
 		return nil, p.errf("SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT")
 	}
 	if p.consumeKeyword("FROM") {
-		// FROM (SELECT ...) AS alias — a derived table.
+		// FROM (SELECT ...) AS alias — a derived table. LATERAL is
+		// accepted ahead of the first member, which has nothing to its
+		// left to read.
+		p.consumeLateral()
 		derived := false
 		if sub, ok, err := p.parseSubquery(); err != nil {
 			return nil, err
@@ -2676,6 +2693,7 @@ func (p *parser) parseSelect() (Statement, error) {
 				return nil, p.errf("too many joined tables (limit %d)", maxJoinTables)
 			}
 			jc := JoinClause{Left: left, Cross: cross, Right: jk.right, Full: jk.full, Natural: jk.natural}
+			jc.Lateral = p.consumeLateral()
 			if fe, ok, err := p.parseFuncTable(); err != nil {
 				return nil, err
 			} else if ok {
@@ -2694,6 +2712,8 @@ func (p *parser) parseSelect() (Statement, error) {
 					return nil, p.errf("subquery in FROM must have an alias")
 				}
 				jc.Table = jc.Alias
+			} else if jc.Lateral {
+				return nil, p.errf("LATERAL must be followed by a subquery or a function call, found %q", p.peek().text)
 			} else {
 				jt, err := p.parseTableName()
 				if err != nil {
@@ -2752,7 +2772,9 @@ func (p *parser) parseSelect() (Statement, error) {
 				}
 				jc.Filter = append(jc.Filter, c)
 			}
-			if len(jc.On) == 0 {
+			// A lateral member's ON may be any condition (LEFT JOIN
+			// LATERAL ... ON true): it is evaluated per candidate row.
+			if len(jc.On) == 0 && !jc.Lateral {
 				return nil, p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
 			}
 			sel.Joins = append(sel.Joins, jc)

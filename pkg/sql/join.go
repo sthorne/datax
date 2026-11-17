@@ -662,7 +662,9 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 		}
 		stats[i] = st
 	}
-	if haveAll && !noReorder {
+	// A lateral side reads the sides to its left: the written order
+	// stands.
+	if haveAll && !noReorder && !s.anyLateralSide(sides) {
 		if clone, order, changed, ok := reorderJoins(t, sides, stats); ok && changed {
 			jq.sel, jq.reordered = clone, true
 			permuted := make([]joinSide, len(sides))
@@ -728,6 +730,14 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	// One left-deep level at a time: every partial row either fans out
 	// over that side's matches, NULL-extends (LEFT), or drops (INNER).
 	for k := 1; k < len(sides); k++ {
+		if lat := s.lateralAt(sides[k].desc); lat != nil {
+			// A lateral side: its query runs per partial row.
+			if joined, err = s.joinLateral(ctx, txn, sides, k, lat, ons[k-1], t.Joins[k-1].Filter, joined, params); err != nil {
+				return nil, err
+			}
+			s.note("join level %d (%s, lateral %s): %d rows", k, sides[k].alias, levelKindName(sides, t, keys, k), len(joined))
+			continue
+		}
 		var next []joinedRow
 		var matchedKeys map[string]bool // RIGHT/FULL: side k's rows that found a partner
 		if sides[k].right {
@@ -1070,6 +1080,15 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 	var b strings.Builder
 	fmt.Fprintf(&b, "nested loop %s join; outer (%s): %s%s", kind, sides[0].alias, basePlan.String(), estimate(basePlan))
 	for k := 1; k < len(sides); k++ {
+		if s.lateralAt(sides[k].desc) != nil {
+			const how = "subquery run with the row's values (memoized on them)"
+			if k == 1 {
+				fmt.Fprintf(&b, "; lateral (%s) per outer row: %s", sides[k].alias, how)
+			} else {
+				fmt.Fprintf(&b, "; then lateral %s (%s) per row: %s", levelKindName(sides, t, keys, k), sides[k].alias, how)
+			}
+			continue
+		}
 		// Placeholder non-NULL datums of the join-key columns' own types
 		// give the planner the same shape the per-row lookups will use.
 		synth := make([]parser.Comparison, 0, len(ons[k-1])+len(keys[k-1].pairs)+len(keys[k-1].consts))

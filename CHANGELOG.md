@@ -709,6 +709,24 @@ state or the internode protocol does, and an entry below says so.
   statements and roles it applies to, its `USING` and `WITH CHECK`
   expressions — and the reconstructed DDL reproduces them. `/api/schema`
   gains `row_security`, `force_row_security` and `policies` per table.
+- **`LATERAL` subqueries and table functions that read other `FROM`
+  members** (#338). `FROM t, LATERAL (SELECT ...) l`, `CROSS JOIN LATERAL`,
+  `JOIN LATERAL ... ON cond` and `LEFT JOIN LATERAL ... ON true` (a miss
+  NULL-extends) run the subquery once per row of the members to its left,
+  reading their columns: top-N per group (`FROM users u, LATERAL (SELECT *
+  FROM orders o WHERE o.user_id = u.id ORDER BY created DESC LIMIT 3) o`),
+  per-row aggregates, chained and nested laterals. A table function call in
+  `FROM` is implicitly lateral, as in PostgreSQL: `FROM t, unnest(t.tags)
+  AS tag` works (before, it was refused with `0A000`). Execution is a
+  correlated nested loop memoized on the referenced values, and works with
+  `WHERE`, `ORDER BY`, `LIMIT`, aggregates over the result, `EXPLAIN`,
+  Describe and prepared statements. A reference to a member further right
+  is `42P01`, and a `RIGHT` or `FULL JOIN LATERAL` is refused (`42P10`).
+  The lateral subquery must be a plain select (not itself over a derived
+  table or a set operation), and cannot read the outer row in its `ORDER
+  BY`, `GROUP BY` or aggregate arguments. A view may now join a subquery
+  (`CREATE VIEW v AS SELECT ... JOIN (SELECT ...) d ON ...` was refused with
+  `42P01`).
 
 ### Security
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server

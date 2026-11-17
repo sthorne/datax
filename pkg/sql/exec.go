@@ -2265,7 +2265,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// A joined derived table runs as a relation named by its alias.
 		inner, err := s.execSubSelect(ctx, txn, t.Derived, params)
 		if err != nil {
-			return nil, err
+			return nil, s.fromSubErr(ctx, txn, t.Derived, err)
 		}
 		name := strings.ToLower(t.Alias)
 		desc, err := relationDesc(name, inner.Columns, nil)

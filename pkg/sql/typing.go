@@ -51,9 +51,9 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 			fam = sessionFuncFamily(e.Func)
 		}
 	case e.Lit != nil:
-		if !e.Lit.Null {
-			fam = e.Lit.Fam
-		}
+		// A NULL carrying a family (a column's value substituted into
+		// a correlated or lateral query) is typed by it.
+		fam = e.Lit.Fam
 	case e.Column != "":
 		if colType != nil {
 			if f, ok := colType(e.Column); ok {

@@ -1049,7 +1049,8 @@ func funcTableDesc(t *parser.Select) (*catalog.TableDescriptor, error) {
 }
 
 // isLateralFunc reports whether a table function call's arguments read
-// a column, which can only be an earlier FROM member's (LATERAL).
+// a column, which can only be an earlier FROM member's (implicitly
+// LATERAL).
 func isLateralFunc(e parser.Expr) bool {
 	lateral := false
 	exprColumns(e, func(string) { lateral = true })
@@ -1064,7 +1065,10 @@ func (s *Session) execTableFunc(ctx context.Context, txn *kvclient.Txn, fe parse
 		return nil, nil, err
 	}
 	if isLateralFunc(fe) {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "table function %s cannot read columns of other FROM items (LATERAL)", fe.Func)
+		// A lateral call joined to the members to its left runs per row
+		// with their values substituted (pkg/sql/lateral.go); one still
+		// reading a column has nothing to its left that has it.
+		return nil, nil, fromRefErr(fe)
 	}
 	var rows [][]types.Datum
 	switch fe.Func {
