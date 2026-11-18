@@ -2,8 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/kvpb"
 )
 
 // TestFullTablesManifestMagic (issue #376): an incremental holding a
@@ -102,5 +106,32 @@ func TestSupersedeFullTables(t *testing.T) {
 	// The manifests the chain was opened with are not changed.
 	if len(full.Tables) != 2 || len(inc1.Tables) != 2 {
 		t.Fatal("supersedeFullTables changed the manifests it was given")
+	}
+}
+
+// TestBaseCollected: the incremental falls back to a full export of a
+// table only when the export's window opened below the GC threshold, not
+// when its own timestamp was refused (which a full export meets too) —
+// however either is wrapped. Both read as GC-threshold refusals to
+// kvpb.IsBelowGCThreshold, so that cannot be what decides.
+func TestBaseCollected(t *testing.T) {
+	baseErr := kvpb.NewErrorf("r2: export start timestamp %s is below the GC threshold %s (incremental base too old)", hts(1), hts(5))
+	own := kvpb.NewBelowGCThresholdError(base.RangeID(2), hts(3), hts(5))
+	if !baseErr.IsBelowGCThreshold() || !own.IsBelowGCThreshold() {
+		t.Fatal("both refusals should read as GC-threshold refusals")
+	}
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{baseErr, true},
+		{fmt.Errorf("export: %w", baseErr), true},
+		{own, false},
+		{fmt.Errorf("export: %w", own), false},
+		{fmt.Errorf("something else"), false},
+	} {
+		if got := baseCollected(c.err); got != c.want {
+			t.Errorf("baseCollected(%v) = %v, want %v", c.err, got, c.want)
+		}
 	}
 }

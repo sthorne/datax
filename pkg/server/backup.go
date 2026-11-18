@@ -865,8 +865,18 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 // baseCollected says an incremental's export of a table was refused
 // because the table's history since the base has been collected: the
 // export's window opens below a range's GC threshold
-// (kvserver.Replica's "incremental base too old").
+// (kvserver.Replica's "incremental base too old"). It is told apart
+// explicitly from a refusal of the export's own timestamp, which carries
+// the typed BelowGCThreshold detail and which a full export would meet
+// too. Both carry the text kvpb.IsBelowGCThreshold and
+// kvclient.IsRetryable recognize, so neither of those may decide this:
+// the export is not retried (exportSpan consults neither), and the
+// fallback must see the export's own error.
 func baseCollected(err error) bool {
+	var kerr *kvpb.Error
+	if errors.As(err, &kerr) && kerr.BelowGCThreshold != nil {
+		return false
+	}
 	return strings.Contains(err.Error(), "incremental base too old")
 }
 
