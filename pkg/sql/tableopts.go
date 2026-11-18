@@ -297,8 +297,10 @@ func (s *Session) execResetOptions(ctx context.Context, t *parser.AlterTable) (*
 // threshold of now, compact the span on every replica, and return what
 // each replica then holds. One row per replica; the tag says whether the
 // purge is complete. The work is the node's (server.Node.PurgeSpan); the
-// statement names the span and renders the report.
-func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
+// statement names the span and renders the report. With WHERE (issue
+// #375) the spans are the ones purgeWhereSpans computes, purged in turn
+// and reported as one.
+func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, *Error) {
 	if err := s.requireV21("ALTER TABLE ... PURGE"); err != nil {
 		return nil, ToSQLError(err)
 	}
@@ -316,12 +318,20 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 	}); err != nil {
 		return nil, ToSQLError(err)
 	}
-	start, end := keys.TableDataSpan(desc.ID)
-	rep, err := s.db.Purge(ctx, start, end)
+	spans := []keySpan{{}}
+	spans[0].start, spans[0].end = keys.TableDataSpan(desc.ID)
+	var notices []string
+	if t.PurgeWhere != nil {
+		var serr *Error
+		if spans, notices, serr = purgeWhereSpans(desc, t.PurgeWhere, params); serr != nil {
+			return nil, serr
+		}
+	}
+	rep, err := s.purgeSpans(ctx, spans)
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	res := &Result{Columns: purgeColumns()}
+	res := &Result{Columns: purgeColumns(), Notices: notices}
 	sort.Slice(rep.Replicas, func(i, j int) bool {
 		a, b := rep.Replicas[i], rep.Replicas[j]
 		if a.RangeID != b.RangeID {

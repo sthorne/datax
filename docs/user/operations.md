@@ -657,7 +657,14 @@ manual split is an ordinary one.
 
 `datax debug purge` is `ALTER TABLE ... PURGE`
 ([SQL guide](sql.md#gc-window-and-purge)) for an operator, and for a key
-range that is not a whole table:
+range that is not a whole table. For one tenant's or one key prefix's
+rows, prefer `ALTER TABLE t PURGE WHERE tenant = 'acme'`: it computes
+the spans from the primary key, including the matching spans of
+secondary indexes that lead with the same columns, and purges the
+indexes it cannot narrow whole, so the purged rows' old versions are
+gone from every index. A `--key`/`--end-key` purge covers exactly the
+raw span it is given and nothing else, so on its own it leaves those
+rows' index entries' history in place.
 
 ```sh
 datax debug purge --table-name app.documents
@@ -689,7 +696,15 @@ Things to know before relying on it:
   becomes the purge time: `AS OF SYSTEM TIME` before it, follower reads
   before it, a transaction that began before it, and an incremental
   backup whose base is older all fail on that span, with an error. Take
-  a full backup after a purge if you run incrementals.
+  a full backup after a purge if you run incrementals. A whole-table
+  purge does this for every row of the table; `PURGE WHERE` only for the
+  named keys and for any secondary index it had to purge whole (it
+  names those in a `NOTICE`).
+- **Its split points stay** until the merge queue folds them away, which
+  it does once the neighbouring range's own GC window has passed the
+  purge: a merged range adopts the higher threshold, so merging earlier
+  would cut off the neighbour's history. The splits are not sticky and
+  need no `UNSPLIT`.
 - **A node that is down** makes the purge incomplete, by name. When it
   restarts it applies the collection from the log (or is given a
   snapshot without the data) and serves no follower read until it has

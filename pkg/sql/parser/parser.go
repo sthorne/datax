@@ -5142,6 +5142,11 @@ func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
 		}
 	case p.consumeIdentWord("purge"):
 		at.Purge = true
+		if p.peek().kind == tkKeyword && p.peek().text == "WHERE" {
+			if err := p.parsePurgeWhere(at); err != nil {
+				return err
+			}
+		}
 	case p.consumeIdentWord("rotate"):
 		if !p.peekEncryptionKey(0) {
 			return p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
@@ -5191,6 +5196,138 @@ func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
 		return p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
 	return nil
+}
+
+// parsePurgeWhere parses the WHERE clause of ALTER TABLE ... PURGE
+// WHERE predicate (issue #375): an ordinary predicate, plus the row
+// equality (a, b) = (1, 2) as a conjunct, which it lowers to a = 1 AND
+// b = 2. Whether the predicate names a primary-key prefix or range is
+// the executor's to judge; the parser keeps the conjuncts and the text.
+func (p *parser) parsePurgeWhere(at *AlterTable) error {
+	if err := p.expectKeyword("WHERE"); err != nil {
+		return err
+	}
+	start := p.peek().pos
+	n, err := p.parsePurgeOr()
+	if err != nil {
+		return err
+	}
+	end := len(p.src)
+	if t := p.peek(); t.kind != tkEOF {
+		end = t.pos
+	}
+	conds, err := lowerBool(n, false)
+	if err != nil {
+		return p.errf("WHERE: %v", err)
+	}
+	if len(conds) == 0 {
+		return p.errf("PURGE WHERE: expected a predicate")
+	}
+	at.PurgeWhere = conds
+	at.PurgeWhereText = strings.TrimSpace(p.src[start:end])
+	return nil
+}
+
+// parsePurgeOr is parseBoolOr over parsePurgeAnd's conjunctions, so a
+// row equality may stand anywhere a conjunct may at the top level.
+func (p *parser) parsePurgeOr() (boolNode, error) {
+	n, err := p.parsePurgeAnd()
+	if err != nil || !(p.peek().kind == tkKeyword && p.peek().text == "OR") {
+		return n, err
+	}
+	node := boolNode{op: "or", kids: []boolNode{n}}
+	for p.consumeKeyword("OR") {
+		k, err := p.parsePurgeAnd()
+		if err != nil {
+			return node, err
+		}
+		node.kids = append(node.kids, k)
+	}
+	return node, nil
+}
+
+func (p *parser) parsePurgeAnd() (boolNode, error) {
+	node := boolNode{op: "and"}
+	for {
+		var k boolNode
+		var err error
+		if p.peekRowEquality() {
+			k, err = p.parseRowEquality()
+		} else {
+			k, err = p.parseBoolFactor()
+		}
+		if err != nil {
+			return node, err
+		}
+		node.kids = append(node.kids, k)
+		if !p.consumeKeyword("AND") {
+			break
+		}
+	}
+	if len(node.kids) == 1 {
+		return node.kids[0], nil
+	}
+	return node, nil
+}
+
+// peekRowEquality reports whether a row constructor of columns starts
+// here: ( ident , ...
+func (p *parser) peekRowEquality() bool {
+	if p.i+2 >= len(p.toks) {
+		return false
+	}
+	a, b, c := p.toks[p.i], p.toks[p.i+1], p.toks[p.i+2]
+	return a.kind == tkOp && a.text == "(" && b.kind == tkIdent && c.kind == tkOp && c.text == ","
+}
+
+// parseRowEquality parses (c1, c2, ...) = (v1, v2, ...) into the
+// conjunction c1 = v1 AND c2 = v2 ...
+func (p *parser) parseRowEquality() (boolNode, error) {
+	if err := p.expectOp("("); err != nil {
+		return boolNode{}, err
+	}
+	var cols []string
+	for {
+		c, err := p.expectIdent()
+		if err != nil {
+			return boolNode{}, err
+		}
+		cols = append(cols, c)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return boolNode{}, err
+	}
+	if !p.consumeOp("=") {
+		return boolNode{}, p.errf("PURGE WHERE: a row comparison must be (column, ...) = (value, ...), found %q", p.peek().text)
+	}
+	if err := p.expectOp("("); err != nil {
+		return boolNode{}, err
+	}
+	var vals []Expr
+	for {
+		v, err := p.parseAddExpr()
+		if err != nil {
+			return boolNode{}, err
+		}
+		vals = append(vals, v)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return boolNode{}, err
+	}
+	if len(vals) != len(cols) {
+		return boolNode{}, p.errf("unequal number of entries in row expressions")
+	}
+	node := boolNode{op: "and"}
+	for i, c := range cols {
+		node.kids = append(node.kids, boolNode{op: "leaf", leaf: Comparison{Column: c, Op: "=", Value: vals[i]}})
+	}
+	return node, nil
 }
 
 // parseSplitTuples parses VALUES (k, ...), (k, ...): the key tuples of

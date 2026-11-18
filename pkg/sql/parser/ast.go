@@ -870,6 +870,14 @@ type AlterTable struct {
 	// Purge is ALTER TABLE ... PURGE: collect the table's garbage now
 	// and report, replica by replica, that none is left.
 	Purge bool
+	// PurgeWhere is ALTER TABLE ... PURGE WHERE predicate (issue #375):
+	// the purge covers only the primary keys the predicate selects, which
+	// must be an equality on leading primary-key columns and optionally
+	// a range on the next one (the executor checks). A row equality
+	// (a, b) = (1, 2) arrives as a = 1 AND b = 2. PurgeWhereText is the
+	// predicate as written. Both are empty for a whole-table purge.
+	PurgeWhere     []Comparison
+	PurgeWhereText string
 	// RotateKey is ALTER TABLE ... ROTATE ENCRYPTION KEY [KEEP OLD
 	// VERSIONS]: a sealed table's key gets a new version, and a
 	// background job rewrites the rows under the older ones; RotateKeepOld

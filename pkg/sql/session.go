@@ -1092,7 +1092,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 		switch {
 		case at.Purge:
-			return s.execPurge(ctx, at)
+			return s.execPurge(ctx, at, params)
 		case at.RotateKey:
 			return s.execRotateTableKey(ctx, at)
 		}

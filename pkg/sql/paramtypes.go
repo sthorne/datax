@@ -368,6 +368,16 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 		if t.As != nil {
 			pt.selectStmt(t.As, parent, false)
 		}
+	case *parser.AlterTable:
+		// PURGE WHERE key = $1: the parameter takes the key column's
+		// type.
+		if t.PurgeWhere != nil {
+			if desc, err := pt.lookup(t.Table); err == nil {
+				pt.walk(t, tableScope(parent, desc, t.Table, ""))
+				break
+			}
+		}
+		pt.walk(stmt, parent)
 	default:
 		pt.walk(stmt, parent)
 	}
