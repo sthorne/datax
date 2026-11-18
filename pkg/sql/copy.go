@@ -118,7 +118,7 @@ func (s *Session) copyTxn(ctx context.Context, inBlock bool, name string, fn fun
 func (s *Session) failBlock() {
 	if s.state == StateOpen {
 		s.state = StateFailed
-		s.extraDDL, s.pendingWipes = nil, nil
+		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 	}
 }
 

@@ -35,7 +35,7 @@ CockroachDB row was checked on the live node or in datax's code and docs.
 | Gap | What is missing or different |
 | Today | How it fails now: the error text and SQLSTATE, or "silently different" with what happens instead |
 | Workaround | What a user can do now; "—" if nothing |
-| P | P1 breaks common applications, ORMs, drivers or tools; P2 notable; P3 niche |
+| P | P1 breaks common applications, ORMs, drivers or tools; P2 notable; P3 niche; P4 low priority by decision (Rails migration requirements) |
 | Size | Rough effort: S (days), M (one to two weeks), L (weeks), XL (a project) |
 | Src | **V** verified on a live node at `fb15d88`; **D** from datax's code or docs, not probed; **K** CockroachDB behaviour from its documentation (datax's side as V or D, said in the row) |
 | Issue | The GitHub issue, if one exists |
@@ -44,32 +44,32 @@ CockroachDB row was checked on the live node or in datax's code and docs.
 
 Open gaps by area and priority.
 
-| Area | P1 | P2 | P3 | Total |
-|---|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 0 | 17 | 9 | 26 |
-| [PG: Functions and operators](#functions-and-operators) | 0 | 15 | 6 | 21 |
-| [PG: Types](#types) | 0 | 12 | 16 | 28 |
-| [PG: DDL](#ddl) | 2 | 15 | 6 | 23 |
-| [PG: Programmability](#programmability) | 2 | 3 | 2 | 7 |
-| [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 12 |
-| [PG: Security](#security) | 0 | 6 | 4 | 10 |
-| [PG: Extensions](#extensions) | 0 | 6 | 4 | 10 |
-| [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 3 | 4 | 7 |
-| [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 1 | 7 | 6 | 14 |
-| [PG: Operations](#operations) | 0 | 5 | 7 | 12 |
-| [CR: Changefeeds / CDC](#changefeeds-and-cdc) | 1 | 0 | 1 | 2 |
-| [CR: Multi-region and placement](#multi-region-and-placement) | 0 | 5 | 2 | 7 |
-| [CR: Indexes, computed columns, spatial](#indexes-computed-columns-and-spatial) | 0 | 6 | 1 | 7 |
-| [CR: Bulk I/O, backup and restore](#bulk-io-backup-and-restore) | 0 | 5 | 4 | 9 |
-| [CR: Jobs](#jobs) | 0 | 1 | 1 | 2 |
-| [CR: Transactions and programmability](#transactions-and-programmability) | 1 | 2 | 3 | 6 |
-| [CR: Row-level TTL and historical reads](#row-level-ttl-and-historical-reads) | 0 | 1 | 1 | 2 |
-| [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 2 |
-| [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 4 |
-| [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 4 |
-| **PostgreSQL total** | **6** | **95** | **69** | **170** |
-| **CockroachDB total** | **2** | **25** | **18** | **45** |
-| **All** | **8** | **120** | **87** | **215** |
+| Area | P1 | P2 | P3 | P4 | Total |
+|---|---:|---:|---:|---:|---:|
+| [PG: Query language](#query-language) | 0 | 17 | 9 | 0 | 26 |
+| [PG: Functions and operators](#functions-and-operators) | 0 | 15 | 6 | 0 | 21 |
+| [PG: Types](#types) | 0 | 12 | 16 | 0 | 28 |
+| [PG: DDL](#ddl) | 2 | 14 | 6 | 1 | 23 |
+| [PG: Programmability](#programmability) | 2 | 3 | 2 | 0 | 7 |
+| [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 0 | 12 |
+| [PG: Security](#security) | 0 | 6 | 4 | 0 | 10 |
+| [PG: Extensions](#extensions) | 0 | 6 | 4 | 0 | 10 |
+| [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 3 | 4 | 0 | 7 |
+| [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 1 | 7 | 6 | 0 | 14 |
+| [PG: Operations](#operations) | 0 | 5 | 7 | 0 | 12 |
+| [CR: Changefeeds / CDC](#changefeeds-and-cdc) | 1 | 0 | 1 | 0 | 2 |
+| [CR: Multi-region and placement](#multi-region-and-placement) | 0 | 5 | 2 | 0 | 7 |
+| [CR: Indexes, computed columns, spatial](#indexes-computed-columns-and-spatial) | 0 | 6 | 1 | 0 | 7 |
+| [CR: Bulk I/O, backup and restore](#bulk-io-backup-and-restore) | 0 | 5 | 4 | 0 | 9 |
+| [CR: Jobs](#jobs) | 0 | 1 | 1 | 0 | 2 |
+| [CR: Transactions and programmability](#transactions-and-programmability) | 1 | 2 | 3 | 0 | 6 |
+| [CR: Row-level TTL and historical reads](#row-level-ttl-and-historical-reads) | 0 | 1 | 1 | 0 | 2 |
+| [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
+| [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
+| [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
+| **PostgreSQL total** | **6** | **94** | **69** | **1** | **170** |
+| **CockroachDB total** | **2** | **25** | **18** | **0** | **45** |
+| **All** | **8** | **119** | **87** | **1** | **215** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -209,7 +209,7 @@ which do exist: see PG-F-022.
 | PG-D-028 | `RENAME TO` across databases | refused (user doc) | recreate | P3 | S | D | — |
 | PG-D-029 | **Index leftovers**: pattern operator classes are accepted but do not make `LIKE 'abc%'` use the index; `pg_index.indclass` / `indcollation` are not modelled and `pg_opclass` is empty; `SHOW CREATE TABLE` does not print operator classes or collations; a duplicate index name is `42710` (PostgreSQL `42P07`); a quoted `"concurrently"` index name is read as the keyword; `CREATE INDEX` in a transaction block is refused (`25001`) unless the block created the table, since the online build spans transactions | silently different, or `25001 CREATE INDEX cannot run inside a transaction block` | build the index outside the block | P2 | M | V | — |
 | PG-D-030 | **Index-form and key leftovers**: the planner uses a partial index only when the query repeats the predicate's conjuncts (no implication, no `OR`, no parameter for a literal); an expression index serves `=` and ranges, not `ORDER BY`, `IN` or `LIKE`; zone-dependent expressions (`date_trunc`, timestamp casts) are refused in index expressions even over `timestamp without time zone`; `pg_get_indexdef` prints expressions as written, without PostgreSQL's casts; `DESC` keys are stored ascending, so a mixed-direction `ORDER BY` is sorted; `ALTER TABLE ... ADD PRIMARY KEY` on a table created without one is refused; `ADD COLUMN rowid` on such a table is `42710` | `0A000`; `42P17`; a sort instead of an index order | — | P2 | M | V | — |
-| PG-D-031 | **`ALTER TABLE` leftovers**: a volatile `ADD COLUMN` default and every action that reads rows are refused inside a transaction block (`25001`), even on a table the block created (Rails needs `disable_ddl_transaction!`); a concurrent `INSERT` during `ADD COLUMN ... NOT NULL` without a default fails `23502` instead of waiting; an interrupted online `ALTER` can only be finished by re-running it; `DROP DATABASE ... CASCADE` against concurrent `CREATE TABLE` in that database keeps losing (each try runs for tens of seconds before its `40001`) where PostgreSQL's exclusive lock would make the creators wait; `ADD PRIMARY KEY` on a table created without one keeps the hidden rowid as the key and shows a unique index as the primary key | `25001`; `23502` | run the statement outside a block | P2 | M | V | — |
+| PG-D-031 | **`ALTER TABLE` leftovers**: a volatile `ADD COLUMN` default and every action that reads rows are refused inside a transaction block (`25001`), even on a table the block created (Rails needs `disable_ddl_transaction!`); a concurrent `INSERT` during `ADD COLUMN ... NOT NULL` without a default fails `23502` instead of waiting; an interrupted online `ALTER` can only be finished by re-running it; `DROP DATABASE ... CASCADE` against concurrent `CREATE TABLE` in that database keeps losing (each try runs for tens of seconds before its `40001`) where PostgreSQL's exclusive lock would make the creators wait; `ADD PRIMARY KEY` on a table created without one keeps the hidden rowid as the key and shows a unique index as the primary key | `25001`; `23502` | run the statement outside a block | P4 | M | V | — |
 
 ### Programmability
 
@@ -592,16 +592,15 @@ carried several).
 
 The gaps that would most widen what runs unmodified, in order. The
 earlier list's items 1–2 are closed (#367, #368); pg_dump 17/18 and
-parallel restore (#370, #371) are tabled for now.
+parallel restore (#370, #371) are tabled for now, and Rails migration
+requirements (PG-D-031) are P4, out of this list.
 
 1. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
    missing function families.
 2. **PG-X-014** advisory locks taken per row (job queues).
-3. **PG-D-031** `ALTER TABLE` actions that read rows, inside transaction
-   blocks (Rails migrations without `disable_ddl_transaction!`).
-4. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
-5. **PG-Q-033** a hash join, for large joins without a usable equality.
-6. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
-7. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
+3. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
+4. **PG-Q-033** a hash join, for large joins without a usable equality.
+5. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
+6. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
    changefeeds: the large structural gaps that decide whether bigger
    applications can move at all; each is XL and wants a design first.

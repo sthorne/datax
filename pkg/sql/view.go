@@ -577,10 +577,12 @@ func (s *Session) dropDependentViews(ctx context.Context, txn *kvclient.Txn, id 
 			return err
 		}
 		deps = append(deps, more...)
-		if _, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name); err != nil {
+		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name)
+		if err != nil {
 			return err
 		}
 		dropped[v.ID] = true
+		s.noteDrop(gone)
 		s.noteDDL(v.Name)
 		log.Audit("view-ddl", "stmt", "DROP VIEW (cascade)", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}
@@ -644,13 +646,15 @@ func (s *Session) execDropView(ctx context.Context, txn *kvclient.Txn, t *parser
 		if err := s.dropDependentViews(ctx, txn, v.ID, "view "+v.Name, true, "DROP VIEW ..."); err != nil {
 			return nil, err
 		}
-		if _, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name); err != nil {
+		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name)
+		if err != nil {
 			var nf *catalog.ErrTableNotFound
 			if asErr(err, &nf) {
 				continue // dropped along with a target it depended on
 			}
 			return nil, err
 		}
+		s.noteDrop(gone)
 		s.noteDDL(v.Name)
 		log.Audit("view-ddl", "stmt", "DROP VIEW", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}

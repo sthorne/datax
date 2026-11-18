@@ -1139,6 +1139,12 @@ type Accessor struct {
 	// cached entry is not handed out.
 	adopting map[string]*adoptMark
 
+	// flights are the lease transactions in progress, by key, with the
+	// drops seen while they were (lease.go, "Drops"); flightSeq orders
+	// those drops against the transactions' starts.
+	flights   map[string]*leaseFlight
+	flightSeq uint64
+
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
 	statsDB    *kvclient.DB
@@ -1175,6 +1181,17 @@ type cachedDesc struct {
 // entry is never evicted, because the cache is where they are remembered.
 func (c *cachedDesc) outstanding(nowWall int64) bool {
 	return (c.handedOut && c.expiration > nowWall) || c.handedOutExpiration > nowWall || c.priorExpiration > nowWall
+}
+
+// outstandingExpiration is the latest deadline a statement may still
+// hold under this entry or the ones it replaced (zero when none was
+// handed out): what a drain of the table's drop waits out here.
+func (c *cachedDesc) outstandingExpiration() int64 {
+	e := max(c.handedOutExpiration, c.priorExpiration)
+	if c.handedOut {
+		e = max(e, c.expiration)
+	}
+	return e
 }
 
 func NewAccessor() *Accessor {
@@ -1296,7 +1313,13 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 		return d, nil
 	}
 	entry = &cachedDesc{desc: ld, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration, lastUsed: now}
-	if !a.install(key, entry, reserved) {
+	if ok, dropped, out := a.install(key, entry, reserved, info.flightSeq); dropped {
+		// The table was dropped after the lease transaction read it: the
+		// lease is acknowledged as dropped, and the statement keeps d,
+		// which its own transaction read.
+		a.ackDropped(ctx, ld.ID, info.expiration, max(out, info.priorExpiration, info.handedOutExpiration))
+		return d, nil
+	} else if !ok {
 		// The entry this lookup meant to replace went away while the
 		// lease was being taken, and the cache filled meanwhile. Nothing
 		// was handed out under the lease, so it is given back.

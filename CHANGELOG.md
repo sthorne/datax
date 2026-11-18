@@ -1735,6 +1735,33 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Dropped tables are drained from every gateway** (#377). Once
+  `DROP TABLE`, `DROP VIEW`, `DROP OWNED` or `DROP DATABASE ... CASCADE`
+  returns, no gateway still serves the dropped table from its leased cache;
+  lookups fail with `42P01`. Before, other gateways could plan against it
+  until their next lease renewal, and a renewal racing the drop could
+  re-cache it on the dropping gateway. A statement planned against the
+  table before the drop can no longer commit after it, and the dropped-table
+  cleanup does not clear a table's rows while any gateway still holds a
+  lease on it. A drop now waits like `ALTER` does: a few seconds at the
+  default lease TTL when other gateways cache the table.
+- **Default privileges no longer reach the sealed system tables.** A rule
+  for `root` (`ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO ...`) made
+  before `datax_audit`, the large-object tables or `datax_keys` were created
+  stamped its grants on them, opening the audit trail and every large
+  object's bytes to the grantee. Those tables are now created with no
+  grants; rules still apply to `datax_metrics`, the shape tables and
+  `datax_ui_prefs`, as they do to any table root creates. Admins may
+  `REVOKE` any privilege on a sealed table to clean up grants stamped
+  earlier, and a grant on `datax_keys` no longer shows its row count. See
+  docs/user/security.md, "Default privileges and the cluster's own tables".
+- **`GRANT`, `REVOKE` and the policy statements read the table's current
+  descriptor.** They decided what to change from the gateway's cached copy,
+  which can lag a change still draining from another gateway: a `REVOKE` of
+  a privilege granted moments earlier elsewhere, a `GRANT` of one revoked
+  meanwhile, or a `DROP POLICY IF EXISTS` of a new policy could report
+  success and change nothing. They now read the descriptor in their own
+  transaction.
 - **Concurrent online `CREATE INDEX` on one table could lose an index**
   (#368): every phase of an online schema change wrote the table descriptor
   from the gateway's cached copy, a blind write, so one build could write
