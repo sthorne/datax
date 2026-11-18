@@ -40,6 +40,11 @@ type Expr struct {
 	// Sub is a scalar subquery: (SELECT ...) used as a value. Uncorrelated
 	// only — the executor evaluates it once and splices the result.
 	Sub *Select `json:"sub,omitempty"`
+	// SubCol, when set, makes Sub a row subquery of SubCols columns of
+	// which this value is column SubCol (1-based): UPDATE ... SET (a, b)
+	// = (SELECT x, y ...) gives a and b one each.
+	SubCol  int `json:"sub_col,omitempty"`
+	SubCols int `json:"sub_cols,omitempty"`
 	// Func is a builtin call (lower-cased): coalesce, length, lower,
 	// upper, abs, now. Args are its arguments.
 	Func string `json:"func,omitempty"`
@@ -499,7 +504,9 @@ type OnConflict struct {
 	Where      []Comparison
 }
 
-// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET.
+// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET. A
+// multiple-column assignment, SET (a, b) = (x, y) | ROW(x, y) | (SELECT
+// x, y ...), is one SetClause per column (see Expr.SubCol).
 type SetClause struct {
 	Column string
 	Value  Expr
@@ -525,13 +532,16 @@ func (f CopyFormat) String() string {
 	}
 }
 
-// CopyFrom is COPY table [(cols)] FROM STDIN [format clause]. The data
+// CopyFrom is COPY table [(cols)] FROM STDIN [[WITH] options]. The data
 // itself travels out of band (pgwire copy-in sub-protocol), so this
-// statement only names the target and the encoding.
+// statement only names the target and the encoding. Options holds the
+// option list as written (CopyTo's), which the session validates;
+// Format is the FORMAT among them, when it names one.
 type CopyFrom struct {
 	Table   string
 	Columns []string // empty = all visible columns in order
 	Format  CopyFormat
+	Options []CopyOption
 }
 
 // CopyTo is COPY {table [(cols)] | (query)} TO {STDOUT | 'file' |
@@ -801,6 +811,10 @@ type Select struct {
 	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
 	// ForUpdate.
 	LockWait LockWait
+	// Values marks a row of a VALUES list: the rows are FROM-less
+	// selects chained with UNION ALL, whose column types are resolved
+	// across the rows as PostgreSQL resolves a VALUES list's.
+	Values bool
 	// DMLTarget is never set by the parser. It marks the select an
 	// UPDATE ... FROM or DELETE ... USING runs to join its target with
 	// the FROM list, naming the member (by alias) that is the target:
@@ -1349,3 +1363,8 @@ func (*DropDatabase) stmt()           {}
 func (*AlterDatabase) stmt()          {}
 func (*ShowDatabases) stmt()          {}
 func (*Use) stmt()                    {}
+func (*Discard) stmt()                {}
+
+// Discard is DISCARD { ALL | PLANS | SEQUENCES | TEMP[ORARY] }: Kind is
+// "all", "plans", "sequences" or "temp".
+type Discard struct{ Kind string }

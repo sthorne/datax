@@ -356,10 +356,10 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			if err != nil {
 				return false, err
 			}
-			if lhs.Null || rhs.Null {
+			if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 				return false, nil
 			}
-			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
 			if err != nil || !ok {
 				return false, nil
 			}
@@ -432,11 +432,11 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if err != nil {
 			return false, err
 		}
-		if lhs.Null || rhs.Null {
+		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil
 		}
 		if !plainCmpOp(cmp.Op) {
-			ok, err := applyCmpOp(cmp.Op, lhs, rhs)
+			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
 			if err != nil {
 				return false, err
 			}

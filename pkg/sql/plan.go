@@ -181,16 +181,22 @@ func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			c.Derived, c.Table = nil, name
 			return s.PlanColumns(ctx, &c)
 		}
+		if fromlessGrouped(t) {
+			return s.PlanColumns(ctx, oneRowFrom(t))
+		}
 		if t.Union != nil {
 			// A set operation's output is named by its head and typed by
 			// unifying every member (the numeric families lift, anything
-			// else meets as text).
+			// else meets as text); a VALUES list's as execution types it
+			// (resolveValuesTypes).
 			head := *t
 			head.Union, head.OrderBy, head.Limit, head.Offset = nil, nil, -1, 0
 			cols, err := s.PlanColumns(ctx, &head)
 			if err != nil {
 				return nil, err
 			}
+			asts := []*parser.Select{t}
+			memberCols := [][]ResultColumn{cols}
 			for m := t.Union; m != nil; m = m.Union {
 				one := *m
 				one.Union = nil
@@ -201,6 +207,19 @@ func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]Res
 				if len(mc) != len(cols) {
 					return nil, newErrf(CodeSyntaxError, "each set operation member must have the same number of columns")
 				}
+				asts, memberCols = append(asts, m), append(memberCols, mc)
+			}
+			if valuesList(asts) {
+				for i := range cols {
+					fam, verr := valuesColumnType(asts, i, func(mi int) types.Family { return memberCols[mi][i].Type })
+					if verr != nil {
+						return nil, ToSQLError(verr)
+					}
+					cols[i].Type = fam
+				}
+				return cols, nil
+			}
+			for _, mc := range memberCols[1:] {
 				for i := range cols {
 					cols[i].Type = unifyFamily(cols[i].Type, mc[i].Type)
 				}

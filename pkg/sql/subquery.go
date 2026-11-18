@@ -40,19 +40,27 @@ func (s *Session) execSubSelect(ctx context.Context, txn *kvclient.Txn, sub *par
 
 // execScalarSub evaluates (SELECT ...) used as a value: exactly one output
 // column; zero rows is NULL; more than one row is an error.
-func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, params []types.Datum) (types.Datum, error) {
-	res, err := s.execSubSelect(ctx, txn, sub, params)
+// A row subquery (e.SubCol set: SET (a, b) = (SELECT x, y ...)) must
+// return e.SubCols columns, and yields column e.SubCol.
+func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum) (types.Datum, error) {
+	res, err := s.execSubSelect(ctx, txn, e.Sub, params)
 	if err != nil {
 		return types.Datum{}, err
 	}
-	if len(res.Columns) != 1 {
+	col := 0
+	switch {
+	case e.SubCol > 0 && len(res.Columns) != e.SubCols:
+		return types.Datum{}, newErrf(CodeSyntaxError, "number of columns does not match number of values")
+	case e.SubCol > 0:
+		col = e.SubCol - 1
+	case len(res.Columns) != 1:
 		return types.Datum{}, newErrf(CodeSyntaxError, "subquery must return only one column")
 	}
 	switch len(res.Rows) {
 	case 0:
 		return types.DNull, nil
 	case 1:
-		return res.Rows[0][0], nil
+		return res.Rows[0][col], nil
 	}
 	return types.Datum{}, newErrf(CodeCardinality, "more than one row returned by a subquery used as an expression")
 }
@@ -84,11 +92,11 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		return s.spliceVolatile(ctx, txn, e, params)
 	}
 	if e.Sub != nil {
-		d, err := s.execScalarSub(ctx, txn, e.Sub, params)
+		d, err := s.execScalarSub(ctx, txn, e, params)
 		if err != nil {
 			return e, err
 		}
-		out.Sub, out.Lit = nil, &d
+		out.Sub, out.Lit, out.SubCol, out.SubCols = nil, &d, 0, 0
 	}
 	if callAs, ok := builtins.TextSearchDefaultArg(e.Func, len(e.Args)); ok {
 		// A text-search call that names no configuration gets the

@@ -21,8 +21,9 @@ import (
 // format (Result.Copy), and the wire layer sends its rows as CopyData
 // instead of DataRows; the encoders live there (pkg/pgwire/copyto.go).
 
-// CopyOut is the output format of a COPY TO, its options validated and
-// defaults filled in as PostgreSQL's ProcessCopyOptions does.
+// CopyOut is the data format of a COPY TO (or FROM), its options
+// validated and defaults filled in as PostgreSQL's ProcessCopyOptions
+// does.
 type CopyOut struct {
 	Format parser.CopyFormat
 	// Delim is the column delimiter (text and CSV).
@@ -38,6 +39,20 @@ type CopyOut struct {
 	// FORCE_QUOTE *.
 	ForceQuote    []bool
 	ForceQuoteAll bool
+	// HeaderMatch (COPY FROM's HEADER MATCH) asks for the header line's
+	// fields to be checked against the column names.
+	HeaderMatch bool
+	// ForceNotNull and ForceNull mark, per COPY FROM column, CSV's
+	// FORCE_NOT_NULL (an unquoted NULL string is that string, not NULL)
+	// and FORCE_NULL (a quoted NULL string is NULL too).
+	ForceNotNull, ForceNull []bool
+}
+
+// copyColumnLists are the column lists of a COPY's options, resolved by
+// the caller against the COPY's columns; *All is the * form.
+type copyColumnLists struct {
+	forceQuote, forceNotNull, forceNull []string
+	forceNotNullAll, forceNullAll       bool
 }
 
 // copyFileHint is PostgreSQL's hint for a COPY to or from the server's
@@ -50,10 +65,11 @@ func (s *Session) planCopyTo(ctx context.Context, ct *parser.CopyTo) (parser.Sta
 	if ct.File != "" {
 		return nil, nil, s.refuseCopyFile(ctx, ct)
 	}
-	co, forceQuote, err := processCopyToOptions(ct.Options)
+	co, lists, err := processCopyOptions(ct.Options, false)
 	if err != nil {
 		return nil, nil, err
 	}
+	forceQuote := lists.forceQuote
 	if ct.Query != nil {
 		return s.planCopyQuery(ctx, ct, co, forceQuote)
 	}
@@ -255,16 +271,17 @@ func copyQuoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// processCopyToOptions validates a COPY TO's options and fills in the
-// defaults, with PostgreSQL's checks, order, messages and SQLSTATEs
-// (ProcessCopyOptions). It returns FORCE_QUOTE's column names, resolved
-// by the caller against the COPY's columns.
-func processCopyToOptions(opts []parser.CopyOption) (*CopyOut, []string, error) {
+// processCopyOptions validates a COPY TO's (from false) or COPY FROM's
+// options and fills in the defaults, with PostgreSQL's checks, order,
+// messages and SQLSTATEs (ProcessCopyOptions). It returns the column
+// lists of FORCE_QUOTE, FORCE_NOT_NULL and FORCE_NULL, resolved by the
+// caller against the COPY's columns.
+func processCopyOptions(opts []parser.CopyOption, from bool) (*CopyOut, copyColumnLists, error) {
 	co := &CopyOut{Format: parser.CopyFormatText}
 	var (
 		seen                                  = map[string]bool{}
 		delim, null, quote, escape, dflt      *string
-		forceQuote                            []string
+		lists                                 copyColumnLists
 		forceNotNull, forceNull, forceQuoteOn bool
 	)
 	conflict := func(name string) error {
@@ -304,11 +321,11 @@ func processCopyToOptions(opts []parser.CopyOption) (*CopyOut, []string, error) 
 		switch o.Name {
 		case "format":
 			if err := conflict("format"); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			v, err := str(o)
 			if err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			switch v {
 			case "text":
@@ -318,24 +335,24 @@ func processCopyToOptions(opts []parser.CopyOption) (*CopyOut, []string, error) 
 			case "binary":
 				co.Format = parser.CopyFormatBinary
 			default:
-				return nil, nil, newErrf(CodeInvalidParameterValue, "COPY format %q not recognized", v)
+				return nil, lists, newErrf(CodeInvalidParameterValue, "COPY format %q not recognized", v)
 			}
 		case "freeze":
 			// Meaningful only to COPY FROM; PostgreSQL accepts and ignores
 			// it here.
 			if err := conflict("freeze"); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			if _, ok := boolean(o); !ok {
-				return nil, nil, newErrf(CodeSyntaxError, "%s requires a Boolean value", o.Name)
+				return nil, lists, newErrf(CodeSyntaxError, "%s requires a Boolean value", o.Name)
 			}
 		case "delimiter", "null", "default", "quote", "escape", "encoding":
 			if err := conflict(o.Name); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			v, err := str(o)
 			if err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			switch o.Name {
 			case "delimiter":
@@ -350,62 +367,68 @@ func processCopyToOptions(opts []parser.CopyOption) (*CopyOut, []string, error) 
 				escape = &v
 			case "encoding":
 				if err := checkCopyEncoding(v); err != nil {
-					return nil, nil, err
+					return nil, lists, err
 				}
 			}
 		case "header":
 			if err := conflict("header"); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			if o.HasArg && strings.EqualFold(o.Arg, "match") {
-				return nil, nil, newErrf(CodeFeatureNotSupported, "cannot use %q with HEADER in COPY TO", o.Arg)
+				if !from {
+					return nil, lists, newErrf(CodeFeatureNotSupported, "cannot use %q with HEADER in COPY TO", o.Arg)
+				}
+				co.Header, co.HeaderMatch = true, true
+				continue
 			}
 			b, ok := boolean(o)
 			if !ok {
-				return nil, nil, newErrf(CodeSyntaxError, "%s requires a Boolean value or \"match\"", o.Name)
+				return nil, lists, newErrf(CodeSyntaxError, "%s requires a Boolean value or \"match\"", o.Name)
 			}
 			co.Header = b
 		case "force_quote":
 			if err := conflict("force_quote"); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			switch {
 			case o.Star:
 				co.ForceQuoteAll = true
 			case o.HasList:
-				forceQuote = append([]string{}, o.List...)
+				lists.forceQuote = append([]string{}, o.List...)
 			default:
-				return nil, nil, newErrf(CodeInvalidParameterValue, "argument to option %q must be a list of column names", o.Name)
+				return nil, lists, newErrf(CodeInvalidParameterValue, "argument to option %q must be a list of column names", o.Name)
 			}
 			forceQuoteOn = true
 		case "force_not_null", "force_null", "convert_selectively":
 			if err := conflict(o.Name); err != nil {
-				return nil, nil, err
+				return nil, lists, err
 			}
 			if !o.HasList && !(o.Star && o.Name != "convert_selectively") {
-				return nil, nil, newErrf(CodeInvalidParameterValue, "argument to option %q must be a list of column names", o.Name)
+				return nil, lists, newErrf(CodeInvalidParameterValue, "argument to option %q must be a list of column names", o.Name)
 			}
 			switch o.Name {
 			case "force_not_null":
 				forceNotNull = true
+				lists.forceNotNull, lists.forceNotNullAll = append([]string{}, o.List...), o.Star
 			case "force_null":
 				forceNull = true
+				lists.forceNull, lists.forceNullAll = append([]string{}, o.List...), o.Star
 			}
 		default:
-			return nil, nil, newErrf(CodeSyntaxError, "option %q not recognized", o.Name)
+			return nil, lists, newErrf(CodeSyntaxError, "option %q not recognized", o.Name)
 		}
 	}
 
 	binary := co.Format == parser.CopyFormatBinary
 	csv := co.Format == parser.CopyFormatCSV
 	if binary && delim != nil {
-		return nil, nil, newErrf(CodeSyntaxError, "cannot specify DELIMITER in BINARY mode")
+		return nil, lists, newErrf(CodeSyntaxError, "cannot specify DELIMITER in BINARY mode")
 	}
 	if binary && null != nil {
-		return nil, nil, newErrf(CodeSyntaxError, "cannot specify NULL in BINARY mode")
+		return nil, lists, newErrf(CodeSyntaxError, "cannot specify NULL in BINARY mode")
 	}
 	if binary && dflt != nil {
-		return nil, nil, newErrf(CodeSyntaxError, "cannot specify DEFAULT in BINARY mode")
+		return nil, lists, newErrf(CodeSyntaxError, "cannot specify DEFAULT in BINARY mode")
 	}
 	d, n := "\t", `\N`
 	if csv {
@@ -428,64 +451,70 @@ func processCopyToOptions(opts []parser.CopyOption) (*CopyOut, []string, error) 
 		}
 	}
 	if len(d) != 1 {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY delimiter must be a single one-byte character")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY delimiter must be a single one-byte character")
 	}
 	if strings.ContainsAny(d, "\r\n") {
-		return nil, nil, newErrf(CodeInvalidParameterValue, "COPY delimiter cannot be newline or carriage return")
+		return nil, lists, newErrf(CodeInvalidParameterValue, "COPY delimiter cannot be newline or carriage return")
 	}
 	if strings.ContainsAny(n, "\r\n") {
-		return nil, nil, newErrf(CodeInvalidParameterValue, "COPY null representation cannot use newline or carriage return")
+		return nil, lists, newErrf(CodeInvalidParameterValue, "COPY null representation cannot use newline or carriage return")
 	}
 	if !csv && strings.Contains(`\.abcdefghijklmnopqrstuvwxyz0123456789`, d) {
-		return nil, nil, newErrf(CodeInvalidParameterValue, "COPY delimiter cannot be \"%s\"", d)
+		return nil, lists, newErrf(CodeInvalidParameterValue, "COPY delimiter cannot be \"%s\"", d)
 	}
 	if binary && co.Header {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "cannot specify HEADER in BINARY mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "cannot specify HEADER in BINARY mode")
 	}
 	if !csv && quote != nil {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY quote available only in CSV mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY quote available only in CSV mode")
 	}
 	if csv && len(*q) != 1 {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY quote must be a single one-byte character")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY quote must be a single one-byte character")
 	}
 	if csv && d[0] == (*q)[0] {
-		return nil, nil, newErrf(CodeInvalidParameterValue, "COPY delimiter and quote must be different")
+		return nil, lists, newErrf(CodeInvalidParameterValue, "COPY delimiter and quote must be different")
 	}
 	if !csv && escape != nil {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY escape available only in CSV mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY escape available only in CSV mode")
 	}
 	if csv && len(*e) != 1 {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY escape must be a single one-byte character")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY escape must be a single one-byte character")
 	}
 	if !csv && forceQuoteOn {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY force quote available only in CSV mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force quote available only in CSV mode")
+	}
+	if forceQuoteOn && from {
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force quote only available using COPY TO")
 	}
 	if !csv && forceNotNull {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY force not null available only in CSV mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force not null available only in CSV mode")
 	}
-	if forceNotNull {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY force not null only available using COPY FROM")
+	if forceNotNull && !from {
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force not null only available using COPY FROM")
 	}
 	if !csv && forceNull {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY force null available only in CSV mode")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force null available only in CSV mode")
 	}
-	if forceNull {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY force null only available using COPY FROM")
+	if forceNull && !from {
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY force null only available using COPY FROM")
 	}
 	if strings.Contains(n, d) {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY delimiter must not appear in the NULL specification")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY delimiter must not appear in the NULL specification")
 	}
 	if csv && strings.Contains(n, *q) {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "CSV quote character must not appear in the NULL specification")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "CSV quote character must not appear in the NULL specification")
+	}
+	if dflt != nil && !from {
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY DEFAULT only available using COPY FROM")
 	}
 	if dflt != nil {
-		return nil, nil, newErrf(CodeFeatureNotSupported, "COPY DEFAULT only available using COPY FROM")
+		return nil, lists, newErrf(CodeFeatureNotSupported, "COPY FROM's DEFAULT option is not supported")
 	}
 	co.Delim, co.Null = d[0], n
 	if csv {
 		co.Quote, co.Escape = (*q)[0], (*e)[0]
 	}
-	return co, forceQuote, nil
+	return co, lists, nil
 }
 
 // checkCopyEncoding validates COPY's ENCODING option. Any name
