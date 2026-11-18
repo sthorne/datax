@@ -78,8 +78,8 @@ func hasConstraintNamed(desc *catalog.TableDescriptor, name string) bool {
 // taken), else PostgreSQL's <table>_<col>_<suffix>, numbered when taken.
 func constraintName(desc *catalog.TableDescriptor, given string, cols []string, suffix string) (string, error) {
 	taken := func(n string) bool {
-		if n == desc.Name+"_pkey" {
-			return true
+		if n == desc.Name+"_pkey" && len(visiblePKIDs(desc)) > 0 {
+			return true // the declared key's (a rowid-keyed table's is free)
 		}
 		if _, ok := desc.Constraint(n); ok {
 			return true
@@ -166,7 +166,14 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err != nil {
 			return nil, nil, err
 		}
-		name, err := constraintName(desc, cd.Name, cd.Columns, "key")
+		suffixCols, suffix := cd.Columns, "key"
+		if cd.PrimaryKey {
+			if desc.PrimaryKeyIndex() != nil {
+				return nil, nil, newErrf(CodeInvalidTableDefinition, "multiple primary keys for table %q are not allowed", desc.Name)
+			}
+			suffixCols, suffix = nil, "pkey"
+		}
+		name, err := constraintName(desc, cd.Name, suffixCols, suffix)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -181,7 +188,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 				return nil, nil, err
 			}
 		}
-		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState, NullsNotDistinct: cd.NullsNotDistinct}
+		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState, NullsNotDistinct: cd.NullsNotDistinct, Primary: cd.PrimaryKey}
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
 		c.Name, c.IndexID, c.Validated = name, idx.ID, true
@@ -266,7 +273,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		}
 		refNames := cd.RefColumns
 		if len(refNames) == 0 {
-			for _, id := range visiblePKIDs(ref) {
+			for _, id := range declaredKeyIDs(ref) {
 				col, _ := ref.ColByID(id)
 				refNames = append(refNames, col.Name)
 			}
@@ -340,6 +347,19 @@ func visiblePKIDs(d *catalog.TableDescriptor) []catalog.ColumnID {
 		out = append(out, id)
 	}
 	return out
+}
+
+// declaredKeyIDs is the key a foreign key without columns references:
+// the visible primary key, or a rowid-keyed table's Primary index's
+// columns (empty when it has neither).
+func declaredKeyIDs(d *catalog.TableDescriptor) []catalog.ColumnID {
+	if ids := visiblePKIDs(d); len(ids) > 0 {
+		return ids
+	}
+	if idx := d.PrimaryKeyIndex(); idx != nil && idx.Public() {
+		return idx.ColumnIDs
+	}
+	return nil
 }
 
 // uniqueKeyOf reports whether cols (as a set) are the table's primary

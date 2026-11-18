@@ -65,9 +65,13 @@ jobs:
       # skips where there is no Chrome, which is right on a laptop and
       # wrong here — the runner image ships one, and if that ever stops
       # being true the test must fail rather than quietly stop running.
+      # DATAX_REQUIRE_PGDUMP (issue #366): likewise for pg_dump,
+      # pg_restore and psql, which the runner image ships (PostgreSQL's
+      # client tools): TestPgDumpRestore must run here, not skip.
       - name: test
         env:
           DATAX_REQUIRE_BROWSER: "1"
+          DATAX_REQUIRE_PGDUMP: "1"
         run: |
           set -o pipefail
           go test -race -timeout 30m ${{ matrix.select }} ./pkg/testutils/testcluster/ 2>&1 | tee test.log

@@ -330,11 +330,35 @@ func Names() []string {
 // OIDs.
 
 // TableOID is a table's pg_class OID.
-func TableOID(d *catalog.TableDescriptor) int64 { return int64(d.ID) }
+func TableOID(d *catalog.TableDescriptor) int64 { return relOID(d.ID) }
+
+// SystemTableOIDBase is where the cluster's own tables' OIDs start. Their
+// descriptor IDs (catalog.MetricsTableID and up, above 2^40) are no OID
+// a PostgreSQL client can hold — libpq reads an OID as 32 bits, and
+// pg_dump took datax_largeobject (2^40 + 5) for the table whose OID is 5
+// — so each takes one of the 256 OIDs from here instead, below the
+// 65536 the index OIDs are scaled by.
+const SystemTableOIDBase = 0xFF00
+
+// relOID is the pg_class OID of the table with descriptor ID id.
+func relOID(id uint64) int64 {
+	if id >= catalog.MetricsTableID && id < catalog.MetricsTableID+256 {
+		return SystemTableOIDBase + int64(id-catalog.MetricsTableID)
+	}
+	return int64(id)
+}
+
+// TableIDOfOID inverts TableOID: the descriptor ID a table OID stands for.
+func TableIDOfOID(oid int64) uint64 {
+	if oid >= SystemTableOIDBase && oid < SystemTableOIDBase+256 {
+		return catalog.MetricsTableID + uint64(oid-SystemTableOIDBase)
+	}
+	return uint64(oid)
+}
 
 // IndexOID is an index's pg_class OID (the primary index is index 1).
 func IndexOID(d *catalog.TableDescriptor, indexID uint64) int64 {
-	return int64(d.ID)<<16 | int64(indexID)
+	return relOID(d.ID)<<16 | int64(indexID)
 }
 
 // DatabaseOID is a database's pg_database OID (the default database
@@ -837,6 +861,9 @@ func UniqueDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string 
 	for _, id := range idx.ColumnIDs {
 		cols = append(cols, columnName(d, id))
 	}
+	if idx.Primary {
+		return "PRIMARY KEY (" + strings.Join(cols, ", ") + ")"
+	}
 	return uniqueKeyword(idx) + " (" + strings.Join(cols, ", ") + ")"
 }
 
@@ -852,7 +879,7 @@ func uniqueKeyword(idx *catalog.IndexDescriptor) string {
 // ConstraintOID is a constraint's pg_constraint OID (a bit above the
 // index OIDs of the same table, so the two never collide).
 func ConstraintOID(d *catalog.TableDescriptor, c *catalog.Constraint) int64 {
-	return int64(d.ID)<<16 | 1<<15 | int64(c.ID)
+	return relOID(d.ID)<<16 | 1<<15 | int64(c.ID)
 }
 
 // ConstraintDef renders pg_get_constraintdef() for a CHECK, FOREIGN KEY

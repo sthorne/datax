@@ -92,6 +92,17 @@ func init() {
 	register(&Builtin{Name: "array_subscript", Args: []types.Family{Any, types.Int}, MinArgs: 2, Ret: Any, Hidden: true, Category: catArray,
 		Doc: "v[i]: the i-th element (1-based; NULL when out of range).",
 		Fn: func(a []types.Datum) (types.Datum, error) {
+			if a[0].Fam == types.String && !a[0].Null && !a[1].Null && !strings.HasPrefix(strings.TrimSpace(a[0].S), "{") {
+				// A text that is no array literal subscripts as PostgreSQL's
+				// name type does, a fixed array of bytes from 0: the
+				// catalogs' names are text here, and pg_dump asks
+				// typname[0] = '_' for an array type.
+				i := a[1].I
+				if i < 0 || i >= int64(len(a[0].S)) {
+					return types.NewString(""), nil
+				}
+				return types.NewString(a[0].S[i : i+1]), nil
+			}
 			arr, err := toArray(a[0])
 			if err != nil {
 				return types.Datum{}, err
@@ -101,6 +112,28 @@ func init() {
 				return types.DNull, nil
 			}
 			return arr.A[i-1], nil
+		}})
+	register(&Builtin{Name: "pg_options_to_table", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.String, Category: catCatalog,
+		Columns: []string{"option_name", "option_value"}, ColFams: []types.Family{types.String},
+		Doc: "One row per name=value element of an options array (reloptions, a foreign server's options): the name and the value (NULL when the element has no =).",
+		Rows: func(a []types.Datum) (RowIter, error) {
+			arr, err := toArray(a[0])
+			if err != nil {
+				return nil, err
+			}
+			var rows [][]types.Datum
+			for _, el := range arr.A {
+				if el.Null {
+					continue
+				}
+				name, value, ok := strings.Cut(el.Text(), "=")
+				v := types.DNull
+				if ok {
+					v = types.NewString(value)
+				}
+				rows = append(rows, []types.Datum{types.NewString(name), v})
+			}
+			return rowsOf(rows), nil
 		}})
 	register(&Builtin{Name: "array_length", Args: []types.Family{Any, types.Int}, MinArgs: 2, Ret: types.Int, Category: catArray,
 		Doc: "The number of elements of an array (dimension 1; NULL for an empty array or another dimension).",

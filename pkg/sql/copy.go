@@ -48,6 +48,8 @@ type CopyIn struct {
 	bufBytes  int
 	rowsRead  int64
 	committed int64
+	// inBlock: the COPY runs in the session's transaction block.
+	inBlock bool
 }
 
 // Text returns a COPY field's text as a datum to coerce to its column:
@@ -62,19 +64,23 @@ func (ci *CopyIn) Text(v string) types.Datum {
 }
 
 // BeginCopy validates a COPY FROM statement (table, columns, privilege)
-// and returns the copy-in state machine. Refused inside an explicit
-// transaction block: COPY commits per chunk.
+// and returns the copy-in state machine. Outside a transaction block
+// COPY commits per chunk; inside one (pg_restore -j's BEGIN; TRUNCATE;
+// COPY; COMMIT) its chunks are written in the block's transaction and
+// stand or fall with it.
 func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, error) {
+	inBlock := false
 	switch s.state {
 	case StateOpen:
-		return nil, newErrf(CodeActiveTransaction, "COPY FROM cannot run inside a transaction block")
+		inBlock = true
+		s.txnQueried = true
 	case StateFailed:
 		return nil, newErrf(CodeInFailedTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	s.policyMemo = nil // a statement of its own, though not run by Execute
 	var target []catalog.Column
-	err := s.db.RunTxn(ctx, "copy-begin", func(ctx context.Context, txn *kvclient.Txn) error {
+	err := s.copyTxn(ctx, inBlock, "copy-begin", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, err := s.lookup(ctx, txn, cf.Table)
 		if err != nil {
 			return err
@@ -89,9 +95,31 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 		return err
 	})
 	if err != nil {
+		if inBlock {
+			s.failBlock()
+		}
 		return nil, err
 	}
-	return &CopyIn{s: s, table: cf.Table, target: target}, nil
+	return &CopyIn{s: s, table: cf.Table, target: target, inBlock: inBlock}, nil
+}
+
+// copyTxn runs fn in the transaction block's transaction (once: a
+// conflict fails the block, as any statement's would) or, outside one,
+// in an implicit transaction of its own with retries.
+func (s *Session) copyTxn(ctx context.Context, inBlock bool, name string, fn func(context.Context, *kvclient.Txn) error) error {
+	if inBlock {
+		return fn(ctx, s.txn)
+	}
+	return s.db.RunTxn(ctx, name, fn)
+}
+
+// failBlock marks the transaction block failed, as an error in any
+// statement in it does.
+func (s *Session) failBlock() {
+	if s.state == StateOpen {
+		s.state = StateFailed
+		s.extraDDL, s.pendingWipes = nil, nil
+	}
 }
 
 // Columns returns the resolved target columns, in stream order — the wire
@@ -104,7 +132,12 @@ func (ci *CopyIn) RowsRead() int64 { return ci.rowsRead }
 
 // RowsCommitted returns how many rows earlier chunks have durably
 // committed.
-func (ci *CopyIn) RowsCommitted() int64 { return ci.committed }
+func (ci *CopyIn) RowsCommitted() int64 {
+	if ci.inBlock {
+		return 0 // written in the block, which a failure rolls back
+	}
+	return ci.committed
+}
 
 // AddRow buffers one decoded row (positionally parallel to Columns) and
 // flushes a chunk when full.
@@ -137,6 +170,11 @@ func (ci *CopyIn) Finish(ctx context.Context) (int64, error) {
 func (ci *CopyIn) Abort() {
 	ci.buf = nil
 	ci.bufBytes = 0
+	if ci.inBlock {
+		// In a block nothing was committed: the block fails, and its
+		// rollback takes the chunks written so far with it.
+		ci.s.failBlock()
+	}
 }
 
 // flushChunk commits the buffered rows in one implicit transaction. The
@@ -150,7 +188,7 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 	rows := ci.buf
 	ci.buf = nil
 	ci.bufBytes = 0
-	err := ci.s.db.RunTxn(ctx, "copy-chunk", func(ctx context.Context, txn *kvclient.Txn) error {
+	err := ci.s.copyTxn(ctx, ci.inBlock, "copy-chunk", func(ctx context.Context, txn *kvclient.Txn) error {
 		// Re-resolve the descriptor inside the transaction so concurrent
 		// DDL (a new index mid-COPY) is honored, like the index backfill.
 		desc, err := ci.s.lookup(ctx, txn, ci.table)
@@ -233,6 +271,9 @@ func (ci *CopyIn) flushChunk(ctx context.Context) error {
 		return txn.RunBatch(ctx, &wb)
 	})
 	if err != nil {
+		if ci.inBlock {
+			ci.s.failBlock()
+		}
 		return err
 	}
 	ci.committed += int64(len(rows))

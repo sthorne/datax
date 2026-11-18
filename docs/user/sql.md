@@ -633,10 +633,17 @@ restore.
   referenced columns, as in PostgreSQL: `REFERENCES t` is refused with
   `42830` (there is no primary key for referenced table), and so is
   `REFERENCES t (a)` without a unique constraint on `a`.
-- *`ALTER TABLE ... ADD PRIMARY KEY`* is refused (`0A000`): the new key
-  would re-encode every row and index entry. Create a new table with
-  the key and copy the rows (`INSERT INTO t2 SELECT * FROM t`). On a
-  table that has a primary key it is `42P16`, as in PostgreSQL.
+- *`ALTER TABLE ... ADD [CONSTRAINT name] PRIMARY KEY (cols)`* (what a
+  pg_dump restore runs) makes the columns `NOT NULL` and adds a unique
+  index, `<table>_pkey` unless named, which the catalogs, psql's `\d`
+  and a foreign key written without columns treat as the primary key;
+  existing NULLs (`23502`) or duplicates (`23505`) refuse it. The rows
+  stay keyed by the `rowid`: a lookup by the key reads the index, then
+  the row. For a table keyed by its columns themselves, create a new
+  table with the key and copy the rows (`INSERT INTO t2 SELECT * FROM
+  t`). `DROP CONSTRAINT` removes such a key like any unique index. On a
+  table that has a primary key (declared, or added this way) a second
+  one is `42P16`, as in PostgreSQL.
 - *Time-series tables* still declare their key: the timestamp must
   close it.
 
@@ -1408,8 +1415,10 @@ unique checks, and secondary indexes all apply — but commits in **chunks**
 of 128 rows / 1 MiB as data streams in. That makes huge loads safe
 (bounded memory, bounded transactions), at a price worth knowing: a
 mid-load failure keeps the chunks already committed (the error reports
-the failing row and the committed count), and COPY cannot run inside
-`BEGIN`. Only the `FORMAT text|csv|binary` option is supported on
+the failing row and the committed count). Inside `BEGIN` the chunks
+are written in the block's transaction instead, so the load commits or
+rolls back with it (pg_restore's `BEGIN; TRUNCATE ONLY t; COPY t ...;
+COMMIT`). Only the `FORMAT text|csv|binary` option is supported on
 `COPY FROM`.
 
 ### Exporting with COPY TO

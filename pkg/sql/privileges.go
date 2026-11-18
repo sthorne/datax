@@ -831,6 +831,9 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 					return nil, newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be granted on", shared.Virtual)
 				}
 				descs = append(descs, shared)
+				if db, bare := catalog.SplitTableName(name); db == vtable.PgCatalog {
+					name = bare // pg_catalog.datax_metrics: the system table
+				}
 				given = append(given, name)
 			}
 		}

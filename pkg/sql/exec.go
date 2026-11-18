@@ -187,6 +187,8 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execShow(ctx, txn, t)
 	case *parser.ShowStats:
 		return s.execShowStats(ctx, txn, t)
+	case *parser.LockTable:
+		return s.execLockTable(ctx, txn, t)
 	case *parser.Analyze:
 		// ANALYZE runs a multi-transaction sweep and is intercepted before
 		// execStmt; reaching here means an unsupported calling context.
