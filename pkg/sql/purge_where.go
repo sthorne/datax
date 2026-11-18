@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -461,11 +462,33 @@ func (s *Session) purgeSpans(ctx context.Context, spans []keySpan) (*kvpb.PurgeR
 		if err != nil {
 			return nil, err
 		}
-		all.Ranges += rep.Ranges
-		all.VersionsRemoved += rep.VersionsRemoved
-		all.Replicas = append(all.Replicas, rep.Replicas...)
-		all.Incomplete = append(all.Incomplete, rep.Incomplete...)
-		all.Complete = all.Complete && rep.Complete
+		mergePurgeReport(all, rep)
 	}
 	return all, nil
+}
+
+// mergePurgeReport folds one span's report into all. A backup in
+// progress that held any span back (issue #376) holds the whole
+// statement back: the backups are listed once, the collection stopped
+// below the oldest of them, and the statement is purged again
+// automatically only if every held span will be.
+func mergePurgeReport(all, rep *kvpb.PurgeReport) {
+	all.Ranges += rep.Ranges
+	all.VersionsRemoved += rep.VersionsRemoved
+	all.Replicas = append(all.Replicas, rep.Replicas...)
+	all.Incomplete = append(all.Incomplete, rep.Incomplete...)
+	all.Complete = all.Complete && rep.Complete
+	if len(rep.HeldBy) == 0 {
+		return
+	}
+	first := len(all.HeldBy) == 0
+	for _, b := range rep.HeldBy {
+		if !slices.Contains(all.HeldBy, b) {
+			all.HeldBy = append(all.HeldBy, b)
+		}
+	}
+	if first || rep.HeldBelowNanos < all.HeldBelowNanos {
+		all.HeldBelowNanos = rep.HeldBelowNanos
+	}
+	all.Rerun = rep.Rerun && (first || all.Rerun)
 }

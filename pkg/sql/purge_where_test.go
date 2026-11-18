@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
@@ -287,5 +288,30 @@ func TestPurgeWhereRefusals(t *testing.T) {
 	}
 	if _, _, serr := purgeWhereSpans(rowid, purgeConds(t, `tenant = 'a'`), nil); serr == nil || serr.Code != CodeInvalidColumnReference || !strings.Contains(serr.Hint, "no declared primary key") {
 		t.Fatalf("rowid table: %v", serr)
+	}
+}
+
+// TestMergePurgeReportHeld checks that a backup holding back any span of
+// a PURGE WHERE holds back the statement's report (issue #376): the
+// backups once each, the oldest stop, and a rerun only if every held
+// span reruns.
+func TestMergePurgeReportHeld(t *testing.T) {
+	all := &kvpb.PurgeReport{Complete: true}
+	mergePurgeReport(all, &kvpb.PurgeReport{Complete: true, Ranges: 1, VersionsRemoved: 2})
+	if len(all.HeldBy) != 0 || all.Rerun || !all.Complete {
+		t.Fatalf("unheld span: %+v", all)
+	}
+	mergePurgeReport(all, &kvpb.PurgeReport{HeldBy: []string{"b1"}, HeldBelowNanos: 50, Rerun: true})
+	mergePurgeReport(all, &kvpb.PurgeReport{HeldBy: []string{"b1", "b2"}, HeldBelowNanos: 30, Rerun: true})
+	mergePurgeReport(all, &kvpb.PurgeReport{HeldBy: []string{"b2"}, HeldBelowNanos: 40, Rerun: true})
+	if all.Complete || all.Ranges != 1 || all.VersionsRemoved != 2 {
+		t.Fatalf("totals: %+v", all)
+	}
+	if strings.Join(all.HeldBy, ",") != "b1,b2" || all.HeldBelowNanos != 30 || !all.Rerun {
+		t.Fatalf("held: %+v", all)
+	}
+	mergePurgeReport(all, &kvpb.PurgeReport{HeldBy: []string{"b3"}, HeldBelowNanos: 60})
+	if all.Rerun || all.HeldBelowNanos != 30 || len(all.HeldBy) != 3 {
+		t.Fatalf("a span without a rerun: %+v", all)
 	}
 }
