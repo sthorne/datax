@@ -80,9 +80,10 @@ var adminUnauditedOps = map[string]bool{
 	"notify": true,
 	// The steps of a purge, asked by the purging node of the others; the
 	// purge writes one record, with the whole report (purge.go).
-	"purge-range":   true,
-	"purge-replica": true,
-	"purge-scrub":   true,
+	"purge-range":       true,
+	"purge-range-below": true,
+	"purge-replica":     true,
+	"purge-scrub":       true,
 	// A range clear's step on a range's leader, asked by the node running
 	// the dropped-table reclaim, which logs the clear (clear_span.go).
 	"clear-range": true,
@@ -540,7 +541,7 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		}
 		return cluster.AdminResponse{Purge: rep, TableNames: n.tableNamesFor(ctx, kvpb.RangeDescriptor{StartKey: start, EndKey: end})}
 
-	case "purge-range", "purge-replica", "purge-scrub":
+	case "purge-range", "purge-range-below", "purge-replica", "purge-scrub":
 		return n.servePurgeStep(ctx, req)
 
 	case "clear-range":

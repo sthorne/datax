@@ -297,8 +297,10 @@ func (s *Session) execResetOptions(ctx context.Context, t *parser.AlterTable) (*
 // threshold of now, compact the span on every replica, and return what
 // each replica then holds. One row per replica; the tag says whether the
 // purge is complete. The work is the node's (server.Node.PurgeSpan); the
-// statement names the span and renders the report.
-func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result, *Error) {
+// statement names the span and renders the report. With WHERE (issue
+// #375) the spans are the ones purgeWhereSpans computes, purged in turn
+// and reported as one.
+func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable, params []types.Datum) (*Result, *Error) {
 	if err := s.requireV21("ALTER TABLE ... PURGE"); err != nil {
 		return nil, ToSQLError(err)
 	}
@@ -316,12 +318,20 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 	}); err != nil {
 		return nil, ToSQLError(err)
 	}
-	start, end := keys.TableDataSpan(desc.ID)
-	rep, err := s.db.Purge(ctx, start, end)
+	spans := []keySpan{{}}
+	spans[0].start, spans[0].end = keys.TableDataSpan(desc.ID)
+	var notices []string
+	if t.PurgeWhere != nil {
+		var serr *Error
+		if spans, notices, serr = purgeWhereSpans(desc, t.PurgeWhere, params); serr != nil {
+			return nil, serr
+		}
+	}
+	rep, err := s.purgeSpans(ctx, spans)
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	res := &Result{Columns: purgeColumns()}
+	res := &Result{Columns: purgeColumns(), Notices: notices}
 	sort.Slice(rep.Replicas, func(i, j int) bool {
 		a, b := rep.Replicas[i], rep.Replicas[j]
 		if a.RangeID != b.RangeID {
@@ -351,6 +361,20 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 		// The statement did what it could reach; the rows say what it
 		// could not, and the tag must not read as an attestation.
 		res.Tag = "PURGE INCOMPLETE"
+	}
+	if len(rep.HeldBy) > 0 {
+		// A backup in progress holds the newest history (issue #376):
+		// said as a notice, since no row of the report is about it.
+		msg := fmt.Sprintf("purge held back by %d backup(s) in progress: versions deleted before %s are gone, and those deleted since remain on disk until the backups end",
+			len(rep.HeldBy), time.Unix(0, rep.HeldBelowNanos).UTC().Format(time.RFC3339Nano))
+		if rep.Rerun {
+			msg += "; the table is purged again automatically then"
+		} else {
+			msg += "; run the purge again then"
+		}
+		// Which backups, and where they write, is the operator's to read
+		// (the audit log, `datax debug purge`), not every table owner's.
+		res.Notices = append(res.Notices, msg)
 	}
 	return res, nil
 }

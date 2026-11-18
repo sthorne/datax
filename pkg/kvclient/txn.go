@@ -89,10 +89,41 @@ func batchCommits(ba *kvpb.BatchRequest) bool {
 	return false
 }
 
-// IsRetryable reports whether err calls for a transaction restart.
+// SnapshotTooOldError is a historical transaction's read refused by a
+// range whose GC threshold has passed the transaction's timestamp. The
+// timestamp is the client's (AS OF SYSTEM TIME, an imported snapshot),
+// and the history at it is gone: no restart can help. It is the only
+// GC-threshold refusal that is not a restart (issue #374).
+type SnapshotTooOldError struct {
+	Cause *kvpb.Error
+}
+
+func (e *SnapshotTooOldError) Error() string { return e.Cause.Message }
+
+func (e *SnapshotTooOldError) Unwrap() error { return e.Cause }
+
+// IsRetryable reports whether err calls for a transaction restart: a
+// RetryableError, or a GC-threshold refusal that is not a historical
+// read's SnapshotTooOldError. The transaction coordinator turns the
+// refusals of its own reads and writes into RetryableErrors, but a
+// refusal can reach a statement by other ways — a push or an intent
+// resolution of a peer older than the exemption in kvserver, a
+// non-transactional read at a timestamp the cluster chose (a backfill's
+// boundary) — and wherever the timestamp was the cluster's, running
+// again at a new one succeeds (issue #374). Counting them here makes
+// every retry loop that consults IsRetryable (implicit statements,
+// streamed results, COPY) retry them, and SQL map them to 40001.
 func IsRetryable(err error) bool {
 	var re *RetryableError
-	return errors.As(err, &re)
+	if errors.As(err, &re) {
+		return true
+	}
+	var stoo *SnapshotTooOldError
+	if errors.As(err, &stoo) {
+		return false
+	}
+	var kerr *kvpb.Error
+	return errors.As(err, &kerr) && kerr.IsBelowGCThreshold()
 }
 
 // Txn is a client transaction coordinator: it stamps requests with the
@@ -963,6 +994,8 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 		case t.restartsBelowGCThreshold(kerr):
 			metrics.TxnRetries.Inc()
 			return nil, &RetryableError{Cause: kerr}
+		case kerr.IsBelowGCThreshold():
+			return nil, &SnapshotTooOldError{Cause: kerr}
 		default:
 			return nil, kerr
 		}
@@ -1601,6 +1634,8 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		case t.restartsBelowGCThreshold(kerr):
 			metrics.TxnRetries.Inc()
 			return nil, true, &RetryableError{Cause: kerr}
+		case kerr.IsBelowGCThreshold():
+			return nil, true, &SnapshotTooOldError{Cause: kerr}
 		default:
 			return nil, true, kerr
 		}

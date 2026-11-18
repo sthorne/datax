@@ -16,6 +16,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -33,8 +34,10 @@ import (
 //     inside it. Collection raises a range's GC threshold, and with it
 //     refuses every older read of that range; the split keeps that to
 //     the span that was named.
-//  2. On each range's leader, collect garbage at a threshold of now and
-//     truncate the raft log (kvserver.Store.PurgeRange).
+//  2. On each range's leader, collect garbage at a threshold of now — or
+//     just below the oldest backup in progress, which a purge does not
+//     cut off (backup_protect.go, issue #376) — and truncate the raft
+//     log (kvserver.Store.PurgeRangeBelow).
 //  3. On every replica of each range, wait for the leader's applied
 //     index, compact the span on the state engine and the range's log on
 //     the raft engine, and count what is left (kvserver.Store.
@@ -134,9 +137,15 @@ func (n *Node) purgeSpan(ctx context.Context, start, end keys.Key) (*kvpb.PurgeR
 		return nil, err
 	}
 	rep.Ranges = len(ranges)
+	// The backups in progress hold the collection below the oldest of
+	// them (backup_protect.go).
+	limit, held, err := n.purgeHold(ctx)
+	if err != nil {
+		return nil, err
+	}
 	nodes := map[base.NodeID]bool{}
 	for _, desc := range ranges {
-		ans, err := n.purgeRangeOnLeader(ctx, desc, start, end)
+		ans, err := n.purgeRangeOnLeader(ctx, desc, start, end, limit, len(held) > 0)
 		if err != nil {
 			rep.Incomplete = append(rep.Incomplete, fmt.Sprintf("%s was not collected: %v", desc.RangeID, err))
 			rep.Replicas = append(rep.Replicas, kvpb.PurgeReplicaReport{RangeID: desc.RangeID, Error: "range not collected: " + err.Error()})
@@ -177,6 +186,21 @@ func (n *Node) purgeSpan(ctx context.Context, start, end keys.Key) (*kvpb.PurgeR
 		if _, err := n.purgeCall(ctx, id, cluster.AdminRequest{Op: "purge-scrub"}); err != nil {
 			rep.Incomplete = append(rep.Incomplete, fmt.Sprintf("n%d did not retire its write-ahead logs: %v", id, err))
 		}
+	}
+	if len(held) > 0 {
+		for _, p := range held {
+			rep.HeldBy = append(rep.HeldBy, p.String())
+		}
+		rep.HeldBelowNanos = held[0].TS.WallTime
+		rep.Rerun = n.schedulePurgeRerun(start, end, held)
+		line := fmt.Sprintf("held back by %d backup(s) in progress: versions deleted before %s are gone, and those deleted since are still on disk until they end",
+			len(held), describeBackupTS(held[0].TS))
+		if rep.Rerun {
+			line += "; this node purges the span again then"
+		} else {
+			line += "; purge again then"
+		}
+		rep.Incomplete = append([]string{line}, rep.Incomplete...)
 	}
 	rep.Complete = len(rep.Incomplete) == 0
 	return rep, nil
@@ -227,10 +251,23 @@ func (n *Node) rangesTiling(ctx context.Context, start, end keys.Key) ([]kvpb.Ra
 }
 
 // purgeRangeOnLeader finds the range's leader among its replicas and has
-// it run its step.
-func (n *Node) purgeRangeOnLeader(ctx context.Context, desc kvpb.RangeDescriptor, start, end keys.Key) (*cluster.PurgeRangeAnswer, error) {
-	req := cluster.AdminRequest{Op: "purge-range", RangeID: desc.RangeID, Key: start, EndKey: end}
-	resp, err := n.leaderCall(ctx, desc, req, func(resp cluster.AdminResponse) bool { return resp.PurgeRange != nil })
+// it run its step, collecting no higher than limit. held says a backup
+// in progress set limit: then a leader from before backup protection,
+// which would collect at its own now, is not asked at all. Otherwise
+// such a leader is asked as it was before (purge-range), and only the
+// race with a backup starting at that moment is uncovered while the
+// cluster is mixed.
+func (n *Node) purgeRangeOnLeader(ctx context.Context, desc kvpb.RangeDescriptor, start, end keys.Key, limit hlc.Timestamp, held bool) (*cluster.PurgeRangeAnswer, error) {
+	answered := func(resp cluster.AdminResponse) bool { return resp.PurgeRange != nil }
+	req := cluster.AdminRequest{Op: "purge-range-below", RangeID: desc.RangeID, Key: start, EndKey: end, PurgeBelow: &limit}
+	resp, err := n.leaderCall(ctx, desc, req, answered)
+	if err != nil && strings.Contains(err.Error(), "unknown admin op") {
+		if held {
+			return nil, fmt.Errorf("a node of the range runs a version from before backup protection and would purge through the backup in progress: %w", err)
+		}
+		req.Op, req.PurgeBelow = "purge-range", nil
+		resp, err = n.leaderCall(ctx, desc, req, answered)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -305,8 +342,15 @@ func (n *Node) purgeCallRaw(ctx context.Context, id base.NodeID, req cluster.Adm
 // servePurgeStep answers the three steps a purge asks of a node.
 func (n *Node) servePurgeStep(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
 	switch req.Op {
-	case "purge-range":
-		res, err := n.store.PurgeRange(ctx, req.RangeID, keys.Key(req.Key), keys.Key(req.EndKey))
+	case "purge-range", "purge-range-below":
+		var limit hlc.Timestamp
+		if req.Op == "purge-range-below" {
+			if req.PurgeBelow == nil || req.PurgeBelow.IsEmpty() {
+				return cluster.AdminResponse{Error: "purge-range-below names no limit"}
+			}
+			limit = *req.PurgeBelow
+		}
+		res, err := n.store.PurgeRangeBelow(ctx, req.RangeID, keys.Key(req.Key), keys.Key(req.EndKey), limit)
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

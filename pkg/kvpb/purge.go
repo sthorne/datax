@@ -27,6 +27,16 @@ type PurgeReport struct {
 	// NotCovered names what a purge does not reach, so the report cannot
 	// be read as saying more than it does.
 	NotCovered []string `json:"not_covered"`
+	// HeldBy names the backups in progress that held the purge back
+	// (issue #376): each reads the span at a timestamp of its own, and
+	// the collection stopped just below the oldest of them, HeldBelowNanos
+	// (wall time). What was deleted before it is gone; what was deleted
+	// after it is still on disk, and the report is incomplete. Rerun says
+	// the purging node runs the purge again by itself once those backups
+	// have ended, as a purge of its own with its own report.
+	HeldBy         []string `json:"held_by,omitempty"`
+	HeldBelowNanos int64    `json:"held_below_nanos,omitempty"`
+	Rerun          bool     `json:"rerun,omitempty"`
 }
 
 // PurgeReplicaReport is one replica's part of a PurgeReport.

@@ -657,7 +657,14 @@ manual split is an ordinary one.
 
 `datax debug purge` is `ALTER TABLE ... PURGE`
 ([SQL guide](sql.md#gc-window-and-purge)) for an operator, and for a key
-range that is not a whole table:
+range that is not a whole table. For one tenant's or one key prefix's
+rows, prefer `ALTER TABLE t PURGE WHERE tenant = 'acme'`: it computes
+the spans from the primary key, including the matching spans of
+secondary indexes that lead with the same columns, and purges the
+indexes it cannot narrow whole, so the purged rows' old versions are
+gone from every index. A `--key`/`--end-key` purge covers exactly the
+raw span it is given and nothing else, so on its own it leaves those
+rows' index entries' history in place.
 
 ```sh
 datax debug purge --table-name app.documents
@@ -687,9 +694,34 @@ Things to know before relying on it:
 
 - **It cuts off older readers of the span.** The span's GC threshold
   becomes the purge time: `AS OF SYSTEM TIME` before it, follower reads
-  before it, a transaction that began before it, and an incremental
-  backup whose base is older all fail on that span, with an error. Take
-  a full backup after a purge if you run incrementals.
+  before it, and a transaction that began before it all fail on that
+  span, with an error. A whole-table purge does this for every row of
+  the table; `PURGE WHERE` only for the named keys and for any secondary
+  index it had to purge whole (it names those in a `NOTICE`). An
+  incremental backup whose base is older does not fail: it holds the
+  purged table in full (see [Backup and restore](#backup-and-restore)),
+  so incrementals need no full backup after a purge.
+- **Its split points stay** until the merge queue folds them away, which
+  it does once the neighbouring range's own GC window has passed the
+  purge: a merged range adopts the higher threshold, so merging earlier
+  would cut off the neighbour's history. The splits are not sticky and
+  need no `UNSPLIT`.
+- **A backup in progress is never cut off.** A running backup protects
+  the timestamp it reads at (below). A purge first waits up to 10
+  seconds for the backups in progress to end. If one is still running,
+  the purge collects up to just below the oldest backup's timestamp —
+  everything deleted before that backup began is gone — and reports
+  itself **incomplete**, naming the backups (`INCOMPLETE: held back by
+  ...`, `held by the backup to <dir> on n<id>, reading at <ts>`): what
+  was deleted after the backup's timestamp is still on disk. The node
+  that ran the purge purges the span again by itself as soon as those
+  backups have ended, as a purge of its own with its own audit record
+  and operation; the CLI's message says so, and the command still exits
+  non-zero, since the purge it ran was not complete. If that node
+  restarts first, the rerun is lost: run the purge again. A purge never
+  reports a held purge as done. During a rolling upgrade, a range whose
+  leader is on a binary from before this is not purged while a backup
+  is running (it is reported, and the purge can be run again).
 - **A node that is down** makes the purge incomplete, by name. When it
   restarts it applies the collection from the log (or is given a
   snapshot without the data) and serves no follower read until it has
@@ -712,7 +744,11 @@ Things to know before relying on it:
   from every file the database owns, not from the device beneath.
 
 `datax_purge_versions_removed_total` counts what purges on a node
-removed. A dropped table's ranges are emptied by a range clear before
+removed. The same protection holds every purge, whoever asks for it:
+`ALTER TABLE ... PURGE`, `datax debug purge` (a key range included) and
+the reclaim of a dropped table. The reclaim also waits to clear a
+dropped table's rows while a backup that began before the drop is
+running. A dropped table's ranges are emptied by a range clear before
 their purge, once the cluster is at v22 (`datax_range_clears_total`
 counts them on the leaders that proposed them); the purge then has
 nothing to collect and removes the bytes from the files and logs.
@@ -859,10 +895,29 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   them from; a manifest carrying any other key — the cluster's
   authentication secret, say — is refused before anything is applied.
 - Incrementals capture only keys changed since the base — deletions
-  included — and must chain within the MVCC GC window (25h by default): a
-  base older than that is refused ("the base backup is older than the
-  garbage-collection window"), because changes since it have been
-  collected in part. Take a fresh full backup at least daily.
+  included. That needs the history since the base, which garbage
+  collection removes after the GC window (25h by default, or a table's
+  own `gc_ttl`) and a purge removes at once. When a table's history
+  since the base has been collected, the incremental holds **that table
+  in full**, as it stands at the incremental's timestamp, and the rest
+  as changes; the summary marks it `(held in full)` and says why in a
+  note. A restore of the chain then takes the table from that
+  incremental and from no backup before it, so rows a purge removed are
+  not brought back from the full backup beneath. Such an incremental is
+  as big as the table, so still chain within the GC window, and take a
+  fresh full backup at least daily. A backup with a table held in full
+  has its own manifest format (`DXBK4`): a binary from before it refuses
+  it ("not a datax backup") rather than restoring the table wrongly.
+- **A running backup is protected.** Before it reads anything a backup
+  records the timestamp it reads at, cluster-wide, and renews the record
+  every 30 seconds while it runs. Garbage collection and purges do not
+  collect at or above that timestamp while the record is live, so a
+  short `gc_ttl` or a purge (see [Purging deleted data](#purging-deleted-data))
+  does not fail a backup in progress. The record goes when the backup
+  ends; one left by a backup whose node died lapses after 2 minutes, so
+  a crashed backup holds collection back for no longer than that. Only
+  the backup's own timestamp is protected, not an incremental's base: a
+  purge during an incremental makes it hold the purged table in full.
 - **Time-series retention and backups.** Retention expires rows beneath
   SQL by commit time and leaves no tombstone, so an incremental taken
   after rows expired has nothing to say about them. A backup therefore
@@ -1143,13 +1198,16 @@ datax restore --addr 10.0.0.1:26257 --src /backups/sun-full,/backups/mon-06,/bac
   incremental holds one record per version, where a plain one holds one
   per changed key. The summary prints both (`records`, `versions`).
 - **History must still exist to be backed up.** Versions older than the
-  GC TTL (25h by default) are collected. An incremental whose base is
-  older than that is refused rather than written with a hole in it — so
-  take history incrementals more often than the GC TTL, and leave
-  margin: nothing holds collection back for a chain that falls behind.
-  If one is refused, the chain ends at its last backup and a new full
-  backup starts the next. Rows a timeseries table's retention has
-  expired are gone from history like any other collected version.
+  GC TTL (25h by default) are collected, and a purge collects a table's
+  at once. An incremental whose base is older than what a table still
+  has holds that table in full instead of its history, rather than
+  writing it with a hole in it: the chain then restores that table to
+  the incremental's end, and a moment inside its interval is refused
+  for it ("holds it only as it stood then"), as for a table created in
+  the interval. So take history incrementals more often than the GC
+  TTL, and leave margin: nothing holds collection back for a chain that
+  falls behind. Rows a timeseries table's retention has expired are
+  gone from history like any other collected version.
 - **The schema is not versioned.** A backup holds each table's
   definition, and the cluster's roles and sequences, as of the backup's
   end. A restore to a moment *inside* an interval therefore refuses a

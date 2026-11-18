@@ -11,6 +11,34 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`ALTER TABLE t PURGE WHERE <predicate>`** (#375) purges only the
+  rows a primary-key prefix or range names, such as one tenant's
+  (`WHERE tenant = 'acme'`, `WHERE (a, b) = (1, 2)`,
+  `WHERE a = 1 AND b BETWEEN 10 AND 20`). Only those keys' older readers
+  are cut off; other keys keep their history. Secondary indexes that lead
+  with the same columns are purged over the same prefix; any other index
+  is purged whole, with a `NOTICE` naming it, so the purged rows' old
+  versions are gone from every index. Other predicates are refused with a
+  hint naming the primary key: `42P10` for a non-key column, `0A000` for
+  `OR` / `IN` / functions, `22023` for inexact or `NULL` values.
+- **Backups are protected from purges** (#376). A running backup protects
+  its read timestamp from `ALTER TABLE ... PURGE` (including
+  `PURGE WHERE`), `datax debug purge`, garbage collection and the
+  dropped-table cleanup, under a 2-minute lease so a crashed backup cannot
+  hold collection back. A purge waits up to 10 seconds for running
+  backups; if one is still running it removes everything deleted before
+  that backup began, reports itself incomplete (`PURGE INCOMPLETE` and a
+  `NOTICE`; `datax debug purge` exits non-zero and names the backups), and
+  purges again automatically once the backup ends (lost if that node
+  restarts first). Each backup now starts about a second later, twice the
+  maximum clock offset.
+- **An incremental backup survives a purge** (#376). When a purge or
+  garbage collection has passed its base, the incremental holds the
+  affected tables in full instead of failing, and restoring the chain
+  takes those tables from that backup, so purged rows are not brought
+  back. Manifests carrying a full table use the new format `DXBK4`, which
+  older binaries refuse; a point-in-time restore to a moment inside such
+  a table's gap is refused for that table.
 - **Quoted identifiers as in PostgreSQL** (#367): a quoted type name keeps
   its case (`CREATE TYPE "Role"`, a column `r "Role"`, `::"Role"`, `CAST(x
   AS "public"."Role")`, `ALTER COLUMN ... TYPE "Role"`, `regtype`,
@@ -1735,6 +1763,22 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A purge no longer surfaces as `72000 snapshot too old` in ordinary
+  transactions** (#374). A transaction that ran into another's
+  uncommitted write while `ALTER TABLE ... PURGE` ran could fail with
+  `72000`: the intent push and resolution it sent are not transactional
+  and could arrive below the new GC threshold. Requests that touch only
+  transaction records and the transaction's own intents (push, heartbeat,
+  recovery, intent resolution and rollback, an aborting end) are no
+  longer checked against the threshold, and any other below-threshold
+  refusal of a non-historical read is a `40001` restart; a single
+  statement outside a transaction block retries it internally. `72000`
+  is now only for `AS OF SYSTEM TIME` and imported-snapshot reads.
+- **A `COMMIT` refused with `40001` releases its locks at once** (#374).
+  The abort after a refused commit was itself refused below the GC
+  threshold, so its intents stayed until the record expired and the next
+  writer to those rows waited about 5 seconds. A `ROLLBACK TO SAVEPOINT`
+  refused for the same reason reports `40001` instead of `3B001`.
 - **Dropped tables are drained from every gateway** (#377). Once
   `DROP TABLE`, `DROP VIEW`, `DROP OWNED` or `DROP DATABASE ... CASCADE`
   returns, no gateway still serves the dropped table from its leased cache;

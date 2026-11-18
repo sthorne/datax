@@ -258,6 +258,9 @@ func printBackupSummary(what string, sum *cluster.BackupSummary) {
 		if t.Versions != 0 {
 			line += fmt.Sprintf(" versions=%d", t.Versions)
 		}
+		if t.Full {
+			line += " (held in full)"
+		}
 		if t.From != "" {
 			tableRestore = true
 			line += fmt.Sprintf("  (from %s, id %d)", t.From, t.FromID)

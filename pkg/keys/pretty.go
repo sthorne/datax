@@ -177,7 +177,7 @@ func prettySystem(b *strings.Builder, rest []byte) {
 	switch name {
 	case "nodes", "desc", "stats", "db", "seqdesc", "seq", "dropped", "seal-job":
 		shape = "u"
-	case "idgen", "users", "admins", "ns", "dbns":
+	case "idgen", "users", "admins", "ns", "dbns", "backup-protect":
 		shape = "s"
 	case "nsdb", "seqns":
 		shape = "us"

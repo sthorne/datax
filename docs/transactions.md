@@ -784,8 +784,9 @@ refused (writes as well as reads, so a write cannot land beneath a
 collected tombstone), intents are never collected around, and a
 transaction record born at or below it cannot be recreated. What a short
 window does is make those refusals reachable by ordinary work — a long
-transaction, an old `AS OF SYSTEM TIME`, an incremental backup from an
-old base — and they surface as errors, never as short results.
+transaction, an old `AS OF SYSTEM TIME` — and they surface as errors,
+never as short results. An incremental backup from an old base is the
+exception: it holds such a table whole instead (below).
 
 ### Purge
 
@@ -837,6 +838,44 @@ implies the log up to it, the collection included. A replica that is
 partitioned but running has no such signal and is the remaining gap; the
 purge names every replica that did not confirm, and is not complete
 until none is left.
+
+### Backups in progress
+
+A backup reads every table at one timestamp for as long as it runs, so
+a threshold raised past that timestamp mid-backup — by a purge, or by a
+short `gc_ttl` — would fail it (issue #376). A backup therefore writes a
+record (`keys.BackupProtectionKey`, `pkg/server/backup_protect.go`)
+before it reads anything: a timestamp at or below the one it reads at,
+and a lease it renews every quarter of `BackupProtectionTTL` (2m) and
+removes when it ends. A lapsed record protects nothing, so a backup
+whose node died holds collection back for one lease at most.
+
+- **GC** (`StoreConfig.GCLimit`) reads the records once per pass and
+  sets no threshold at or above the oldest live one; if it cannot read
+  them it skips the pass.
+- **A purge** (`PurgeSpan`, so whole-table, key-range and dropped-table
+  purges alike) waits up to `PurgeBackupWait` (10s) for the backups in
+  progress to end, then collects at `min(read timestamp of the records,
+  just below the oldest live record)`, passed to the leader as
+  `purge-range-below` (a node from before it refuses that op name rather
+  than collecting at its own now). A purge held back this way is
+  reported incomplete, with the backups (`PurgeReport.HeldBy`), and the
+  purging node runs it again once they have ended.
+- **The race** between a purge reading the records and a backup writing
+  one is closed by the clock bound, like a transaction's uncertainty: a
+  purge never collects above the timestamp it read the records at, and
+  a backup takes its timestamp only after its record is written and
+  twice the maximum clock offset has passed, so a record the purge did
+  not see belongs to a backup reading above anything it collected.
+- **Only the backup's own timestamp** is protected, never an
+  incremental's base: holding purges to the base would keep deleted data
+  for a whole backup interval. An incremental export refused for its
+  base (`incremental base too old`) is taken again from zero instead,
+  and the table is marked `full` in the manifest (magic `DXBK4`, which
+  older binaries refuse); restore reads such a table from the last
+  backup of the chain that holds it whole and from none before it.
+- The dropped-table reclaim does not clear a table's span while a
+  backup that began before the drop is running.
 
 Not reached, and listed in every report: backups; a raft snapshot in
 flight; the log of a range the rows were written to before a split moved

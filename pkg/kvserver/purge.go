@@ -77,6 +77,15 @@ type intentResolver interface {
 // inside [start, end): the threshold a purge raises covers a whole range,
 // and a range holding other data would lose that data's history too.
 func (s *Store) PurgeRange(ctx context.Context, rangeID base.RangeID, start, end keys.Key) (PurgeRangeResult, error) {
+	return s.PurgeRangeBelow(ctx, rangeID, start, end, hlc.Timestamp{})
+}
+
+// PurgeRangeBelow is PurgeRange with the collection's threshold held at
+// or below limit when limit is set (issue #376): the purging node reads
+// the backups in progress and passes the highest threshold none of them
+// is cut off by. The threshold is the leader's now or limit, whichever
+// is lower.
+func (s *Store) PurgeRangeBelow(ctx context.Context, rangeID base.RangeID, start, end keys.Key, limit hlc.Timestamp) (PurgeRangeResult, error) {
 	var res PurgeRangeResult
 	r, ok := s.GetReplica(rangeID)
 	if !ok || !r.IsLeader() {
@@ -93,6 +102,9 @@ func (s *Store) PurgeRange(ctx context.Context, rangeID base.RangeID, start, end
 	r.resolveIntentsForPurge(ctx, desc)
 
 	res.Threshold = s.cfg.Clock.Now()
+	if !limit.IsEmpty() && limit.Less(res.Threshold) {
+		res.Threshold = limit
+	}
 	removed, err := r.collectGarbage(ctx, res.Threshold, false, nil)
 	if err != nil {
 		return res, err

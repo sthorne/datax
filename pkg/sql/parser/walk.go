@@ -77,6 +77,7 @@ func (w *Walker) Statement(stmt Statement) {
 		for _, c := range t.Cmds {
 			w.Statement(c)
 		}
+		w.Conds(t.PurgeWhere)
 		for _, tuple := range t.SplitAt {
 			for i := range tuple {
 				w.WalkExpr(&tuple[i])
