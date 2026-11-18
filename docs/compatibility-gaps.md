@@ -46,17 +46,17 @@ Open gaps by area and priority.
 
 | Area | P1 | P2 | P3 | Total |
 |---|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 3 | 17 | 8 | 28 |
+| [PG: Query language](#query-language) | 0 | 17 | 9 | 26 |
 | [PG: Functions and operators](#functions-and-operators) | 0 | 15 | 6 | 21 |
-| [PG: Types](#types) | 0 | 12 | 15 | 27 |
-| [PG: DDL](#ddl) | 4 | 14 | 6 | 24 |
+| [PG: Types](#types) | 1 | 12 | 15 | 28 |
+| [PG: DDL](#ddl) | 3 | 15 | 6 | 24 |
 | [PG: Programmability](#programmability) | 2 | 3 | 2 | 7 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 12 |
 | [PG: Security](#security) | 0 | 6 | 4 | 10 |
 | [PG: Extensions](#extensions) | 0 | 6 | 4 | 10 |
 | [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 3 | 4 | 7 |
 | [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 1 | 7 | 6 | 14 |
-| [PG: Operations](#operations) | 1 | 4 | 7 | 12 |
+| [PG: Operations](#operations) | 0 | 5 | 7 | 12 |
 | [CR: Changefeeds / CDC](#changefeeds-and-cdc) | 1 | 0 | 1 | 2 |
 | [CR: Multi-region and placement](#multi-region-and-placement) | 0 | 5 | 2 | 7 |
 | [CR: Indexes, computed columns, spatial](#indexes-computed-columns-and-spatial) | 0 | 6 | 1 | 7 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 4 |
-| **PostgreSQL total** | **12** | **93** | **67** | **172** |
+| **PostgreSQL total** | **8** | **95** | **68** | **171** |
 | **CockroachDB total** | **2** | **25** | **18** | **45** |
-| **All** | **14** | **118** | **85** | **217** |
+| **All** | **10** | **120** | **86** | **216** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -93,7 +93,6 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 |---|---|---|---|---|---|---|---|
 | PG-Q-003 | `DISTINCT ON` together with window functions; `DISTINCT ON` in a select without `FROM` (ignored) | `0A000`; ignored | `row_number() OVER (PARTITION BY ...)` in a derived table | P3 | S | D | — |
 | PG-Q-004 | What `LATERAL` (#338) does not cover yet: a lateral subquery over a derived table or a set operation of its own, an outer reference in a lateral subquery's `ORDER BY` / `GROUP BY` / aggregate arguments, `RIGHT` / `FULL JOIN LATERAL` (PostgreSQL allows it when nothing to the left is read); `ROWS FROM (...)`; `json_table`; multi-argument `unnest`; a set-returning function in the select list of a query with `FROM` | `0A000 correlated subqueries are not supported`; `42P10`; `0A000` | a plain lateral select; expand in `FROM` | P2 | M | D | — |
-| PG-Q-006 | `JOIN ... ON` must equate a column with one from an earlier table: `ON true`, non-equi joins (`ON u.tid < t.id`), `OR` in `ON` | `42601 syntax error: JOIN ... ON must equate a column of u with one from an earlier table` | comma or `CROSS JOIN` with the condition in `WHERE` (works); an equality plus extra `AND` conditions works | P1 | M | V | — |
 | PG-Q-008 | Aggregates in a `SELECT` without `FROM` (`SELECT count(*)`, `SELECT max(1)`) | `XX000 empty expression` (an internal error) | `SELECT count(*) FROM (SELECT 1) s` (works) | P2 | S | V | — |
 | PG-Q-009 | Window functions over aggregates (`sum(count(*)) OVER ()`), a window call in `ORDER BY` | `0A000 grouped SELECT items must be plain columns or aggregates`; `42803 aggregate functions in ORDER BY require GROUP BY ...` | derived table | P2 | M | V | — |
 | PG-Q-010 | Window frames: `RANGE` with an offset, `GROUPS`, `EXCLUDE`; `FILTER` and `DISTINCT` on a window call | `0A000 RANGE frames with an offset are not supported; use ROWS`; `42601 expected ")", found "groups" / "exclude"`; `0A000` for `FILTER` on a window call, with PostgreSQL's messages for `DISTINCT` / `ORDER BY` / `WITHIN GROUP` (which PostgreSQL refuses too) | `ROWS` frames; `CASE` inside the aggregate | P2 | M | V | — |
@@ -104,7 +103,6 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 | PG-Q-015 | `VALUES` as a `FROM` item (`(VALUES (1,'a')) AS v(x, y)`); `TABLE t` | `42601 expected identifier, found "("`; `42601 unsupported statement "TABLE"` | `WITH v(x, y) AS (VALUES ...)` (works) | P2 | S | V | — |
 | PG-Q-016 | `MERGE` (and PG 17's `MERGE ... RETURNING`, `WHEN NOT MATCHED BY SOURCE`) | `42601 unsupported statement "merge"` | `INSERT ... ON CONFLICT DO UPDATE`; `UPSERT` | P2 | L | V | — |
 | PG-Q-017 | Multi-column `UPDATE ... SET (a, b) = (...)` and `= (SELECT ...)` | `42601 expected identifier, found "("` | one assignment per column | P2 | S | V | — |
-| PG-Q-018 | `COPY ... TO STDOUT`, `COPY (query) TO` | `42601 COPY TO is not supported`; `42601 expected identifier, found "("` | `SELECT` and format client-side | P1 | M | V | — |
 | PG-Q-019 | `COPY FROM` options other than `FORMAT`: `HEADER`, `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL`, `ON_ERROR` (17), `ENCODING` | `42601 unsupported COPY option "header"` | strip the header; default delimiters | P2 | S | V | — |
 | PG-Q-020 | `COPY FROM` is not atomic (commits in 128-row / 1 MiB chunks) and is refused inside `BEGIN` | `25001 COPY FROM cannot run inside a transaction block`; silently different on failure (earlier chunks stay) | load into a staging table, then `INSERT ... SELECT` | P2 | L | V | — |
 | PG-Q-021 | SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`; cursors: `DECLARE`, `FETCH`, `MOVE`, `CLOSE`, `WITH HOLD` (psycopg named cursors, some reporting tools) | `42601 unsupported statement "prepare" / "declare"` | protocol-level prepare and portal suspension (both work) | P2 | M | V | — |
@@ -117,8 +115,8 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 | PG-Q-028 | Operators and predicates: `OVERLAPS`, `IS [NOT] JSON` (16), `^@` (starts-with) | `42601 expected ")", found ","`; `42601 expected NULL, TRUE, FALSE or DISTINCT FROM after IS`; `42601 unexpected character '@'` | explicit comparisons; `starts_with()` | P3 | S | V | — |
 | PG-Q-029 | `ON CONFLICT (cols) WHERE predicate` (partial unique index arbiter); `DO UPDATE` changing a primary-key column | `42601 expected DO NOTHING or DO UPDATE after ON CONFLICT, found "WHERE"`; key change refused (see user doc) | `ON CONFLICT ON CONSTRAINT name` (partial indexes exist since #358) | P3 | S | V | — |
 | PG-Q-030 | A NOTICE for `IF EXISTS` / `IF NOT EXISTS` no-ops (`DROP TABLE IF EXISTS nosuch`) | silently different: no NOTICE (PostgreSQL: `table "nosuch" does not exist, skipping`) | — | P3 | S | V | — |
-| PG-Q-031 | **A correlated subquery in a grouped query binds the outer table's name to an aliased inner table**: `SELECT grp, (SELECT count(*) FROM ev e2 WHERE e2.grp = ev.grp) FROM ev GROUP BY grp` counts the whole table (6) where PostgreSQL counts the group (3); with another outer alias the grouped correlated form is refused | silently different (wrong result) | alias the outer table and the inner one differently | P1 | S | V | [#361](https://github.com/sthorne/datax/issues/361) |
 | PG-Q-032 | **DML and aggregate leftovers**: `UPDATE ... FROM` takes the first joined row for a target row with several matches (PostgreSQL leaves it unspecified); `EXPLAIN` of `UPDATE` / `DELETE`; a duplicate table name in a `FROM` list is `42P07` (PostgreSQL `42712`); an aggregate `ORDER BY` on a `jsonb` value is `0A000` (jsonb has no ordering), so `jsonb_agg(DISTINCT j)` keeps input order; `sum` / `avg` over floats ignore the aggregate `ORDER BY`; `string_agg`'s separator must be a constant or parameter | `0A000`; silently different | — | P3 | S | V | — |
+| PG-Q-033 | **Join, correlation and COPY leftovers**: no hash or merge join, so a join with no usable equality is a nested loop (outer × inner rows); `SELECT * ... ORDER BY 1` over a join fails; a correlated scalar subquery column describes as `text`; correlated subqueries in a window-function select, `ORDER BY` one over a join or with `DISTINCT ON` / `FOR UPDATE`, and outer references inside aggregate arguments or `FILTER` are `0A000`; `SELECT 1/0 WHERE false` returns no row (PostgreSQL folds and raises); `COPY FROM` takes only the `FORMAT` option; `COPY` `ENCODING` takes only UTF8 / SQL_ASCII; `E''` strings lack `\b`, `\f`, `\xHH` | `0A000`; slow plans | add an equality to large joins | P3 | M | V | — |
 
 ### Functions and operators
 
@@ -183,14 +181,13 @@ which do exist: see PG-F-022.
 | PG-T-026 | Expression results lose their declared typmod and describe as the family (`DECIMAL(10,2)` arithmetic is `numeric`; `a + 1` over `INT4` is `INT8`) | silently different (Describe output) | cast | P3 | M | D | — |
 | PG-T-027 | `"char"`, `name` and other internal types behave as `text` | silently different | — | P3 | S | V | — |
 | PG-T-028 | **Cast leftovers**: a schema qualifier on a cast type is ignored (`1::foo.int8` is accepted, PostgreSQL `3F000`); over the extended protocol an unknown cast type fails at Execute, not Parse; casts written in row-level security policy text are not checked when the policy is created; `foo 'lit'` for an unknown `foo` is `42601`, not `42704`; `json` and `jsonb` are one type, so `json \|\| json` merges where PostgreSQL refuses it (`42883`): a deliberate difference, kept | silently different, or a different SQLSTATE | — | P3 | S | V | — |
+| PG-T-029 | **A quoted mixed-case type name is folded to lower case** in column definitions (`r "Role"` reads `role`), so every Prisma schema with an enum fails; `""` inside a quoted identifier is not supported | `42704 type "role" does not exist` | lower-case enum names | P1 | S | V | [#367](https://github.com/sthorne/datax/issues/367) |
 
 ### DDL
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-D-001 | **Schemas**: `CREATE SCHEMA`, `DROP SCHEMA`, objects in schemas other than `public`, `ALTER TABLE ... SET SCHEMA`; `search_path` is accepted and echoed by `SHOW` but ignored; a schema-qualified name is read as a database (`app.x` → database `app`) | `42601 expected TABLE, found "schema"`; `3D000 database "app" does not exist`; `42601 expected "(", found "schema"` | databases in place of schemas | P1 | XL | V | — |
-| PG-D-007 | **Several actions in one `ALTER TABLE`** (`ADD COLUMN a INT, ADD COLUMN b INT`; Rails `bulk: true`, Prisma, pg_dump) | `42601 unexpected "," after statement` | one statement per action | P1 | M | V | — |
-| PG-D-008 | **`ADD COLUMN` with a non-constant default** (`DEFAULT now()`, `DEFAULT gen_random_uuid()`) | `0A000 ADD COLUMN takes a constant DEFAULT only` | add nullable, backfill, then `SET DEFAULT` | P1 | M | V | — |
 | PG-D-009 | **Temporary tables** (`CREATE TEMP TABLE`, `ON COMMIT DROP`) and `UNLOGGED` tables | `42601 expected TABLE, found "temp" / "unlogged"` | ordinary tables with session-unique names | P1 | L | V | — |
 | PG-D-010 | Generated columns `GENERATED ALWAYS AS (expr) STORED` (and 18's `VIRTUAL`) | `42601 expected IDENTITY, found "("` | compute in the application | P2 | M | V | — |
 | PG-D-011 | `DEFERRABLE` / `INITIALLY DEFERRED` constraints and `SET CONSTRAINTS` | `42601 expected ")", found "deferrable"`; `42601 expected = or TO after SET constraints` | order the writes | P2 | M | V | — |
@@ -212,6 +209,8 @@ which do exist: see PG-F-022.
 | PG-D-028 | `RENAME TO` across databases | refused (user doc) | recreate | P3 | S | D | — |
 | PG-D-029 | **Index leftovers**: pattern operator classes are accepted but do not make `LIKE 'abc%'` use the index; `pg_index.indclass` / `indcollation` are not modelled and `pg_opclass` is empty; `SHOW CREATE TABLE` does not print operator classes or collations; a duplicate index name is `42710` (PostgreSQL `42P07`); a quoted `"concurrently"` index name is read as the keyword; `CREATE INDEX` in a transaction block is refused (`25001`) unless the block created the table, since the online build spans transactions | silently different, or `25001 CREATE INDEX cannot run inside a transaction block` | build the index outside the block | P2 | M | V | — |
 | PG-D-030 | **Index-form and key leftovers**: the planner uses a partial index only when the query repeats the predicate's conjuncts (no implication, no `OR`, no parameter for a literal); an expression index serves `=` and ranges, not `ORDER BY`, `IN` or `LIKE`; zone-dependent expressions (`date_trunc`, timestamp casts) are refused in index expressions even over `timestamp without time zone`; `pg_get_indexdef` prints expressions as written, without PostgreSQL's casts; `DESC` keys are stored ascending, so a mixed-direction `ORDER BY` is sorted; `ALTER TABLE ... ADD PRIMARY KEY` on a table created without one is refused; `ADD COLUMN rowid` on such a table is `42710` | `0A000`; `42P17`; a sort instead of an index order | — | P2 | M | V | — |
+| PG-D-031 | **`ALTER TABLE` leftovers**: a volatile `ADD COLUMN` default and every action that reads rows are refused inside a transaction block (`25001`), even on a table the block created (Rails needs `disable_ddl_transaction!`); a concurrent `INSERT` during `ADD COLUMN ... NOT NULL` without a default fails `23502` instead of waiting; an interrupted online `ALTER` can only be finished by re-running it; `ADD PRIMARY KEY` on a table created without one keeps the hidden rowid as the key and shows a unique index as the primary key | `25001`; `23502` | run the statement outside a block | P2 | M | V | — |
+| PG-D-032 | **Two concurrent online `CREATE INDEX` on one table can lose an index**: both report success and one index is missing, or a build fails with "index vanished during backfill" (`pg_restore -j` hits it) | silently different (an index reported created does not exist) | build indexes on a table one at a time | P1 | M | V | [#368](https://github.com/sthorne/datax/issues/368) |
 
 ### Programmability
 
@@ -343,7 +342,6 @@ the empty list commands all render.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-O-001 | **Settings leftovers** (the common settings were added in #345): `IntervalStyle` and `bytea_output` change only top-level text columns on the wire, not `::text`, arrays, records or JSON; `SHOW statement_timeout` (and the other timeouts) gives `5000` where PostgreSQL gives `5s`; error HINTs are missing; `pg_settings` has no `enumvals`, `min_val` or `max_val`; `lc_messages` and `session_replication_role` need no superuser | silently different | — | P3 | S | D | — |
-| PG-O-002 | **pg_dump / pg_restore**: pg_dump 16 gets past its first queries and settings since #345 and #357 (not run further yet); it would need `COPY TO`, `SET TRANSACTION SNAPSHOT`, multi-action `ALTER TABLE`; restoring a PostgreSQL dump needs schemas, functions, `ALTER TABLE ONLY ... ADD CONSTRAINT`, sequences' `setval` (works) | not verified past the settings | `datax backup` / `restore`; `\copy ... from` | P1 | L | V | — |
 | PG-O-003 | `VACUUM` (all forms, including `VACUUM ANALYZE`) | `42601 unsupported statement "vacuum"` | none needed for space (MVCC GC, `ALTER TABLE ... PURGE`); `ANALYZE` | P2 | S | V | — |
 | PG-O-004 | Logical replication: `CREATE PUBLICATION`, `CREATE SUBSCRIPTION` (the catalogs are empty stubs) | `42601` | backup / restore; LISTEN/NOTIFY | P2 | XL | V | — |
 | PG-O-005 | Collations and ICU: the only ordering is bytewise (`'a' < 'B'` is false, as under `C`); no ICU or nondeterministic (case-insensitive) collations, no `CREATE COLLATION`, no `COLLATE` in expressions or indexes; `\l` shows `C` | silently different from an `en_US` database | sort client-side | P2 | L | V | — |
@@ -354,6 +352,7 @@ the empty list commands all render.
 | PG-O-010 | `CHECKPOINT` | `42601 unsupported statement "checkpoint"` | — | P3 | S | V | — |
 | PG-O-011 | Server-side file access: `COPY FROM 'file'`, `pg_read_file`, `pg_ls_dir`, server-side `lo_import` / `lo_export` | `42883 unknown function "pg_read_file"` | client-side `\copy`, `\lo_import` | P3 | S | V | — |
 | PG-O-012 | WAL-based tooling: `pg_basebackup`, WAL archiving, `pg_rewind`, physical standbys | not applicable: datax replicates ranges with Raft and backs up with `datax backup` | `datax backup --revision-history` for point-in-time restore | P3 | — | D | — |
+| PG-O-013 | **pg_dump leftovers**: roles are not dumped and `pg_dumpall` does not work (no `pg_authid`); `pg_restore --single-transaction` fails (`ADD CONSTRAINT` / `CREATE INDEX` refused in a block); `pg_restore -j` is not recommended (PG-D-032, and `40001` on parallel large objects); a dumped sequence resumes after its cached block (a gap); large objects are cluster-wide, so a restore into a second database of the same cluster says "already exists"; grants on `datax_*` tables dump as `ON pg_catalog.datax_x`; DDL within the clock-offset window of the dump's start can fail it with `40001`; only pg_dump 16 is tested | `0A000`; `40001` | create roles first; restore without `-j` | P2 | M | V | — |
 
 ---
 
@@ -529,11 +528,16 @@ Useful context when weighing gaps; none of these is a gap.
 ## Closed
 
 Gaps closed recently, newest first. From CHANGELOG 0.58.0 and the merged
-PRs #317–#352 (issue numbers in the changelog are given where the PR
+PRs #317–#362 (issue numbers in the changelog are given where the PR
 carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| Correlated subqueries follow PostgreSQL scoping; grouped correlated subqueries (was PG-Q-031) | PR (this branch) (#361) |
+| `JOIN ... ON` with any condition (was PG-Q-006) | PR (this branch) (#363) |
+| Several actions in one `ALTER TABLE`; `ADD COLUMN` with any default (were PG-D-007, PG-D-008; leftovers are PG-D-031) | PR (this branch) (#364) |
+| `COPY ... TO STDOUT` (was PG-Q-018) | PR (this branch) (#365) |
+| pg_dump / pg_restore end to end (was PG-O-002; leftovers are PG-O-013) | PR (this branch) (#366) |
 | Advisory locks, cluster-wide (was PG-X-003; leftovers are PG-X-014) | PR (this branch) (#353) |
 | Tables without a declared primary key get a hidden `rowid` (was PG-D-002) | PR (this branch) (#354) |
 | `UPDATE ... FROM`, `DELETE ... USING`; `SET a = b, b = a` swaps (was PG-Q-007) | PR (this branch) (#355) |
@@ -586,22 +590,20 @@ carried several).
 ## Priorities
 
 The gaps that would most widen what runs unmodified, in order. The
-earlier list's items 1–6 are closed (#353–#360); what is left of them is
-in the rows named above.
+earlier list's items 1–4 are closed (#361, #363–#366); what is left of
+them is in the rows named above.
 
-1. **PG-Q-031** a correlated subquery in a grouped query binds an outer
-   name to an aliased inner table: a silently wrong answer (#361).
-2. **PG-Q-006** non-equi and `ON true` joins.
-3. **PG-D-007 / PG-D-008** multi-action `ALTER TABLE` and `ADD COLUMN
-   ... DEFAULT now()`: generated migrations.
-4. **PG-Q-018 / PG-O-002** `COPY TO` and pg_dump: the standard way out
-   of a PostgreSQL-compatible database (pg_dump now gets past its
-   settings and first queries).
-5. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
+1. **PG-D-032** two concurrent `CREATE INDEX` on one table can lose an
+   index (#368): an index reported created does not exist.
+2. **PG-T-029** quoted mixed-case type names are folded (#367): every
+   Prisma schema with an enum fails.
+3. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
    missing function families.
-6. **PG-X-014** advisory locks taken per row (`pg_try_advisory_lock(id)
-   FROM jobs`, job queues).
-7. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
+4. **PG-X-014** advisory locks taken per row (job queues).
+5. **PG-D-031 / PG-O-013** `ALTER TABLE` in transaction blocks and the
+   pg_dump leftovers (roles, single-transaction and parallel restore).
+6. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
+7. **PG-Q-033** a hash join, for large joins without a usable equality.
 8. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
    changefeeds: the large structural gaps that decide whether bigger
    applications can move at all; each is XL and wants a design first.

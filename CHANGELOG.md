@@ -11,6 +11,19 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **pg_dump and pg_restore** (#366): PostgreSQL 16's `pg_dump` dumps a datax
+  database and the output restores into another: plain, custom and
+  directory formats, `--schema-only` / `--data-only`, `--snapshot`, and
+  `-Fd -j N` dumps. `TestPgDumpRestore` runs the real tools in CI. On the
+  way: `LOCK TABLE` (weak modes), `PREPARE` / `EXECUTE` / `DEALLOCATE`,
+  cursors (`DECLARE` / `FETCH` / `MOVE` / `CLOSE`), `pg_export_snapshot()` /
+  `SET TRANSACTION SNAPSHOT` (over timestamped reads), `ALTER COLUMN ... ADD
+  GENERATED AS IDENTITY`, `ALTER VIEW / SCHEMA public / LARGE OBJECT ...
+  OWNER TO`, `ALTER SEQUENCE ... OWNED BY` (it was ignored), `ADD PRIMARY
+  KEY` on a table created without one, `COPY FROM` inside a transaction
+  block, ACL columns filled from grants, and `datax_*` tables listed in
+  `pg_catalog` with 32-bit OIDs. Roles are not dumped, and `pg_restore -j` is
+  not recommended yet. See docs/user/pg-dump.md.
 - **`JOIN ... ON` takes any boolean condition** (#363): `ON true`, non-equi
   (`u.tid < t.id`, `BETWEEN`), `OR`, conditions on one side, expressions
   (`lower(a.x) = lower(b.y)`), for `INNER`, `LEFT`, `RIGHT` and `FULL` joins,
@@ -1710,6 +1723,12 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Catalog values pg_dump reads** (#366): a table whose only index is its
+  primary key reported `relhasindex` false, so a dump lost the key;
+  `pg_get_viewdef` lacked the trailing `;`, so pg_dump cut the view's last
+  character (`price < 10` became `price < 1`); `format_type` dropped the
+  typmod; a policy's `USING` clause was lost; `set_config` over
+  `pg_settings` ran once instead of per row.
 - **A correlated subquery bound a table's name hidden by its alias**
   (#361): `SELECT grp, (SELECT count(*) FROM ev e2 WHERE e2.grp = ev.grp)
   FROM ev GROUP BY grp` counted the whole table, the inner `ev` answering to
