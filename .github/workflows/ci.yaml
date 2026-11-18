@@ -1,9 +1,14 @@
 name: ci
 on:
-  push:
-    # 'claude/**' covers the working branches, which take direct pushes.
-    branches: [main, master, 'claude/**']
-  pull_request:
+  # Paused (automatic triggers removed): the account is out of GitHub
+  # Actions minutes, so every run would fail. Run by hand (workflow
+  # dispatch) or locally (docs/testing.md); restore the triggers below
+  # when minutes are available again.
+  #   push:
+  #     # 'claude/**' covers the working branches, which take direct pushes.
+  #     branches: [main, master, 'claude/**']
+  #   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
