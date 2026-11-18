@@ -208,6 +208,10 @@ func (e *Error) RetryTimestamp(fallback hlc.Timestamp) hlc.Timestamp {
 		return fallback.Forward(e.Uncertainty.ExistingTimestamp.Next())
 	case e.TxnRetry != nil:
 		return fallback.Forward(e.TxnRetry.RetryTimestamp)
+	case e.BelowGCThreshold != nil:
+		// A restart must read above the threshold, which may come from
+		// a clock ahead of the restarting node's.
+		return fallback.Forward(e.BelowGCThreshold.Threshold.Next())
 	}
 	return fallback
 }

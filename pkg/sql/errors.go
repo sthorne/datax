@@ -153,17 +153,18 @@ func ToSQLError(err error) *Error {
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}
 	}
 	if kvclient.IsRetryable(err) {
+		// Every GC-threshold refusal but a historical read's is one
+		// (issue #374): the timestamp was the cluster's.
 		return &Error{Code: CodeSerializationFailure, Msg: restartMessage(err)}
 	}
-	var kerr *kvpb.Error
-	if errors.As(err, &kerr) && kerr.IsBelowGCThreshold() {
-		// What is left of a GC-threshold refusal once a transaction that
-		// could restart has been given 40001 (kvclient): a read at a
-		// timestamp the client chose, below the history kept.
-		// PostgreSQL's code for that is snapshot_too_old; retrying at the
-		// same timestamp cannot succeed (issue #313).
+	var stoo *kvclient.SnapshotTooOldError
+	if errors.As(err, &stoo) {
+		// A read at a timestamp the client chose, below the history
+		// kept. PostgreSQL's code for that is snapshot_too_old; retrying
+		// at the same timestamp cannot succeed (issue #313).
 		return &Error{Code: CodeSnapshotTooOld, Msg: "snapshot too old: the history at the timestamp read has been garbage-collected (AS OF SYSTEM TIME must lie within the table's GC window): " + err.Error()}
 	}
+	var kerr *kvpb.Error
 	if errors.As(err, &kerr) && kerr.TooLarge != nil {
 		return &Error{Code: CodeProgramLimitExceeded, Msg: fmt.Sprintf("the statement writes about %d MiB to one range in a single piece, and a single write can carry %d MiB: a row and what is written with it must stay well below that (store a large value as a large object: lo_create, lowrite)",
 			(kerr.TooLarge.Bytes+1<<19)>>20, kerr.TooLarge.Limit>>20)}
