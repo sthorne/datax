@@ -112,6 +112,7 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 		if err := s.cat.DropDescriptor(txn, d, &wb); err != nil {
 			return nil, err
 		}
+		s.noteDrop(d)
 		wb.Delete(keys.TableStatsKey(d.ID))
 	}
 	if err := txn.RunBatch(ctx, &wb); err != nil {

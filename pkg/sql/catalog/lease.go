@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +57,35 @@ import (
 // deadline and needs none: it read the descriptor inside its own
 // transaction, so a schema change committing after that read fails the
 // transaction's refresh.
+
+// Drops (issue #377). A drop has no next version to drain to: the
+// descriptor and its name go in the dropping transaction. Draining it
+// still means the same two things — once DROP returns, no gateway plans
+// against the table, and no statement planned against it can still
+// commit — so a gateway that sees its cached descriptor gone answers
+// the drain with an acknowledgement rather than letting its lease
+// lapse: it uncaches the table and rewrites its lease record at
+// droppedLeaseVersion, a version every drain counts as adopted, with
+// PriorExpiration set to the latest deadline it handed out under the
+// entry (ackDropped). After the dropping transaction commits, the
+// session drains each dropped descriptor by id (FinishDrop) as it
+// drains any other schema change: until every live lease on it is an
+// acknowledgement whose handed-out deadlines have passed. Lookups after
+// that resolve nothing and fail with 42P01, and a write planned before
+// the drop fails its deadline rather than commit into the dropped span.
+//
+// The acknowledgement keeps the lease's own expiration, so a record
+// stays live until every deadline taken under the lease has passed;
+// the dropped-table reclaim does not clear a table's span while any
+// lease on it is live (DescriptorLeased).
+//
+// A lease transaction that read the descriptor before the drop
+// committed can still be installing its entry after this gateway has
+// acknowledged the drop — a renewal, or a first use. Every lease
+// transaction is registered as in flight (beginFlight) before it reads,
+// and a drop seen on the gateway marks the descriptor in every flight
+// (markDroppedLocked); an install whose flight was marked after it began
+// is refused, and the lease it took is acknowledged as dropped too.
 
 // Eviction (issue #311). A gateway holds a lease, and renews it every
 // TTL/3, for each descriptor in its cache; left alone, the cache and the
@@ -143,19 +173,27 @@ func (a *Accessor) releaseSlot(reserved bool) {
 }
 
 // install puts a leased entry in the cache, consuming the reservation if
-// there was one. It reports false, caching nothing, only when the lookup
-// had counted on replacing an entry that has since gone and the cache
-// has no room left.
-func (a *Accessor) install(key string, entry *cachedDesc, reserved bool) bool {
+// there was one. It reports false, caching nothing, when the lookup had
+// counted on replacing an entry that has since gone and the cache has no
+// room left — or, with dropped true, when the descriptor was seen dropped
+// on this gateway after the lease transaction began (lease.go, "Drops"),
+// with the deadline still outstanding from the drop.
+func (a *Accessor) install(key string, entry *cachedDesc, reserved bool, seq uint64) (ok, dropped bool, outstanding int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if reserved {
 		a.acquiring--
-	} else if _, present := a.cache[key]; !present && len(a.cache)+a.acquiring >= a.maxEntriesLocked() {
-		return false
+	}
+	if dropped, out := a.droppedSinceLocked(key, entry.desc.ID, seq); dropped {
+		return false, true, out
+	}
+	if !reserved {
+		if _, present := a.cache[key]; !present && len(a.cache)+a.acquiring >= a.maxEntriesLocked() {
+			return false, false, 0
+		}
 	}
 	a.cache[key] = entry
-	return true
+	return true, false, 0
 }
 
 // evictIdle removes the entries no statement has used for the idle time
@@ -241,7 +279,19 @@ type descLease struct {
 }
 
 // leaseInfo is what one acquisition established.
-type leaseInfo struct{ expiration, priorExpiration, handedOutExpiration int64 }
+type leaseInfo struct {
+	expiration, priorExpiration, handedOutExpiration int64
+	// flightSeq is where the drop marks stood when the lease
+	// transaction began (beginFlight): a mark above it is a drop the
+	// transaction's read may predate.
+	flightSeq uint64
+}
+
+// droppedLeaseVersion is the version a lease record claims once its
+// gateway has seen the descriptor dropped and stopped using it (issue
+// #377): at or past any version a drain waits for, so only the record's
+// PriorExpiration — the deadlines still outstanding — holds a drain up.
+const droppedLeaseVersion = math.MaxUint64
 
 // TestingPauseRenewal stops (or resumes) the background lease renewal:
 // tests use it to let this gateway's leases expire while its sessions
@@ -328,8 +378,8 @@ func (a *Accessor) renewAll(ctx context.Context) error {
 
 // refreshOne re-reads a table's descriptor (adopting any new version),
 // renews this gateway's lease on it, and updates the cache. A dropped
-// table is uncached and its lease released. Returns the fresh descriptor
-// (nil when dropped).
+// table is uncached and the drop acknowledged in its lease record
+// (ackDropped). Returns the fresh descriptor (nil when dropped).
 func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescriptor, error) {
 	dbID, bare := splitCacheKey(name)
 	desc, info, done, err := a.acquireLease(ctx, dbID, bare, name)
@@ -344,17 +394,34 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		a.mu.Lock()
 		old, had := a.cache[name]
 		delete(a.cache, name)
+		var out int64
+		if had && old.desc != nil {
+			out = old.outstandingExpiration()
+			a.markDroppedLocked(old.desc.ID, out, name)
+		}
 		a.mu.Unlock()
-		if had {
+		if had && old.desc != nil {
 			// Only if the record is still this entry's: after a rename
 			// the same descriptor may already be cached, and leased,
 			// under its new name.
-			a.releaseLease(ctx, old.desc.ID, old.expiration)
+			a.ackDropped(ctx, old.desc.ID, old.expiration, out)
 		}
 		return nil, nil
 	}
 	entry := &cachedDesc{desc: desc, expiration: info.expiration, priorExpiration: info.priorExpiration, handedOutExpiration: info.handedOutExpiration}
 	a.mu.Lock()
+	if dropped, out := a.droppedSinceLocked(name, desc.ID, info.flightSeq); dropped {
+		// The descriptor this transaction read has been dropped since
+		// (see "Drops" above): the entry must not be installed, and the
+		// lease just taken is given up the same way.
+		if cur, ok := a.cache[name]; ok && cur.desc != nil && cur.desc.ID == desc.ID {
+			delete(a.cache, name)
+			out = max(out, cur.outstandingExpiration())
+		}
+		a.mu.Unlock()
+		a.ackDropped(ctx, desc.ID, info.expiration, max(out, info.priorExpiration, info.handedOutExpiration))
+		return nil, nil
+	}
 	old, had := a.cache[name]
 	if had {
 		// A renewal is not a use.
@@ -371,6 +438,11 @@ func (a *Accessor) refreshOne(ctx context.Context, name string) (*TableDescripto
 		// A schema change on a table this gateway does not cache, with
 		// the cache full: the lease just taken covers nothing.
 		a.releaseLease(ctx, desc.ID, info.expiration)
+	}
+	if had && old.desc != nil && old.desc.ID != desc.ID {
+		// The name now belongs to another table: the one cached under it
+		// was dropped (or renamed away), and this gateway is done with it.
+		a.ackDropped(ctx, old.desc.ID, old.expiration, old.outstandingExpiration())
 	}
 	return desc, nil
 }
@@ -425,13 +497,15 @@ func SetTestingBeforeLeaseWrite(f func(a *Accessor, name string)) {
 // an older entry for name (supersededLocked). done is never nil.
 func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name string) (desc *TableDescriptor, info leaseInfo, done func(), err error) {
 	marked := false
+	seq := a.beginFlight(name)
 	done = func() {
 		if marked {
 			a.unmarkAdopting(name)
 		}
+		a.endFlight(name)
 	}
 	err = a.db.RunTxn(ctx, "lease-acquire", func(ctx context.Context, txn *kvclient.Txn) error {
-		desc, info = nil, leaseInfo{}
+		desc, info = nil, leaseInfo{flightSeq: seq}
 		d, err := lookupUncached(ctx, txn, dbID, bare, a.isDefaultID(dbID))
 		var nf *ErrTableNotFound
 		if errors.As(err, &nf) {
@@ -445,7 +519,7 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		}
 		now := a.clock.Now().WallTime
 		e := now + a.ttl.Nanoseconds()
-		prior, handedOut := a.carryOver(name, d.Version, now)
+		prior, handedOut := a.carryOver(name, d.ID, d.Version, now)
 		raw, err := json.Marshal(descLease{Version: d.Version, Expiration: e, PriorExpiration: prior})
 		if err != nil {
 			return err
@@ -462,7 +536,7 @@ func (a *Accessor) acquireLease(ctx context.Context, dbID uint64, bare, name str
 		if err := txn.RunBatch(ctx, &wb); err != nil {
 			return err
 		}
-		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior, handedOutExpiration: handedOut}
+		desc, info = d, leaseInfo{expiration: e, priorExpiration: prior, handedOutExpiration: handedOut, flightSeq: seq}
 		a.markAdopting(name, d.Version, !marked)
 		marked = true
 		return nil
@@ -544,11 +618,13 @@ func (a *Accessor) supersededLocked(key string, c *cachedDesc) bool {
 //
 // Either value is zero when there is nothing to wait for: nothing was
 // handed out, or its expiration has passed.
-func (a *Accessor) carryOver(name string, version uint64, nowWall int64) (prior, handedOut int64) {
+func (a *Accessor) carryOver(name string, id, version uint64, nowWall int64) (prior, handedOut int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	old, ok := a.cache[name]
-	if !ok || old.desc == nil {
+	if !ok || old.desc == nil || old.desc.ID != id {
+		// Nothing cached, or another table that had the name: what was
+		// handed out under that one is acknowledged with its drop.
 		return 0, 0
 	}
 	handedOut = old.handedOutExpiration
@@ -574,7 +650,8 @@ func (a *Accessor) carryOver(name string, version uint64, nowWall int64) (prior,
 // FinishDDL runs after a schema change on name commits: it adopts the new
 // version locally (renewing this gateway's own lease) and drains — blocks
 // until every live gateway lease on the descriptor has adopted it. Nil for
-// unleased accessors and for dropped tables.
+// unleased accessors and for dropped tables, which the session drains by
+// id with FinishDrop.
 func (a *Accessor) FinishDDL(ctx context.Context, name string) error {
 	return a.FinishDDLIn(ctx, DefaultDatabase, name)
 }
@@ -689,7 +766,11 @@ func (a *Accessor) waitForAdoption(ctx context.Context, descID, version uint64) 
 			return nil
 		}
 		if time.Now().After(deadline) {
-			log.Warnf("descriptor %d: a live lease never adopted version %d; proceeding after drain timeout", descID, version)
+			if version == droppedLeaseVersion {
+				log.Warnf("descriptor %d: a live lease never acknowledged the drop; proceeding after drain timeout", descID)
+			} else {
+				log.Warnf("descriptor %d: a live lease never adopted version %d; proceeding after drain timeout", descID, version)
+			}
 			return nil
 		}
 		select {
@@ -698,4 +779,241 @@ func (a *Accessor) waitForAdoption(ctx context.Context, descID, version uint64) 
 		case <-time.After(poll):
 		}
 	}
+}
+
+// leaseFlight counts the lease transactions on a cache key that have
+// begun and not yet finished installing (or giving up) their entry, and
+// carries the drops marked while they were in flight.
+type leaseFlight struct {
+	n       int
+	dropped map[uint64]dropMark // descriptor id → the latest mark
+}
+
+// dropMark records that a descriptor was seen dropped on this gateway:
+// seq orders it against the flights' starts, and outstanding is the
+// latest deadline the gateway had handed out under its entries for it.
+type dropMark struct {
+	seq         uint64
+	outstanding int64
+}
+
+// beginFlight registers a lease transaction on name before it reads
+// the descriptor, and returns the mark sequence it starts at.
+func (a *Accessor) beginFlight(name string) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.flights == nil {
+		a.flights = make(map[string]*leaseFlight)
+	}
+	f := a.flights[name]
+	if f == nil {
+		f = &leaseFlight{}
+		a.flights[name] = f
+	}
+	f.n++
+	return a.flightSeq
+}
+
+func (a *Accessor) endFlight(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if f := a.flights[name]; f != nil {
+		if f.n--; f.n <= 0 {
+			delete(a.flights, name)
+		}
+	}
+}
+
+// markDroppedLocked records in the lease transactions in flight —
+// those on name, or every one when name is empty — that descriptor id
+// has been seen dropped: none of them may install an entry for it.
+// Callers hold a.mu.
+func (a *Accessor) markDroppedLocked(id uint64, outstanding int64, name string) {
+	if len(a.flights) == 0 {
+		return
+	}
+	a.flightSeq++
+	for key, f := range a.flights {
+		if name != "" && key != name {
+			continue
+		}
+		if f.dropped == nil {
+			f.dropped = make(map[uint64]dropMark)
+		}
+		m := f.dropped[id]
+		m.seq = a.flightSeq
+		m.outstanding = max(m.outstanding, outstanding)
+		f.dropped[id] = m
+	}
+}
+
+// droppedSinceLocked reports whether descriptor id was marked dropped
+// in name's flight after seq, and the deadline outstanding with it.
+// Callers hold a.mu.
+func (a *Accessor) droppedSinceLocked(name string, id, seq uint64) (bool, int64) {
+	f := a.flights[name]
+	if f == nil {
+		return false, 0
+	}
+	m, ok := f.dropped[id]
+	if !ok || m.seq <= seq {
+		return false, 0
+	}
+	return true, m.outstanding
+}
+
+// forgetIDLocked removes every cache entry for descriptor id and
+// returns the latest deadline handed out under them. Callers hold a.mu.
+func (a *Accessor) forgetIDLocked(id uint64) int64 {
+	var out int64
+	for k, c := range a.cache {
+		if c.desc != nil && c.desc.ID == id {
+			out = max(out, c.outstandingExpiration())
+			delete(a.cache, k)
+		}
+	}
+	return out
+}
+
+// ackDropped rewrites this gateway's lease record on a dropped
+// descriptor as an acknowledgement: version droppedLeaseVersion, its
+// expiration kept (extended to outstanding if that is later), and
+// PriorExpiration the deadline still outstanding under it, which is
+// what a drain of the drop waits out. With expectExp nonzero the record
+// is rewritten only if it is still the lease of that expiration — the
+// entry being given up, not one taken since (as releaseLease). A record
+// with nothing left live is deleted. Errors are logged: an unacknowledged
+// lease holds the drain up until it expires, no longer.
+func (a *Accessor) ackDropped(ctx context.Context, id uint64, expectExp, outstanding int64) {
+	key := keys.DescLeaseKey(id, a.gateway)
+	err := a.db.RunTxn(ctx, "lease-ack-drop", func(ctx context.Context, txn *kvclient.Txn) error {
+		raw, err := txn.Get(ctx, key)
+		if err != nil || raw == nil {
+			return err
+		}
+		var l descLease
+		if json.Unmarshal(raw, &l) != nil {
+			return txn.Delete(ctx, key)
+		}
+		if expectExp != 0 && l.Expiration != expectExp {
+			return nil
+		}
+		now := a.clock.Now().WallTime
+		prior := outstanding
+		if l.Version == droppedLeaseVersion {
+			prior = max(prior, l.PriorExpiration)
+		}
+		if prior <= now {
+			prior = 0
+		}
+		exp := max(l.Expiration, prior)
+		if exp <= now {
+			return txn.Delete(ctx, key)
+		}
+		raw, err = json.Marshal(descLease{Version: droppedLeaseVersion, Expiration: exp, PriorExpiration: prior})
+		if err != nil {
+			return err
+		}
+		return txn.Put(ctx, key, raw)
+	})
+	if err != nil {
+		log.Debugf("acknowledging the drop of descriptor %d: %v", id, err)
+	}
+}
+
+// FinishDrop runs after a transaction that dropped table (or view) id
+// commits: it uncaches the descriptor here, acknowledges the drop in
+// this gateway's lease, and drains — blocks until every live lease on
+// the descriptor has acknowledged it and no statement planned against
+// it on any gateway can still commit (see "Drops" above). A descriptor
+// that is there after all (a drop rolled back to a savepoint, a table
+// restored under its id) is not drained. Nil for unleased accessors.
+func (a *Accessor) FinishDrop(ctx context.Context, id uint64) error {
+	a.mu.Lock()
+	leasing := a.leasing
+	a.mu.Unlock()
+	if !leasing {
+		return nil
+	}
+	// Read in a transaction: the dropping transaction's intent on the
+	// key may not be resolved yet, and a transactional read resolves it
+	// where a plain one would fail on it.
+	var present bool
+	if err := a.db.RunTxn(ctx, "drop-check", func(ctx context.Context, txn *kvclient.Txn) error {
+		raw, err := txn.Get(ctx, keys.TableDescKey(id))
+		present = raw != nil
+		return err
+	}); err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	a.mu.Lock()
+	// The dropping transaction uncached the descriptor under its name;
+	// whatever a lease transaction installed since goes too, and any
+	// still installing is refused.
+	out := a.forgetIDLocked(id)
+	a.markDroppedLocked(id, out, "")
+	a.mu.Unlock()
+	a.ackDropped(ctx, id, 0, out)
+	if err := a.waitForAdoption(ctx, id, droppedLeaseVersion); err != nil {
+		return err
+	}
+	a.sweepExpiredLeases(ctx, id)
+	return nil
+}
+
+// sweepExpiredLeases deletes the lapsed lease records on a dropped
+// descriptor; acknowledgements still live are left to lapse, and the
+// dropped-table reclaim takes what is left.
+func (a *Accessor) sweepExpiredLeases(ctx context.Context, id uint64) {
+	err := a.db.RunTxn(ctx, "lease-sweep-drop", func(ctx context.Context, txn *kvclient.Txn) error {
+		return DeleteExpiredLeases(ctx, txn, id, a.clock.Now().WallTime)
+	})
+	if err != nil {
+		log.Debugf("sweeping the leases of dropped descriptor %d: %v", id, err)
+	}
+}
+
+// DeleteExpiredLeases deletes, in txn, every lease record on descriptor
+// id that expired by nowWall: after a drop's drain, and for the
+// dropped-table reclaim once the table is gone for good.
+func DeleteExpiredLeases(ctx context.Context, txn *kvclient.Txn, id uint64, nowWall int64) error {
+	lo, hi := keys.DescLeaseSpan(id)
+	rows, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return err
+	}
+	for _, kv := range rows {
+		var l descLease
+		if json.Unmarshal(kv.Value, &l) == nil && l.Expiration > nowWall {
+			continue
+		}
+		if err := txn.Delete(ctx, kv.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DescriptorLeased reports whether any gateway holds a live lease on
+// descriptor id at nowWall (HLC wall nanos). A statement planned under a
+// cached descriptor commits before its lease's expiration, and a
+// gateway's acknowledgement of a drop keeps that expiration, so once
+// this is false no statement can still write under the descriptor: the
+// dropped-table reclaim waits for it before clearing the span.
+func DescriptorLeased(ctx context.Context, txn *kvclient.Txn, id uint64, nowWall int64) (bool, error) {
+	lo, hi := keys.DescLeaseSpan(id)
+	rows, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil {
+		return false, err
+	}
+	for _, kv := range rows {
+		var l descLease
+		if json.Unmarshal(kv.Value, &l) == nil && l.Expiration > nowWall {
+			return true, nil
+		}
+	}
+	return false, nil
 }
