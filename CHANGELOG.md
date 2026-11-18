@@ -11,6 +11,81 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **PostgreSQL compatibility: the small P2 gaps, and `information_schema`**
+  (docs/compatibility-gaps.md; leftovers are new P3 rows there).
+  - **Queries.**
+    - Aggregates in a `SELECT` without `FROM` (`SELECT count(*)`).
+    - Quantified comparisons `< <= > >= = <>` and `LIKE` with
+      `ANY` / `SOME` / `ALL` over subqueries, with PostgreSQL's NULL and
+      empty-set rules.
+    - `VALUES` column types resolved across rows; multi-row
+      `LATERAL (VALUES ...)`; `TABLE t`.
+    - `UPDATE ... SET (a, b) = (...) / ROW(...) / (SELECT ...)`, also in
+      `UPDATE ... FROM` and `ON CONFLICT DO UPDATE`.
+    - `COPY FROM` options `HEADER [MATCH]`, `DELIMITER`, `NULL`, `QUOTE`,
+      `ESCAPE`, `FORCE_NULL`, `FORCE_NOT_NULL` and `ENCODING`, in both
+      syntaxes. The text format no longer splits a row at an escaped
+      delimiter.
+    - `COLLATE "C" / "POSIX" / "default" / ucs_basic`.
+    - `DISCARD ALL / PLANS / SEQUENCES / TEMP`.
+    - Dollar-quoted string literals anywhere.
+    - `VACUUM` in all forms, a no-op; `VACUUM ANALYZE` refreshes
+      statistics.
+  - **Functions and operators.**
+    - jsonb `-`, `#-` and subscripting, also in `UPDATE ... SET j['a'] = ...`.
+      PostgreSQL's jsonb ordering applies to comparisons, `ORDER BY` and
+      `DISTINCT`.
+    - Integer bitwise operators `& | # << >>` and prefix `~ @ |/ ||/`.
+    - `regexp_instr`; `substring(s FROM pattern)` and
+      `substring(s SIMILAR p ESCAPE e)`.
+    - About twenty string functions (`overlay`, `to_ascii`, `convert*`,
+      `unistr`, `normalize`, `parse_ident`, sha2 and crc32, byte and bit
+      access) and `format()` widths.
+    - The trigonometric, degree and hyperbolic functions, `factorial`,
+      `lcm`, `scale`, `trim_scale`, `random(min, max)`, `random_normal`,
+      `erf`.
+    - Array functions `array_dims`, `array_fill`, `array_replace`,
+      `array_positions`, `array_sample`, `array_shuffle`, `trim_array`,
+      `generate_subscripts`, `array_reverse`, `array_sort`.
+    - Aggregates `corr`, `covar_*`, `regr_*`, `bit_and` / `bit_or` /
+      `bit_xor`, `any_value` and the `json[b]_*agg_strict` / `_unique`
+      forms, also as window functions.
+    - A session function nested in another's arguments resolves
+      (`pg_cancel_backend(pg_backend_pid())`).
+  - **Types.**
+    - `numeric` `NaN` and `±Infinity`: ordering (index keys of finite
+      values are unchanged), arithmetic and the binary wire format.
+    - `bytea` `||`, trim and reverse on bytes, and escape-format input.
+    - reg* literals (`regclass`, `regtype`, `regproc`, `regnamespace`,
+      `regrole`, ...) resolve to OIDs and print as names.
+    - Time zones are applied in `ON` conditions and in
+      `to_jsonb` / `format` / `array_to_string`; about 110 more zone
+      abbreviations.
+  - **Catalogs.**
+    - Every PostgreSQL 16 `information_schema` view, with PostgreSQL's
+      columns, types and visibility rules: `sequences` (read by
+      Hibernate), `table_privileges`, `role_table_grants`,
+      `applicable_roles`, `view_table_usage` and the rest. Views for
+      features datax lacks (`routines`, `triggers`, ...) are empty.
+    - `pg_get_indexdef` / `pg_get_constraintdef` of a literal OID or
+      regclass.
+    - `pg_timezone_names`, `pg_timezone_abbrevs`.
+    - Connections receive PostgreSQL 14's full set of reported
+      parameters. `server_version` stays 14, because pg_dump 16 dumps no
+      tables from a server that reports 16.
+  - **Databases and roles.**
+    - `CREATE DATABASE` options (`ENCODING`, `TEMPLATE`, `LOCALE`,
+      `OWNER`, `CONNECTION LIMIT`, ...).
+    - `ALTER DATABASE ... SET / RESET` defaults, applied when a session
+      starts.
+    - Role attributes `SUPERUSER` (the admin role), `CREATEDB`,
+      `CREATEROLE`, `REPLICATION`, `CONNECTION LIMIT` (per node) and
+      `VALID UNTIL` (enforced at password login), shown in `pg_roles`,
+      `pg_user` and a new admin-only `pg_authid`.
+  - **Historical reads.** `AS OF SYSTEM TIME follower_read_timestamp()`,
+    `with_min_timestamp(...)` and `with_max_staleness(...)`. `BEGIN` /
+    `SET TRANSACTION AS OF SYSTEM TIME` makes a read-only historical
+    block.
 - **`ALTER TABLE t PURGE WHERE <predicate>`** (#375) purges only the
   rows a primary-key prefix or range names, such as one tenant's
   (`WHERE tenant = 'acme'`, `WHERE (a, b) = (1, 2)`,
@@ -1472,6 +1547,36 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **Behaviour now matching PostgreSQL** (the compatibility batch
+  above). Clients that depended on the old behaviour see these changes:
+  - **`information_schema.columns.data_type`** no longer includes a
+    length or precision (`character varying`, not
+    `character varying(10)`). NOT NULL columns appear in
+    `table_constraints` as CHECK rows, `check_clause` is
+    parenthesized, and `views.view_definition` ends with `;`.
+  - **Error codes:**
+    - Regex back references and lookaround are refused with `0A000`
+      (was `2201B`). `~` / `~*` with a bad pattern give `2201B`
+      (was `22023`).
+    - `ln` / `log` of zero or a negative number give `2201E`.
+      `sqrt`, `power` and `factorial` domain errors give `2201F`.
+    - Text-only functions applied to `bytea` give `42883`.
+  - **Timestamps:**
+    - `now()` and `clock_timestamp()` are truncated to microseconds,
+      and timestamp input is rounded to microseconds.
+    - Text output shows at most 6 fractional digits, so values stored
+      earlier with nanoseconds render rounded.
+  - **`pg_authid`** exists and is admin-only (`42501`), where it was
+    missing (`42P01`).
+  - **`ALTER ROLE me PASSWORD ...`** may change only the password: a
+    statement that also sets an attribute needs an admin.
+  - **Each new connection does one more catalog read**, for connection
+    limits, database defaults and `is_superuser`. The read is best
+    effort: if it fails, the session still opens.
+- **The hosted CI, vulnerability-check and bench workflows are paused**:
+  their push, pull-request and schedule triggers are commented out while
+  the account has no GitHub Actions minutes. `scripts/ci-local.sh` runs
+  the same gate locally; `docs/testing.md` describes it.
 - **Running a request as a stopper task costs less** (#331). Every gRPC
   call, raft message, HTTP request and SQL connection has been a stopper
   task since #324, and each took the stopper's one mutex twice, updated
