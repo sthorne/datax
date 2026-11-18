@@ -22,13 +22,15 @@ import (
 // AST is never mutated — resolution builds modified copies — so a prepared
 // statement re-evaluates its subqueries on every execution.
 
-// execSubSelect executes a subquery. A column that fails to resolve inside
-// the subquery's own scope is (almost always) a correlated reference,
-// which is not supported.
+// execSubSelect executes a subquery. A column or qualifier that fails to
+// resolve inside the subquery's own scope is (almost always) a
+// correlated reference of a shape the correlation analysis does not
+// cover, which is not supported. (Covered shapes resolve every name
+// before they run: a genuine typo there is reported as such.)
 func (s *Session) execSubSelect(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, params []types.Datum) (*Result, error) {
 	res, err := s.execSelect(ctx, txn, sub, params)
 	if err != nil {
-		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedColumn {
+		if serr, ok := err.(*Error); ok && (serr.Code == CodeUndefinedColumn || serr.Code == CodeUndefinedTable && strings.Contains(serr.Msg, "FROM-clause entry")) {
 			return nil, newErrf(CodeFeatureNotSupported, "correlated subqueries are not supported (%s)", serr.Msg)
 		}
 		return nil, err
@@ -1460,7 +1462,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 
 	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
-		return s.execGroupedOver(desc, rows, t, params)
+		return s.execGroupedOver(desc, rows, t, params, nil)
 	}
 	if len(t.Having) > 0 {
 		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")

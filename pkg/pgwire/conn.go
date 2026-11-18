@@ -764,6 +764,7 @@ func (c *conn) sendError(serr *sql.Error) {
 		SeverityUnlocalized: "ERROR",
 		Code:                serr.Code,
 		Message:             serr.Msg,
+		Hint:                serr.Hint,
 	})
 }
 

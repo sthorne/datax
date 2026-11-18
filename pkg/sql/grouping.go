@@ -698,7 +698,12 @@ func normalizeConds(conds []parser.Comparison) []parser.Comparison {
 // aggregate state per group; then, per group, HAVING, the outputs and
 // the hidden sort keys over the group's environment; then DISTINCT,
 // ORDER BY and LIMIT over the output rows.
-func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedRow, t *parser.Select, params []types.Datum) (*Result, error) {
+//
+// With gc, the select has correlated subqueries in its per-group
+// positions: t is its shape (fixing keys, aggregates and outputs), and
+// each group's HAVING, outputs and hidden keys come from the select gc
+// substitutes for the group's keys.
+func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedRow, t *parser.Select, params []types.Datum, gc *groupedCorr) (*Result, error) {
 	gq, err := resolveGrouped(desc, t)
 	if err != nil {
 		return nil, err
@@ -815,8 +820,15 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 			}
 			env[catalog.ColumnID(nk+len(aggVals)+i+1)] = types.NewInt(bits)
 		}
-		if len(gq.having) > 0 {
-			keep, err := matchesWhere(gq.having, gq.env, env, params)
+		cur, curAll := gq, all
+		if gc != nil {
+			if cur, err = groupCorrQuery(desc, gq, gc, g.key); err != nil {
+				return nil, err
+			}
+			curAll = append(append([]groupedOut(nil), cur.outs...), cur.hidden...)
+		}
+		if len(cur.having) > 0 {
+			keep, err := matchesWhere(cur.having, cur.env, env, params)
 			if err != nil {
 				return nil, err
 			}
@@ -824,19 +836,26 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 				continue
 			}
 		}
-		out := make([]types.Datum, 0, len(all))
-		for _, oc := range all {
+		out := make([]types.Datum, 0, len(curAll))
+		for i, oc := range curAll {
 			switch {
 			case oc.groupPos >= 0:
 				out = append(out, g.key[oc.groupPos])
 			case oc.aggPos >= 0:
 				out = append(out, aggVals[oc.aggPos])
 			default:
-				d, err := evalExpr(*oc.expr, gq.env, env, params)
+				d, err := evalExpr(*oc.expr, cur.env, env, params)
 				if err != nil {
 					return nil, err
 				}
-				out = append(out, conformTo(d, oc.typ))
+				d = conformTo(d, oc.typ)
+				if gc != nil && !d.Null && oc.typ != all[i].typ {
+					// A correlated subquery's value: the shape could
+					// not type it (typed after evaluation, as an
+					// ungrouped select's are).
+					res.Columns[i].Type = d.Fam
+				}
+				out = append(out, d)
 			}
 		}
 		if err := s.chargeDatums(out); err != nil {
@@ -874,4 +893,27 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 	res.Rows = trimRows(res.Rows, t)
 	res.Tag = fmt.Sprintf("SELECT %d", len(res.Rows))
 	return res, nil
+}
+
+// groupCorrQuery resolves the select gc substitutes for one group's
+// keys, checking that it groups and aggregates exactly as the shape gq
+// the input rows were accumulated by does.
+func groupCorrQuery(desc *catalog.TableDescriptor, gq *groupedQuery, gc *groupedCorr, keys []types.Datum) (*groupedQuery, error) {
+	t, err := gc.selectFor(keys)
+	if err != nil {
+		return nil, err
+	}
+	cur, err := resolveGrouped(desc, t)
+	if err != nil {
+		return nil, err
+	}
+	same := reflect.DeepEqual(cur.keys, gq.keys) && reflect.DeepEqual(cur.groupings, gq.groupings) &&
+		len(cur.specs) == len(gq.specs) && len(cur.outs) == len(gq.outs) && len(cur.hidden) == len(gq.hidden)
+	for i := 0; same && i < len(cur.specs); i++ {
+		same = cur.specs[i].fn == gq.specs[i].fn && cur.specs[i].key == gq.specs[i].key
+	}
+	if !same {
+		return nil, newErrf(CodeInternal, "a correlated subquery changed the grouping of its select")
+	}
+	return cur, nil
 }

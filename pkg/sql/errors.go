@@ -116,6 +116,8 @@ const (
 type Error struct {
 	Code string
 	Msg  string
+	// Hint is PostgreSQL's optional HINT field (empty: none).
+	Hint string
 }
 
 func (e *Error) Error() string { return e.Msg }

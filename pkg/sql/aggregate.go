@@ -961,7 +961,7 @@ func encodeGroupKey(ds []types.Datum) string {
 // hash-group over the fetched rows on the group columns' datums, streaming
 // aggregate state per group, HAVING post-aggregation, then ORDER BY/LIMIT
 // over the output rows.
-func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum, corr []correlatedConjunct) (*Result, error) {
+func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.Select, params []types.Datum, corr []correlatedConjunct, gc *groupedCorr) (*Result, error) {
 	rows, _, err := s.fetchRows(ctx, txn, desc, t.Where, params, 0)
 	if err != nil {
 		return nil, err
@@ -982,7 +982,7 @@ func (s *Session) execGroupedSelect(ctx context.Context, txn *kvclient.Txn, desc
 		}
 		rows = kept
 	}
-	return s.execGroupedOver(desc, rows, t, params)
+	return s.execGroupedOver(desc, rows, t, params, gc)
 }
 
 // dedupeRows removes duplicate output rows, keeping first occurrences in

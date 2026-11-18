@@ -91,6 +91,9 @@ func (s *Session) lateralScope(ctx context.Context, txn *kvclient.Txn, t *parser
 	if err != nil {
 		return scopeLevel{}, err
 	}
+	if _, err := expandUsing(sides, &left); err != nil {
+		return scopeLevel{}, err
+	}
 	scope, _ := joinScope(sides)
 	return scope, nil
 }

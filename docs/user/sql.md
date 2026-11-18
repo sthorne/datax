@@ -1120,9 +1120,16 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
   select list, `array(...)`, `CASE` arms or `OR` groups, over a single
   table or a join — are evaluated per row of the enclosing query,
-  memoized on the referenced values, up to 8 nesting levels. An
-  uncorrelated scalar subquery can also sort: `ORDER BY x - (SELECT
-  avg(x) FROM t)`.
+  memoized on the referenced values, up to 8 nesting levels. In a
+  grouped or aggregate select they run once per group, in the select
+  list, `HAVING` and `ORDER BY`, and may read only the grouping columns
+  (anything else is `42803`, as in PostgreSQL). A scalar subquery can
+  also sort, correlated or not: `ORDER BY (SELECT count(*) FROM o WHERE
+  o.uid = u.id)`, `ORDER BY x - (SELECT avg(x) FROM t)`. Names follow
+  PostgreSQL's scoping: an aliased `FROM` item answers to its alias only
+  (`FROM t AS a` hides `t`), so `t.x` inside a subquery over `t AS a`
+  reads an enclosing `t`, and is `42P01` (invalid reference to
+  FROM-clause entry) when there is none.
 - **Set operations**: `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL]`,
   between selects, `VALUES` lists and parenthesized queries (which may
   carry their own `ORDER BY` / `LIMIT`) with the same number of

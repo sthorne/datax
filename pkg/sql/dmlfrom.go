@@ -2,6 +2,7 @@ package sql
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -492,17 +493,24 @@ func (s *Session) execDeleteUsing(ctx context.Context, txn *kvclient.Txn, t *par
 	return s.applyDelete(ctx, txn, desc, rows, project, retCols)
 }
 
-// stripUpdateAlias addresses the target's columns by bare name in an
-// aliased single-table UPDATE (a.c becomes c in SET, WHERE and
-// RETURNING; subqueries keep theirs, which correlate through the alias).
-func stripUpdateAlias(t *parser.Update) *parser.Update {
+// stripUpdateAlias addresses the target's columns by bare name in a
+// single-table UPDATE (a.c, or t.c unaliased, becomes c in SET, WHERE
+// and RETURNING; subqueries keep theirs, which correlate through the
+// alias). A qualifier naming no FROM item — the table's own name behind
+// an alias included — is refused (42P01), as stripTableAlias does.
+func stripUpdateAlias(t *parser.Update) (*parser.Update, error) {
 	c := *t
 	sel := &parser.Select{Table: t.Table, Alias: t.Alias, Where: append([]parser.Comparison(nil), t.Where...)}
 	for _, sc := range t.Set {
 		sel.Exprs = append(sel.Exprs, parser.SelectExpr{Expr: sc.Value})
 	}
 	sel.Exprs = append(sel.Exprs, t.Returning...)
-	stripTableAlias(sel)
+	if err := stripTableAlias(sel); err != nil {
+		return nil, err
+	}
+	if t.Alias == "" && unchangedStrip(sel, t.Where, len(t.Set), t.Set, t.Returning) {
+		return t, nil // keeps the statement's identity (the plan cache's key)
+	}
 	c.Set = append([]parser.SetClause(nil), t.Set...)
 	for i := range c.Set {
 		c.Set[i].Value = sel.Exprs[i].Expr
@@ -511,17 +519,37 @@ func stripUpdateAlias(t *parser.Update) *parser.Update {
 		c.Returning = sel.Exprs[len(t.Set):]
 	}
 	c.Where = sel.Where
-	return &c
+	return &c, nil
 }
 
 // stripDeleteAlias is stripUpdateAlias for DELETE.
-func stripDeleteAlias(t *parser.Delete) *parser.Delete {
+func stripDeleteAlias(t *parser.Delete) (*parser.Delete, error) {
 	c := *t
 	sel := &parser.Select{Table: t.Table, Alias: t.Alias, Where: append([]parser.Comparison(nil), t.Where...), Exprs: append([]parser.SelectExpr(nil), t.Returning...)}
-	stripTableAlias(sel)
+	if err := stripTableAlias(sel); err != nil {
+		return nil, err
+	}
+	if t.Alias == "" && unchangedStrip(sel, t.Where, 0, nil, t.Returning) {
+		return t, nil
+	}
 	if t.Returning != nil {
 		c.Returning = sel.Exprs
 	}
 	c.Where = sel.Where
-	return &c
+	return &c, nil
+}
+
+// unchangedStrip reports whether stripping left a DML statement's
+// WHERE, SET values (the first nset select items) and RETURNING as they
+// were.
+func unchangedStrip(sel *parser.Select, where []parser.Comparison, nset int, set []parser.SetClause, ret []parser.SelectExpr) bool {
+	if !reflect.DeepEqual(sel.Where, where) {
+		return false
+	}
+	for i := 0; i < nset; i++ {
+		if !reflect.DeepEqual(sel.Exprs[i].Expr, set[i].Value) {
+			return false
+		}
+	}
+	return reflect.DeepEqual(sel.Exprs[nset:], ret) || len(ret) == 0 && len(sel.Exprs) == nset
 }

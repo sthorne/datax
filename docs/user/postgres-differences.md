@@ -267,9 +267,9 @@ syntax error or `0A000` feature not supported):
   `CROSS JOIN` or `FROM a, b`), except on a `LATERAL` member, whose `ON`
   may be any condition.
 - **Correlated subqueries are nested loops.** Each is re-run per row of
-  the enclosing query (memoized on the referenced values), so a
-  correlated subquery over a large outer table costs outer rows × inner
-  query. Prefer a `JOIN` when the outer side is big. A `LATERAL`
+  the enclosing query (memoized on the referenced values), or once per
+  group of a grouped one, so a correlated subquery over a large outer
+  table costs outer rows × inner query. Prefer a `JOIN` when the outer side is big. A `LATERAL`
   subquery or a table function reading another `FROM` member's columns
   is the same nested loop. A lateral subquery must be a plain select
   (not over a derived table or a set operation of its own) and cannot

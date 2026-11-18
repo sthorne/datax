@@ -2,6 +2,7 @@ package sql
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -102,6 +103,75 @@ func TestCorrScopeStack(t *testing.T) {
 	}
 	if sc.bindLevel() != 2 {
 		t.Fatalf("bindLevel=%d, want 2", sc.bindLevel())
+	}
+}
+
+// TestCorrScopeAliasHiding (#361): an alias hides its table's name at
+// its own level, so a qualifier naming the table reaches the nearest
+// enclosing level that answers to it — or, reaching none, is PostgreSQL's
+// 42P01 "invalid reference to FROM-clause entry" (vs. "missing ..." for a
+// name no level knows). A bare name that the nearest level carrying it
+// carries on two join sides is 42702.
+func TestCorrScopeAliasHiding(t *testing.T) {
+	ev := &catalog.TableDescriptor{Name: "ev", Columns: []catalog.Column{
+		{ID: 1, Name: "id", Type: types.Int},
+		{ID: 2, Name: "grp", Type: types.Int},
+	}}
+	g := &catalog.TableDescriptor{Name: "g", Columns: []catalog.Column{
+		{ID: 1, Name: "grp", Type: types.Int},
+		{ID: 2, Name: "name", Type: types.String},
+	}}
+	code := func(err error) string {
+		if serr, ok := err.(*Error); ok {
+			return serr.Code
+		}
+		return ""
+	}
+
+	// (SELECT ... FROM ev e2 WHERE e2.grp = ev.grp) inside FROM ev: the
+	// inner alias hides "ev", so ev.grp is the enclosing row's.
+	sc := corrScope{inner: tableLevel(ev, "ev", "e2"), outers: []scopeLevel{tableLevel(ev, "ev", "")}}
+	for name, want := range map[string]int{"e2.grp": 0, "ev.grp": 1, "grp": 0} {
+		if level, err := sc.classify(name); err != nil || level != want {
+			t.Fatalf("%s: level %d err %v, want %d", name, level, err, want)
+		}
+	}
+	// ... and inside FROM ev o: nothing answers to "ev".
+	sc = corrScope{inner: tableLevel(ev, "ev", "e2"), outers: []scopeLevel{tableLevel(ev, "ev", "o")}}
+	if _, err := sc.classify("ev.grp"); code(err) != CodeUndefinedTable || !strings.Contains(err.Error(), `invalid reference to FROM-clause entry for table "ev"`) {
+		t.Fatalf("hidden table name: %v", err)
+	}
+	if _, err := sc.classify("nosuch.grp"); code(err) != CodeUndefinedTable || !strings.Contains(err.Error(), "missing FROM-clause entry") {
+		t.Fatalf("unknown qualifier: %v", err)
+	}
+	if level, err := sc.classify("o.grp"); err != nil || level != 1 {
+		t.Fatalf("o.grp: level %d err %v", level, err)
+	}
+
+	// An enclosing join of ev a and ev b: a bare "id" reaching it is
+	// ambiguous; qualified, it is not; "ev" is hidden by both aliases.
+	join, _ := joinScope([]joinSide{{desc: ev, alias: "a", aliased: true}, {desc: ev, alias: "b", aliased: true}})
+	sc = corrScope{inner: tableLevel(g, "g", ""), outers: []scopeLevel{join}}
+	if _, err := sc.classify("id"); code(err) != CodeAmbiguousColumn {
+		t.Fatalf("ambiguous outer column: %v", err)
+	}
+	if level, err := sc.classify("b.id"); err != nil || level != 1 {
+		t.Fatalf("b.id: level %d err %v", level, err)
+	}
+	if _, err := sc.classify("ev.id"); code(err) != CodeUndefinedTable || !strings.Contains(err.Error(), "invalid reference") {
+		t.Fatalf("hidden join table name: %v", err)
+	}
+	// The inner level's own column shadows the ambiguous outer one.
+	if level, err := sc.classify("grp"); err != nil || level != 0 {
+		t.Fatalf("grp: level %d err %v", level, err)
+	}
+
+	// A USING column belongs, bare, to the earlier side: not ambiguous.
+	sides := []joinSide{{desc: ev, alias: "ev"}, {desc: g, alias: "g", merged: map[string]int{"grp": 0}}}
+	join, _ = joinScope(sides)
+	sc = corrScope{inner: scopeLevel{desc: &catalog.TableDescriptor{}}, outers: []scopeLevel{join}}
+	if level, err := sc.classify("grp"); err != nil || level != 1 {
+		t.Fatalf("USING column: level %d err %v", level, err)
 	}
 }
 
