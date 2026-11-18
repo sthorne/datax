@@ -220,7 +220,11 @@ func TestJoinSession(t *testing.T) {
 	if len(res.Rows) != 1 || res.Rows[0][0].I != 3 {
 		t.Fatalf("join aggregate: %+v", res.Rows)
 	}
-	if _, serr := trySQL(ctx, s, `SELECT c.name FROM customers c JOIN orders o ON c.id = o.id AND o.total = o.total`); serr == nil {
-		t.Fatal("same-side ON condition accepted")
+	// A same-side ON equality is a join condition, not a key (issue
+	// #363): no order shares a customer's id, so a LEFT join
+	// NULL-extends both customers.
+	res = execSQL(t, ctx, s, `SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON c.id = o.id AND o.total = o.total ORDER BY 1`)
+	if len(res.Rows) != 2 || res.Rows[0][0].S != "ann" || !res.Rows[0][1].Null || !res.Rows[1][1].Null {
+		t.Fatalf("same-side ON condition: %+v", res.Rows)
 	}
 }

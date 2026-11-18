@@ -262,10 +262,14 @@ syntax error or `0A000` feature not supported):
   sampler), INNER joins are cost-reordered greedily; LEFT joins,
   self-joins, cross joins and joins carrying ON filters, correlated
   subqueries or `LATERAL` members always run in the written order, so
-  put the most selective table first there. `ON` must include an
-  equality against an earlier table (`ON true` is not accepted; use
-  `CROSS JOIN` or `FROM a, b`), except on a `LATERAL` member, whose `ON`
-  may be any condition.
+  put the most selective table first there. `ON` may be any boolean
+  condition (`ON true`, `u.tid < t.id`, `BETWEEN`, `OR`, a condition
+  on one side, expressions), for every join type. An `ON` with an
+  equality between the joined table and an earlier one looks rows up
+  by it (through an index when there is one) and applies the rest per
+  match; one without is a nested loop over the joined table, read once
+  and tried against every row so far, so it costs rows × rows: add an
+  equality on large tables where you can.
 - **Correlated subqueries are nested loops.** Each is re-run per row of
   the enclosing query (memoized on the referenced values), so a
   correlated subquery over a large outer table costs outer rows × inner
@@ -312,15 +316,14 @@ syntax error or `0A000` feature not supported):
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
 - **`UPDATE ... FROM` and `DELETE ... USING`** work as in PostgreSQL
-  ([reference](sql.md#writing)), with three differences. A target row
+  ([reference](sql.md#writing)), with two differences. A target row
   that joins several rows takes its new values from the first of them
   in the order the join reads the `FROM` list (a table by primary key,
   or by the index it is looked up through; a `VALUES` list as
   written), where PostgreSQL uses an unspecified one. The target needs
   only the `UPDATE` (`DELETE`) privilege, as a plain `UPDATE ... WHERE`
   does here; PostgreSQL also asks for `SELECT` on the target columns
-  the statement reads. And the `FROM` list's joins have a plain
-  `SELECT`'s limits (`ON` must equate columns, above).
+  the statement reads.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`, which is
   accepted and changes nothing) and cannot run inside a transaction
   block (`25001`) — except on a table created in the same block, where

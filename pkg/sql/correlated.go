@@ -413,6 +413,11 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 	conds := append([]parser.Comparison(nil), sub.Where...)
 	for _, jc := range sub.Joins {
 		conds = append(conds, jc.Filter...)
+		// A column = column ON conjunct may read an enclosing row too
+		// (JOIN e ON e.k = outer.id).
+		for _, c := range jc.On {
+			conds = append(conds, joinCondCmp(c))
+		}
 	}
 	for _, cmp := range conds {
 		condColumns(cmp, func(n string) { record(n, true, "WHERE") })
@@ -799,10 +804,25 @@ func substituteSub(sub *parser.Select, node *scopeNode, row map[catalog.ColumnID
 					c.Joins[i].Derived = nd
 				}
 			}
-			if len(c.Joins[i].Filter) == 0 {
+			// An ON equality reading an enclosing row is no join key
+			// once that row is bound: it becomes a filter conjunct, and
+			// is substituted like one.
+			filter := sub.Joins[i].Filter
+			var keep []parser.JoinCond
+			for _, jcond := range sub.Joins[i].On {
+				ll, _ := node.scope.classify(jcond.L.String())
+				rl, _ := node.scope.classify(jcond.R.String())
+				if ll == 0 && rl == 0 {
+					keep = append(keep, jcond)
+					continue
+				}
+				filter = append(filter[:len(filter):len(filter)], joinCondCmp(jcond))
+			}
+			c.Joins[i].On = keep
+			if len(filter) == 0 {
 				continue
 			}
-			if c.Joins[i].Filter, err = substituteConds(sub.Joins[i].Filter, node, row, params); err != nil {
+			if c.Joins[i].Filter, err = substituteConds(filter, node, row, params); err != nil {
 				return nil, err
 			}
 		}

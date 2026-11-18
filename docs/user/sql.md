@@ -1035,12 +1035,19 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   point INNER joins are automatically reordered to drive from the
   cheapest side (`EXPLAIN` says `join reordered by cost`; outer joins,
   self-joins, cross joins and joins with correlated subqueries or ON
-  filters always keep the written order). `ON` is a boolean expression
-  (parentheses welcome) that must include at least one equality between
-  a column of the newly joined table and one from an earlier table; its
-  other conjuncts (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN
-  (...)`) are join conditions, evaluated per candidate match — an outer
-  join NULL-extends when they fail, unlike a `WHERE` filter. `LEFT`
+  filters always keep the written order). `ON` is any boolean
+  expression (parentheses welcome): `ON true`, `ON u.tid < t.id`, `ON
+  t.ts BETWEEN u.lo AND u.hi`, `OR`, a condition on one side only (`ON
+  u.active`), expressions (`ON lower(a.x) = lower(b.y)`), parameters.
+  Its equalities between a column of the newly joined table and one
+  from an earlier table are lookup keys; every other conjunct
+  (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN (...)`) is a join
+  condition, evaluated per candidate match — an outer join NULL-extends
+  when it fails, unlike a `WHERE` filter. An `ON` with no such equality
+  joins by nested loop: the joined table is read once and every row so
+  far is tried against each of its rows (`EXPLAIN`: `fetched once,
+  every row tried`; `+ join filter` marks a level with join
+  conditions). It cannot name a table joined after it (`42P01`). `LEFT`
   keeps the earlier sides' unmatched rows, `RIGHT` the joined table's
   (appended after the lookups, NULL on every earlier side), `FULL` both.
   `JOIN ... USING (c)` and `NATURAL JOIN` (every column name the sides

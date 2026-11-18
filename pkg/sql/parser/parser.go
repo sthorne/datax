@@ -3042,10 +3042,6 @@ func (p *parser) parseFromList(sel *Select) error {
 			jc.Table = jt
 			jc.Alias = p.parseOptTableAlias(false)
 		}
-		jt := jc.Table
-		if jt == "" {
-			jt = jc.Alias
-		}
 		if cross || jk.natural {
 			sel.Joins = append(sel.Joins, jc)
 			continue
@@ -3073,10 +3069,13 @@ func (p *parser) parseFromList(sel *Select) error {
 		if err := p.expectKeyword("ON"); err != nil {
 			return err
 		}
-		// The ON clause is a full boolean expression (parentheses,
-		// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
-		// two column references are the join keys; every other
-		// conjunct is a filter evaluated per candidate match.
+		// The ON clause is any boolean expression (parentheses,
+		// AND/OR/NOT, IN, IS NULL, ON true ...). Top-level equalities
+		// between two column references are join-key candidates (the
+		// executor keeps those that equate the joined member with an
+		// earlier one and moves the rest to the filter); every other
+		// conjunct is a filter evaluated per candidate match. A
+		// condition with no usable key joins by nested loop.
 		n, err := p.parseBoolOr()
 		if err != nil {
 			return err
@@ -3091,11 +3090,6 @@ func (p *parser) parseFromList(sel *Select) error {
 				continue
 			}
 			jc.Filter = append(jc.Filter, c)
-		}
-		// A lateral member's ON may be any condition (LEFT JOIN
-		// LATERAL ... ON true): it is evaluated per candidate row.
-		if len(jc.On) == 0 && !jc.Lateral {
-			return p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
 		}
 		sel.Joins = append(sel.Joins, jc)
 	}

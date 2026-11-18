@@ -223,7 +223,7 @@ func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []jo
 			}
 			ext := jr.extend(r)
 			if len(filter) > 0 {
-				ok, err := evalJoinWhere(sides, filter, ext, params)
+				ok, err := evalJoinWhere(sides[:k+1], filter, ext, params)
 				if err != nil {
 					return nil, err
 				}
