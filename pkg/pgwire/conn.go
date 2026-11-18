@@ -703,20 +703,37 @@ func (c *conn) handleStartup(ctx context.Context) error {
 					return fmt.Errorf("startup database %q: %v", dbName, serr)
 				}
 			}
-			// The settings the startup packet carries (TimeZone,
-			// DateStyle, application_name, ... and those of options'
-			// -c name=value) apply before the parameters are reported,
-			// so ParameterStatus tells the client the session's own
+			// The limits and defaults are read best effort: a catalog
+			// that cannot be read in time costs them, not the session.
+			ictx, icancel := context.WithTimeout(ctx, 5*time.Second)
+			info, serr := c.session.StartupInfo(ictx)
+			icancel()
+			if serr != nil {
+				log.Warnf("reading connection limits and database defaults for %q: %v", m.Parameters["user"], serr)
+				info = sql.StartupInfo{RoleLimit: -1, DatabaseLimit: -1}
+			}
+			if serr = c.checkConnectionLimits(info); serr != nil {
+				c.sendError(serr)
+				_ = c.backend.Flush()
+				return fmt.Errorf("startup refused: %v", serr)
+			}
+			// ALTER DATABASE ... SET's defaults, before the client's own
+			// parameters, as PostgreSQL applies them; the reported
+			// parameters below carry their values.
+			c.session.ApplyDatabaseDefaults(ctx, info.Settings)
+			// Then the settings the startup packet carries (TimeZone,
+			// DateStyle, ... and those of options' -c name=value), so
+			// ParameterStatus tells the client the session's own
 			// TimeZone, as PostgreSQL's does.
 			for _, kv := range startupSettings(m.Parameters) {
 				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: kv[0], Value: kv[1]}, nil)
 			}
-			for _, kv := range append([][2]string{
-				{"server_version", "14.0 datax"},
-				{"server_encoding", "UTF8"},
-				{"integer_datetimes", "on"},
-				{"standard_conforming_strings", "on"},
-			}, c.session.ReportedParams()...) {
+			if app := m.Parameters["application_name"]; app != "" {
+				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
+			}
+			// PostgreSQL 14's reported parameters, each once, with the
+			// session's values.
+			for _, kv := range c.session.StartupParams(ctx) {
 				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
 			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: uint32(c.pid), SecretKey: binary.BigEndian.AppendUint32(nil, c.secret)})
@@ -1655,4 +1672,25 @@ func startupSettings(params map[string]string) [][2]string {
 		}
 	}
 	return out
+}
+
+// checkConnectionLimits refuses a session past its role's or its
+// database's CONNECTION LIMIT (53300, PostgreSQL's too_many_connections),
+// counting this node's sessions: the limits are per node. An admin is
+// exempt, as PostgreSQL exempts superusers. As in PostgreSQL, two
+// sessions starting at once may both get in at the limit.
+func (c *conn) checkConnectionLimits(info sql.StartupInfo) *sql.Error {
+	if c.act == nil {
+		return nil
+	}
+	user, db := c.session.SessionUser(), c.session.Database()
+	byUser, byDB := c.act.countSessions(c, user, db)
+	switch {
+	case info.Exempt:
+	case info.RoleLimit >= 0 && byUser >= info.RoleLimit:
+		return &sql.Error{Code: "53300", Msg: fmt.Sprintf("too many connections for role %q", user)}
+	case info.DatabaseLimit >= 0 && byDB >= info.DatabaseLimit:
+		return &sql.Error{Code: "53300", Msg: fmt.Sprintf("too many connections for database %q", db)}
+	}
+	return nil
 }

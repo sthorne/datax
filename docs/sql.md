@@ -2116,7 +2116,9 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `information_schema` descriptor to anyone and nothing else, and
   `virtualEnv` decides what each lists — every table of the current
   database for `pg_catalog`, the tables `catalog.CanSeeTable` admits
-  (and whose schema the reader may use) for `information_schema`; no
+  (and whose schema the reader may use) for `information_schema`, each
+  of whose views then applies its PostgreSQL rule (`vtable/infoschema.go`:
+  `pgHasRole`, `tablePriv`, the exploded ACLs); no
   other database's (issue #322) — and gathers
   statistics only for tables `catalog.CanSelectTable` admits and row
   security does not confine, and a sequence's counter only past
@@ -2158,10 +2160,13 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   today; a dropped one, having none, is readable by admins only.
   `virtualEnv` under a historical transaction uses today's role set and
   withholds statistics and sequence counters from non-admins.
-  Then `ParameterStatus` for `server_version` (reports a PG-14-compatible
-  version string), `client_encoding=UTF8`, `DateStyle=ISO`,
-  `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`;
-  then `BackendKeyData` and `ReadyForQuery`.
+  Then `ParameterStatus` for PostgreSQL 14's reported parameters
+  (`Session.StartupParams`: `server_version` a PG-14-compatible version
+  string, `application_name`, `client_encoding`, `DateStyle`,
+  `default_transaction_read_only`, `in_hot_standby`, `integer_datetimes`,
+  `IntervalStyle`, `is_superuser`, `server_encoding`,
+  `session_authorization`, `standard_conforming_strings`, `TimeZone`,
+  with the session's values); then `BackendKeyData` and `ReadyForQuery`.
 - **Simple query** (`Q`): multi-statement strings split on `;`, each executed;
   results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).

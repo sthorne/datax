@@ -259,7 +259,7 @@ func TestAlterColumnType(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	expect(s, `SELECT data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_name = 'm' AND column_name = 'n'`, "numeric(12,2)|NO|'7.00'|12|2")
+	expect(s, `SELECT data_type, is_nullable, column_default, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_name = 'm' AND column_name = 'n'`, "numeric|NO|'7.00'|12|2")
 	expect(s, `SELECT count(*) FROM information_schema.columns WHERE table_name = 'm'`, "5")
 	expect(s, `SELECT n >= 20 AND n < 100 FROM m WHERE id = 2`, "t") // the updater bumped it a few times
 	expect(sB, `SELECT n FROM m WHERE id = 1000`, "1000.00")

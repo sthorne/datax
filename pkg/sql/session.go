@@ -40,6 +40,9 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 		}
 		return now.AddNanos(d.Nanoseconds()), nil
 	}
+	if operand == parser.FollowerReadTimestamp {
+		return now.AddNanos(-FollowerReadLag.Nanoseconds()), nil
+	}
 	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
 		ts := hlc.Timestamp{WallTime: t.UnixNano()}
 		if !ts.Less(now) {
@@ -174,6 +177,9 @@ type Session struct {
 	// identity. user is the current role — the session user, or the role
 	// SET ROLE selected (current_user vs session_user).
 	sessionUser string
+	// isSuperuser is whether sessionUser is a superuser, read when the
+	// connection starts (StartupParams; nil until then).
+	isSuperuser *bool
 	user        string
 	// privAs, when set, is the role privilege checks run as instead of
 	// user: a view's owner while its query executes (cte.go).
@@ -333,6 +339,7 @@ func (s *Session) SetUser(user string) {
 		user = "root"
 	}
 	s.sessionUser = user
+	s.isSuperuser = nil
 	s.vars.role = ""
 	s.applyRole()
 }
@@ -517,7 +524,7 @@ const (
 // gathered only for the tables the reader may read rows of, and a
 // sequence's counter only for one it may read.
 func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables, filtered bool) (*vtable.Env, error) {
-	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
+	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Now: s.statementTime()}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -829,7 +836,21 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "there is already a transaction in progress")
 		}
-		s.txn = s.db.NewTxn("sql")
+		var asOf hlc.Timestamp
+		if t.AsOf != nil {
+			ts, serr := s.resolveTxnAsOf(*t.AsOf)
+			if serr != nil {
+				return nil, serr
+			}
+			asOf = ts
+		}
+		if asOf.IsEmpty() {
+			s.txn = s.db.NewTxn("sql")
+		} else {
+			// BEGIN AS OF SYSTEM TIME: the read-only historical
+			// transaction SET TRANSACTION SNAPSHOT also makes.
+			s.txn = s.db.NewHistoricalTxn("sql-asof", asOf)
+		}
 		s.state = StateOpen
 		s.txnQueried = false
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
@@ -945,6 +966,8 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return s.execExecutePrepared(ctx, t, params)
 	case *parser.SetTransactionSnapshot:
 		return s.execSetTransactionSnapshot(t)
+	case *parser.SetTransactionAsOf:
+		return s.execSetTransactionAsOf(t)
 	case *parser.DeclareCursor:
 		return s.execDeclareCursor(ctx, t, params)
 	case *parser.Fetch:
@@ -1167,6 +1190,12 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ANALYZE sweeps tables at a frozen timestamp in paced chunks outside
 	// any transaction, so — like the other multi-transaction statements —
 	// it cannot run inside an explicit transaction block.
+	if v, ok := stmt.(*parser.Vacuum); ok {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "VACUUM cannot run inside a transaction block")
+		}
+		return s.execVacuum(ctx, v)
+	}
 	if an, ok := stmt.(*parser.Analyze); ok {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ANALYZE cannot run inside a transaction block")
@@ -1187,26 +1216,16 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// AS OF SYSTEM TIME pins a SELECT to a fixed past timestamp: it runs
 	// in its own read-only historical transaction (servable by follower
 	// replicas), so it cannot join an explicit transaction's timestamp.
-	if sel, ok := stmt.(*parser.Select); ok && (sel.AsOf != "" || sel.AsOfMaxStaleness != "") {
+	if sel, ok := stmt.(*parser.Select); ok && (sel.AsOf != "" || sel.AsOfMaxStaleness != "" || sel.AsOfMinTimestamp != "") {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "AS OF SYSTEM TIME cannot run inside a transaction block")
 		}
 		if sel.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with AS OF SYSTEM TIME")
 		}
-		var ts hlc.Timestamp
-		if sel.AsOfMaxStaleness != "" {
-			var err error
-			ts, err = resolveMaxStaleness(sel.AsOfMaxStaleness, s.db.Clock().Now(), s.db.LocalClosedTimestamp())
-			if err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "with_max_staleness: %v", err)
-			}
-		} else {
-			var err error
-			ts, err = resolveAsOf(sel.AsOf, s.db.Clock().Now())
-			if err != nil {
-				return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
-			}
+		ts, aerr := s.resolveAsOfClause(parser.AsOfClause{Exact: sel.AsOf, MaxStaleness: sel.AsOfMaxStaleness, MinTimestamp: sel.AsOfMinTimestamp, NearestOnly: sel.AsOfNearestOnly})
+		if aerr != nil {
+			return nil, aerr
 		}
 		// Historical reads plan against the descriptor current AT their
 		// timestamp (the catalog reads it through the historical txn), so
@@ -1229,7 +1248,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			}
 		}
 		s.streamTop = true
-		s.asofLocal, s.asofTS = sel.AsOfMaxStaleness != "", ts
+		s.asofLocal, s.asofTS = sel.AsOfMaxStaleness != "" || sel.AsOfMinTimestamp != "", ts
 		res, serr := s.execSelect(ctx, txn, sel, params)
 		s.streamTop = false
 		s.asofLocal, s.asofTS = false, hlc.Timestamp{}

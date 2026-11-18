@@ -31,6 +31,17 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   `E'\0'` and `E'\x80'` are `22021` (invalid byte sequence); a short
   `\u` / `\U` escape is `22025`, `\u0000` "invalid Unicode escape value"
   and a lone surrogate "invalid Unicode surrogate pair" (`42601`).
+- **Dollar-quoted strings**: `$$...$$` and `$tag$...$tag$` are string
+  literals wherever a string may stand, taken exactly as written — no
+  escapes, quotes and backslashes are ordinary characters, and a `;`
+  inside does not end the statement. A tag is an identifier without
+  `$` and its case counts (`$Fn$` is not closed by `$fn$`). As in
+  PostgreSQL, a parameter run into an identifier character (`$1$`,
+  `$1a`) is `42601` "trailing junk after parameter", an unclosed quote
+  is "unterminated dollar-quoted string", and a `$` may continue an
+  unquoted identifier (`a$b`). The `datax sql` shell ends a statement at
+  a line ending in `;`, whatever quoting it is in (psql tracks dollar
+  quotes itself).
 
 ## Types
 
@@ -2156,7 +2167,7 @@ invalid value `22023`:
 | `bytea_output` | `hex` (default), `escape` | the text format of a `BYTEA` column on the wire |
 | `client_min_messages` | `debug5` ... `debug1`, `log`, `notice` (default), `warning`, `error` | at `warning` or `error`, `NOTICE`s are not sent |
 | `row_security` | `on` (default), `off` | `off` refuses (`42501`) a query that a table's row-level security policies would filter, as `pg_dump` expects |
-| `server_version_num`, `max_identifier_length` | `140000`, `63` | read only (`55P02`) |
+| `server_version_num`, `max_identifier_length`, `block_size`, `max_index_keys`, `max_function_args`, `lc_collate`, `lc_ctype`, `in_hot_standby`, `is_superuser`, `session_authorization`, ... | `140000`, `63`, `8192`, `32`, `100`, `C`, `C`, `off`, whether the session user is root or an admin, its name | read only (`55P02`) |
 | PostgreSQL's other common settings: `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `lc_*`, `default_transaction_isolation`, ... | PostgreSQL's values, checked as PostgreSQL checks them | accepted, kept and reported, with no effect: the list is in [Differences from PostgreSQL](postgres-differences.md) |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
@@ -2220,11 +2231,35 @@ so multi-range results stay consistent. Watch
 `datax_follower_read_fallbacks_total` (sent to a leader) to see whether
 your bound is doing its job.
 
+CockroachDB's other forms are accepted too:
+
+```sql
+SELECT ... AS OF SYSTEM TIME follower_read_timestamp();
+SELECT ... AS OF SYSTEM TIME with_min_timestamp('2026-08-30T10:00:00Z');
+SELECT ... AS OF SYSTEM TIME with_max_staleness('10s', false);
+BEGIN AS OF SYSTEM TIME '-10s';             -- a read-only block in the past
+BEGIN; SET TRANSACTION AS OF SYSTEM TIME follower_read_timestamp(); ...
+```
+
+`follower_read_timestamp()` (also `experimental_follower_read_timestamp()`)
+is now minus 4.8s: past the closed-timestamp lag and its publication
+interval, so any replica serves the read. `with_min_timestamp(ts)` is
+bounded staleness with an absolute bound: the freshest timestamp the
+local replicas serve, never older than `ts` (a `ts` in the future is
+`22023`). The `nearest_only` argument of both bounded forms must be
+`false` (`true` is `0A000`: a range the node cannot serve within the
+bound is read from its leader rather than refused). `BEGIN AS OF SYSTEM
+TIME` and `SET TRANSACTION AS OF SYSTEM TIME` (before the block's first
+query; `25001` after it) pin the whole block at an exact timestamp: it
+is read-only (`25006` for a write), and privileges are today's, as for
+a single historical read. Bounded staleness is a single statement's:
+it cannot open a block (`0A000`).
+
 All forms: bounded by the GC window on the old side (25h, or the
-table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); not allowed
-inside `BEGIN`; a freshly written row may be invisible until the closed
-timestamp passes its write (~the lag) — that is the staleness you signed
-up for.
+table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); a
+statement's own `AS OF SYSTEM TIME` is not allowed inside `BEGIN`; a
+freshly written row may be invisible until the closed timestamp passes
+its write (~the lag) — that is the staleness you signed up for.
 
 ## Table statistics
 
@@ -2247,6 +2282,18 @@ minute (configurable) one node re-collects at most one table whose
 statistics are missing or older than 10 minutes, in paced 1024-row
 chunks. Watch `datax_stats_refreshes_total` and
 `datax_stats_rows_scanned_total` for its cost.
+
+`VACUUM` is accepted in all its forms — `VACUUM`, `VACUUM FULL t`,
+`VACUUM ANALYZE t`, `VACUUM (VERBOSE, ANALYZE) t (col)` — for the tools
+and migrations that send it. There is nothing for it to reclaim: MVCC
+garbage collection removes old row versions once they pass the table's
+`gc_ttl`, and `ALTER TABLE ... PURGE` removes history on demand
+([GC window and purge](#gc-window-and-purge)). With `ANALYZE` it
+refreshes the statistics as `ANALYZE` does (admins; others get a
+warning and are skipped). Like PostgreSQL's it cannot run inside a
+transaction block (`25001`), refuses an unknown option (`42601`) or
+table (`42P01`), and skips a view, or a table the role does not own,
+with a warning.
 
 ## Timeseries tables
 
@@ -2568,10 +2615,11 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pgcrypto`, `uuid-ossp` and `vector`, always installed)
 (and empty stand-ins for the catalogs of features datax lacks —
 publications, functions, triggers, operator classes and
-families, `pg_amop`, `pg_amproc`, ...), plus
-`information_schema.schemata`, `tables`, `views`, `columns`,
-`table_constraints`, `key_column_usage`, `statistics` and
-`role_table_grants`. OIDs are stable across the cluster (a table's is its
+families, `pg_amop`, `pg_amproc`, ...), plus `pg_timezone_names` and `pg_timezone_abbrevs`, and every view of
+PostgreSQL 16's `information_schema` (`tables`, `columns`, `views`,
+`sequences`, `table_constraints`, `key_column_usage`,
+`table_privileges`, `role_table_grants`, `routines`, ..., the ones for
+features datax lacks empty) and MySQL's `information_schema.statistics`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it); a catalog whose rows have OIDs
 also has PostgreSQL's `tableoid` system column (not in `*`). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
@@ -2673,6 +2721,8 @@ guide names) and a reserved, empty `system` database.
 ```sql
 CREATE DATABASE app;
 CREATE DATABASE IF NOT EXISTS app;
+CREATE DATABASE app2 WITH OWNER = alice ENCODING = 'UTF8' TEMPLATE = template0
+  LC_COLLATE = 'C' LC_CTYPE = 'C' CONNECTION LIMIT = 50;
 SHOW DATABASES;
 USE app;                      -- or: SET database = app
 SELECT current_database();    -- app
@@ -2695,6 +2745,32 @@ dropped or renamed, and the session cannot drop the database it is in.
 drops: it retries itself like any single statement, and if it still
 loses to DDL running in the same database it fails with `40001` having
 dropped nothing.
+
+`CREATE DATABASE` takes an admin, or a role with the `CREATEDB`
+attribute. Its PostgreSQL options are accepted as Rails, Django and
+pg_dump send them: `ENCODING` UTF8 (the only encoding; any other is
+`22023`), `TEMPLATE` `template0` or `template1` (both an empty
+database), `LOCALE` / `LC_COLLATE` / `LC_CTYPE` `C`, `POSIX`,
+`C.UTF-8` or `en_US.UTF-8` (shown in `pg_database`; text compares
+bytewise, as in `C`, whichever is named), `OWNER` (a role the creator
+belongs to, unless an admin), `CONNECTION LIMIT`, `STRATEGY`,
+`TABLESPACE pg_default`, `ALLOW_CONNECTIONS true` and `IS_TEMPLATE
+false`. The database's owner (or an admin) may run:
+
+```sql
+ALTER DATABASE app SET statement_timeout = '30s';  -- a default for new sessions
+ALTER DATABASE app SET TimeZone TO 'Europe/Paris';
+ALTER DATABASE app RESET statement_timeout;        -- or RESET ALL
+ALTER DATABASE app CONNECTION LIMIT 100;           -- -1: no limit
+ALTER DATABASE app OWNER TO alice;
+```
+
+A default set with `ALTER DATABASE ... SET` applies to the sessions
+that connect to the database afterwards, before the client's own
+startup parameters, as in PostgreSQL. A database's (and a role's)
+`CONNECTION LIMIT` counts the sessions on the node a client connects
+to — not the whole cluster — and refuses one more with `53300` "too
+many connections"; admins are exempt.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
 bob`. `CREATE` lets a non-admin create tables there (admins and the

@@ -101,7 +101,8 @@ func TestPrivilegeGaps(t *testing.T) {
 		rlsWant(t, ctx, alice, []string{"alice|********", "cat_bob|********", "root|********"},
 			`SELECT rolname, rolpassword FROM pg_roles WHERE rolname IN ('alice', 'cat_bob', 'root') ORDER BY rolname`)
 		rlsWant(t, ctx, alice, []string{"cat_bob|********"}, `SELECT usename, passwd FROM pg_user WHERE usename = 'cat_bob'`)
-		rlsRefused(t, ctx, alice, "42P01", `SELECT * FROM pg_authid`)
+		// pg_authid is an admin's, as PostgreSQL's is a superuser's.
+		rlsRefused(t, ctx, alice, "42501", `SELECT * FROM pg_authid`)
 		rlsRefused(t, ctx, alice, "42P01", `SELECT * FROM pg_shadow`)
 		// Another role's statement text stays hidden.
 		for _, r := range rlsRows(t, ctx, alice, `SELECT usename, query FROM pg_stat_activity`) {

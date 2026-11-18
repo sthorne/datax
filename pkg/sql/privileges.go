@@ -124,12 +124,13 @@ func (s *Session) invalidateRoles() {
 }
 
 // requiresAdmin reports whether a statement is restricted to the admin
-// role outright: creating databases and cluster-wide maintenance.
+// role outright: cluster-wide maintenance. (CREATE DATABASE also takes
+// an admin, or the CREATEDB attribute: execCreateDatabase checks.)
 // Everything else is checked against ownership and grants by its
 // executor.
 func requiresAdmin(stmt parser.Statement) bool {
 	switch stmt.(type) {
-	case *parser.CreateDatabase, *parser.Analyze:
+	case *parser.Analyze:
 		return true
 	}
 	return false

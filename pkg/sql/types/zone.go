@@ -251,3 +251,13 @@ func InZone(nanos int64, loc *time.Location) int64 {
 	t := time.Unix(0, nanos).In(loc)
 	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC).UnixNano()
 }
+
+// ZoneAbbrevs lists the time zone abbreviations AT TIME ZONE accepts,
+// each with its offset in seconds east of UTC (pg_timezone_abbrevs).
+func ZoneAbbrevs() map[string]int {
+	out := make(map[string]int, len(zoneAbbrevs))
+	for k, v := range zoneAbbrevs {
+		out[k] = v
+	}
+	return out
+}

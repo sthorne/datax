@@ -223,6 +223,29 @@ func (a *Activity) connClosed(c *conn) {
 	a.gauges()
 }
 
+// countSessions counts this node's other connections opened by user,
+// and those on database db, for CONNECTION LIMIT.
+func (a *Activity) countSessions(self *conn, user, db string) (byUser, byDB int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ca, ok := a.conns[self]; ok && ca.db == "" {
+		// The new session's database, before its first statement.
+		ca.db = db
+	}
+	for c, ca := range a.conns {
+		if c == self {
+			continue
+		}
+		if ca.user == user {
+			byUser++
+		}
+		if ca.db == db {
+			byDB++
+		}
+	}
+	return byUser, byDB
+}
+
 func (a *Activity) setUser(c *conn, user string) {
 	a.mu.Lock()
 	if ca, ok := a.conns[c]; ok {
@@ -275,7 +298,7 @@ func statementKind(stmt parser.Statement) string {
 		return "copy"
 	case *parser.Begin, *parser.Commit, *parser.Rollback, *parser.Savepoint, *parser.ReleaseSavepoint, *parser.RollbackToSavepoint:
 		return "txn"
-	case *parser.CreateTable, *parser.CreateIndex, *parser.DropTable, *parser.AlterTable, *parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned, *parser.AlterDefaultPrivileges, *parser.Analyze,
+	case *parser.CreateTable, *parser.CreateIndex, *parser.DropTable, *parser.AlterTable, *parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned, *parser.AlterDefaultPrivileges, *parser.Analyze, *parser.Vacuum,
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
 		return "ddl"
 	default:
