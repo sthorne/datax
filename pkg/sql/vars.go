@@ -689,7 +689,7 @@ func (s *Session) readOnlyViolation(stmt parser.Statement) *Error {
 
 // writeKind names a statement that writes ("" for a read).
 func writeKind(stmt parser.Statement) string {
-	switch stmt.(type) {
+	switch t := stmt.(type) {
 	case *parser.Insert:
 		return "INSERT"
 	case *parser.Update:
@@ -698,6 +698,12 @@ func writeKind(stmt parser.Statement) string {
 		return "DELETE"
 	case *parser.CopyFrom:
 		return "COPY"
+	case *parser.CopyTo:
+		// COPY (INSERT ... RETURNING) TO writes; COPY t TO reads.
+		if t.Query != nil {
+			return writeKind(t.Query)
+		}
+		return ""
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable, *parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex,
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateType, *parser.AlterType, *parser.DropType,
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,

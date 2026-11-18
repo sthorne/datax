@@ -153,6 +153,10 @@ var describeSamples = []struct {
 	{"Notify", []describeSample{{sql: `NOTIFY shapes_ch`}}},
 	{"Unlisten", []describeSample{{sql: `UNLISTEN shapes_ch`}}},
 	{"CopyFrom", []describeSample{{sql: `COPY shapes FROM STDIN`, fails: true}}},
+	{"CopyTo", []describeSample{
+		{sql: `COPY shapes TO STDOUT`},
+		{sql: `COPY (SELECT id FROM shapes ORDER BY id) TO STDOUT WITH (FORMAT csv)`},
+	}},
 	{"Truncate", []describeSample{{sql: `TRUNCATE shapes`}}},
 	{"DropView", []describeSample{{sql: `DROP VIEW shapes_view`}}},
 	{"DropIndex", []describeSample{{sql: `DROP INDEX shapes_v2`}}},
@@ -289,6 +293,12 @@ func walkExtended(t *testing.T, r *rawFrontend, s describeSample) {
 				t.Errorf("%s: DataRow of %d values, RowDescription of %d fields", s.sql, len(m.Values), len(portalDesc.Fields))
 			}
 			rows++
+		case *pgproto3.CopyOutResponse, *pgproto3.CopyData, *pgproto3.CopyDone:
+			// COPY TO: described as NoData, its rows go out in copy-out
+			// mode.
+			if !describedP || portalDesc != nil {
+				t.Errorf("%s: %T from a statement not described as NoData", s.sql, m)
+			}
 		case *pgproto3.CommandComplete:
 			completed = true
 		case *pgproto3.ErrorResponse:

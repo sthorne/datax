@@ -1322,8 +1322,48 @@ of 128 rows / 1 MiB as data streams in. That makes huge loads safe
 (bounded memory, bounded transactions), at a price worth knowing: a
 mid-load failure keeps the chunks already committed (the error reports
 the failing row and the committed count), and COPY cannot run inside
-`BEGIN`. Only the `FORMAT text|csv|binary` option is supported; `COPY TO`
-is not.
+`BEGIN`. Only the `FORMAT text|csv|binary` option is supported on
+`COPY FROM`.
+
+### Exporting with COPY TO
+
+```sql
+COPY t TO STDOUT;                                   -- text format
+COPY t (a, b) TO STDOUT WITH (FORMAT csv, HEADER);
+COPY (SELECT a, sum(b) FROM t GROUP BY a) TO STDOUT WITH (FORMAT binary);
+COPY t TO STDOUT WITH CSV HEADER;                   -- the pre-9.0 spelling
+```
+
+```sh
+psql "$URL" -c "\copy t TO data.csv WITH (FORMAT csv, HEADER)"
+```
+
+`COPY ... TO STDOUT` writes a table, some of its columns, or any query's
+rows (`SELECT`, `VALUES`, `WITH`, or `INSERT` / `UPDATE` / `DELETE` with
+`RETURNING`) in PostgreSQL's text, CSV or binary format, byte for byte
+as PostgreSQL writes them, over the simple or the extended protocol
+(pgx's `CopyTo`, psql's `\copy ... to`). The options are PostgreSQL's:
+`FORMAT`, `DELIMITER`, `NULL`, `HEADER`, `QUOTE`, `ESCAPE`, `FORCE_QUOTE
+(cols)` or `FORCE_QUOTE *`, and `ENCODING` (`UTF8` or `SQL_ASCII`:
+datax writes UTF8 only, and refuses another encoding with `0A000`);
+`FORCE_NOT_NULL`, `FORCE_NULL` and `DEFAULT` belong to `COPY FROM` and
+are refused as PostgreSQL refuses them. Values print as they do in a
+`SELECT`'s text or binary result, under the session's `TimeZone`,
+`IntervalStyle`, `bytea_output` and `extra_float_digits`; what COPY
+writes, `COPY FROM` reads back to the same rows.
+
+A COPY TO runs as the query it stands for: the `SELECT` privilege and
+row-level security apply (a role a policy filters copies only the rows
+it may see, as in PostgreSQL), the whole output is one transaction's
+snapshot (a block's own writes included, inside `BEGIN`), and a table's
+rows stream in pages, so a table of any size is copied in bounded
+memory. Cancelling it, its `statement_timeout`, or the client going
+away ends it. A query that sorts, groups or joins is computed first,
+under the statement memory limit, as a `SELECT` would be. `COPY (query)`
+takes no parameters (`42P02`, as in PostgreSQL), and `COPY ... TO 'file'`
+or `TO PROGRAM` is refused: with PostgreSQL's privilege error (`42501`)
+for a role without `pg_write_server_files`, and as not supported
+(`0A000`) for root and the admins, since datax writes no server files.
 
 ## Large objects
 

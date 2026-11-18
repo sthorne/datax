@@ -154,6 +154,16 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	r.drain()
 }
 
+// copyFieldDatum converts a text or CSV field to its column's type. An
+// enum label stays text: the write path resolves it against the column's
+// labels (as it does an INSERT's), which a bare Coerce cannot.
+func copyFieldDatum(ci *sql.CopyIn, raw string, col catalog.Column) (types.Datum, error) {
+	if col.Type == types.Enum {
+		return types.NewString(raw), nil
+	}
+	return ci.Text(raw).Coerce(col.Type)
+}
+
 // rowFmtErr labels a format-level decode failure with the failing row.
 func rowFmtErr(ci *sql.CopyIn, code string, format string, args ...any) error {
 	return &sql.Error{Code: code, Msg: fmt.Sprintf("COPY row %d: %s", ci.RowsRead()+1, fmt.Sprintf(format, args...))}
@@ -188,7 +198,7 @@ func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "%v", derr)
 			}
 			if i < len(cols) {
-				d, cerr := ci.Text(raw).Coerce(cols[i].Type)
+				d, cerr := copyFieldDatum(ci, raw, cols[i])
 				if cerr != nil {
 					return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, cerr)
 				}
@@ -320,7 +330,7 @@ func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []c
 				continue
 			}
 			if i < len(cols) {
-				d, cerr := ci.Text(f.text).Coerce(cols[i].Type)
+				d, cerr := copyFieldDatum(ci, f.text, cols[i])
 				if cerr != nil {
 					return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, cerr)
 				}

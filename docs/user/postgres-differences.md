@@ -18,7 +18,7 @@ syntax error or `0A000` feature not supported):
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | `ALTER TABLE ... ADD COLUMN` with an expression default (`DEFAULT now()`) | sequences (with `OWNED BY`), `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
 | `ADD PRIMARY KEY` (a table created without one is keyed by a hidden `rowid`, [reference](sql.md#tables-without-a-primary-key); `0A000`) / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
-| `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
+| `COPY FROM` options beyond `FORMAT`; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
@@ -436,9 +436,7 @@ syntax error or `0A000` feature not supported):
   `enable_sort`, `enable_hashagg` and `enable_material`,
   `synchronous_commit` (every commit is durable and replicated),
   `default_transaction_deferrable` and `SET SESSION CHARACTERISTICS AS
-  TRANSACTION DEFERRABLE`, `extra_float_digits` (a float always prints
-  in its shortest exact form, which is what `1` to `3` give; `0` and
-  below do not round), `lc_messages`, `lc_monetary`, `lc_numeric` and
+  TRANSACTION DEFERRABLE`, `lc_messages`, `lc_monetary`, `lc_numeric` and
   `lc_time` (messages, numbers, money and dates stay in the C locale;
   `C`, `POSIX` and names shaped like `en_US.UTF-8` are accepted),
   `escape_string_warning`, `array_nulls` (`off` does not make a
@@ -447,9 +445,11 @@ syntax error or `0A000` feature not supported):
   `session_replication_role` (`replica` does not disable foreign keys).
   `default_with_oids` takes only `off`, as in PostgreSQL 12 and later.
   The ones that do act: `IntervalStyle` (`postgres`, `iso_8601`,
-  `sql_standard`, `postgres_verbose`) and `bytea_output` (`hex`,
-  `escape`) set the text format of `INTERVAL` and `BYTEA` columns on the
-  wire, though not of `::text` casts, arrays or JSON;
+  `sql_standard`, `postgres_verbose`), `bytea_output` (`hex`,
+  `escape`) and `extra_float_digits` (`1` to `3` print a `FLOAT8` in its
+  shortest exact form, `0` and below round it to `15 + n` digits) set
+  the text format of `INTERVAL`, `BYTEA` and `FLOAT8` columns on the
+  wire and in `COPY TO`, though not of `::text` casts, arrays or JSON;
   `client_min_messages` at `warning` or `error` keeps `NOTICE`s from
   the client; `row_security = off` refuses a query a policy would
   filter (below). `max_identifier_length` reports `63` and, like
