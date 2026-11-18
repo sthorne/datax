@@ -127,11 +127,13 @@ func TestNWayJoins(t *testing.T) {
 		JOIN orders o ON o.customer_id = c.id`); serr == nil || serr.Code != sql.CodeUndefinedTable {
 		t.Fatalf("forward ON reference: %+v", serr)
 	}
-	// Same-side ON still rejected at any level.
-	if _, serr := trySQL(ctx, s, `SELECT r.name FROM regions r
+	// A same-side ON at any level is a join condition (issue #363):
+	// c.id = c.id holds for every customer, so level 2 is a cross join
+	// of the 3 customers with a region and the 4 orders.
+	if res := execSQL(t, ctx, s, `SELECT count(*) FROM regions r
 		JOIN customers c ON c.region_id = r.id
-		JOIN orders o ON c.id = c.id`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
-		t.Fatalf("same-side ON at level 2: %+v", serr)
+		JOIN orders o ON c.id = c.id`); len(res.Rows) != 1 || res.Rows[0][0].I != 12 {
+		t.Fatalf("same-side ON at level 2: %+v", res.Rows)
 	}
 
 	// EXPLAIN renders one line per level; the indexed side shows its path.

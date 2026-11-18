@@ -1890,8 +1890,12 @@ fetched through the ranking above using the WHERE conjuncts that
 reference only it; for each partial row, the next JOIN's ON equalities
 become synthetic equality predicates on that table — so a join key that
 hits its primary key or an index turns into a point/index lookup per
-row. Each ON conjunct must equate a column of the table being joined
-with a column of any *earlier* table (skip-level equalities are fine).
+row. The ON equalities that equate a column of the table being joined
+with a column of any *earlier* table (skip-level equalities are fine)
+are those keys; every other ON conjunct — non-equi, `OR`, one-sided,
+`ON true` — is a join filter on each candidate pair. A level with no
+key is a plain nested loop: its table is fetched once and every partial
+row is tried against each buffered row.
 The full WHERE clause evaluates on complete rows only, which is what
 makes it filter after NULL extension on a LEFT JOIN
 (`WHERE inner.col IS NULL` is the anti-join) — WHERE conjuncts are never

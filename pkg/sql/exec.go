@@ -3647,7 +3647,9 @@ func (s *Session) emptyCatalogSelect(ctx context.Context, txn *kvclient.Txn, t *
 		return nil, false
 	}
 	for _, jc := range t.Joins {
-		if jc.Left {
+		// A RIGHT or FULL join keeps the joined member's rows even
+		// when the catalog has none.
+		if jc.Left || jc.Right || jc.Full {
 			return nil, false
 		}
 	}

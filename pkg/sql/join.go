@@ -18,7 +18,10 @@ import (
 // base-only WHERE conjuncts; for each partial row the next side's ON
 // equalities become synthetic equality predicates, so every join step
 // reuses pickPlan — a join key on that side's PK or an index turns into a
-// point/index lookup per row. The full WHERE clause evaluates on complete
+// point/index lookup per row. A level whose ON has no such equality (ON
+// true, non-equi, OR, one-sided) fetches its side once and tries every
+// partial row against every buffered row; the remaining ON conjuncts
+// are the join filter either way. The full WHERE clause evaluates on complete
 // rows only (PostgreSQL semantics: on a LEFT JOIN it filters after
 // NULL-extension). Aggregates and GROUP BY over the join run the joined
 // rows through the grouped executor under a synthetic descriptor whose
@@ -147,8 +150,10 @@ type onPair struct {
 	rightCol catalog.Column
 }
 
-// resolveOn resolves side k's ON conjuncts against sides[:k+1]; each must
-// equate a column of the newly joined side with a column of an earlier one.
+// resolveOn resolves side k's ON key equalities against sides[:k+1]; each
+// must equate a column of the newly joined side with a column of an
+// earlier one (splitJoinConds moved every other equality to the level's
+// filter).
 func resolveOn(sides []joinSide, k int, conds []parser.JoinCond) ([]onPair, error) {
 	scope := sides[:k+1]
 	pairs := make([]onPair, 0, len(conds))
@@ -389,6 +394,20 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			continue
 		}
 		if cmp.Op == "IN" || cmp.Op == "NOT IN" {
+			// List members may read the joined row (c.k IN (a.x, b.y),
+			// or ON c.k = a.x OR c.k = b.y, which parses to that): bind
+			// them first, as matchesIn sees no joined row.
+			if inListHasColumn(cmp.Values) {
+				vals := make([]parser.Expr, len(cmp.Values))
+				for j, v := range cmp.Values {
+					d, err := evalExprEnv(v, joinEnv{sides, jr}, params)
+					if err != nil {
+						return false, err
+					}
+					vals[j] = parser.Expr{Lit: &d}
+				}
+				cmp.Values = vals
+			}
 			match, err := matchesIn(cmp, cmpType, lhs, nil, nil, params)
 			if err != nil || !match {
 				return false, err
@@ -464,7 +483,7 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 		}
 		// A row-dependent right side (c.oid = i.indrelid) is a join
 		// predicate, not a base bound: the post-join filter applies it.
-		if exprHasColumn(cmp.Value) {
+		if exprHasColumn(cmp.Value) || inListHasColumn(cmp.Values) {
 			continue
 		}
 		bare := cmp
@@ -472,6 +491,16 @@ func baseOnlyWhere(sides []joinSide, where []parser.Comparison) ([]parser.Compar
 		out = append(out, bare)
 	}
 	return out, nil
+}
+
+// inListHasColumn reports whether any IN-list member references a column.
+func inListHasColumn(vals []parser.Expr) bool {
+	for _, v := range vals {
+		if exprHasColumn(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // exprHasColumn reports whether a value expression references any column.
@@ -653,6 +682,9 @@ func (s *Session) resolveJoinQuery(ctx context.Context, txn *kvclient.Txn, baseD
 	if t, err = expandUsing(sides, t); err != nil {
 		return nil, err
 	}
+	if t, err = splitJoinConds(sides, t); err != nil {
+		return nil, err
+	}
 	jq := &joinQuery{sides: sides, sel: t}
 	// Reorder only with statistics for EVERY side: their absence keeps
 	// the syntactic order byte-identical to the pre-statistics executor.
@@ -747,51 +779,76 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		if sides[k].right {
 			matchedKeys = map[string]bool{}
 		}
-		for _, jr := range joined {
-			// Synthetic equality predicate from the partial row's join
-			// keys. A NULL key (including a NULL-extended earlier side)
-			// matches nothing (SQL equality).
-			nullKey := false
-			synth := make([]parser.Comparison, 0, len(ons[k-1])+len(keys[k-1].pairs)+len(keys[k-1].consts))
-			synth = append(synth, keys[k-1].consts...)
-			for _, p := range append(ons[k-1][:len(ons[k-1]):len(ons[k-1])], keys[k-1].pairs...) {
-				d := jr.datum(joinRef{side: p.leftSide, col: p.leftCol})
-				if d.Null {
-					nullKey = true
-					break
-				}
-				lit := d
-				synth = append(synth, parser.Comparison{
-					Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
-				})
+		// A level with no per-row key (ON true, a non-equi or OR
+		// condition, a condition on one side only) is a plain nested
+		// loop: side k is fetched once, through the planner with any
+		// constant bounds the WHERE lends it, and every partial row
+		// tries every buffered row against the ON filter. Re-fetching
+		// it per partial row would scan the side once per row.
+		perRow := len(ons[k-1]) > 0 || len(keys[k-1].pairs) > 0
+		var buffered []fetchedRow
+		if !perRow && (len(joined) > 0 || sides[k].right) {
+			if buffered, err = s.fetchRowsInner(ctx, txn, sides[k].desc, keys[k-1].consts); err != nil {
+				return nil, err
 			}
-			var matches []fetchedRow
-			if !nullKey {
-				matches, err = s.fetchRowsInner(ctx, txn, sides[k].desc, synth)
-				if err != nil {
+		}
+		// Non-key ON conjuncts (tc.relkind = 't', u.tid < t.id, OR, ON
+		// true) decide matching, not the final row set: a candidate that
+		// fails them is a miss, so a LEFT side NULL-extends. They see
+		// only the sides joined so far.
+		filter := t.Joins[k-1].Filter
+		scope := sides[:k+1]
+		for i, jr := range joined {
+			if i&1023 == 1023 {
+				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
 			}
-			if len(matches) == 0 {
-				if sides[k].left {
-					next = append(next, jr.extend(nil))
+			matches := buffered
+			if perRow {
+				// Synthetic equality predicate from the partial row's
+				// join keys. A NULL key (including a NULL-extended
+				// earlier side) matches nothing (SQL equality).
+				nullKey := false
+				synth := make([]parser.Comparison, 0, len(ons[k-1])+len(keys[k-1].pairs)+len(keys[k-1].consts))
+				synth = append(synth, keys[k-1].consts...)
+				for _, p := range append(ons[k-1][:len(ons[k-1]):len(ons[k-1])], keys[k-1].pairs...) {
+					d := jr.datum(joinRef{side: p.leftSide, col: p.leftCol})
+					if d.Null {
+						nullKey = true
+						break
+					}
+					lit := d
+					synth = append(synth, parser.Comparison{
+						Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
+					})
 				}
-				continue
+				matches = nil
+				if !nullKey {
+					matches, err = s.fetchRowsInner(ctx, txn, sides[k].desc, synth)
+					if err != nil {
+						return nil, err
+					}
+				}
 			}
-			// Non-key ON conjuncts (tc.relkind = 't', NOT a.attisdropped)
-			// decide matching, not the final row set: a candidate that
-			// fails them is a miss, so a LEFT side NULL-extends.
-			filter := t.Joins[k-1].Filter
 			matched := 0
 			for _, ifr := range matches {
 				ext := jr.extend(ifr.row)
 				if len(filter) > 0 {
-					ok, err := evalJoinWhere(sides, filter, ext, params)
+					ok, err := evalJoinWhere(scope, filter, ext, params)
 					if err != nil {
 						return nil, err
 					}
 					if !ok {
 						continue
+					}
+				}
+				if !perRow {
+					// The nested loop's output is what grows: charge each
+					// joined row's slot against statement_memory_limit
+					// (the rows it points at were charged when fetched).
+					if err := s.charge(int64(24 + 8*len(ext.rows))); err != nil {
+						return nil, err
 					}
 				}
 				next = append(next, ext)
@@ -806,10 +863,13 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		}
 		if sides[k].right {
 			// The joined side's unmatched rows, NULL-extended on every
-			// earlier side.
-			all, _, err := s.fetchRows(ctx, txn, sides[k].desc, nil, params, 0)
-			if err != nil {
-				return nil, err
+			// earlier side. A buffered side already holds all of them
+			// (a chain with a RIGHT or FULL join lends no WHERE bounds).
+			all := buffered
+			if perRow {
+				if all, _, err = s.fetchRows(ctx, txn, sides[k].desc, nil, params, 0); err != nil {
+					return nil, err
+				}
 			}
 			for _, fr := range all {
 				if matchedKeys[joinRowID(sides[k].desc, fr)] {
@@ -1124,15 +1184,23 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		if err != nil {
 			return "", err
 		}
-		if k == 1 {
-			fmt.Fprintf(&b, "; inner (%s) per outer row: %s%s", sides[k].alias, innerPathDesc(plan), estimate(plan))
-			if sides[k].right {
-				fmt.Fprintf(&b, " + unmatched %s rows appended", sides[k].alias)
-			}
-			continue
+		// A level with per-row keys looks the side up per row; one
+		// without is a plain nested loop over the side, fetched once.
+		how, path := "per outer row", innerPathDesc(plan)
+		if k > 1 {
+			how = "per row"
 		}
-		lk := levelKindName(sides, t, keys, k)
-		fmt.Fprintf(&b, "; then %s (%s) per row: %s%s", lk, sides[k].alias, innerPathDesc(plan), estimate(plan))
+		if len(ons[k-1]) == 0 && len(keys[k-1].pairs) == 0 {
+			how, path = "fetched once, every row tried", plan.String()
+		}
+		if k == 1 {
+			fmt.Fprintf(&b, "; inner (%s) %s: %s%s", sides[k].alias, how, path, estimate(plan))
+		} else {
+			fmt.Fprintf(&b, "; then %s (%s) %s: %s%s", levelKindName(sides, t, keys, k), sides[k].alias, how, path, estimate(plan))
+		}
+		if len(t.Joins[k-1].Filter) > 0 {
+			b.WriteString(" + join filter")
+		}
 		if sides[k].right {
 			fmt.Fprintf(&b, " + unmatched %s rows appended", sides[k].alias)
 		}
@@ -1246,6 +1314,91 @@ func expandUsing(sides []joinSide, t *parser.Select) (*parser.Select, error) {
 		return t, nil
 	}
 	return out, nil
+}
+
+// splitJoinConds settles each JOIN's ON clause against the sides, on a
+// copy of t when anything moves (the caller's statement, possibly
+// cached, is never changed). The parser takes every column = column
+// conjunct as a key candidate; one that does not equate the joined side
+// with an earlier side (ON u.a = u.b, ON t.a = t.b) is not a key, so it
+// joins the level's filter, evaluated per candidate pair like any other
+// ON condition. The filter's column references are checked against the
+// sides joined so far: like PostgreSQL, an ON clause cannot see a member
+// joined after it (42P01 / 42703).
+func splitJoinConds(sides []joinSide, t *parser.Select) (*parser.Select, error) {
+	var out *parser.Select
+	for i := range t.Joins {
+		k := i + 1
+		scope := sides[:k+1]
+		jc := t.Joins[i]
+		var keep []parser.JoinCond
+		var moved []parser.Comparison
+		for _, c := range jc.On {
+			for _, ref := range []parser.ColumnRef{c.L, c.R} {
+				if err := checkOnScope(sides, k, ref.String()); err != nil {
+					return nil, err
+				}
+			}
+			l, lerr := resolveJoinRef(scope, c.L.String())
+			r, rerr := resolveJoinRef(scope, c.R.String())
+			if lerr == nil && rerr == nil && (l.side == k) == (r.side == k) {
+				moved = append(moved, joinCondCmp(c))
+				continue
+			}
+			keep = append(keep, c)
+		}
+		for _, cmp := range jc.Filter {
+			var err error
+			condColumns(cmp, func(name string) {
+				if err == nil {
+					err = checkOnScope(sides, k, name)
+				}
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		if len(moved) == 0 {
+			continue
+		}
+		if out == nil {
+			c := *t
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+			out = &c
+		}
+		out.Joins[i].On = keep
+		out.Joins[i].Filter = append(append([]parser.Comparison(nil), jc.Filter...), moved...)
+	}
+	if out == nil {
+		return t, nil
+	}
+	return out, nil
+}
+
+// joinCondCmp is a column = column ON conjunct as a filter comparison.
+func joinCondCmp(c parser.JoinCond) parser.Comparison {
+	return parser.Comparison{Column: c.L.String(), Op: "=", Value: parser.Expr{Column: c.R.String()}}
+}
+
+// checkOnScope reports the PostgreSQL error for a column reference in
+// level k's ON clause that names a member joined after it: a qualified
+// one is "invalid reference to FROM-clause entry" (42P01), an unqualified
+// one a column that does not exist (42703). Any other reference is left
+// to evaluation, which reports unknown names as it always has (and a
+// correlated subquery's enclosing references are substituted before
+// the join runs).
+func checkOnScope(sides []joinSide, k int, name string) error {
+	if _, err := resolveJoinRef(sides[:k+1], name); err == nil {
+		return nil
+	}
+	ref, err := resolveJoinRef(sides, name)
+	if err != nil || ref.side <= k {
+		return nil
+	}
+	if q, _ := splitQualified(name); q != "" {
+		return newErrf(CodeUndefinedTable, "invalid reference to FROM-clause entry for table %q", q)
+	}
+	return newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 }
 
 // joinRowID identifies a RIGHT or FULL joined side's row, to tell the

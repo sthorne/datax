@@ -47,9 +47,10 @@ func TestParseLateral(t *testing.T) {
 	if sel := parseOne(t, `SELECT * FROM t, lateral l`).(*Select); sel.Joins[0].Lateral || sel.Joins[0].Table != "lateral" || sel.Joins[0].Alias != "l" {
 		t.Fatalf("table named lateral: %+v", sel.Joins[0])
 	}
-	// An ordinary JOIN still needs a join-key equality.
-	if _, err := Parse(`SELECT * FROM t JOIN (SELECT 1 AS a) s ON true`); err == nil {
-		t.Fatal("non-lateral JOIN ON true: no error")
+	// An ordinary JOIN takes any ON condition too (issue #363): ON
+	// true has neither key equalities nor filter conjuncts.
+	if sel := parseOne(t, `SELECT * FROM t JOIN (SELECT 1 AS a) s ON true`).(*Select); len(sel.Joins) != 1 || sel.Joins[0].Lateral || len(sel.Joins[0].On) != 0 {
+		t.Fatalf("non-lateral JOIN ON true: %+v", sel.Joins)
 	}
 	// The keyword shows in the fingerprint: a lateral and a plain
 	// derived member are different statements.
