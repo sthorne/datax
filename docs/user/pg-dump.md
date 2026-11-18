@@ -11,7 +11,11 @@ What is tested: the `pg_dump`, `pg_restore` and `psql` of PostgreSQL 16,
 against every format (`plain`, `-Fc`, `-Fd`) and `--schema-only` /
 `--data-only`. The test suite runs them on every CI build
 (`TestPgDumpRestore`). Other versions of the client tools send other
-catalog queries and may stop on one datax does not answer.
+catalog queries and may stop on one datax does not answer: pg_dump 18
+stops on its first table query (`column "c.relallvisible" does not
+exist`). Use the PostgreSQL 16 client (on Debian and Ubuntu,
+`postgresql-client-16`, in `/usr/lib/postgresql/16/bin`) until 17 and
+18 are supported (issue #370).
 
 ## Quick start
 
