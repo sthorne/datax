@@ -187,11 +187,30 @@ func TestNoPrimaryKeyTables(t *testing.T) {
 	h.code(`ALTER TABLE t DROP COLUMN rowid`, sql.CodeUndefinedColumn)
 	h.code(`ALTER TABLE t ADD COLUMN rowid INT`, sql.CodeDuplicateColumn)
 
-	// ---- ADD PRIMARY KEY: refused ----
-	serr := h.code(`ALTER TABLE t ADD PRIMARY KEY (a)`, sql.CodeFeatureNotSupported)
-	if !strings.Contains(serr.Msg, "hidden rowid") {
-		t.Fatalf("ADD PRIMARY KEY message: %s", serr.Msg)
-	}
+	// ---- ADD PRIMARY KEY: NOT NULL columns and a unique index the
+	// catalogs show as the key (what pg_dump's restore runs); the rows
+	// stay keyed by the rowid ----
+	h.code(`ALTER TABLE t ADD PRIMARY KEY (a)`, sql.CodeUniqueViolation) // a = 5 twice
+	h.expect(`SELECT count(*) FROM pg_constraint WHERE conrelid = 't'::regclass`, "0")
+	h.exec(`DELETE FROM t WHERE a = 5`)
+	h.exec(`INSERT INTO t VALUES (5, 7), (NULL, 8)`)
+	h.code(`ALTER TABLE t ADD PRIMARY KEY (a)`, sql.CodeNotNullViolation)
+	h.exec(`DELETE FROM t WHERE a IS NULL`)
+	h.exec(`ALTER TABLE t ADD PRIMARY KEY (a)`)
+	h.expect(`SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 't'::regclass`, "t_pkey|p|PRIMARY KEY (a)")
+	h.expect(`SELECT i.indisprimary, i.indisunique, c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = 't'::regclass`, "t|t|t_pkey")
+	h.expect(`SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 't'`, "PRIMARY KEY")
+	h.expect(`SELECT attnotnull FROM pg_attribute WHERE attrelid = 't'::regclass AND attname = 'a'`, "t")
+	h.expect(`SELECT relhasindex FROM pg_class WHERE relname = 't'`, "t")
+	h.code(`INSERT INTO t VALUES (5, 1)`, sql.CodeUniqueViolation)
+	h.code(`INSERT INTO t (n) VALUES (1)`, sql.CodeNotNullViolation)
+	h.code(`ALTER TABLE t ADD PRIMARY KEY (n)`, sql.CodeInvalidTableDefinition)
+	h.exec(`CREATE TABLE t_ref (x INT REFERENCES t)`) // the key a foreign key without columns names
+	h.expect(`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 't_ref'::regclass`, "FOREIGN KEY (x) REFERENCES t(a)")
+	h.code(`INSERT INTO t_ref VALUES (99)`, sql.CodeForeignKeyViolation)
+	h.exec(`DROP TABLE t_ref`)
+	h.exec(`ALTER TABLE t DROP CONSTRAINT t_pkey`)
+	h.expect(`SELECT count(*) FROM pg_constraint WHERE conrelid = 't'::regclass`, "0")
 	h.code(`ALTER TABLE users ADD CONSTRAINT users_pk PRIMARY KEY (id)`, sql.CodeInvalidTableDefinition)
 
 	// ---- LIKE ... INCLUDING ALL ----
@@ -218,7 +237,7 @@ func TestNoPrimaryKeyTables(t *testing.T) {
 
 	// ---- CREATE TABLE AS keeps its rowid ----
 	h.exec(`CREATE TABLE ctas AS SELECT a FROM t`)
-	h.expect(`SELECT count(DISTINCT rowid) FROM ctas`, "3")
+	h.expect(`SELECT count(DISTINCT rowid) FROM ctas`, "2")
 
 	// ---- COPY FROM over the wire: no rowid in the default column list ----
 	conn, err := pgx.Connect(ctx, pgURL(tc, 0))

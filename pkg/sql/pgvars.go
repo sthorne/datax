@@ -89,6 +89,14 @@ var pgVarList = []pgVar{
 		}
 		return newErrf(CodeUndefinedObject, "invalid value for parameter %q: %q", name, value)
 	}},
+	{name: "default_table_access_method", vartype: "string", boot: "heap", context: "user", check: func(name, value string) *Error {
+		// pg_dump sets it before each CREATE TABLE; heap is the only
+		// table access method there is.
+		if value == "heap" {
+			return nil
+		}
+		return newErrf(CodeInvalidParameterValue, "invalid value for parameter %q: %q", name, value)
+	}},
 	boolVar("row_security", "on"),
 	{name: "bytea_output", vartype: "enum", boot: "hex", context: "user", enum: []string{"escape", "hex"}},
 	boolVar("default_transaction_deferrable", "off"),

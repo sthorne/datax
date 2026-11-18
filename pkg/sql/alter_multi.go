@@ -216,6 +216,8 @@ func alterActionName(t *parser.AlterTable) string {
 		return fmt.Sprintf("ALTER COLUMN %s SET NOT NULL", t.SetNotNull)
 	case t.DropNotNull != "":
 		return fmt.Sprintf("ALTER COLUMN %s DROP NOT NULL", t.DropNotNull)
+	case t.AddIdentity != nil:
+		return fmt.Sprintf("ALTER COLUMN %s ADD GENERATED AS IDENTITY", t.AddIdentity.Column)
 	case t.SetDefault != nil:
 		return fmt.Sprintf("ALTER COLUMN %s SET DEFAULT", t.SetDefault.Column)
 	case t.DropDefault != "":
@@ -388,6 +390,8 @@ func (s *Session) applyAlterAction(ctx context.Context, txn *kvclient.Txn, desc 
 			return newErrf(CodeSyntaxError, "column %q is an identity column and cannot be nullable", t.DropNotNull)
 		}
 		setColumnNotNull(desc, col.ID, false)
+	case t.AddIdentity != nil:
+		return s.applyAddIdentity(ctx, txn, desc, t.AddIdentity, eff)
 	case t.AddCol != nil:
 		_, err := s.applyAddColumn(ctx, txn, desc, t, eff, false)
 		return err

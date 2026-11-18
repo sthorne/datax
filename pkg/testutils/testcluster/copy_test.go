@@ -221,19 +221,50 @@ func TestCopyFailAborts(t *testing.T) {
 	}
 }
 
-// TestCopyProtocolGates: BEGIN gate, non-final-statement gate, extended
-// protocol rejection, and the stray-CopyData desync regression.
+// TestCopyProtocolGates: COPY in a transaction block, non-final-statement
+// gate, extended protocol rejection, and the stray-CopyData desync
+// regression.
 func TestCopyProtocolGates(t *testing.T) {
 	tc := Start(t, 3)
 	r := dialRaw(t, tc)
 	r.simpleExec("CREATE TABLE cg (id INT8 PRIMARY KEY)")
 
-	// Inside an explicit transaction: 25001.
+	// Inside an explicit transaction (pg_restore -j's BEGIN; TRUNCATE;
+	// COPY; COMMIT): the rows are the block's, gone with a ROLLBACK and
+	// kept by a COMMIT — more than a chunk's worth either way.
+	var rows strings.Builder
+	for i := 1; i <= 200; i++ {
+		fmt.Fprintf(&rows, "%d\n", 1000+i)
+	}
 	r.simpleExec("BEGIN")
-	r.send(&pgproto3.Query{String: "COPY cg FROM STDIN"})
-	expectErrorCode(r, "25001")
+	r.copyIn("COPY cg FROM STDIN", 0)
+	r.send(&pgproto3.CopyData{Data: []byte(rows.String())})
+	r.finishCopy(200)
+	r.simpleExec("ROLLBACK")
+	if n := countRows(t, tc, "cg"); n != 0 {
+		t.Fatalf("rows after ROLLBACK of a block's COPY: %d, want 0", n)
+	}
+	r.simpleExec("BEGIN")
+	r.simpleExec("TRUNCATE TABLE ONLY cg")
+	r.copyIn("COPY cg FROM STDIN", 0)
+	r.send(&pgproto3.CopyData{Data: []byte(rows.String())})
+	r.finishCopy(200)
+	r.simpleExec("COMMIT")
+	if n := countRows(t, tc, "cg"); n != 200 {
+		t.Fatalf("rows after COMMIT of a block's COPY: %d, want 200", n)
+	}
+	// A COPY that fails in a block fails the block, and keeps nothing.
+	r.simpleExec("BEGIN")
+	r.copyIn("COPY cg FROM STDIN", 0)
+	r.send(&pgproto3.CopyData{Data: []byte("1\n1001\n")})
+	r.send(&pgproto3.CopyDone{})
+	expectErrorCode(r, "23505")
+	expect[*pgproto3.ReadyForQuery](r)
+	r.send(&pgproto3.Query{String: "SELECT 1"})
+	expectErrorCode(r, "25P02")
 	expect[*pgproto3.ReadyForQuery](r)
 	r.simpleExec("ROLLBACK")
+	r.simpleExec("TRUNCATE cg")
 
 	// COPY not last in a multi-statement query: 0A000. As the LAST
 	// statement it runs (after the leading statement).

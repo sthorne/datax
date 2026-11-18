@@ -1626,3 +1626,49 @@ func SweepLargeObjects(ctx context.Context, db *kvclient.DB, cat *catalog.Access
 	metrics.LargeObjectPagesReclaimed.Add(float64(res.Pages))
 	return res, nil
 }
+
+// loSetOwner is ALTER LARGE OBJECT loid OWNER TO owner (what pg_dump
+// writes after each lo_create): the object's owner, or an admin, gives
+// it to another role.
+func (s *Session) loSetOwner(ctx context.Context, txn *kvclient.Txn, loid int64, owner string) error {
+	st, err := s.loBegin(ctx, txn)
+	if err != nil {
+		return err
+	}
+	if obj, mine := st.created[loid]; mine {
+		// Created in this transaction block: its metadata row is written
+		// at commit, with the owner it has then.
+		if err := s.checkOwner(ctx, txn, "large object", fmt.Sprint(loid), obj.owner); err != nil {
+			return err
+		}
+		obj.owner = owner
+		return nil
+	}
+	key, err := st.tables.metaKey(loid)
+	if err != nil {
+		return err
+	}
+	raw, err := txn.GetForUpdate(ctx, key)
+	if err != nil {
+		return err
+	}
+	if raw == nil {
+		return loErrNoObject(loid)
+	}
+	row, err := rowenc.DecodeValue(st.tables.meta, raw)
+	if err != nil {
+		return err
+	}
+	if err := s.checkOwner(ctx, txn, "large object", fmt.Sprint(loid), row[loMetaColOwner].S); err != nil {
+		return err
+	}
+	if obj := st.objs[row[loMetaColCID].I]; obj != nil {
+		obj.owner = owner
+	}
+	row[loMetaColOwner] = types.NewString(owner)
+	val, err := rowenc.EncodeValue(st.tables.meta, row)
+	if err != nil {
+		return err
+	}
+	return txn.Put(ctx, key, val)
+}

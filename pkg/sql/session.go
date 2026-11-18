@@ -988,6 +988,13 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// COLUMN with a volatile default (or another that needs them), run
 	// online too (alter_multi.go); several that need nothing but the
 	// descriptor run below, in the statement's transaction.
+	if at, ok := stmt.(*parser.AlterTable); ok {
+		r, serr := s.rewriteAddPrimaryKey(ctx, at)
+		if serr != nil {
+			return nil, serr
+		}
+		stmt = r
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && alterRunsOnline(at) {
 		if at.IfExists && !s.tableExists(ctx, at.Table) {
 			return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("relation %q does not exist, skipping", at.Table)}}, nil
