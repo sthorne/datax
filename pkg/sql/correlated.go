@@ -44,6 +44,70 @@ type scopeLevel struct {
 	desc    *catalog.TableDescriptor
 	alias   string   // alias if given, else the table name
 	aliases []string // further qualifiers naming this level (join sides)
+	// hidden are the table names an alias hides at this level (FROM ev
+	// e2 hides "ev"), each with the alias: a qualifier naming one
+	// reaches past this level, and, reaching nothing, is PostgreSQL's
+	// "invalid reference to FROM-clause entry" rather than "missing
+	// FROM-clause entry".
+	hidden []hiddenName
+	// ambiguous are the bare names more than one side of a join level
+	// carries: an unqualified reference reaching this level is 42702.
+	ambiguous map[string]bool
+}
+
+// hiddenName is a table name an alias hides.
+type hiddenName struct{ table, alias string }
+
+// hider returns the alias hiding table name q at this level, if any.
+func (sl scopeLevel) hider(q string) (string, bool) {
+	for _, h := range sl.hidden {
+		if h.table == q {
+			return h.alias, true
+		}
+	}
+	return "", false
+}
+
+// tableLevel is the scope level of one FROM item: table (as written)
+// resolved to desc, under alias if one was given. An alias hides the
+// table's own name; without one, the bare name and the written spelling
+// (pg_catalog.pg_class) both qualify.
+func tableLevel(desc *catalog.TableDescriptor, table, alias string) scopeLevel {
+	sl := scopeLevel{desc: desc, alias: alias}
+	if alias == "" {
+		sl.alias = desc.Name
+		if table != "" && table != desc.Name {
+			sl.aliases = []string{table}
+		}
+		return sl
+	}
+	for _, h := range []string{desc.Name, table} {
+		if _, dup := sl.hider(h); h != "" && h != alias && !dup {
+			sl.hidden = append(sl.hidden, hiddenName{table: h, alias: alias})
+		}
+	}
+	return sl
+}
+
+// fromEntryErr is the error for a qualifier q that names no visible
+// FROM item: PostgreSQL's 42P01, worded "invalid reference" when q is a
+// table an alias hides somewhere in levels (the alias must be used),
+// else "missing FROM-clause entry".
+func fromEntryErr(q string, levels ...scopeLevel) error {
+	for _, sl := range levels {
+		if alias, ok := sl.hider(q); ok {
+			return hiddenTableErr(q, alias)
+		}
+	}
+	return newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
+}
+
+// hiddenTableErr is PostgreSQL's error for a reference to table q by
+// its name where only its alias is visible.
+func hiddenTableErr(q, alias string) error {
+	err := newErrf(CodeUndefinedTable, "invalid reference to FROM-clause entry for table %q", q)
+	err.Hint = fmt.Sprintf("Perhaps you meant to reference the table alias %q.", alias)
+	return err
 }
 
 // matches reports whether q names this level. An aliased table answers
@@ -119,7 +183,7 @@ func (sc *corrScope) classify(name string) (int, error) {
 			}
 			return i + 1, nil
 		}
-		return 0, newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
+		return 0, fromEntryErr(q, append(sc.owns(), sc.outers...)...)
 	}
 	if _, ok := sc.own("", name); ok {
 		return 0, nil
@@ -127,6 +191,10 @@ func (sc *corrScope) classify(name string) (int, error) {
 	for i, sl := range sc.outers {
 		if _, ok := sl.desc.Col(name); ok {
 			return i + 1, nil
+		}
+		if sl.ambiguous[name] {
+			// The nearest level carrying the name carries it twice.
+			return 0, newErrf(CodeAmbiguousColumn, "column reference %q is ambiguous", name)
 		}
 	}
 	return 0, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
@@ -312,29 +380,16 @@ func (s *Session) analyzeSub(ctx context.Context, txn *kvclient.Txn, sub *parser
 			return nil, nil, err
 		}
 	}
-	inner := scopeLevel{desc: innerDesc, alias: sub.Alias}
-	if inner.alias == "" {
-		// Unaliased: the bare name, and the qualified spelling if the
-		// query used one (pg_catalog.pg_class).
-		inner.alias = innerDesc.Name
-		if sub.Table != "" && sub.Table != innerDesc.Name {
-			inner.aliases = []string{sub.Table}
-		}
-	}
+	// Unaliased: the bare name, and the qualified spelling if the query
+	// used one (pg_catalog.pg_class). Aliased: the alias only.
+	inner := tableLevel(innerDesc, sub.Table, sub.Alias)
 	node := &scopeNode{scope: corrScope{inner: inner, outers: outers}}
 	for _, jc := range sub.Joins {
 		jd, err := s.lookupMaybePlan(ctx, txn, jc.Table)
 		if err != nil {
 			return nil, nil, err
 		}
-		side := scopeLevel{desc: jd, alias: jc.Alias}
-		if side.alias == "" {
-			side.alias = jd.Name
-			if jc.Table != jd.Name {
-				side.aliases = []string{jc.Table}
-			}
-		}
-		node.scope.more = append(node.scope.more, side)
+		node.scope.more = append(node.scope.more, tableLevel(jd, jc.Table, jc.Alias))
 	}
 	bind := node.scope.bindLevel()
 
@@ -508,11 +563,8 @@ func conjunctSubs(cmp parser.Comparison) []*parser.Select {
 // and correlated ones. It must run before subquery resolution AND before
 // access planning: a correlated conjunct reaching either would fail (the
 // planner evaluates bound values with no row in scope).
-func (s *Session) splitCorrelatedWhere(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, outerDesc *catalog.TableDescriptor, outerAlias string) (plannable []parser.Comparison, corr []correlatedConjunct, err error) {
-	if outerAlias == "" {
-		outerAlias = outerDesc.Name
-	}
-	return s.splitCorrelatedWhereScope(ctx, txn, where, scopeLevel{desc: outerDesc, alias: outerAlias})
+func (s *Session) splitCorrelatedWhere(ctx context.Context, txn *kvclient.Txn, where []parser.Comparison, outerDesc *catalog.TableDescriptor, outerTable, outerAlias string) (plannable []parser.Comparison, corr []correlatedConjunct, err error) {
+	return s.splitCorrelatedWhereScope(ctx, txn, where, tableLevel(outerDesc, outerTable, outerAlias))
 }
 
 // splitCorrelatedWhereScope is splitCorrelatedWhere against an explicit
@@ -617,7 +669,7 @@ func (s *Session) splitCorrelatedUpdate(ctx context.Context, txn *kvclient.Txn, 
 	if err != nil {
 		return nil, t, nil // let the ordinary path report the missing table
 	}
-	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Alias)
+	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Table, t.Alias)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -635,7 +687,7 @@ func (s *Session) splitCorrelatedDelete(ctx context.Context, txn *kvclient.Txn, 
 	if err != nil {
 		return nil, t, nil
 	}
-	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Alias)
+	plannable, corr, err := s.splitCorrelatedWhere(ctx, txn, t.Where, desc, t.Table, t.Alias)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1315,10 +1367,11 @@ func (s *Session) evalCorrProj(ctx context.Context, txn *kvclient.Txn, cp *corrP
 // joinCorr carries a join select's correlated conjuncts and output
 // expressions, bound against the merged scope of its sides.
 type joinCorr struct {
-	conds []correlatedConjunct
-	projs []corrProj
-	desc  *catalog.TableDescriptor // the merged descriptor
-	rowOf func(jr joinedRow) map[catalog.ColumnID]types.Datum
+	conds   []correlatedConjunct
+	projs   []corrProj
+	grouped *groupedCorr             // a grouped select's per-group subqueries
+	desc    *catalog.TableDescriptor // the merged descriptor
+	rowOf   func(jr joinedRow) map[catalog.ColumnID]types.Datum
 }
 
 // joinScope merges a join's sides into one scope level: every column
@@ -1329,17 +1382,40 @@ type joinCorr struct {
 func joinScope(sides []joinSide) (scopeLevel, func(jr joinedRow) map[catalog.ColumnID]types.Datum) {
 	const stride = 1 << 16
 	desc := &catalog.TableDescriptor{Name: sides[0].desc.Name}
+	// A column a later side joined USING (or NATURALly) belongs, by its
+	// bare name, to the earlier side it merged into: it counts once.
 	count := map[string]int{}
 	for _, js := range sides {
 		for _, c := range js.desc.Columns {
-			count[c.Name]++
+			if _, merged := js.merged[c.Name]; !merged {
+				count[c.Name]++
+			}
+		}
+	}
+	ambiguous := map[string]bool{}
+	for n, k := range count {
+		if k > 1 {
+			ambiguous[n] = true
 		}
 	}
 	var aliases []string
+	var hidden []hiddenName
+	// coalesced are the bare USING columns, read as COALESCE(earlier,
+	// later) — under IDs of their own, past every side's.
+	type coalescedCol struct {
+		id   catalog.ColumnID
+		side int
+		col  catalog.Column
+	}
+	var coalesced []coalescedCol
 	for i, js := range sides {
 		quals := []string{js.alias}
-		if js.desc.Name != js.alias && !js.aliased {
-			quals = append(quals, js.desc.Name)
+		if js.desc.Name != js.alias {
+			if js.aliased {
+				hidden = append(hidden, hiddenName{table: js.desc.Name, alias: js.alias})
+			} else {
+				quals = append(quals, js.desc.Name)
+			}
 		}
 		aliases = append(aliases, quals...)
 		for _, c := range js.desc.Columns {
@@ -1349,11 +1425,16 @@ func joinScope(sides []joinSide) (scopeLevel, func(jr joinedRow) map[catalog.Col
 				mc.ID, mc.Name = id, q+"."+c.Name
 				desc.Columns = append(desc.Columns, mc)
 			}
-			if count[c.Name] == 1 {
-				mc := c
-				mc.ID = id
-				desc.Columns = append(desc.Columns, mc)
+			if _, merged := js.merged[c.Name]; merged || count[c.Name] != 1 {
+				continue
 			}
+			mc := c
+			mc.ID = id
+			if ref := sideRef(sides, i, c); ref.alt != nil {
+				mc.ID = catalog.ColumnID((len(sides)+i)*stride) + c.ID
+				coalesced = append(coalesced, coalescedCol{id: mc.ID, side: i, col: c})
+			}
+			desc.Columns = append(desc.Columns, mc)
 		}
 	}
 	rowOf := func(jr joinedRow) map[catalog.ColumnID]types.Datum {
@@ -1363,7 +1444,387 @@ func joinScope(sides []joinSide) (scopeLevel, func(jr joinedRow) map[catalog.Col
 				row[catalog.ColumnID(i*stride)+c.ID] = jr.datum(joinRef{side: i, col: c})
 			}
 		}
+		for _, cc := range coalesced {
+			row[cc.id] = jr.datum(sideRef(sides, cc.side, cc.col))
+		}
 		return row
 	}
-	return scopeLevel{desc: desc, alias: sides[0].alias, aliases: aliases}, rowOf
+	return scopeLevel{desc: desc, alias: sides[0].alias, aliases: aliases, hidden: hidden, ambiguous: ambiguous}, rowOf
+}
+
+// mapCondsSubqueries is mapExprSubqueries over a conjunction: every
+// subquery a conjunct carries (EXISTS / IN operands, those inside its
+// expressions and OR groups) is replaced by f's result, in a copy.
+func mapCondsSubqueries(conds []parser.Comparison, f func(*parser.Select) (*parser.Select, error)) ([]parser.Comparison, error) {
+	if conds == nil {
+		return nil, nil
+	}
+	out := make([]parser.Comparison, len(conds))
+	for i := range conds {
+		c := conds[i]
+		e, err := mapExprSubqueries(parser.Expr{Cmp: &c}, f)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = *e.Cmp
+	}
+	return out, nil
+}
+
+// Correlated subqueries of a grouped select.
+//
+// A subquery in the select list, HAVING, ORDER BY or DISTINCT ON of a
+// grouped (or aggregate) select is evaluated once per group. As in
+// PostgreSQL, every reference it makes to the select's own row must be
+// a grouping column (else 42803: the reference has no single value per
+// group), so a group's grouping-key values bind it: the subquery tree is
+// substituted with them, as for a row of an ungrouped select, and the
+// grouped expressions over the group's environment are resolved with
+// the substituted subqueries' values spliced in. The aggregates and
+// grouping keys are those of the statement as a whole (the subqueries
+// cannot read the select's aggregates: an aggregate argument naming an
+// outer column is refused by the analysis).
+
+// groupedCorr carries a grouped select's correlated subqueries.
+// selectFor returns the select (in the grouped executor's coordinates)
+// whose correlated subqueries are substituted for one group's keys —
+// the keys in GROUP BY order, NULL where the group's grouping set rolls
+// one up — and resolved.
+type groupedCorr struct {
+	selectFor func(keys []types.Datum) (*parser.Select, error)
+}
+
+// splitCorrelatedGrouped finds the correlated subqueries of a grouped
+// select's per-group positions. It returns nil and t when there are
+// none; otherwise the grouping executor's handle and the statement's
+// shape: t with each correlated subquery replaced by a trivial one (the
+// shape fixes the grouping keys, the aggregates and the outputs; each
+// group evaluates the real subqueries).
+func (s *Session) splitCorrelatedGrouped(ctx context.Context, txn *kvclient.Txn, t *parser.Select, outer scopeLevel, params []types.Datum) (*groupedCorr, *parser.Select, error) {
+	cs, err := s.findCorrelatedSubs(ctx, txn, t, outer)
+	if err != nil || cs == nil {
+		return nil, t, err
+	}
+	// The grouping keys that are plain columns of the select's own row,
+	// by their IDs in the outer scope (GROUP BY order).
+	keyIDs := make([]catalog.ColumnID, len(t.GroupBy))
+	grouped := map[catalog.ColumnID]bool{}
+	for i, k := range t.GroupBy {
+		if !isPlainRef(k) {
+			continue
+		}
+		q, n := splitQualified(k.Column)
+		if c, ok := outer.col(q, n); ok {
+			keyIDs[i] = c.ID
+			grouped[c.ID] = true
+		}
+	}
+	for _, r := range cs.refs {
+		q, n := splitQualified(r)
+		if c, ok := outer.col(q, n); !ok || !grouped[c.ID] {
+			if q == "" && ok {
+				// Named as PostgreSQL names it: qualified.
+				r = outer.alias + "." + n
+				for _, mc := range outer.desc.Columns {
+					if mc.ID == c.ID && strings.Contains(mc.Name, ".") {
+						r = mc.Name
+						break
+					}
+				}
+			}
+			return nil, nil, newErrf(CodeGrouping, "subquery uses ungrouped column %q from outer query", r)
+		}
+	}
+	shape, err := cs.shape()
+	if err != nil {
+		return nil, nil, err
+	}
+	gc := &groupedCorr{selectFor: func(keys []types.Datum) (*parser.Select, error) {
+		row := make(map[catalog.ColumnID]types.Datum, len(keyIDs))
+		for i, id := range keyIDs {
+			if id != 0 && i < len(keys) {
+				row[id] = keys[i]
+			}
+		}
+		g, err := cs.mapSel(func(sub *parser.Select) (*parser.Select, error) {
+			node := cs.nodes[sub]
+			if node == nil {
+				return sub, nil
+			}
+			return substituteSub(sub, node, row, params)
+		})
+		if err != nil {
+			return nil, err
+		}
+		g.Where = nil // the rows are grouped already
+		return s.resolveSelectSubs(ctx, txn, g, params)
+	}}
+	return gc, shape, nil
+}
+
+// corrSubs are the correlated subqueries of a select's select list,
+// HAVING, ORDER BY and DISTINCT ON (its WHERE's are correlated
+// conjuncts, split apart before).
+type corrSubs struct {
+	t     *parser.Select
+	nodes map[*parser.Select]*scopeNode // per correlated subquery
+	refs  []string                      // their references to the select's row
+}
+
+// findCorrelatedSubs analyzes the subqueries of t's per-row (or, grouped,
+// per-group) positions against its scope outer; nil when none
+// correlates.
+func (s *Session) findCorrelatedSubs(ctx context.Context, txn *kvclient.Txn, t *parser.Select, outer scopeLevel) (*corrSubs, error) {
+	cs := &corrSubs{t: t, nodes: map[*parser.Select]*scopeNode{}}
+	consider := func(subs []*parser.Select) error {
+		for _, sub := range subs {
+			if !innerSubShape(sub) {
+				continue // uncovered shape: the eager path handles (or refuses) it
+			}
+			r, node, err := s.analyzeSub(ctx, txn, sub, []scopeLevel{outer})
+			if err != nil {
+				return err
+			}
+			if len(r) > 0 {
+				cs.nodes[sub] = node
+				cs.refs = append(cs.refs, r...)
+			}
+		}
+		return nil
+	}
+	for _, se := range t.Exprs {
+		if se.Star || se.Agg != "" {
+			continue
+		}
+		if err := consider(exprSubqueries(se.Expr)); err != nil {
+			return nil, err
+		}
+	}
+	for _, hc := range t.Having {
+		if err := consider(condSubqueries(hc)); err != nil {
+			return nil, err
+		}
+	}
+	for _, oc := range t.OrderBy {
+		if oc.Expr != nil {
+			if err := consider(exprSubqueries(*oc.Expr)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, e := range t.DistinctOn {
+		if err := consider(exprSubqueries(e)); err != nil {
+			return nil, err
+		}
+	}
+	if len(cs.nodes) == 0 {
+		return nil, nil
+	}
+	return cs, nil
+}
+
+// mapSel returns a copy of the select with f applied to every subquery
+// of its select list, HAVING, ORDER BY and DISTINCT ON.
+func (cs *corrSubs) mapSel(f func(*parser.Select) (*parser.Select, error)) (*parser.Select, error) {
+	t := cs.t
+	c := *t
+	var err error
+	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+	for i := range c.Exprs {
+		if c.Exprs[i].Star || c.Exprs[i].Agg != "" {
+			continue
+		}
+		if c.Exprs[i].Expr, err = mapExprSubqueries(c.Exprs[i].Expr, f); err != nil {
+			return nil, err
+		}
+	}
+	if c.Having, err = mapCondsSubqueries(t.Having, f); err != nil {
+		return nil, err
+	}
+	c.OrderBy = append([]parser.OrderCol(nil), t.OrderBy...)
+	for i := range c.OrderBy {
+		if oc := t.OrderBy[i]; oc.Expr != nil {
+			e, err := mapExprSubqueries(*oc.Expr, f)
+			if err != nil {
+				return nil, err
+			}
+			c.OrderBy[i].Expr = &e
+		}
+	}
+	if len(t.DistinctOn) > 0 {
+		c.DistinctOn = make([]parser.Expr, len(t.DistinctOn))
+		for i, e := range t.DistinctOn {
+			if c.DistinctOn[i], err = mapExprSubqueries(e, f); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &c, nil
+}
+
+// ordersBy reports whether an ORDER BY term carries a correlated
+// subquery.
+func (cs *corrSubs) ordersBy() bool {
+	for _, oc := range cs.t.OrderBy {
+		if oc.Expr == nil {
+			continue
+		}
+		for _, sub := range exprSubqueries(*oc.Expr) {
+			if cs.nodes[sub] != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// shape is the select with each correlated subquery replaced by a
+// trivial one (SELECT NULL): the statement's shape, to plan or group by.
+func (cs *corrSubs) shape() (*parser.Select, error) {
+	return cs.mapSel(func(sub *parser.Select) (*parser.Select, error) {
+		if cs.nodes[sub] == nil {
+			return sub, nil
+		}
+		null := types.DNull
+		return &parser.Select{Exprs: []parser.SelectExpr{{Expr: parser.Expr{Lit: &null}}}, Limit: -1}, nil
+	})
+}
+
+// postSort is the ORDER BY of a plain single-table select that sorts by
+// a correlated value: the output rows are sorted after projection (by
+// the select's own columns, or by hidden ones appended for the terms
+// that are no output column), then the hidden columns are dropped.
+type postSort struct {
+	order  []parser.OrderCol
+	hidden int // trailing output columns that only sort
+}
+
+// splitCorrelatedOrder finds the ORDER BY terms of a plain single-table
+// select that sort by a correlated value — a term carrying a correlated
+// subquery, or naming (by output name or position) a select item that
+// is one (corrIdx, the select-list positions splitCorrelatedProj took).
+// Without any, it returns t and nil. Otherwise it returns a clone whose
+// ORDER BY is empty and whose select list ends with a hidden item per
+// term that is no output column, and the sort to apply to the output.
+func (s *Session) splitCorrelatedOrder(ctx context.Context, txn *kvclient.Txn, t *parser.Select, outer scopeLevel, corrIdx map[int]bool) (*parser.Select, *postSort, error) {
+	if len(t.OrderBy) == 0 {
+		return t, nil, nil
+	}
+	// Output position (0-based) of each select item: a * expands.
+	outAt := make([]int, len(t.Exprs))
+	n := 0
+	for i, se := range t.Exprs {
+		outAt[i] = n
+		if se.Star {
+			n += len(outer.desc.VisibleColumns())
+		} else {
+			n++
+		}
+	}
+	alias := map[string]int{}
+	for i, se := range t.Exprs {
+		if !se.Star && se.Alias != "" {
+			if _, dup := alias[se.Alias]; !dup {
+				alias[se.Alias] = i
+			}
+		}
+	}
+	need := false
+	for _, oc := range t.OrderBy {
+		switch {
+		case oc.Expr != nil:
+			for _, sub := range exprSubqueries(*oc.Expr) {
+				if !innerSubShape(sub) {
+					continue
+				}
+				refs, _, err := s.analyzeSub(ctx, txn, sub, []scopeLevel{outer})
+				if err != nil {
+					return nil, nil, err
+				}
+				need = need || len(refs) > 0
+			}
+		case oc.Position > 0:
+			for i := range t.Exprs {
+				if corrIdx[i] && outAt[i] == oc.Position-1 {
+					need = true
+				}
+			}
+		case oc.Column != "":
+			if i, ok := alias[oc.Column]; ok && corrIdx[i] {
+				need = true
+			}
+		}
+	}
+	if !need {
+		return t, nil, nil
+	}
+	if len(t.DistinctOn) > 0 || t.ForUpdate {
+		return nil, nil, newErrf(CodeFeatureNotSupported, "ORDER BY a correlated subquery is not supported with DISTINCT ON or FOR UPDATE")
+	}
+	c := *t
+	c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
+	c.OrderBy = nil
+	ps := &postSort{}
+	for i, oc := range t.OrderBy {
+		term := parser.OrderCol{Desc: oc.Desc, Nulls: oc.Nulls}
+		switch {
+		case oc.Position > 0:
+			term.Position = oc.Position
+		case oc.Expr == nil && oc.Column != "" && func() bool { _, ok := alias[oc.Column]; return ok }():
+			term.Column = oc.Column // an output name
+		default:
+			e := parser.Expr{Column: oc.Column}
+			if oc.Expr != nil {
+				e = *oc.Expr
+			}
+			name := fmt.Sprintf("__corder%d", i)
+			c.Exprs = append(c.Exprs, parser.SelectExpr{Expr: e, Alias: name})
+			term.Column = name
+			ps.hidden++
+		}
+		ps.order = append(ps.order, term)
+	}
+	if t.Distinct && ps.hidden > 0 {
+		return nil, nil, newErrf(CodeInvalidColumnReference, "for SELECT DISTINCT, ORDER BY expressions must appear in select list")
+	}
+	return &c, ps, nil
+}
+
+// splitCorrelatedSet finds the SET values of a single-table UPDATE whose
+// subqueries reference the row being updated (UPDATE g SET n = (SELECT
+// count(*) FROM e WHERE e.g = g.id)), keyed by SET position, and returns
+// a clone with each replaced by a NULL placeholder; the values are
+// evaluated per row (evalCorrProj).
+func (s *Session) splitCorrelatedSet(ctx context.Context, txn *kvclient.Txn, t *parser.Update) (map[int]*corrProj, *parser.Update, error) {
+	has := false
+	for _, sc := range t.Set {
+		has = has || !sc.Value.IsDefault && exprHasSubquery(sc.Value)
+	}
+	if !has {
+		return nil, t, nil
+	}
+	desc, err := s.lookup(ctx, txn, t.Table)
+	if err != nil {
+		return nil, t, nil // let the ordinary path report the missing table
+	}
+	sel := &parser.Select{Table: t.Table, Alias: t.Alias, Limit: -1}
+	for _, sc := range t.Set {
+		sel.Exprs = append(sel.Exprs, parser.SelectExpr{Expr: sc.Value})
+	}
+	projs, clone, err := s.splitCorrelatedProj(ctx, txn, sel, tableLevel(desc, t.Table, t.Alias))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(projs) == 0 {
+		return nil, t, nil
+	}
+	c := *t
+	c.Set = append([]parser.SetClause(nil), t.Set...)
+	out := map[int]*corrProj{}
+	for i := range projs {
+		cp := &projs[i]
+		out[cp.idx] = cp
+		c.Set[cp.idx].Value = clone.Exprs[cp.idx].Expr
+	}
+	return out, &c, nil
 }

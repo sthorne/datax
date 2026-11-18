@@ -43,8 +43,20 @@ type joinSide struct {
 	merged map[string]int
 }
 
+// matches reports whether qualifier names this side. An aliased side
+// answers to its alias only: FROM ev e hides "ev" (PostgreSQL scoping).
 func (js joinSide) matches(qualifier string) bool {
-	return qualifier == js.alias || qualifier == js.desc.Name
+	return qualifier == js.alias || !js.aliased && qualifier == js.desc.Name
+}
+
+// joinFromEntryErr is fromEntryErr over join sides: q names no side.
+func joinFromEntryErr(sides []joinSide, q string) error {
+	for _, js := range sides {
+		if js.aliased && js.desc.Name == q && js.alias != q {
+			return hiddenTableErr(q, js.alias)
+		}
+	}
+	return newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
 }
 
 // joinRef is a column resolved to a side; alt, when set, is the later
@@ -94,7 +106,7 @@ func resolveJoinRef(sides []joinSide, name string) (joinRef, error) {
 			}
 			return joinRef{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 		}
-		return joinRef{}, newErrf(CodeUndefinedTable, "missing FROM-clause entry for table %q", q)
+		return joinRef{}, joinFromEntryErr(sides, q)
 	}
 	found := -1
 	var fcol catalog.Column
@@ -906,10 +918,11 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 	joined = filtered
 
 	if grouped {
-		if jc != nil && len(jc.projs) > 0 {
-			return nil, newErrf(CodeFeatureNotSupported, "correlated subqueries in the select list are not supported with GROUP BY")
+		var gc *groupedCorr
+		if jc != nil {
+			gc = jc.grouped
 		}
-		return s.execGroupedJoin(sides, joined, t, params)
+		return s.execGroupedJoin(sides, joined, t, params, gc)
 	}
 
 	if len(t.OrderBy) > 0 {

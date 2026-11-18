@@ -1487,7 +1487,9 @@ func (s *Session) returningProjection(desc *catalog.TableDescriptor, table strin
 		return nil, nil
 	}
 	sel := &parser.Select{Table: table, Exprs: append([]parser.SelectExpr(nil), exprs...), Limit: -1}
-	stripTableAlias(sel)
+	if err := stripTableAlias(sel); err != nil {
+		return nil, err
+	}
 	for _, se := range sel.Exprs {
 		if se.Agg != "" || !se.Star && exprHasAgg(se.Expr) {
 			return nil, newErrf(CodeGrouping, "aggregate functions are not allowed in RETURNING")
@@ -2327,7 +2329,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// A single table's columns are addressed by bare name from here on,
 	// whatever the select's shape (grouped, windowed, plain): t.c and
 	// alias.c become c.
-	stripTableAlias(t)
+	if err := stripTableAlias(t); err != nil {
+		return nil, err
+	}
 	if len(t.DistinctOn) > 0 {
 		if err := checkDistinctOn(t); err != nil {
 			return nil, err
@@ -2356,6 +2360,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// supports them.
 	var corr []correlatedConjunct
 	var corrProjs []corrProj
+	var grouped *groupedCorr
+	var post *postSort
 	var jc *joinCorr
 	if t.Table != "" && t.Derived == nil {
 		if outer, rowOf, ok := s.selectScope(ctx, txn, t); ok {
@@ -2374,9 +2380,34 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 					return nil, perr
 				}
 				t, corrProjs = c, cp
+				if len(t.Joins) == 0 {
+					corrIdx := map[int]bool{}
+					for _, p := range corrProjs {
+						corrIdx[p.idx] = true
+					}
+					c, ps, oerr := s.splitCorrelatedOrder(ctx, txn, t, outer, corrIdx)
+					if oerr != nil {
+						return nil, oerr
+					}
+					if ps != nil {
+						// The hidden sort items correlate too.
+						more, c2, perr := s.splitCorrelatedProj(ctx, txn, c, outer)
+						if perr != nil {
+							return nil, perr
+						}
+						t, post = c2, ps
+						corrProjs = append(corrProjs, more...)
+					}
+				}
+			} else {
+				g, c, gerr := s.splitCorrelatedGrouped(ctx, txn, t, outer, params)
+				if gerr != nil {
+					return nil, gerr
+				}
+				t, grouped = c, g
 			}
-			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0) {
-				jc = &joinCorr{conds: corr, projs: corrProjs, desc: outer.desc, rowOf: rowOf}
+			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0 || grouped != nil) {
+				jc = &joinCorr{conds: corr, projs: corrProjs, grouped: grouped, desc: outer.desc, rowOf: rowOf}
 			}
 		}
 	}
@@ -2394,7 +2425,15 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		// FROM-less SELECT: one row of evaluated expressions — or, with
 		// an unnest(array) among them, one row per element (the other
 		// expressions repeated; SELECT unnest($1::int8[]) expands a
-		// parameter into rows).
+		// parameter into rows). A WHERE clause decides whether the row is
+		// there at all; when it is not, nothing is evaluated.
+		keep, werr := matchesWhere(t.Where, &catalog.TableDescriptor{}, nil, params)
+		if werr != nil {
+			return nil, werr
+		}
+		if len(t.Having) > 0 {
+			return nil, newErrf(CodeFeatureNotSupported, "HAVING without a FROM clause is not supported")
+		}
 		res := &Result{}
 		var row []types.Datum
 		var sets []selectSet
@@ -2406,7 +2445,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if name == "" {
 				name = "?column?"
 			}
-			if fn, ok := selectSRF(se.Expr); ok {
+			if fn, ok := selectSRF(se.Expr); ok && keep {
 				if name == "?column?" {
 					name = fn
 				}
@@ -2420,9 +2459,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				row = append(row, types.DNull)
 				continue
 			}
-			d, err := evalExpr(se.Expr, nil, nil, params)
-			if err != nil {
-				return nil, err
+			d := types.DNull
+			if keep {
+				var err error
+				if d, err = evalExpr(se.Expr, nil, nil, params); err != nil {
+					return nil, err
+				}
 			}
 			// Typed as described (Describe sees the expression, not the
 			// value); the value is conformed to it.
@@ -2437,6 +2479,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}
+		if !keep {
+			rows = nil
+		}
 		if len(sets) > 0 {
 			// Set-returning calls in the list run in lockstep, the
 			// shorter ones padded with NULLs (PostgreSQL 10's rule); the
@@ -2479,7 +2524,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		if t.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with GROUP BY or aggregate functions")
 		}
-		return s.execGroupedSelect(ctx, txn, desc, t, params, corr)
+		return s.execGroupedSelect(ctx, txn, desc, t, params, corr, grouped)
 	}
 	if len(t.Having) > 0 {
 		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")
@@ -2515,7 +2560,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if pe != nil {
 		proj = pe.proj
 	} else {
-		stripTableAlias(t)
+		if err := stripTableAlias(t); err != nil {
+			return nil, err
+		}
 		var perr error
 		if proj, perr = resolveProjection(desc, t.Exprs); perr != nil {
 			return nil, perr
@@ -2526,7 +2573,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// path already delivers the requested order); with DISTINCT only after
 	// deduplication.
 	fetchLimit := keepCount(t)
-	if t.Distinct || len(corr) > 0 {
+	if t.Distinct || len(corr) > 0 || post != nil {
 		// A correlated filter runs after the fetch, so the fetch itself
 		// must not stop early; the limit re-applies to the survivors.
 		fetchLimit = 0
@@ -2590,7 +2637,7 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if err != nil {
 				return nil, err
 			}
-			if !needSort && !t.Distinct {
+			if !needSort && !t.Distinct && post == nil {
 				rows = cutRows(rows, keepCount(t))
 			}
 		}
@@ -2688,6 +2735,20 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 		res.Rows = append(res.Rows, out)
 	}
+	if post != nil {
+		// ORDER BY a correlated value: sorted now that it is computed.
+		if err := sortResultRows(res.Columns, res.Rows, post.order, params); err != nil {
+			return nil, err
+		}
+		s.note("sort: %d rows in memory", len(res.Rows))
+		if post.hidden > 0 {
+			visible := len(res.Columns) - post.hidden
+			res.Columns = res.Columns[:visible]
+			for i := range res.Rows {
+				res.Rows[i] = res.Rows[i][:visible]
+			}
+		}
+	}
 	if t.Distinct && len(t.DistinctOn) == 0 {
 		// Degenerate grouping over the projection: keep first occurrences
 		// (rows are already in the requested order).
@@ -2713,14 +2774,21 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if len(t.From) > 0 {
 		return s.execUpdateFrom(ctx, txn, t, params)
 	}
-	if t.Alias != "" {
-		t = stripUpdateAlias(t)
+	var err error
+	if t, err = stripUpdateAlias(t); err != nil {
+		return nil, err
 	}
 	corr, t2, err := s.splitCorrelatedUpdate(ctx, txn, t)
 	if err != nil {
 		return nil, err
 	}
 	t = t2
+	// SET values whose subqueries read the row being updated are
+	// evaluated per row (the rest are resolved once, below).
+	setCorr, t, err := s.splitCorrelatedSet(ctx, txn, t)
+	if err != nil {
+		return nil, err
+	}
 	t, err = s.resolveUpdateSubs(ctx, txn, t, params)
 	if err != nil {
 		return nil, err
@@ -2749,7 +2817,7 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	// them — so does the SELECT policies'. The new version of each row
 	// must pass WITH CHECK below. A statement so filtered plans in full:
 	// the plan cache cannot tell roles or settings apart.
-	reads := updateReadsTable(t, corr)
+	reads := updateReadsTable(t, corr) || len(setCorr) > 0
 	cmds := []string{catalog.PolicyUpdate}
 	if reads {
 		cmds = append(cmds, catalog.PolicySelect)
@@ -2783,9 +2851,13 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
+	setMemo := corrMemo{}
 	u := updateApply{
 		desc: desc, set: t.Set, rows: rows, pkSet: pkSet, reads: reads,
 		eval: func(i, j int) (types.Datum, error) {
+			if cp := setCorr[j]; cp != nil {
+				return s.evalCorrProj(ctx, txn, cp, desc, rows[i].row, params, setMemo)
+			}
 			value := t.Set[j].Value
 			if exprIsVolatile(value) {
 				var err error
@@ -3018,8 +3090,9 @@ func (s *Session) execDelete(ctx context.Context, txn *kvclient.Txn, t *parser.D
 	if len(t.Using) > 0 {
 		return s.execDeleteUsing(ctx, txn, t, params)
 	}
-	if t.Alias != "" {
-		t = stripDeleteAlias(t)
+	var err error
+	if t, err = stripDeleteAlias(t); err != nil {
+		return nil, err
 	}
 	corr, t2, err := s.splitCorrelatedDelete(ctx, txn, t)
 	if err != nil {
@@ -3252,7 +3325,9 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	}
 	// The plan reads a single table's columns by bare name, as
 	// execution does.
-	stripTableAlias(sel)
+	if err := stripTableAlias(sel); err != nil {
+		return nil, err
+	}
 	windowed := ""
 	if hasWindows(sel.Exprs) {
 		wp, err := windowPlanFor(sel)
@@ -3267,7 +3342,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	var corr []correlatedConjunct
 	if sel.Table != "" && len(sel.Joins) == 0 && sel.Derived == nil {
 		if cdesc, derr := s.lookup(ctx, txn, sel.Table); derr == nil {
-			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Alias)
+			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Table, sel.Alias)
 			if serr != nil {
 				return nil, serr
 			}
@@ -3275,6 +3350,31 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 				c := *sel
 				c.Where = plannable
 				sel, corr = &c, cc
+			}
+		}
+	}
+	// Correlated subqueries elsewhere (select list, HAVING, ORDER BY)
+	// run per row or per group: the plan shows the statement's shape.
+	corrNote := ""
+	if sel.Table != "" && sel.Derived == nil {
+		if outer, _, ok := s.selectScope(ctx, txn, sel); ok {
+			cs, cerr := s.findCorrelatedSubs(ctx, txn, sel, outer)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if cs != nil {
+				shape, serr := cs.shape()
+				if serr != nil {
+					return nil, serr
+				}
+				corrNote = fmt.Sprintf("; %d correlated subquery(ies) outside WHERE: run per row or group", len(cs.nodes))
+				if !hasAggregates(sel.Exprs) && len(sel.GroupBy) == 0 && cs.ordersBy() {
+					// Sorted once the values are computed: no ordered or
+					// top-k fetch.
+					shape.OrderBy = nil
+					corrNote += "; then a sort by them in memory"
+				}
+				sel = shape
 			}
 		}
 	}
@@ -3300,6 +3400,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 		if jerr != nil {
 			return nil, jerr
 		}
+		text += corrNote
 		return &Result{
 			Columns: []ResultColumn{{Name: "plan", Type: types.String}},
 			Rows:    [][]types.Datum{{types.NewString(text)}},
@@ -3345,6 +3446,7 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	if len(corr) > 0 {
 		text += fmt.Sprintf("; correlated filter: nested loop over %d conjunct(s) (O(outer rows x inner query), memoized per correlation key)", len(corr))
 	}
+	text += corrNote
 	grouped := hasAggregates(sel.Exprs) || len(sel.GroupBy) > 0 || sel.Distinct
 	dec := orderPlan(desc, plan, sel.OrderBy, s.db.ReverseScansOK())
 	// The top-k paths, decided as execSelect decides them.
@@ -3438,15 +3540,28 @@ func asErr[T error](err error, target *T) bool {
 // in SELECT r.rolname FROM pg_roles r) to bare names for a single-table
 // select, where the executor addresses columns by name alone. Joins keep
 // their qualifiers; they resolve them per side.
-func stripTableAlias(t *parser.Select) {
+//
+// PostgreSQL scoping: an aliased table answers to its alias only (FROM
+// ev e hides "ev"), so only the alias is stripped then; unaliased, the
+// bare and the written table name are. A qualified name left over names
+// no FROM item of this select and is refused with PostgreSQL's 42P01
+// (never read as this table's column, which bound a correlated
+// subquery's outer reference to its own table). The subqueries' names
+// are theirs to resolve.
+func stripTableAlias(t *parser.Select) error {
 	if len(t.Joins) > 0 || t.Table == "" {
-		return
+		return nil
 	}
 	_, bare := catalog.SplitTableName(t.Table)
-	prefixes := map[string]bool{bare + ".": true, t.Table + ".": true}
-	if t.Alias != "" {
+	prefixes := map[string]bool{}
+	var hidden scopeLevel
+	if t.Alias != "" && t.Alias != bare && t.Alias != t.Table {
 		prefixes[t.Alias+"."] = true
+		hidden.hidden = []hiddenName{{table: bare, alias: t.Alias}, {table: t.Table, alias: t.Alias}}
+	} else {
+		prefixes[bare+"."], prefixes[t.Table+"."] = true, true
 	}
+	var err error
 	// strip rewrites a name in place only when it changes: a statement
 	// already stripped (a prepared one, run again) is only read.
 	strip := func(name *string) {
@@ -3455,6 +3570,9 @@ func stripTableAlias(t *parser.Select) {
 				*name = (*name)[len(pre):]
 				return
 			}
+		}
+		if q, _ := splitQualified(*name); q != "" && err == nil {
+			err = fromEntryErr(q, hidden)
 		}
 	}
 	// Every expression position of this select (select list, aggregate
@@ -3489,6 +3607,7 @@ func stripTableAlias(t *parser.Select) {
 		},
 	}
 	w.SelectStmt(&self)
+	return err
 }
 
 // emptyCatalogSelect answers a select whose base table is an
@@ -3589,14 +3708,7 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 		return scopeLevel{}, nil, false
 	}
 	if len(t.Joins) == 0 {
-		level := scopeLevel{desc: desc, alias: t.Alias}
-		if level.alias == "" {
-			level.alias = desc.Name
-			if t.Table != desc.Name {
-				level.aliases = []string{t.Table}
-			}
-		}
-		return level, nil, true
+		return tableLevel(desc, t.Table, t.Alias), nil, true
 	}
 	inner := make([]*catalog.TableDescriptor, len(t.Joins))
 	for i := range t.Joins {
@@ -3606,6 +3718,10 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 	}
 	sides, err := makeJoinSides(desc, inner, t)
 	if err != nil {
+		return scopeLevel{}, nil, false
+	}
+	// USING / NATURAL merges decide which side owns a bare name.
+	if _, err := expandUsing(sides, t); err != nil {
 		return scopeLevel{}, nil, false
 	}
 	level, rowOf := joinScope(sides)
