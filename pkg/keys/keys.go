@@ -339,6 +339,20 @@ func DroppedTableSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// BackupProtectionKey holds the record of a backup in progress (JSON;
+// issue #376, pkg/server/backup_protect.go): the timestamp it reads at,
+// which garbage collection and purges do not raise a GC threshold to,
+// and when the record lapses unless the backup renews it. The backup
+// writes it before it reads anything and removes it when it ends; a
+// backup whose node died leaves one that lapses on its own.
+func BackupProtectionKey(id string) Key { return systemKey("backup-protect", id) }
+
+// BackupProtectionSpan covers every backup protection record.
+func BackupProtectionSpan() (Key, Key) {
+	p := systemKey("backup-protect")
+	return p, p.PrefixEnd()
+}
+
 // DroppedTableSweepKey holds the progress of the one-time sweep for the
 // rows of tables dropped before DROP TABLE left a DroppedTableKey record
 // (JSON; issue #316, pkg/server/dropped_sweep.go). It sits outside

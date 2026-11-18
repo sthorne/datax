@@ -2333,9 +2333,9 @@ shorter or longer. What a short window costs that table:
   older reads fail with an error naming the GC threshold.
 - A transaction that has been open longer than the window fails when it
   next touches the table.
-- An incremental backup needs its base to be younger than the shortest
-  window it covers; an older base is refused (`incremental base too
-  old`) and you take a full backup instead.
+- An incremental backup whose base is older than the window holds the
+  table in full rather than as the changes since its base: as big as the
+  table, and its history inside that interval cannot be restored to.
 
 The statement does not print a warning — it cannot, there is no notice
 channel — so this list is the warning. The minimum is one second; a
@@ -2376,6 +2376,16 @@ query. A replica with zeros in `garbage_versions`, `tombstones` and
   transaction that began before it, get an error on their next
   statement against the table — never a result with rows missing. Retry
   the transaction. Other tables are unaffected.
+- **A backup in progress is not cut off.** The purge waits up to 10
+  seconds for running backups to end; if one is still running, it
+  removes everything deleted before that backup began, returns `PURGE
+  INCOMPLETE` with a NOTICE (`purge held back by 1 backup(s) in
+  progress: versions deleted before <time> are gone, and those deleted
+  since remain on disk until the backups end; the table is purged again
+  automatically then`), and purges the table again by itself when the
+  backup ends. An incremental backup taken after a purge holds the
+  purged table in full; see the operations guide's
+  [Backup and restore](operations.md#backup-and-restore).
 - **A node that was down** applies the purge when it rejoins, before it
   serves anything from before it, and is compacted and counted by the
   next `PURGE`. A node that was cut off from the others but kept

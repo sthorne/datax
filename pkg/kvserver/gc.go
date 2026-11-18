@@ -100,6 +100,19 @@ func (s *Store) StartHousekeeping(gcTTL, gcInterval time.Duration) error {
 func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 	s.gcTTL.Store(ttl.Nanoseconds())
 	now := s.cfg.Clock.Now()
+	// A backup in progress protects what it reads (issue #376): no
+	// threshold reaches the oldest protected timestamp.
+	var limit hlc.Timestamp
+	if s.cfg.GCLimit != nil {
+		l, ok, err := s.cfg.GCLimit(ctx)
+		if err != nil {
+			log.Warnf("gc: reading backup protections: %v; collection waits for the next pass", err)
+			return
+		}
+		if ok {
+			limit = l
+		}
+	}
 	s.VisitReplicas(func(r *Replica) bool {
 		if ctx.Err() != nil {
 			return false
@@ -130,6 +143,9 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 			return true // GC disabled for this range
 		}
 		threshold := now.AddNanos(-effective.Nanoseconds())
+		if !limit.IsEmpty() && limit.Less(threshold) {
+			threshold = limit
+		}
 		if threshold.WallTime <= 0 {
 			return true
 		}

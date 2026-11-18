@@ -256,6 +256,16 @@ type Config struct {
 	// their spans (0 = default 1m; negative disables it, and a dropped
 	// table's rows then stay).
 	DroppedTableReclaimInterval time.Duration
+	// BackupProtectionTTL is how long a backup's protection record
+	// (backup_protect.go) holds without being renewed: how long a backup
+	// whose node died keeps garbage collection and purges below its
+	// timestamp (0 = default 2m). The backup renews it at a quarter of
+	// that.
+	BackupProtectionTTL time.Duration
+	// PurgeBackupWait is how long a purge waits for the backups in
+	// progress to end before it purges up to the oldest of them and
+	// reports itself held (0 = default 10s; negative does not wait).
+	PurgeBackupWait time.Duration
 	// ClosedTimestampLag is how far behind now() published closed
 	// timestamps sit — the follower-read staleness floor (0 = default 3s;
 	// negative disables closed timestamps and follower reads).
@@ -377,6 +387,11 @@ type Node struct {
 	// droppedSweepDone caches that the sweep for tables dropped before
 	// their records (dropped_sweep.go) has finished.
 	droppedSweepDone atomic.Bool
+	// purgeReruns are the spans whose purge a backup held back and that
+	// this node purges again once the backup ends (backup_protect.go),
+	// keyed by purgeRerunKey.
+	purgeRerunMu sync.Mutex
+	purgeReruns  map[string]*int
 	// metricsSparse is what the metrics recorder last wrote of each
 	// series it writes only on change.
 	metricsSparse metricsSparseState
@@ -840,6 +855,7 @@ func (n *Node) start() error {
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
 		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
+		GCLimit:                 n.gcLimit,
 		MergeBarrier:            n.placementBarrier,
 		RowExpiry:               retention.rowExpiry,
 		TestingKnobs:            n.cfg.TestingKnobs,

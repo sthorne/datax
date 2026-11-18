@@ -581,6 +581,12 @@ func printPurge(rep *kvpb.PurgeReport) error {
 		for _, line := range rep.Incomplete {
 			fmt.Printf("INCOMPLETE: %s\n", line)
 		}
+		for _, b := range rep.HeldBy {
+			fmt.Printf("  held by %s\n", b)
+		}
+		if len(rep.HeldBy) > 0 && rep.Rerun {
+			return fmt.Errorf("the purge is incomplete: backups in progress held it back, and the node purges the span again once they end (see its operations view and audit log)")
+		}
 		return fmt.Errorf("the purge is incomplete; run it again once the replicas above can answer")
 	}
 	fmt.Println("complete: every replica answered and holds no superseded version, tombstone or intent in the span")

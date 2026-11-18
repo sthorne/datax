@@ -65,8 +65,18 @@ const (
 	// the reason backupHistoryMagic is one: a binary from before it would
 	// read the timestamps as records. A backup with no such table keeps
 	// backupManifestMagic, and older binaries read it as before.
-	backupTimedMagic   = "DXBK3"
-	backupManifestName = "BACKUP.json"
+	backupTimedMagic = "DXBK3"
+	// backupFullTablesMagic is the manifest magic of an incremental
+	// backup that holds some tables whole, as of its end, rather than as
+	// the changes since its base (backupTable.Full, issue #376). A
+	// different magic for the reason the others are one, and a sharper
+	// one: a binary from before it would apply such a table's rows on
+	// top of the base's and keep every row of the base the table no
+	// longer has — the rows a purge removed among them. Revision history
+	// and commit times keep their meaning inside it, given by the
+	// manifest's fields.
+	backupFullTablesMagic = "DXBK4"
+	backupManifestName    = "BACKUP.json"
 	// backupExportChunk bounds one Export call's record count: memory on
 	// both sides and the JSON/proto envelope size.
 	backupExportChunk = 4096
@@ -172,6 +182,9 @@ type BackupOptions struct {
 	// since its base, with timestamps, so the chain restores to any
 	// moment of the interval and not only to its end (issue #302).
 	RevisionHistory bool
+	// TestingBeforeExport is called once the backup's timestamp is taken
+	// and protected, before any table is read. Tests only.
+	TestingBeforeExport func()
 }
 
 // backupDataFile is the name of table id's data file inside its backup
@@ -218,6 +231,19 @@ type backupTable struct {
 	// Never set in a backup with revision history, whose files carry
 	// every version's time already.
 	CommitTimes bool `json:"commit_times,omitempty"`
+	// Full says this table's data file, in an incremental, holds the
+	// table whole as of EndTS — every live row, no tombstones — and not
+	// the changes since BaseTS (issue #376). Backup sets it when the
+	// table's history since the base has been collected: a purge of the
+	// table, or garbage collection past the base. A restore takes the
+	// table from the last backup of the chain that holds it whole and
+	// reads it from no backup before that one (supersedeFullTables), so
+	// rows the base held and a purge removed are not restored. In a
+	// backup with revision history the file still frames each record
+	// with its timestamp, one version per key, and the interval it holds
+	// starts at zero; a restore to a moment inside the interval refuses
+	// the table (tableStableAcross).
+	Full bool `json:"full,omitempty"`
 	// history says the data file frames each record with its timestamp;
 	// set from the manifest when it is read, never stored.
 	history bool
@@ -609,7 +635,21 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		}
 	}
 
+	// The backup's timestamp is protected from collection while it runs
+	// (backup_protect.go, issue #376): taken only once the record is
+	// written, and the record then raised to it.
+	guard, err := n.protectBackup(ctx, dest, baseTS)
+	if err != nil {
+		return nil, fmt.Errorf("protecting the backup's timestamp from collection: %w", err)
+	}
+	defer guard.release()
 	endTS := n.clock.Now()
+	if err = guard.raise(ctx, endTS); err != nil {
+		return nil, fmt.Errorf("protecting the backup's timestamp from collection: %w", err)
+	}
+	if opts.TestingBeforeExport != nil {
+		opts.TestingBeforeExport()
+	}
 	man := backupManifest{
 		Magic:     backupManifestMagic,
 		ClusterID: n.ident.ClusterID.String(),
@@ -681,12 +721,12 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 
 	// Table data: the (baseTS, endTS] window over each table's full data
 	// span — every index, raw, so restore needs no backfill.
-	for _, bt := range descs {
-		bt.File = backupDataFile(bt.ID)
+	exportTable := func(bt *backupTable, from hlc.Timestamp) error {
 		f, err := os.OpenFile(filepath.Join(staging, bt.File), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
-			return nil, err
+			return err
 		}
+		bt.Records, bt.Bytes, bt.Versions = 0, 0, 0
 		// Records go to the file as they are exported; sealing buffers
 		// one chunk of them and no more. The checksum is taken here, over
 		// the records and not the file, so it is the same sealed or not.
@@ -695,15 +735,19 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		if dataKey != nil {
 			if sw, err = enc.NewStreamWriter(f, dataKey, bt.File); err != nil {
 				_ = f.Close()
-				return nil, err
+				return err
 			}
 			w = sw
 		}
 		h := sha256.New()
 		start, end := keys.TableDataSpan(bt.ID)
 		var lastKey keys.Key
-		err = n.exportSpan(ctx, start, end, baseTS, endTS, opts.RevisionHistory, func(rec kvpb.ExportRecord) error {
-			if opts.RevisionHistory {
+		// A table held whole in a backup with revision history is one
+		// version per key, each with its commit time.
+		revisions := opts.RevisionHistory && !bt.Full
+		stamped := bt.CommitTimes || (opts.RevisionHistory && bt.Full)
+		err = n.exportSpan(ctx, start, end, from, endTS, revisions, func(rec kvpb.ExportRecord) error {
+			if revisions {
 				if err := writeBackupRevision(w, rec); err != nil {
 					return err
 				}
@@ -714,12 +758,15 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 					return nil
 				}
 				lastKey = keys.Key(rec.Key).Clone()
-			} else if bt.CommitTimes {
+			} else if stamped {
 				if rec.Timestamp.IsEmpty() {
 					return fmt.Errorf("a replica answered the export of %s without commit times (a node from before cluster version %s?)", keys.Key(rec.Key), version.V22)
 				}
 				if err := writeBackupRevision(w, rec); err != nil {
 					return err
+				}
+				if opts.RevisionHistory {
+					bt.Versions++
 				}
 			} else if err := writeBackupRecord(w, rec); err != nil {
 				return err
@@ -739,22 +786,50 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
+		bt.SHA256 = hex.EncodeToString(h.Sum(nil))
+		return err
+	}
+	var notes []string
+	for _, bt := range descs {
+		bt.File = backupDataFile(bt.ID)
+		err = exportTable(&bt, baseTS)
+		if err != nil && !baseTS.IsEmpty() && baseCollected(err) {
+			// Part of (base, end] has been collected under this table —
+			// a purge of it, or garbage collection past the base — so the
+			// changes since the base cannot be told any more, deletions
+			// least of all. The table as it stands at the end can: it is
+			// held whole, and a restore takes it from here (issue #376).
+			log.Infof("backup: table %s (id %d): its history since the base has been collected; holding it in full: %v", bt.Name, bt.ID, err)
+			if rerr := os.Remove(filepath.Join(staging, bt.File)); rerr != nil {
+				return nil, rerr
+			}
+			bt.Full = true
+			err = exportTable(&bt, hlc.Timestamp{})
+			if err == nil {
+				notes = append(notes, fmt.Sprintf("table %s is held in full, as of the backup's end, not as the changes since the base: its history since the base had been collected (a purge, or garbage collection past the base); a restore of the chain takes it from this backup", bt.Name))
+			}
+		}
 		if err != nil {
-			if !baseTS.IsEmpty() && strings.Contains(err.Error(), "below the GC threshold") {
-				// The replica's refusal, in the operator's terms: part of
-				// (base, now] has been collected, so neither the deletions
-				// nor the versions in it can be told from this cluster any
-				// more. Nothing short of a new full backup restarts the chain.
-				return nil, fmt.Errorf("exporting table %s: the base backup is older than the garbage-collection window, so changes since it have been collected in part and an incremental cannot hold them; take a full backup, and take incrementals more often than the GC TTL: %w", bt.Name, err)
+			if strings.Contains(err.Error(), "below the GC threshold") && !baseCollected(err) {
+				// The backup's own timestamp was collected under it, which
+				// its protection is there to prevent.
+				if gerr := guard.err(); gerr != nil {
+					return nil, fmt.Errorf("exporting table %s: %v, and its rows at the backup's timestamp were collected meanwhile: %w", bt.Name, gerr, err)
+				}
+				return nil, fmt.Errorf("exporting table %s: its rows at the backup's timestamp have been collected (by a node from before backup protection, or a collection that started before the backup did); take the backup again: %w", bt.Name, err)
 			}
 			return nil, fmt.Errorf("exporting table %s: %w", bt.Name, err)
 		}
-		bt.SHA256 = hex.EncodeToString(h.Sum(nil))
 		if bt.CommitTimes && man.Magic == backupManifestMagic {
 			man.Magic = backupTimedMagic
 		}
 		man.Tables = append(man.Tables, bt)
 		log.Infof("backup: table %s (id %d): %d records, %d live bytes", bt.Name, bt.ID, bt.Records, bt.Bytes)
+	}
+	for _, bt := range man.Tables {
+		if bt.Full {
+			man.Magic = backupFullTablesMagic
+		}
 	}
 
 	// Manifest last, atomically: its presence marks the backup complete.
@@ -783,7 +858,26 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 	n.events.RecordEnd("backup", opID, "ok", "backup written to %s: %d tables", dest, len(descs))
 	sum := backupSummary(dest, &man)
 	sum.Sealed = dataKey != nil
+	sum.Notes = notes
 	return sum, nil
+}
+
+// baseCollected says an incremental's export of a table was refused
+// because the table's history since the base has been collected: the
+// export's window opens below a range's GC threshold
+// (kvserver.Replica's "incremental base too old"). It is told apart
+// explicitly from a refusal of the export's own timestamp, which carries
+// the typed BelowGCThreshold detail and which a full export would meet
+// too. Both carry the text kvpb.IsBelowGCThreshold and
+// kvclient.IsRetryable recognize, so neither of those may decide this:
+// the export is not retried (exportSpan consults neither), and the
+// fallback must see the export's own error.
+func baseCollected(err error) bool {
+	var kerr *kvpb.Error
+	if errors.As(err, &kerr) && kerr.BelowGCThreshold != nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "incremental base too old")
 }
 
 // readBackupManifest reads the manifest of a plaintext backup.
@@ -864,11 +958,23 @@ func parseBackupManifest(dir string, raw []byte) (*backupManifest, error) {
 	if err := json.Unmarshal(raw, &man); err != nil {
 		return nil, err
 	}
-	timed := false
+	timed, full := false, false
 	for _, t := range man.Tables {
 		timed = timed || t.CommitTimes
+		full = full || t.Full
 	}
 	switch {
+	case man.Magic == backupFullTablesMagic:
+		if !full || man.BaseTS.IsEmpty() || (man.RevisionHistory && timed) {
+			return nil, fmt.Errorf("%s: the manifest's magic %q says it is an incremental holding some tables in full, and its base, tables or revision-history and commit-time markers disagree", dir, man.Magic)
+		}
+		if man.RevisionHistory && !man.BaseTS.Less(man.EndTS) {
+			return nil, fmt.Errorf("%s: a backup with revision history holds the interval after a base backup, and this manifest names none (base %s, end %s)", dir, man.BaseTS, man.EndTS)
+		}
+	case full:
+		// A table held whole under a magic an older binary reads would be
+		// laid over its base by that binary, and the base's rows kept.
+		return nil, fmt.Errorf("%s: the manifest's magic %q and its tables held in full disagree", dir, man.Magic)
 	case man.Magic == backupManifestMagic && !man.RevisionHistory && !timed:
 	case man.Magic == backupTimedMagic && !man.RevisionHistory:
 	case man.Magic == backupHistoryMagic && man.RevisionHistory && !timed:
@@ -886,6 +992,11 @@ func parseBackupManifest(dir string, raw []byte) (*backupManifest, error) {
 	for i := range man.Tables {
 		man.Tables[i].history = man.RevisionHistory
 		man.Tables[i].window = [2]hlc.Timestamp{man.BaseTS, man.EndTS}
+		if man.Tables[i].Full {
+			// The table as it stood at the end: its versions are as old
+			// as its rows.
+			man.Tables[i].window[0] = hlc.Timestamp{}
+		}
 	}
 	// A backup names its own files, and nothing else: refused here, before
 	// any data file is opened, so neither door — restore, or the base of
@@ -998,7 +1109,7 @@ func backupSummary(path string, man *backupManifest) *cluster.BackupSummary {
 	}
 	for _, t := range man.Tables {
 		sum.Tables = append(sum.Tables, cluster.BackupTableSummary{
-			ID: t.ID, Name: t.Name, Records: t.Records, Bytes: t.Bytes, SHA256: t.SHA256, Versions: t.Versions,
+			ID: t.ID, Name: t.Name, Records: t.Records, Bytes: t.Bytes, SHA256: t.SHA256, Versions: t.Versions, Full: t.Full,
 		})
 	}
 	return sum
@@ -1135,7 +1246,43 @@ func openRestoreChain(srcs []string, backupKeys [][]byte, asOf hlc.Timestamp) (*
 		return nil, err
 	}
 	c.srcs, c.mans, c.dataKeys, c.cutoff = c.srcs[:n], c.mans[:n], c.dataKeys[:n], cutoff
+	supersedeFullTables(c.mans)
 	return c, nil
+}
+
+// supersedeFullTables leaves a table held in full by an incremental
+// (backupTable.Full, issue #376) out of every backup of the chain before
+// the last one that holds it so: that backup holds the table whole, and
+// what the ones before it hold of the table is history the cluster had
+// collected by then — rows a purge removed among it, which laying the
+// table over them would bring back. Every reader of a chain (a restore of
+// everything, a table restore, retention, the key checks) goes through
+// the manifests, so cutting the table from them here is cutting it from
+// each. The manifests are replaced, not changed in place.
+func supersedeFullTables(mans []*backupManifest) {
+	last := map[uint64]int{}
+	for i, m := range mans {
+		for _, t := range m.Tables {
+			if t.Full {
+				last[t.ID] = i
+			}
+		}
+	}
+	if len(last) == 0 {
+		return
+	}
+	for i, m := range mans {
+		kept := make([]backupTable, 0, len(m.Tables))
+		for _, t := range m.Tables {
+			if f, ok := last[t.ID]; ok && i < f {
+				continue
+			}
+			kept = append(kept, t)
+		}
+		cp := *m
+		cp.Tables = kept
+		mans[i] = &cp
+	}
 }
 
 // RunRestoreWith applies a backup chain (full first, then incrementals in

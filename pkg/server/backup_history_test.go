@@ -256,7 +256,7 @@ func TestHistoryManifestMagic(t *testing.T) {
 		{backupManifestMagic, false, true, "disagree"},
 		{backupHistoryMagic, true, true, "disagree"},
 		{backupTimedMagic, true, false, "disagree"},
-		{"DXBK4", false, false, "not a datax backup"},
+		{"DXBK9", false, false, "not a datax backup"},
 	} {
 		man := base
 		man.Magic, man.RevisionHistory = c.magic, c.history
