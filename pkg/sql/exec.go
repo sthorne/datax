@@ -944,6 +944,7 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	// sampler's orphan sweep is the backstop for anything missed), and so
 	// do the sequences its columns own.
 	if desc != nil {
+		s.noteDrop(desc)
 		if err := s.queueKeyDestroy(ctx, txn, desc); err != nil {
 			return nil, err
 		}

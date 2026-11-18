@@ -232,6 +232,12 @@ type Session struct {
 	// whose entries are reclaimed once the statement commits.
 	pendingWipes []indexWipe
 	extraDDL     []string
+	// extraDrops are the tables and views a statement dropped, by
+	// descriptor id, for the post-commit drain of the drop
+	// (catalog.Accessor.FinishDrop, issue #377); pendingDrops gathers
+	// them over an explicit transaction, as pendingDDL does names.
+	extraDrops   []uint64
+	pendingDrops []uint64
 	// stmtNow is the statement timestamp (now(), current_timestamp):
 	// taken from the clock on first use in each statement.
 	stmtNow int64
@@ -762,7 +768,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			res, serr = nil, s.recoveredPanic(r, stmt)
 			if s.state == StateOpen {
 				s.state = StateFailed
-				s.extraDDL, s.pendingWipes = nil, nil
+				s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 			}
 		}
 	}()
@@ -791,7 +797,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if err != nil {
 			if s.state == StateOpen {
 				s.state = StateFailed
-				s.extraDDL, s.pendingWipes = nil, nil
+				s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 			}
 			return nil, ToSQLError(err)
 		}
@@ -812,7 +818,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if serr := s.checkCastTypes(ctx, txn, stmt); serr != nil {
 			if s.state == StateOpen {
 				s.state = StateFailed
-				s.extraDDL, s.pendingWipes = nil, nil
+				s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 			}
 			return nil, serr
 		}
@@ -853,15 +859,16 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.endTxnVars()
 		s.endTxnCursors(err == nil)
 		s.advisoryEndTxn()
-		pending := s.pendingDDL
+		pending, drops := s.pendingDDL, s.pendingDrops
 		if err != nil {
 			s.forgetDDL()
 			s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+			s.pendingDrops, s.extraDrops = nil, nil
 			s.keyLeaseAfterCommit = false
 			s.discardNotify()
 			return nil, ToSQLError(err)
 		}
-		s.pendingDDL = nil
+		s.pendingDDL, s.pendingDrops = nil, nil
 		// The transaction is durable: its subscriptions take effect and
 		// its notifications go out, whatever the steps below report.
 		s.commitNotify()
@@ -871,6 +878,9 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
 				return nil, ToSQLError(derr)
 			}
+		}
+		if derr := s.finishDrops(ctx, drops); derr != nil {
+			return nil, derr
 		}
 		s.runPendingWipes(ctx)
 		if serr := s.finishKeyLease(ctx); serr != nil {
@@ -1240,14 +1250,14 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	}
 
 	if s.state == StateOpen {
-		s.extraDDL = nil
+		s.extraDDL, s.extraDrops = nil, nil
 		_, s.streamTop = stmt.(*parser.Select)
 		res, err := s.execStmt(ctx, s.txn, stmt, params)
 		s.streamTop = false
 		if err != nil {
 			// Any error fails the explicit transaction (PG semantics).
 			s.state = StateFailed
-			s.extraDDL, s.pendingWipes = nil, nil
+			s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 			return nil, ToSQLError(err)
 		}
 		if res.Stream != nil {
@@ -1263,7 +1273,8 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			s.pendingDDL = append(s.pendingDDL, name)
 		}
 		s.pendingDDL = append(s.pendingDDL, s.extraDDL...)
-		s.extraDDL = nil
+		s.pendingDrops = append(s.pendingDrops, s.extraDrops...)
+		s.extraDDL, s.extraDrops = nil, nil
 		return res, nil
 	}
 	if sel, ok := stmt.(*parser.Select); ok && s.streaming {
@@ -1272,7 +1283,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	var res *Result
 	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
-		s.extraDDL, s.pendingWipes = nil, nil
+		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
 		s.advisoryRestart()
@@ -1283,11 +1294,11 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return err
 	})
 	if err != nil {
-		s.extraDDL, s.pendingWipes = nil, nil
+		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		return nil, ToSQLError(err)
 	}
-	names := s.extraDDL
-	s.extraDDL = nil
+	names, drops := s.extraDDL, s.extraDrops
+	s.extraDDL, s.extraDrops = nil, nil
 	if name := ddlTableName(stmt); name != "" {
 		names = append([]string{name}, names...)
 	}
@@ -1295,6 +1306,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
 			return nil, ToSQLError(derr)
 		}
+	}
+	if derr := s.finishDrops(ctx, drops); derr != nil {
+		return nil, derr
 	}
 	s.runPendingWipes(ctx)
 	if serr := s.finishKeyLease(ctx); serr != nil {
@@ -1344,6 +1358,31 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 	}
 }
 
+// noteDrop records a table or view a statement dropped, for the
+// post-commit drain of the drop: until it is done no gateway may still
+// plan against the descriptor or commit a statement planned against it
+// (issue #377). Every path that drops a table descriptor notes it.
+func (s *Session) noteDrop(d *catalog.TableDescriptor) {
+	if d != nil {
+		s.extraDrops = append(s.extraDrops, d.ID)
+	}
+}
+
+// finishDrops drains the drops a committed transaction made.
+func (s *Session) finishDrops(ctx context.Context, ids []uint64) *Error {
+	seen := make(map[uint64]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if err := s.cat.FinishDrop(ctx, id); err != nil {
+			return ToSQLError(err)
+		}
+	}
+	return nil
+}
+
 // noteDDL records another table a statement's DDL changed (a foreign
 // key's parent, a dropped table's children), for the post-commit drain.
 func (s *Session) noteDDL(name string) {
@@ -1360,6 +1399,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.endTxnCursors(false)
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
+	s.pendingDrops, s.extraDrops = nil, nil
 	s.keyLeaseAfterCommit = false
 	s.discardNotify()
 	s.advisoryEndTxn()

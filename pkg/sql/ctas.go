@@ -137,10 +137,18 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 	drop := func(cause error) (*Result, *Error) {
 		if created {
 			cctx := context.WithoutCancel(ctx)
-			_ = s.db.RunTxn(cctx, "ctas-drop", func(ctx context.Context, txn *kvclient.Txn) error {
+			s.extraDrops = nil
+			if s.db.RunTxn(cctx, "ctas-drop", func(ctx context.Context, txn *kvclient.Txn) error {
+				s.extraDrops = nil
 				_, err := s.execDropTable(ctx, txn, &parser.DropTable{Name: ct.Name, IfExists: true})
 				return err
-			})
+			}) == nil {
+				// The table was created, and drained, in a transaction of
+				// its own: other gateways may hold it, so its drop drains
+				// too (issue #377).
+				_ = s.finishDrops(cctx, s.extraDrops)
+			}
+			s.extraDrops = nil
 			_ = s.cat.FinishDDLIn(cctx, s.database, ct.Name)
 		}
 		return nil, ToSQLError(cause)

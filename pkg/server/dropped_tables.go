@@ -134,6 +134,24 @@ func (n *Node) RunDroppedTableReclaimOnce(ctx context.Context) int {
 		if now < rec.DroppedAt+(n.droppedTableWindow(rec)+droppedTableSlack).Nanoseconds() {
 			continue
 		}
+		// A statement planned against a gateway's cached descriptor
+		// commits within that gateway's lease, and a gateway that saw the
+		// drop keeps the lease's expiration in its acknowledgement: while
+		// any lease on the table is live, a write planned before the drop
+		// could still land in the span after it was cleared (issue #377).
+		if !rec.Cleared {
+			var leased bool
+			if err := n.db.RunTxn(ctx, "drop-reclaim-leases", func(ctx context.Context, txn *kvclient.Txn) error {
+				var err error
+				leased, err = catalog.DescriptorLeased(ctx, txn, rec.ID, n.clock.Now().WallTime)
+				return err
+			}); err != nil || leased {
+				if err != nil {
+					log.Debugf("dropped-table reclaim: table %s (id %d): reading its leases: %v", rec.Label(), rec.ID, err)
+				}
+				continue
+			}
+		}
 		opID := newOpID()
 		n.events.RecordStart("drop-reclaim", opID, "reclaiming dropped table %s (id %d)", rec.Label(), rec.ID)
 		if err := n.reclaimDroppedTable(ctx, rec); err != nil {
@@ -191,6 +209,10 @@ func (n *Node) reclaimDroppedTable(ctx context.Context, rec *catalog.DroppedTabl
 		}
 	}
 	return n.db.RunTxn(ctx, "drop-reclaim-record", func(ctx context.Context, txn *kvclient.Txn) error {
+		// The gateways' lapsed leases on the table go with its record.
+		if err := catalog.DeleteExpiredLeases(ctx, txn, rec.ID, n.clock.Now().WallTime); err != nil {
+			return err
+		}
 		return txn.Delete(ctx, keys.DroppedTableKey(rec.ID))
 	})
 }
