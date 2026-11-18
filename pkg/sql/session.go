@@ -124,6 +124,10 @@ type Result struct {
 	// scan-shaped SELECT on a streaming session, see stream.go); the
 	// consumer pulls it with Next, closes it, and takes the tag from it.
 	Stream *RowStream
+	// Copy, when set, is a COPY TO's output format: the rows are the
+	// COPY's, sent as CopyData rather than DataRows, and the command tag
+	// is COPY n (see copyto.go).
+	Copy *CopyOut
 }
 
 // AddScanned records KV rows read while executing the current
@@ -761,6 +765,24 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			return nil, newErrf(CodeInFailedTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
+	}
+	// COPY ... TO runs as its query (copyto.go); the result carries the
+	// COPY's format.
+	if ct, ok := stmt.(*parser.CopyTo); ok {
+		inner, co, err := s.planCopyTo(ctx, ct)
+		if err != nil {
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
+			return nil, ToSQLError(err)
+		}
+		stmt = inner
+		defer func() {
+			if res != nil {
+				res.Copy = co
+			}
+		}()
 	}
 	// A cast to a type that does not exist fails the statement before it
 	// runs (and, in a transaction block, the block).

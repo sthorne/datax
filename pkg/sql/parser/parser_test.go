@@ -387,7 +387,6 @@ func TestCopyFrom(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"COPY t TO STDOUT",
 		"COPY t FROM '/tmp/f'",
 		"COPY t FROM STDIN WITH (DELIMITER ',')",
 		"COPY t FROM STDIN WITH (FORMAT nope)",

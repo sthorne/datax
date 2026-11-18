@@ -519,6 +519,34 @@ type CopyFrom struct {
 	Format  CopyFormat
 }
 
+// CopyTo is COPY {table [(cols)] | (query)} TO {STDOUT | 'file' |
+// PROGRAM 'command'} [[WITH] options]. Options holds the option list as
+// written (both the parenthesized form and the pre-9.0 keywords, mapped
+// to their option names); the session validates them, as PostgreSQL
+// does at execution rather than in the grammar.
+type CopyTo struct {
+	Table   string
+	Columns []string  // empty = all visible columns in order
+	Query   Statement // COPY (query) TO: SELECT, VALUES, WITH, or DML with RETURNING
+	// File is the server-side file ('file'), or the command (PROGRAM);
+	// both empty for STDOUT.
+	File    string
+	Program bool
+	Options []CopyOption
+}
+
+// CopyOption is one COPY option: a name (lower-cased) and its argument,
+// which is absent, a word or string (Arg), * (Star) or a parenthesized
+// column list (List).
+type CopyOption struct {
+	Name    string
+	Arg     string
+	HasArg  bool
+	Star    bool
+	List    []string
+	HasList bool
+}
+
 type SelectExpr struct {
 	Star  bool
 	Expr  Expr
@@ -1125,6 +1153,7 @@ func (*Explain) stmt()                {}
 func (*DropTable) stmt()              {}
 func (*Insert) stmt()                 {}
 func (*CopyFrom) stmt()               {}
+func (*CopyTo) stmt()                 {}
 func (*Select) stmt()                 {}
 func (*Update) stmt()                 {}
 func (*Delete) stmt()                 {}

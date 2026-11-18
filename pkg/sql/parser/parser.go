@@ -2665,8 +2665,9 @@ func (p *parser) parseOptReturning() ([]SelectExpr, error) {
 	return out, nil
 }
 
-// parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause].
-// Accepted format spellings — all of them appear in the wild:
+// parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause]
+// and COPY {table [(col, ...)] | (query)} TO target [options].
+// Accepted COPY FROM format spellings — all of them appear in the wild:
 //
 //	COPY t FROM STDIN                        -- text (default)
 //	COPY t FROM STDIN [WITH] (FORMAT csv)    -- PostgreSQL 9.0+ option list
@@ -2676,19 +2677,29 @@ func (p *parser) parseOptReturning() ([]SelectExpr, error) {
 // identifiers.
 func (p *parser) parseCopy() (Statement, error) {
 	p.i++ // copy
-	cf := &CopyFrom{Format: CopyFormatText}
+	// COPY BINARY t ...: the pre-7.3 spelling of FORMAT binary.
+	binaryPrefix := false
+	if t := p.peek(); t.kind == tkIdent && t.text == "binary" {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent {
+			p.i++
+			binaryPrefix = true
+		}
+	}
+	if !binaryPrefix && p.consumeOp("(") {
+		return p.parseCopyQuery()
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
-	cf.Table = name
+	var cols []string
 	if p.consumeOp("(") {
 		for {
 			col, err := p.expectIdent()
 			if err != nil {
 				return nil, err
 			}
-			cf.Columns = append(cf.Columns, col)
+			cols = append(cols, col)
 			if !p.consumeOp(",") {
 				break
 			}
@@ -2698,7 +2709,15 @@ func (p *parser) parseCopy() (Statement, error) {
 		}
 	}
 	if p.consumeKeyword("TO") {
-		return nil, p.errf("COPY TO is not supported")
+		ct := &CopyTo{Table: name, Columns: cols}
+		if binaryPrefix {
+			ct.Options = append(ct.Options, CopyOption{Name: "format", Arg: "binary", HasArg: true})
+		}
+		return ct, p.parseCopyToRest(ct)
+	}
+	cf := &CopyFrom{Format: CopyFormatText, Table: name, Columns: cols}
+	if binaryPrefix {
+		cf.Format = CopyFormatBinary
 	}
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
@@ -2720,6 +2739,216 @@ func (p *parser) parseCopy() (Statement, error) {
 		}
 	}
 	return cf, nil
+}
+
+// parseCopyQuery parses the rest of COPY (query) TO ... after the
+// opening paren. The query is a SELECT, VALUES or WITH, or an INSERT,
+// UPDATE or DELETE (which must have RETURNING: the session checks).
+func (p *parser) parseCopyQuery() (Statement, error) {
+	start := p.peek()
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	switch q.(type) {
+	case *Select, *Insert, *Update, *Delete:
+	default:
+		return nil, &SyntaxError{Msg: fmt.Sprintf("syntax error at or near %q", strings.ToLower(start.text)), Pos: start.pos}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if t := p.peek(); !(t.kind == tkKeyword && t.text == "TO") {
+		return nil, p.errf("syntax error at or near %q", strings.ToLower(t.text))
+	}
+	p.i++
+	ct := &CopyTo{Query: q}
+	return ct, p.parseCopyToRest(ct)
+}
+
+// parseCopyToRest parses a COPY TO's target and options, after TO.
+func (p *parser) parseCopyToRest(ct *CopyTo) error {
+	switch t := p.peek(); {
+	case t.kind == tkIdent && (t.text == "stdout" || t.text == "stdin"):
+		// PostgreSQL's grammar takes either word for the client side.
+		p.i++
+	case t.kind == tkString:
+		p.i++
+		ct.File = t.text
+	case t.kind == tkIdent && t.text == "program":
+		p.i++
+		c := p.peek()
+		if c.kind != tkString {
+			return p.errf("syntax error at or near %q", c.text)
+		}
+		p.i++
+		ct.File, ct.Program = c.text, true
+	default:
+		return p.errf("syntax error at or near %q", t.text)
+	}
+	hasWith := p.consumeIdentWord("with")
+	if p.consumeOp("(") {
+		opts, err := p.parseCopyGenericOptions()
+		if err != nil {
+			return err
+		}
+		ct.Options = append(ct.Options, opts...)
+		return nil
+	}
+	_ = hasWith
+	opts, err := p.parseCopyLegacyOptions()
+	if err != nil {
+		return err
+	}
+	ct.Options = append(ct.Options, opts...)
+	return nil
+}
+
+// copyWord reads a bare word or keyword (lower-cased) or a string; ok is
+// false for any other token, which is left unread.
+func (p *parser) copyWord() (string, bool) {
+	t := p.peek()
+	switch t.kind {
+	case tkIdent, tkString, tkNumber:
+		p.i++
+		return t.text, true
+	case tkKeyword:
+		p.i++
+		return strings.ToLower(t.text), true
+	}
+	return "", false
+}
+
+// parseCopyGenericOptions parses the PostgreSQL 9.0+ option list after
+// its opening paren: name [argument], ... where the argument is a word,
+// a string, a number, * or a parenthesized list.
+func (p *parser) parseCopyGenericOptions() ([]CopyOption, error) {
+	var out []CopyOption
+	for {
+		t := p.peek()
+		if t.kind != tkIdent && t.kind != tkKeyword {
+			return nil, p.errf("syntax error at or near %q", t.text)
+		}
+		p.i++
+		opt := CopyOption{Name: strings.ToLower(t.text)}
+		switch nxt := p.peek(); {
+		case nxt.kind == tkOp && (nxt.text == "," || nxt.text == ")"):
+		case p.consumeOp("*"):
+			opt.Star = true
+		case p.consumeOp("("):
+			opt.HasList = true
+			for {
+				w, ok := p.copyWord()
+				if !ok {
+					return nil, p.errf("syntax error at or near %q", p.peek().text)
+				}
+				opt.List = append(opt.List, w)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		case nxt.kind == tkOp && (nxt.text == "-" || nxt.text == "+"):
+			p.i++
+			num := p.peek()
+			if num.kind != tkNumber {
+				return nil, p.errf("syntax error at or near %q", num.text)
+			}
+			p.i++
+			opt.Arg, opt.HasArg = nxt.text+num.text, true
+		default:
+			w, ok := p.copyWord()
+			if !ok {
+				return nil, p.errf("syntax error at or near %q", nxt.text)
+			}
+			opt.Arg, opt.HasArg = w, true
+		}
+		out = append(out, opt)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return out, p.expectOp(")")
+}
+
+// parseCopyLegacyOptions parses the pre-9.0 option keywords (BINARY,
+// CSV, HEADER, DELIMITER [AS] 'c', NULL [AS] 's', QUOTE [AS] 'q',
+// ESCAPE [AS] 'e', FORCE QUOTE cols|*, FORCE NOT NULL cols, FORCE NULL
+// cols, ENCODING 'e', FREEZE), mapping each to its option name.
+func (p *parser) parseCopyLegacyOptions() ([]CopyOption, error) {
+	var out []CopyOption
+	str := func(name string) error {
+		p.consumeKeyword("AS")
+		t := p.peek()
+		if t.kind != tkString {
+			return p.errf("syntax error at or near %q", t.text)
+		}
+		p.i++
+		out = append(out, CopyOption{Name: name, Arg: t.text, HasArg: true})
+		return nil
+	}
+	cols := func(name string, star bool) error {
+		if star && p.consumeOp("*") {
+			out = append(out, CopyOption{Name: name, Star: true})
+			return nil
+		}
+		opt := CopyOption{Name: name, HasList: true}
+		for {
+			c, err := p.expectIdent()
+			if err != nil {
+				return err
+			}
+			opt.List = append(opt.List, c)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		out = append(out, opt)
+		return nil
+	}
+	for !p.atStatementEnd() {
+		t := p.peek()
+		var err error
+		switch {
+		case t.kind == tkIdent && t.text == "binary":
+			p.i++
+			out = append(out, CopyOption{Name: "format", Arg: "binary", HasArg: true})
+		case t.kind == tkIdent && t.text == "csv":
+			p.i++
+			out = append(out, CopyOption{Name: "format", Arg: "csv", HasArg: true})
+		case t.kind == tkIdent && (t.text == "header" || t.text == "freeze"):
+			p.i++
+			out = append(out, CopyOption{Name: t.text})
+		case t.kind == tkIdent && (t.text == "delimiter" || t.text == "quote" || t.text == "escape" || t.text == "encoding"):
+			p.i++
+			err = str(t.text)
+		case t.kind == tkKeyword && t.text == "NULL":
+			p.i++
+			err = str("null")
+		case t.kind == tkIdent && t.text == "force":
+			p.i++
+			switch {
+			case p.consumeIdentWord("quote"):
+				err = cols("force_quote", true)
+			case p.consumeKeyword("NOT"):
+				if err = p.expectKeyword("NULL"); err == nil {
+					err = cols("force_not_null", false)
+				}
+			case p.consumeKeyword("NULL"):
+				err = cols("force_null", false)
+			default:
+				err = p.errf("syntax error at or near %q", p.peek().text)
+			}
+		default:
+			err = p.errf("syntax error at or near %q", t.text)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // parseCopyOptions parses the body of a COPY option list after its opening

@@ -32,6 +32,7 @@ const (
 	CodeGrouping             = "42803"
 	CodeDivisionByZero       = "22012"
 	CodeAmbiguousColumn      = "42702"
+	CodeDuplicateColumn      = "42701"
 	CodeCardinality          = "21000"
 	CodeInsufficientPriv     = "42501"
 	CodeInternal             = "XX000"
@@ -116,6 +117,10 @@ const (
 type Error struct {
 	Code string
 	Msg  string
+	// Detail and Hint are the error's DETAIL and HINT fields ("" =
+	// none).
+	Detail string
+	Hint   string
 }
 
 func (e *Error) Error() string { return e.Msg }

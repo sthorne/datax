@@ -662,6 +662,8 @@ func statementSubject(s Statement) string {
 		}
 	case *CopyFrom:
 		return t.Table
+	case *CopyTo:
+		return t.Table
 	case *CreatePolicy:
 		return t.Table
 	case *AlterPolicy:
@@ -698,7 +700,7 @@ func statementKindOf(s Statement) string {
 			return "RESET"
 		}
 		return "SET"
-	case *CopyFrom:
+	case *CopyFrom, *CopyTo:
 		return "COPY"
 	case *CreateIndex:
 		// Its subject is the table the index is on, not the index.

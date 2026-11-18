@@ -271,7 +271,7 @@ func statementKind(stmt parser.Statement) string {
 		return "update"
 	case *parser.Delete:
 		return "delete"
-	case *parser.CopyFrom:
+	case *parser.CopyFrom, *parser.CopyTo:
 		return "copy"
 	case *parser.Begin, *parser.Commit, *parser.Rollback, *parser.Savepoint, *parser.ReleaseSavepoint, *parser.RollbackToSavepoint:
 		return "txn"
