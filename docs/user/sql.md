@@ -1026,13 +1026,27 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   so a keyed column's range becomes index bounds), `IS [NOT] TRUE |
   FALSE | UNKNOWN`, `IS [NOT] DISTINCT FROM`, `[NOT] LIKE / ILIKE ...
   [ESCAPE 'c']` (a literal prefix — `LIKE 'ab%'` — becomes index bounds
-  on a keyed column) and `[NOT] SIMILAR TO` (SQL regular expressions;
-  an invalid pattern is SQLSTATE `2201B`). A predicate used as a value
+  on a keyed column), `[NOT] SIMILAR TO` (SQL regular expressions;
+  an invalid pattern is SQLSTATE `2201B`) and `IS [NOT] [NFC | NFD |
+  NFKC | NFKD] NORMALIZED`. The regular-expression operators `~` /
+  `~*` take PostgreSQL's pattern syntax as the `regexp_*` functions
+  do; back references (`\1`) and lookahead / lookbehind (`(?=`, `(?!`,
+  `(?<=`, `(?<!`) are refused with `0A000`, since datax runs patterns
+  on RE2. A predicate used as a value
   (`qty > 3 AS big`) is three-valued: NULL when an input is NULL.
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
   parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
   always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), date and time arithmetic (`date + 1`, `date - date` in
+  `22003`), the integer bitwise operators `&` (and), `|` (or), `#`
+  (xor), `<<` and `>>` (shifts, which wrap rather than overflow; the
+  count is taken modulo 64) and the prefix `~` (not), the prefix `@`
+  (absolute value), `|/` (square root) and `||/` (cube root) — the
+  binary ones, like the vector distances and jsonb's `#-`, bind looser
+  than `+` and `-` and tighter than the comparisons, left to right, as
+  in PostgreSQL (`1 + 2 & 3` is `3`), and are computed on INT8, so
+  `1 << 31` over an `INT4` is `2147483648`, not PostgreSQL's
+  `-2147483648` (PostgreSQL 14 removed the factorial `!`; use
+  `factorial(n)`), date and time arithmetic (`date + 1`, `date - date` in
   days, `timestamp ± interval` and `date ± interval` on the calendar
   with month steps clamped to the end of the month, `timestamp -
   timestamp` an `INTERVAL`, `interval ± interval`, `interval * 2`,
@@ -1091,10 +1105,23 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   column's name (`at::date` describes as `at`).
 - **JSONB operators**: `->` / `->>` (key or array index: `j -> 0`),
   `#>` / `#>>` with a text-array path (`j #>> '{a,0,b}'`), containment
-  `@>` / `<@`, key existence `?`, `?|`, `?&`, and concatenation `||`
+  `@>` / `<@`, key existence `?`, `?|`, `?&`, concatenation `||`
   (objects merge, the right side winning; arrays concatenate; a
-  non-array is appended or prepended as an element) — everywhere an
+  non-array is appended or prepended as an element), deletion `-` (a
+  text key, from an object or the matching strings of an array; a
+  `text[]` of keys; an integer array index, from the end when
+  negative) and `#-` (at a text-array path), subscripting
+  (`j['a']['b'][0]`: an object's key, an array's 0-based index,
+  negative from the end; NULL when absent) and the ordering
+  comparisons `< <= > >=` in PostgreSQL's jsonb order — everywhere an
   expression goes, including HAVING and grouped select lists.
+  `UPDATE t SET j['a'][0] = '1'` assigns at a subscript path as
+  PostgreSQL does: missing keys are added and missing containers
+  created (an array where the next subscript is an integer), arrays
+  are padded with nulls up to the index, a NULL column starts from
+  `{}` (or `[]` when the first subscript is an integer), and a path
+  through an existing scalar is refused (`22023`); several such
+  assignments to one column apply in turn.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
   `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
@@ -1112,9 +1139,7 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   position. With `DISTINCT`, every `ORDER BY` expression must be an
   argument (`42P10` otherwise), and the input is sorted on the
   arguments as in PostgreSQL, so `array_agg(DISTINCT x)` lists `x`
-  ascending, NULL last. `jsonb` values have no order in datax: ordering
-  an aggregate's input by one is refused (`0A000`), and `DISTINCT` over
-  one keeps the input order. The select list, `HAVING` and `ORDER BY` take any expression
+  ascending, NULL last; `jsonb` sorts in PostgreSQL's jsonb order. The select list, `HAVING` and `ORDER BY` take any expression
   over aggregate calls and grouping columns: arithmetic (`SUM(a) /
   COUNT(*)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`), function
   calls (`ROUND(AVG(x), 2)`, `COALESCE(MAX(x), 0)`), `CASE`, casts and

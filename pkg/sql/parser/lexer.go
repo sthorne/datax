@@ -157,12 +157,23 @@ func lex(src string) ([]token, error) {
 				l.pos += 3
 				continue
 			}
+			// ||/ (cube root) and |/ (square root), unless the / opens
+			// a comment.
+			if rest := l.src[l.pos:]; strings.HasPrefix(rest, "||/") && !strings.HasPrefix(rest, "||/*") {
+				l.toks = append(l.toks, token{kind: tkOp, text: "||/", pos: start})
+				l.pos += 3
+				continue
+			}
 			two := ""
 			if l.pos+1 < len(l.src) {
 				two = l.src[l.pos : l.pos+2]
 			}
+			if two == "|/" && l.peekAt(2) == '*' {
+				two = ""
+			}
 			switch two {
-			case "!=", "<>", "<=", ">=", "::", "->", "@>", "!~", "~*", "||", "#>", "<@", "?|", "?&", "&&", "@@":
+			case "!=", "<>", "<=", ">=", "::", "->", "@>", "!~", "~*", "||", "#>", "<@", "?|", "?&", "&&", "@@",
+				"#-", "<<", ">>", "|/":
 				op := two
 				if op == "<>" {
 					op = "!="
@@ -175,7 +186,7 @@ func lex(src string) ([]token, error) {
 				l.pos += 2
 			default:
 				switch c {
-				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '/', '.', '~', '%', '^', '?', '[', ']', ':':
+				case '(', ')', ',', ';', '=', '<', '>', '*', '+', '-', '/', '.', '~', '%', '^', '?', '[', ']', ':', '&', '|', '#', '@':
 					l.toks = append(l.toks, token{kind: tkOp, text: string(c), pos: start})
 					l.pos++
 				default:

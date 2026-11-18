@@ -90,7 +90,8 @@ func init() {
 		Doc: "ARRAY[a, b, ...]: an array of the values (the first non-NULL element's type).",
 		Fn:  BuildArray})
 	register(&Builtin{Name: "array_subscript", Args: []types.Family{Any, types.Int}, MinArgs: 2, Ret: Any, Hidden: true, Category: catArray,
-		Doc: "v[i]: the i-th element (1-based; NULL when out of range).",
+		Doc: "v[i]: the i-th element (1-based; NULL when out of range); over jsonb, j['key'] or j[i] (0-based).",
+		Alt: jsonbSubscript,
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			if a[0].Fam == types.String && !a[0].Null && !a[1].Null && !strings.HasPrefix(strings.TrimSpace(a[0].S), "{") {
 				// A text that is no array literal subscripts as PostgreSQL's
