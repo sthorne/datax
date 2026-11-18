@@ -313,6 +313,228 @@ func (p *parser) expectIdent() (string, error) {
 // NOTIFY channel [, 'payload']. The channel is an identifier, and — as
 // in PostgreSQL, where it is a ColId — may be a word this grammar
 // otherwise reserves.
+// parseCursor parses DECLARE ... CURSOR FOR query, FETCH / MOVE and
+// CLOSE.
+func (p *parser) parseCursor(verb string) (Statement, error) {
+	p.i++
+	switch verb {
+	case "declare":
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		dc := &DeclareCursor{Name: name}
+		for {
+			switch {
+			case p.consumeIdentWord("binary"):
+				return nil, p.errf("binary cursors are not supported")
+			case p.consumeKeyword("NOT") || p.consumeIdentWord("no"):
+				if !p.consumeIdentWord("scroll") {
+					return nil, p.errf("expected SCROLL, found %q", p.peek().text)
+				}
+				continue
+			case p.consumeIdentWord("scroll"), p.consumeIdentWord("asensitive"), p.consumeIdentWord("insensitive"):
+				continue
+			}
+			break
+		}
+		if !p.consumeIdentWord("cursor") {
+			return nil, p.errf("expected CURSOR, found %q", p.peek().text)
+		}
+		switch {
+		case p.consumeIdentWord("with"):
+			if !p.consumeIdentWord("hold") {
+				return nil, p.errf("expected HOLD after WITH, found %q", p.peek().text)
+			}
+			dc.Hold = true
+		case p.consumeIdentWord("without"):
+			if !p.consumeIdentWord("hold") {
+				return nil, p.errf("expected HOLD after WITHOUT, found %q", p.peek().text)
+			}
+		}
+		if !p.consumeIdentWord("for") && !p.consumeKeyword("FOR") {
+			return nil, p.errf("expected FOR, found %q", p.peek().text)
+		}
+		q, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		dc.Query = q
+		return dc, nil
+	case "fetch", "move":
+		f := &Fetch{Count: 1, Move: verb == "move"}
+		num := func() (int64, bool) {
+			t := p.peek()
+			if t.kind != tkNumber {
+				return 0, false
+			}
+			v, err := strconv.ParseInt(t.text, 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			p.i++
+			return v, true
+		}
+		switch {
+		case p.consumeIdentWord("next"):
+		case p.consumeIdentWord("forward"):
+			if n, ok := num(); ok {
+				f.Count = n
+			} else if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+				f.Count = -1
+			}
+		case p.consumeKeyword("ALL") || p.consumeIdentWord("all"):
+			f.Count = -1
+		default:
+			if n, ok := num(); ok {
+				f.Count = n
+			}
+		}
+		if f.Count < -1 {
+			return nil, p.errf("backward FETCH is not supported")
+		}
+		_ = p.consumeKeyword("FROM") || p.consumeIdentWord("in") // optional
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		f.Name = name
+		return f, nil
+	}
+	if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+		return &CloseCursor{All: true}, nil
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	return &CloseCursor{Name: name}, nil
+}
+
+// parsePrepared parses PREPARE name [(type, ...)] AS statement,
+// EXECUTE name [(value, ...)] and DEALLOCATE [PREPARE] {name | ALL}.
+func (p *parser) parsePrepared(verb string) (Statement, error) {
+	p.i++
+	if verb == "deallocate" {
+		p.consumeIdentWord("prepare")
+		if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+			return &Deallocate{All: true}, nil
+		}
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Deallocate{Name: name}, nil
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if verb == "execute" {
+		ex := &ExecutePrepared{Name: name}
+		if p.consumeOp("(") {
+			for {
+				a, err := p.parseValueOrBool()
+				if err != nil {
+					return nil, err
+				}
+				ex.Args = append(ex.Args, a)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+		return ex, nil
+	}
+	pr := &Prepare{Name: name}
+	if p.consumeOp("(") {
+		// Each type as written, up to the comma or closing parenthesis
+		// at its own depth: pg_catalog.oid, numeric(10,2), text[].
+		var b strings.Builder
+		depth := 0
+		for {
+			t := p.peek()
+			if t.kind == tkEOF {
+				return nil, p.errf("expected \")\" after PREPARE's parameter types")
+			}
+			p.i++
+			if t.kind == tkOp && depth == 0 && (t.text == "," || t.text == ")") {
+				pr.Types = append(pr.Types, strings.ToLower(strings.TrimSpace(b.String())))
+				b.Reset()
+				if t.text == ")" {
+					break
+				}
+				continue
+			}
+			if t.kind == tkOp && t.text == "(" {
+				depth++
+			} else if t.kind == tkOp && t.text == ")" {
+				depth--
+			}
+			b.WriteString(t.text)
+		}
+	}
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	st, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	pr.Stmt = st
+	return pr, nil
+}
+
+// lockModes are PostgreSQL's table lock modes, as LOCK spells them.
+var lockModes = map[string]bool{
+	"ACCESS SHARE": true, "ROW SHARE": true, "ROW EXCLUSIVE": true, "SHARE UPDATE EXCLUSIVE": true,
+	"SHARE": true, "SHARE ROW EXCLUSIVE": true, "EXCLUSIVE": true, "ACCESS EXCLUSIVE": true,
+}
+
+// parseLockTable parses LOCK [TABLE] [ONLY] name [*] [, ...] [IN mode
+// MODE] [NOWAIT].
+func (p *parser) parseLockTable() (Statement, error) {
+	p.i++
+	p.consumeKeyword("TABLE")
+	lt := &LockTable{Mode: "ACCESS EXCLUSIVE"}
+	for {
+		p.consumeIdentWord("only")
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		p.consumeOp("*")
+		lt.Tables = append(lt.Tables, name)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if p.consumeIdentWord("in") {
+		var words []string
+		for {
+			t := p.peek()
+			if t.kind != tkIdent && t.kind != tkKeyword {
+				return nil, p.errf("expected a lock mode, found %q", t.text)
+			}
+			p.i++
+			w := strings.ToUpper(t.text)
+			if w == "MODE" {
+				break
+			}
+			words = append(words, w)
+		}
+		lt.Mode = strings.Join(words, " ")
+		if !lockModes[lt.Mode] {
+			return nil, p.errf("unrecognized lock mode %q", strings.ToLower(lt.Mode))
+		}
+	}
+	lt.NoWait = p.consumeIdentWord("nowait")
+	return lt, nil
+}
+
 func (p *parser) parseListenNotify(verb string) (Statement, error) {
 	p.i++
 	if verb == "unlisten" && p.consumeOp("*") {
@@ -690,6 +912,32 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return as, nil
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "large" {
+			p.i += 2 // ALTER LARGE OBJECT oid OWNER TO role
+			if !p.consumeIdentWord("object") {
+				return nil, p.errf("expected OBJECT after ALTER LARGE, found %q", p.peek().text)
+			}
+			t := p.peek()
+			if t.kind != tkNumber {
+				return nil, p.errf("expected a large object id, found %q", t.text)
+			}
+			p.i++
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER LARGE OBJECT supports only OWNER TO")
+			}
+			return p.parseOwnerTo("large object", t.text)
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "schema" {
+			p.i += 2 // ALTER SCHEMA name OWNER TO role
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER SCHEMA supports only OWNER TO")
+			}
+			return p.parseOwnerTo("schema", name)
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
 			p.i += 2 // ALTER VIEW name OWNER TO role
 			name, err := p.parseTableName()
@@ -794,6 +1042,12 @@ func (p *parser) parseStatement() (Statement, error) {
 		return &ReleaseSavepoint{Name: name}, nil
 	case "listen", "unlisten", "notify": // not reserved words; they lex as identifiers
 		return p.parseListenNotify(t.text)
+	case "lock": // not a reserved word; lexes as an identifier
+		return p.parseLockTable()
+	case "prepare", "execute", "deallocate": // not reserved words; they lex as identifiers
+		return p.parsePrepared(t.text)
+	case "declare", "fetch", "move", "close": // not reserved words; they lex as identifiers
+		return p.parseCursor(t.text)
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -1839,6 +2093,14 @@ func (p *parser) parseSet() (Statement, error) {
 		// ignored. A transaction-scoped SET applies to the block.
 		if !characteristics {
 			sv.Local = true
+			if p.consumeIdentWord("snapshot") {
+				t := p.peek()
+				if t.kind != tkString {
+					return nil, p.errf("expected a snapshot identifier string, found %q", t.text)
+				}
+				p.i++
+				return &SetTransactionSnapshot{ID: t.text}, nil
+			}
 		}
 		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
 		if err != nil {
@@ -2070,6 +2332,16 @@ func (p *parser) parseSequenceOptions(o *SequenceOptions, alter bool) error {
 	}
 	for {
 		switch {
+		case p.consumeIdentWord("sequence"):
+			// SEQUENCE NAME name: an identity column's sequence.
+			if !p.consumeIdentWord("name") {
+				return p.errf("expected NAME after SEQUENCE, found %q", p.peek().text)
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return err
+			}
+			o.SeqName = name
 		case p.consumeKeyword("AS"):
 			// AS int2 | int4 | int8: the type is accepted and ignored
 			// (every sequence is 64-bit).
@@ -2135,6 +2407,17 @@ func (p *parser) parseSequenceOptions(o *SequenceOptions, alter bool) error {
 			ref, err := p.parseColumnRef()
 			if err != nil {
 				return err
+			}
+			if p.consumeOp(".") {
+				// schema.table.column (pg_dump's public.t.c).
+				col, err := p.expectIdent()
+				if err != nil {
+					return err
+				}
+				if ref.Table != "public" {
+					return p.errf("schema %q does not exist (public is the only schema)", ref.Table)
+				}
+				ref = ColumnRef{Table: ref.Column, Column: col}
 			}
 			if ref.Table == "" {
 				return p.errf("OWNED BY takes table.column")
@@ -4748,8 +5031,41 @@ func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
 				return err
 			}
 			at.DropNotNull = col
+		case p.consumeKeyword("ADD"):
+			// ADD GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)]
+			if !p.consumeIdentWord("generated") {
+				return p.errf("expected GENERATED after ADD, found %q", p.peek().text)
+			}
+			ai := &AddIdentity{Column: col}
+			switch {
+			case p.consumeIdentWord("always"):
+				ai.Identity = "always"
+			case p.consumeKeyword("BY"):
+				if !p.consumeIdentWord("default") {
+					return p.errf("expected DEFAULT after GENERATED BY, found %q", p.peek().text)
+				}
+				ai.Identity = "by default"
+			default:
+				return p.errf("expected ALWAYS or BY DEFAULT after GENERATED, found %q", p.peek().text)
+			}
+			if err := p.expectKeyword("AS"); err != nil {
+				return err
+			}
+			if !p.consumeIdentWord("identity") {
+				return p.errf("expected IDENTITY, found %q", p.peek().text)
+			}
+			if p.consumeOp("(") {
+				ai.Seq = &SequenceOptions{}
+				if err := p.parseSequenceOptions(ai.Seq, false); err != nil {
+					return err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return err
+				}
+			}
+			at.AddIdentity = ai
 		default:
-			return p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL, DROP NOT NULL or ADD GENERATED, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
@@ -5133,10 +5449,14 @@ func (p *parser) parseTruncate() (Statement, error) {
 	p.consumeKeyword("TABLE")
 	tr := &Truncate{}
 	for {
+		// [ONLY] name [*]: no table has descendants, so both mean the
+		// table (pg_restore's TRUNCATE TABLE ONLY t).
+		p.consumeIdentWord("only")
 		name, err := p.parseTableName()
 		if err != nil {
 			return nil, err
 		}
+		p.consumeOp("*")
 		tr.Tables = append(tr.Tables, name)
 		if !p.consumeOp(",") {
 			break

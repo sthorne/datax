@@ -358,8 +358,19 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.ShowStats:
 		return showStatsColumns(), nil
 
-	case *parser.Analyze:
+	case *parser.Analyze, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot:
 		return nil, nil
+	case *parser.Fetch:
+		if c, ok := s.cursors[t.Name]; ok && !t.Move {
+			return c.cols, nil
+		}
+		return nil, nil
+	case *parser.ExecutePrepared:
+		inner, _, serr := s.executePrepared(t, nil)
+		if serr != nil {
+			return nil, serr
+		}
+		return s.PlanColumns(ctx, inner)
 
 	case *parser.ShowEncryptionKeys:
 		return showEncryptionKeysColumns(), nil

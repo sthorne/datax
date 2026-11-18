@@ -321,6 +321,13 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			return e, err
 		}
 		out.Func, out.Args, out.Lit, out.Case = "", nil, r.Lit, r.Case
+	case "pg_export_snapshot":
+		id, err := s.evalExportSnapshot(txn)
+		if err != nil {
+			return e, err
+		}
+		d := types.NewString(id)
+		out.Func, out.Args, out.Lit = "", nil, &d
 	case "acldefault":
 		return s.spliceACLDefault(ctx, txn, e, params, keepVolatile)
 	case "pg_get_userbyid":
@@ -1580,7 +1587,7 @@ var splicedFuncs = map[string]bool{
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
-	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true, "acldefault": true,
+	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true, "acldefault": true, "pg_export_snapshot": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true, "uuid_generate_v4": true,
 	// The text-search functions take the session's default
 	// configuration when the call names none.

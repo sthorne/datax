@@ -185,6 +185,10 @@ type ConstraintDef struct {
 	// in the unique columns conflict with each other. NULLS DISTINCT, the
 	// default, may be written too.
 	NullsNotDistinct bool
+	// PrimaryKey marks the UNIQUE constraint an ADD PRIMARY KEY on a
+	// rowid-keyed table becomes (the session's rewrite, pgdump.go): its
+	// index is the table's primary key.
+	PrimaryKey bool
 }
 
 type CreateTable struct {
@@ -292,6 +296,17 @@ type SequenceOptions struct {
 	RestartSet bool
 	// OwnedBy is "table.column" (or "none" / "" for none).
 	OwnedBy string
+	// SeqName is an identity column's SEQUENCE NAME option: the name of
+	// the sequence it creates ("" = <table>_<column>_seq).
+	SeqName string
+}
+
+// AddIdentity is ALTER TABLE ... ALTER COLUMN c ADD GENERATED {ALWAYS |
+// BY DEFAULT} AS IDENTITY [(sequence options)].
+type AddIdentity struct {
+	Column   string
+	Identity string // "always" or "by default"
+	Seq      *SequenceOptions
 }
 
 // CreateSequence is CREATE SEQUENCE [IF NOT EXISTS] name [options].
@@ -876,6 +891,8 @@ type AlterTable struct {
 	// NOT NULL (the column name).
 	SetNotNull  string
 	DropNotNull string
+	// AddIdentity is ALTER COLUMN c ADD GENERATED ... AS IDENTITY.
+	AddIdentity *AddIdentity
 	// SplitAt is SPLIT AT VALUES (k, ...), (k, ...): one primary-key
 	// tuple (a prefix of the key is allowed) per range boundary to carve.
 	SplitAt [][]Expr
@@ -1067,6 +1084,64 @@ type Show struct {
 	Role     string
 }
 
+// LockTable is LOCK [TABLE] [ONLY] name [*] [, ...] [IN mode MODE]
+// [NOWAIT]. Mode is PostgreSQL's lock mode, upper-cased with single
+// spaces ("ACCESS SHARE", "ROW EXCLUSIVE"); ACCESS EXCLUSIVE when the
+// statement names none.
+type LockTable struct {
+	Tables []string
+	Mode   string
+	NoWait bool
+}
+
+// Prepare is PREPARE name [(type, ...)] AS statement: the statement,
+// with $1... for its parameters, kept by the session under name.
+// Types are the declared parameter types as written (lower-cased).
+type Prepare struct {
+	Name  string
+	Types []string
+	Stmt  Statement
+}
+
+// ExecutePrepared is EXECUTE name [(value, ...)].
+type ExecutePrepared struct {
+	Name string
+	Args []Expr
+}
+
+// DeclareCursor is DECLARE name [BINARY] [NO SCROLL | SCROLL] CURSOR
+// [WITH HOLD | WITHOUT HOLD] FOR query.
+type DeclareCursor struct {
+	Name  string
+	Hold  bool
+	Query Statement
+}
+
+// Fetch is FETCH [NEXT | FORWARD [n | ALL] | n | ALL] [FROM | IN] name;
+// Count is the rows asked for, -1 for ALL. Move is MOVE, which skips
+// them instead.
+type Fetch struct {
+	Name  string
+	Count int64
+	Move  bool
+}
+
+// CloseCursor is CLOSE {name | ALL}.
+type CloseCursor struct {
+	Name string
+	All  bool
+}
+
+// SetTransactionSnapshot is SET TRANSACTION SNAPSHOT 'id': the
+// transaction reads what the one that exported id saw.
+type SetTransactionSnapshot struct{ ID string }
+
+// Deallocate is DEALLOCATE [PREPARE] {name | ALL}.
+type Deallocate struct {
+	Name string
+	All  bool
+}
+
 // Analyze collects table statistics (row count, per-column distinct
 // estimates) for one table, or every table when Table is empty. Runs
 // outside any transaction (chunked frozen-timestamp sweep); admin-only.
@@ -1180,6 +1255,14 @@ func (*ReleaseSavepoint) stmt()       {}
 func (*RollbackToSavepoint) stmt()    {}
 func (*Rollback) stmt()               {}
 func (*Listen) stmt()                 {}
+func (*LockTable) stmt()              {}
+func (*Prepare) stmt()                {}
+func (*ExecutePrepared) stmt()        {}
+func (*Deallocate) stmt()             {}
+func (*DeclareCursor) stmt()          {}
+func (*Fetch) stmt()                  {}
+func (*CloseCursor) stmt()            {}
+func (*SetTransactionSnapshot) stmt() {}
 func (*Unlisten) stmt()               {}
 func (*Notify) stmt()                 {}
 func (*ShowTables) stmt()             {}
