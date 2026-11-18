@@ -2,7 +2,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -61,7 +60,7 @@ func (s *Session) applyAddIdentity(ctx context.Context, txn *kvclient.Txn, desc 
 		if desc.Columns[i].ID == col.ID {
 			desc.Columns[i].Identity = ai.Identity
 			desc.Columns[i].SequenceID = sd.ID
-			desc.Columns[i].DefaultExpr = fmt.Sprintf("nextval('%s')", sd.Name)
+			desc.Columns[i].DefaultExpr = nextvalDefault(sd.Name)
 		}
 	}
 	return nil

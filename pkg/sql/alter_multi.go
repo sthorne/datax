@@ -499,7 +499,7 @@ func (s *Session) applyAddColumn(ctx context.Context, txn *kvclient.Txn, desc *c
 		col.NotNull = col.NotNull || def.Identity != ""
 		col.FillDefault, col.Backfill = true, pending
 		seqName := desc.Name + "_" + col.Name + "_seq"
-		col.DefaultExpr = fmt.Sprintf("nextval('%s')", seqName)
+		col.DefaultExpr = nextvalDefault(seqName)
 		if !eff.dry {
 			sd := catalog.NewSequenceDescriptor(seqName, desc.DatabaseID)
 			sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID

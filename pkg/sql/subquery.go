@@ -435,6 +435,16 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			}
 			out.Func, out.Args, out.Column = "", nil, prefix+hidden
 		}
+		if out.Func == "format_type" && len(out.Args) > 0 {
+			// format_type of an enum's OID (pg_type's oid, a literal):
+			// the type's name, quoted as PostgreSQL quotes it ("Role");
+			// the builtin types render at evaluation.
+			fe, err := s.formatEnumTypes(ctx, txn, out)
+			if err != nil {
+				return e, err
+			}
+			out = fe
+		}
 	}
 	if e.Left != nil {
 		l, err := s.resolveValueExprOpts(ctx, txn, *e.Left, params, keepVolatile)
@@ -522,6 +532,36 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		} else if ok {
 			out.Cast, out.Lit = "", &v
 			return out, nil
+		}
+	}
+	if isRegtypeCast(out.Cast) && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
+		// 'name'::regtype naming an enum: the name as PostgreSQL prints
+		// it ('"Role"'::regtype is "Role", 'role'::regtype 42704 when
+		// only "Role" exists). A builtin's name passes through.
+		if td, ok, err := s.enumTypeByText(ctx, txn, out.Lit.Text()); err != nil {
+			return e, err
+		} else if ok {
+			d := types.NewString(vtable.QuoteIdent(td.Name))
+			out.Lit, out.Cast = &d, ""
+		}
+	}
+	if (out.Cast == "oid" || out.Cast == "pg_catalog.oid") && e.Left != nil && isRegtypeCast(e.Left.Cast) && e.Left.Lit != nil && !e.Left.Lit.Null && e.Left.Lit.Fam == types.String && e.Left.BinOp == "" {
+		// 'name'::regtype::oid naming an enum: its OID.
+		if td, ok, err := s.enumTypeByText(ctx, txn, e.Left.Lit.Text()); err != nil {
+			return e, err
+		} else if ok {
+			d := types.NewInt(catalog.EnumOID(td.ID))
+			return parser.Expr{Lit: &d}, nil
+		}
+	}
+	if out.Func == "to_regtype" && len(out.Args) == 1 && out.Args[0].Lit != nil && !out.Args[0].Lit.Null && out.Args[0].Lit.Fam == types.String && out.Args[0].Cast == "" {
+		// to_regtype('"Role"'): an enum's OID (NULL, at evaluation, for
+		// a name that is no type).
+		if td, ok, err := s.enumTypeByText(ctx, txn, out.Args[0].Lit.Text()); err != nil {
+			return e, err
+		} else if ok {
+			d := types.NewInt(catalog.EnumOID(td.ID))
+			out.Func, out.Args, out.Lit = "", nil, &d
 		}
 	}
 	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
@@ -1588,7 +1628,7 @@ var splicedFuncs = map[string]bool{
 	"version": true, "pg_backend_pid": true, "pg_sleep": true, "pg_notify": true, "pg_cancel_backend": true, "pg_terminate_backend": true, "pg_get_userbyid": true, "pg_table_is_visible": true, "pg_partition_ancestors": true,
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
-	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
+	"to_regtype": true, "format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
 	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true, "acldefault": true, "pg_export_snapshot": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true, "uuid_generate_v4": true,
 	// The text-search functions take the session's default
@@ -1705,4 +1745,66 @@ func floorDivInt(a, b int64) int64 {
 		q--
 	}
 	return q
+}
+
+// formatEnumTypes resolves format_type(oid, ...) for the database's
+// enum types: a literal OID becomes the name, any other argument a
+// CASE over the enums' OIDs that falls back to the call.
+func (s *Session) formatEnumTypes(ctx context.Context, txn *kvclient.Txn, e parser.Expr) (parser.Expr, error) {
+	dbID, err := s.currentDatabaseID(ctx, txn)
+	if err != nil {
+		return e, err
+	}
+	tds, err := catalog.ListTypes(ctx, txn, dbID)
+	if err != nil || len(tds) == 0 {
+		return e, err
+	}
+	if lit := e.Args[0].Lit; lit != nil && lit.Fam == types.Int && e.Args[0].BinOp == "" && e.Args[0].Cast == "" {
+		for _, td := range tds {
+			if catalog.EnumOID(td.ID) == lit.I {
+				d := types.NewString(vtable.QuoteIdent(td.Name))
+				return parser.Expr{Lit: &d}, nil
+			}
+		}
+		return e, nil
+	}
+	if e.Args[0].Lit != nil {
+		return e, nil
+	}
+	inner := e
+	ce := &parser.CaseExpr{Operand: &e.Args[0], Else: &inner}
+	for _, td := range tds {
+		oid, name := types.NewInt(catalog.EnumOID(td.ID)), types.NewString(vtable.QuoteIdent(td.Name))
+		ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &oid}, Result: parser.Expr{Lit: &name}})
+	}
+	return parser.Expr{Case: ce}, nil
+}
+
+// isRegtypeCast reports whether a cast names regtype.
+func isRegtypeCast(c string) bool { return c == "regtype" || c == "pg_catalog.regtype" }
+
+// enumTypeByText finds the enum type a type name written as text
+// names, read as SQL reads a name (stringToQualifiedNameList): an
+// unquoted part folded to lower case, a quoted one kept, public or
+// pg_catalog as the qualifier. A builtin's name is no enum (ok false).
+func (s *Session) enumTypeByText(ctx context.Context, txn *kvclient.Txn, text string) (*catalog.TypeDescriptor, bool, error) {
+	parts, ok := parseQualifiedName(text)
+	if !ok {
+		return nil, false, nil
+	}
+	if len(parts) == 2 && (parts[0] == catalog.PublicSchema || parts[0] == vtable.PgCatalog) {
+		parts = parts[1:]
+	}
+	if len(parts) != 1 || builtins.KnownCastType(parts[0]) {
+		return nil, false, nil
+	}
+	dbID, err := s.currentDatabaseID(ctx, txn)
+	if err != nil {
+		return nil, false, err
+	}
+	td, err := catalog.LookupType(ctx, txn, dbID, parts[0])
+	if err != nil || td == nil {
+		return nil, false, nil
+	}
+	return td, true, nil
 }

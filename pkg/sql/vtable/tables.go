@@ -392,7 +392,7 @@ func init() {
 			oid := catalog.EnumOID(t.ID)
 			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
-				null(), str(t.Name)})
+				null(), str(QuoteIdent(t.Name))})
 		}
 		// The array type of every element type: typelem points back,
 		// and the element row's typarray forward.

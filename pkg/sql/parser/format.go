@@ -25,7 +25,7 @@ func formatExpr(b *strings.Builder, e Expr) {
 		}
 		b.WriteString(")")
 		if e.Cast != "" {
-			b.WriteString("::" + e.Cast)
+			b.WriteString("::" + formatCastName(e.Cast))
 		}
 		return
 	}
@@ -44,7 +44,7 @@ func formatExpr(b *strings.Builder, e Expr) {
 	case e.Agg != nil:
 		formatAgg(b, *e.Agg)
 	case e.Column != "":
-		b.WriteString(e.Column)
+		b.WriteString(formatColumnName(e.Column))
 	case e.Param > 0:
 		b.WriteString("$" + itoa(e.Param))
 	case e.IsDefault:
@@ -60,7 +60,7 @@ func formatExpr(b *strings.Builder, e Expr) {
 		formatExpr(b, *e.Right)
 	}
 	if e.Cast != "" {
-		b.WriteString("::" + e.Cast)
+		b.WriteString("::" + formatCastName(e.Cast))
 	}
 }
 
@@ -120,7 +120,7 @@ func formatAgg(b *strings.Builder, se SelectExpr) {
 			if oc.Expr != nil {
 				formatExpr(b, *oc.Expr)
 			} else {
-				b.WriteString(oc.Column)
+				b.WriteString(formatColumnName(oc.Column))
 			}
 			if oc.Desc {
 				b.WriteString(" DESC")
@@ -149,6 +149,35 @@ func FormatLiteral(d types.Datum) string {
 		return d.Text()
 	}
 	return "'" + strings.ReplaceAll(d.Text(), "'", "''") + "'"
+}
+
+// formatColumnName renders a column reference ("c" or "t.c") as SQL
+// that reads back as the same name: a part that is not a plain
+// lower-case word, or is a keyword, is double-quoted ("Email",
+// "order", "a""b").
+func formatColumnName(name string) string {
+	parts := strings.Split(name, ".")
+	for i, p := range parts {
+		if p != "*" {
+			parts[i] = quoteIdentIfNeeded(p)
+		}
+	}
+	return strings.Join(parts, ".")
+}
+
+// formatCastName renders a cast's type name as SQL that reads back as
+// the same type: a builtin spelling as is (numeric(10,2), double
+// precision, text[]), a user-defined type's name that a bare word
+// would fold quoted ("Role", "Role"[]).
+func formatCastName(name string) string {
+	base, suffix := name, ""
+	for strings.HasSuffix(base, "[]") {
+		base, suffix = strings.TrimSuffix(base, "[]"), suffix+"[]"
+	}
+	if base != strings.ToLower(base) || strings.ContainsRune(base, '"') {
+		return quoteIdentIfNeeded(base) + suffix
+	}
+	return name
 }
 
 func itoa(n int) string {

@@ -168,8 +168,11 @@ func nextvalSequences(expr string) []string {
 		if end < 0 {
 			return out
 		}
-		name := strings.Trim(arg[1:1+end], `"`)
-		name = strings.TrimPrefix(name, "public.")
+		name := strings.TrimPrefix(arg[1:1+end], "public.")
+		if len(name) > 1 && name[0] == '"' && name[len(name)-1] == '"' {
+			// A quoted name (nextval('"User_id_seq"')): "" inside is one ".
+			name = strings.ReplaceAll(name[1:len(name)-1], `""`, `"`)
+		}
 		out = append(out, name)
 	}
 }

@@ -147,6 +147,9 @@ func ToSQLError(err error) *Error {
 	}
 	var syn *parser.SyntaxError
 	if errors.As(err, &syn) {
+		if syn.Code != "" {
+			return &Error{Code: syn.Code, Msg: syn.Msg, Hint: syn.Hint}
+		}
 		return &Error{Code: CodeSyntaxError, Msg: syn.Error()}
 	}
 	if kvclient.IsRetryable(err) {
