@@ -33,7 +33,6 @@ const (
 	CodeGrouping             = "42803"
 	CodeDivisionByZero       = "22012"
 	CodeAmbiguousColumn      = "42702"
-	CodeDuplicateColumn      = "42701"
 	CodeCardinality          = "21000"
 	CodeInsufficientPriv     = "42501"
 	CodeInternal             = "XX000"
