@@ -1868,6 +1868,18 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Subqueries in a join's `ON` condition are evaluated** (#379). Before,
+  they were silently skipped:
+  - `b.id IN (SELECT ...)` in `ON` never matched, so the join returned no
+    rows, or only NULL-extended ones for a `LEFT JOIN`.
+  - `NOT IN (SELECT ...)` always matched.
+  - Scalar and `EXISTS` subqueries failed with `XX000` or `42703`.
+
+  Subqueries that read nothing from the join run once, as in `WHERE`. Ones
+  that read the tables joined so far run per candidate row. This holds for
+  inner, `LEFT`, `RIGHT`, `FULL` and `LATERAL` joins, and outer joins
+  NULL-extend the unmatched side. `EXPLAIN` no longer runs a correlated
+  `ON` subquery while planning.
 - **A purge no longer surfaces as `72000 snapshot too old` in ordinary
   transactions** (#374). A transaction that ran into another's
   uncommitted write while `ALTER TABLE ... PURGE` ran could fail with
