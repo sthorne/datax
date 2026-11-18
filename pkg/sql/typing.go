@@ -54,6 +54,9 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		// A NULL carrying a family (a column's value substituted into
 		// a correlated or lateral query) is typed by it.
 		fam = e.Lit.Fam
+		if e.Lit.Reg != "" {
+			fam = types.String // a reg* value describes as its name
+		}
 	case e.Column != "":
 		if colType != nil {
 			if f, ok := colType(e.Column); ok {
@@ -113,6 +116,9 @@ func arithFamily(op string, l, r types.Family) types.Family {
 		}
 		if r.IsArray() {
 			return r
+		}
+		if l == types.Bytes && r == types.Bytes {
+			return types.Bytes
 		}
 		return types.String
 	case "^":

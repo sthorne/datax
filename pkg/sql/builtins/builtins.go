@@ -305,9 +305,14 @@ func (b *Builtin) coerceArgs(args []types.Datum) (coerced []types.Datum, null bo
 			coerced[i] = a
 			continue
 		}
-		if want == types.String && a.Fam == types.Bytes && b.Bytea {
-			coerced[i] = a
-			continue
+		if want == types.String && a.Fam == types.Bytes {
+			if b.Bytea {
+				coerced[i] = a
+				continue
+			}
+			// bytea has no implicit cast to text: a text function
+			// without a bytea form does not take one.
+			return nil, false, errf(CodeUndefined, "function %s(%s) does not exist", b.Name, familiesText(args))
 		}
 		if want == types.String {
 			// Anything renders as text (lenient, like the || operator).
@@ -328,6 +333,8 @@ func familiesText(args []types.Datum) string {
 	for i, a := range args {
 		if a.Null {
 			names[i] = "unknown"
+		} else if a.Fam == types.Bytes {
+			names[i] = "bytea"
 		} else {
 			names[i] = strings.ToLower(a.Fam.String())
 		}

@@ -30,6 +30,27 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 	if d.Null {
 		return types.DNull, nil
 	}
+	if d.Reg != "" && !strings.HasPrefix(name, "reg") {
+		// A reg* value cast to anything else (::oid, ::int4) is its
+		// OID; to text, its name (Text renders it before this).
+		if isTextType(name) {
+			return types.NewString(d.Reg), nil
+		}
+		d.Reg = ""
+	}
+	switch name {
+	case "int2", "smallint", "int4", "int", "integer":
+		if f, ok := types.DecimalSpecial(d); ok {
+			target := "integer"
+			if name == "int2" || name == "smallint" {
+				target = "smallint"
+			}
+			if math.IsNaN(f) {
+				return types.Datum{}, errf(CodeNotSupported, "cannot convert NaN to %s", target)
+			}
+			return types.Datum{}, errf(CodeNotSupported, "cannot convert infinity to %s", target)
+		}
+	}
 	switch name {
 	case "int2", "smallint":
 		v, err := toInt(d)
@@ -331,6 +352,12 @@ func toInt(d types.Datum) (types.Datum, error) {
 		}
 		return types.NewInt(int64(math.RoundToEven(d.F))), nil
 	case types.Decimal:
+		if f, ok := types.DecimalSpecial(d); ok {
+			if math.IsNaN(f) {
+				return types.Datum{}, errf(CodeNotSupported, "cannot convert NaN to bigint")
+			}
+			return types.Datum{}, errf(CodeNotSupported, "cannot convert infinity to bigint")
+		}
 		v, err := d.DecimalVal()
 		if err != nil {
 			return types.Datum{}, errf(CodeInvalidText, "%v", err)
@@ -407,8 +434,8 @@ func toDecimal(d types.Datum) (types.Datum, error) {
 	case types.Float:
 		// An explicit cast may launder a float: its shortest decimal
 		// rendering (what the user sees) is the value.
-		if math.IsNaN(d.F) || math.IsInf(d.F, 0) {
-			return types.Datum{}, errf(CodeInvalidText, "cannot convert %v to numeric", d.F)
+		if v, ok := types.DecimalFromSpecial(d.F); ok {
+			return v, nil // NaN and the infinities are numeric's too
 		}
 		v, err := types.ParseDecimal(strconv.FormatFloat(d.F, 'f', -1, 64))
 		if err != nil {
@@ -442,6 +469,12 @@ func quantizeTo(d types.Datum, mods []string) (types.Datum, error) {
 		if scale, err = strconv.Atoi(mods[1]); err != nil {
 			return d, nil
 		}
+	}
+	if f, ok := types.DecimalSpecial(d); ok {
+		if math.IsNaN(f) {
+			return d, nil // NaN fits any numeric(p,s)
+		}
+		return types.Datum{}, errf(CodeOutOfRange, "numeric field overflow: a field with precision %d, scale %d cannot hold an infinite value", prec, scale)
 	}
 	v, err := d.DecimalVal()
 	if err != nil {
@@ -496,11 +529,19 @@ func ToJSONB(d types.Datum) (types.Datum, error) {
 		if d.Fam == types.Float && (math.IsNaN(d.F) || math.IsInf(d.F, 0)) {
 			return types.Datum{}, errf(CodeInvalidText, "cannot convert %v to json", d.F)
 		}
+		if _, ok := types.DecimalSpecial(d); ok {
+			// JSON has no NaN or Infinity: to_jsonb renders them as
+			// strings.
+			return types.ParseJSONB(strconv.Quote(d.S))
+		}
 		return types.ParseJSONB(d.Text())
 	case types.Bool:
 		return types.ParseJSONB(strconv.FormatBool(d.B))
 	case types.String:
 		return types.ParseJSONB(strconv.Quote(d.S))
+	}
+	if t, ok := JSONTimeText(d, nil); ok {
+		return types.ParseJSONB(strconv.Quote(t))
 	}
 	return types.ParseJSONB(strconv.Quote(d.Text()))
 }

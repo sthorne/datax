@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"math"
+
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/decimal"
@@ -153,6 +155,15 @@ func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
 	}
 	if col.Precision == 0 || d.Fam != types.Decimal {
 		return d, nil
+	}
+	if f, ok := types.DecimalSpecial(d); ok {
+		// NaN fits any NUMERIC(p,s); an infinity fits none.
+		if math.IsNaN(f) {
+			return d, nil
+		}
+		return d, newErrf(CodeNumericValueOutOfRange,
+			"numeric field overflow in column %q: a field with precision %d, scale %d cannot hold an infinite value",
+			col.Name, col.Precision, col.Scale)
 	}
 	v, err := decimal.Parse(d.S)
 	if err != nil {
