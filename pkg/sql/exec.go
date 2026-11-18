@@ -382,7 +382,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			return nil, ToSQLError(err)
 		}
 		col.SequenceID = sd.ID
-		col.DefaultExpr = fmt.Sprintf("nextval('%s')", sd.Name)
+		col.DefaultExpr = nextvalDefault(sd.Name)
 		owned = true
 	}
 	constrained, err := s.createTableConstraints(ctx, txn, desc, t)

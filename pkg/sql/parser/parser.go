@@ -1,12 +1,13 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
-	"github.com/sthorne/datax/pkg/sql/builtins"
 	"reflect"
 	"strconv"
 	"strings"
 
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vector"
 )
@@ -19,14 +20,29 @@ const maxJoinTables = 8
 type SyntaxError struct {
 	Msg string
 	Pos int
+	// Code, when set, is the SQLSTATE of an error the scanner raises
+	// with PostgreSQL's own wording (an invalid escape, a zero-length
+	// quoted identifier): Msg is then the whole message, and Hint its
+	// HINT.
+	Code string
+	Hint string
 }
 
-func (e *SyntaxError) Error() string { return fmt.Sprintf("syntax error: %s", e.Msg) }
+func (e *SyntaxError) Error() string {
+	if e.Code != "" {
+		return e.Msg
+	}
+	return fmt.Sprintf("syntax error: %s", e.Msg)
+}
 
 // Parse parses a semicolon-separated statement list.
 func Parse(src string) ([]Statement, error) {
 	toks, err := lex(src)
 	if err != nil {
+		var se *SyntaxError
+		if errors.As(err, &se) {
+			return nil, se
+		}
 		return nil, &SyntaxError{Msg: err.Error()}
 	}
 	p := &parser{toks: toks, src: src}
@@ -185,6 +201,13 @@ func (p *parser) parseColumnRef() (ColumnRef, error) {
 		if err != nil {
 			return ColumnRef{}, err
 		}
+		if name == "public" && p.consumeOp(".") {
+			// public.t.c: the only schema's qualifier is dropped.
+			name = col
+			if col, err = p.expectIdent(); err != nil {
+				return ColumnRef{}, err
+			}
+		}
 		return ColumnRef{Table: name, Column: col}, nil
 	}
 	return ColumnRef{Column: name}, nil
@@ -224,7 +247,7 @@ func (r ColumnRef) String() string {
 // consumeIdentWord consumes the next token when it is the given
 // (lower-cased) identifier — for words that are not reserved keywords.
 func (p *parser) consumeIdentWord(word string) bool {
-	if t := p.peek(); t.kind == tkIdent && t.text == word {
+	if t := p.peek(); t.isWord(word) {
 		p.i++
 		return true
 	}
@@ -584,10 +607,10 @@ func (p *parser) parseStatement() (Statement, error) {
 		}
 		return sel, nil
 	}
-	if t.kind == tkIdent && t.text == "with" {
+	if t.isWord("with") {
 		return p.parseWith()
 	}
-	if t.kind != tkKeyword && t.kind != tkIdent {
+	if t.kind != tkKeyword && (t.kind != tkIdent || t.quoted) {
 		return nil, p.errf("unexpected %q", t.text)
 	}
 	switch t.text {
@@ -601,16 +624,16 @@ func (p *parser) parseStatement() (Statement, error) {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && (nxt.text == "UNIQUE" || nxt.text == "INDEX") {
 			return p.parseCreateIndex()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.isWord("role") {
 			return p.parseRoleStmt(false)
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("sequence") {
 			return p.parseCreateSequence()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("type") {
 			return p.parseCreateType()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("extension") {
 			// CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s]
 			// [VERSION v] [CASCADE]: the trailing options say where and
 			// which, and there is nowhere and nothing to choose.
@@ -638,7 +661,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return ce, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("view") {
 			return p.parseCreateView(false)
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "OR" {
@@ -649,7 +672,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			p.i-- // parseCreateView consumes one token, then VIEW
 			return p.parseCreateView(true)
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("database") {
 			p.i += 2 // CREATE DATABASE
 			cd := &CreateDatabase{}
 			if p.consumeKeyword("IF") {
@@ -682,8 +705,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		analyze := false
 		// EXPLAIN ANALYZE <query> ("analyze" lexes as an identifier; a
 		// bare EXPLAIN ANALYZE t is the ANALYZE statement explained).
-		if t := p.peek(); t.kind == tkIdent && t.text == "analyze" && p.i+1 < len(p.toks) {
-			if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "SELECT" || nxt.kind == tkIdent && nxt.text == "with" || nxt.kind == tkOp && nxt.text == "(" {
+		if t := p.peek(); t.isWord("analyze") && p.i+1 < len(p.toks) {
+			if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "SELECT" || nxt.isWord("with") || nxt.kind == tkOp && nxt.text == "(" {
 				p.i++
 				analyze = true
 			}
@@ -700,10 +723,10 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.peekEncryptionKey(1) {
 			return p.parseDropEncryptionKey()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.isWord("role") {
 			return p.parseDropRole()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "owned" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("owned") {
 			return p.parseDropOwned()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
@@ -728,7 +751,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return di, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "extension" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("extension") {
 			p.i += 2 // DROP EXTENSION
 			de := &DropExtension{}
 			if p.consumeKeyword("IF") {
@@ -752,7 +775,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return de, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("type") {
 			p.i += 2 // DROP TYPE
 			dt := &DropType{}
 			if p.consumeKeyword("IF") {
@@ -771,7 +794,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return dt, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("sequence") {
 			p.i += 2 // DROP SEQUENCE
 			ds := &DropSequence{}
 			if p.consumeKeyword("IF") {
@@ -787,7 +810,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			ds.Name = name
 			return ds, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("view") {
 			p.i += 2 // DROP VIEW
 			dv := &DropView{}
 			if p.consumeKeyword("IF") {
@@ -813,7 +836,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return dv, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("database") {
 			p.i += 2 // DROP DATABASE
 			dd := &DropDatabase{}
 			if p.consumeKeyword("IF") {
@@ -856,10 +879,10 @@ func (p *parser) parseStatement() (Statement, error) {
 		if p.peekEncryptionKey(1) {
 			return p.parseAlterEncryptionKey()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.kind == tkIdent && nxt.text == "role" {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "USER" || nxt.isWord("role") {
 			return p.parseRoleStmt(true)
 		}
-		if p.i+2 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "default" && p.toks[p.i+2].kind == tkIdent && p.toks[p.i+2].text == "privileges" {
+		if p.i+2 < len(p.toks) && p.toks[p.i+1].isWord("default") && p.toks[p.i+2].isWord("privileges") {
 			return p.parseAlterDefaultPrivileges()
 		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkKeyword && nxt.text == "INDEX" {
@@ -887,10 +910,10 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return ai, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "type" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("type") {
 			return p.parseAlterType()
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "sequence" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("sequence") {
 			p.i += 2 // ALTER SEQUENCE
 			as := &AlterSequence{}
 			if p.consumeKeyword("IF") {
@@ -912,7 +935,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return as, nil
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "large" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("large") {
 			p.i += 2 // ALTER LARGE OBJECT oid OWNER TO role
 			if !p.consumeIdentWord("object") {
 				return nil, p.errf("expected OBJECT after ALTER LARGE, found %q", p.peek().text)
@@ -927,7 +950,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return p.parseOwnerTo("large object", t.text)
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "schema" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("schema") {
 			p.i += 2 // ALTER SCHEMA name OWNER TO role
 			name, err := p.expectIdent()
 			if err != nil {
@@ -938,7 +961,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return p.parseOwnerTo("schema", name)
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("view") {
 			p.i += 2 // ALTER VIEW name OWNER TO role
 			name, err := p.parseTableName()
 			if err != nil {
@@ -949,7 +972,7 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return p.parseOwnerTo("view", name)
 		}
-		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "database" {
+		if nxt := p.toks[p.i+1]; nxt.isWord("database") {
 			p.i += 2 // ALTER DATABASE name RENAME TO new
 			name, err := p.expectIdent()
 			if err != nil {
@@ -1635,8 +1658,12 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 	}
 	p.i++
 	typeName := t.text
+	// A quoted name keeps its case: "Role" is a user-defined type, never
+	// the builtin a folded spelling would name; a quoted lower-case name
+	// ("int4", "text") is still the builtin, as in PostgreSQL.
+	userDefined := t.quoted && typeName != strings.ToLower(typeName)
 	// DOUBLE PRECISION / CHARACTER VARYING: absorb a trailing word.
-	if strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character") {
+	if !t.quoted && (strings.EqualFold(typeName, "double") || strings.EqualFold(typeName, "character")) {
 		if n := p.peek(); n.kind == tkIdent {
 			if strings.EqualFold(typeName, "character") && strings.EqualFold(n.text, "varying") {
 				typeName = "VARCHAR"
@@ -1645,6 +1672,9 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		}
 	}
 	upper := strings.ToUpper(typeName)
+	if userDefined {
+		upper = ""
+	}
 	switch upper {
 	case "SERIAL", "SERIAL4":
 		typeName, serial, spec.Width = "INT8", true, 4
@@ -1664,23 +1694,43 @@ func (p *parser) parseColumnType() (spec TypeSpec, serial bool, err error) {
 		return spec, false, p.errf("TIME WITH TIME ZONE is not supported: use TIME (the offset of an input is ignored) or TIMESTAMPTZ")
 	}
 	fam, perr := types.ParseType(typeName)
+	if userDefined {
+		fam, perr = 0, fmt.Errorf("type %q does not exist", typeName)
+	}
 	if perr != nil {
 		// Not a builtin type: a user-defined type (an enum) by name,
 		// optionally database-qualified, resolved by the executor.
 		if t.kind != tkIdent {
 			return spec, false, p.errf("%v", perr)
 		}
-		name := typeName
-		if p.consumeOp(".") {
+		parts := []string{typeName}
+		for p.consumeOp(".") {
 			n, err := p.expectIdent()
 			if err != nil {
 				return spec, false, err
 			}
-			name += "." + n
+			parts = append(parts, n)
 		}
-		spec.Family, spec.TypeName = types.Enum, strings.ToLower(name)
-		if p.consumeOp("[") {
-			return spec, false, p.errf("arrays of enum type %s are not supported", spec.TypeName)
+		// [db.][public.]name: public is the only schema (Prisma writes
+		// "public"."Role").
+		var name string
+		switch {
+		case len(parts) == 1:
+			name = parts[0]
+		case len(parts) == 2 && parts[0] == "public":
+			name = parts[1]
+		case len(parts) == 2:
+			name = parts[0] + "." + parts[1]
+		case len(parts) == 3 && parts[1] == "public":
+			name = parts[0] + "." + parts[2]
+		default:
+			return spec, false, p.errf("improper qualified type name %q", strings.Join(parts, "."))
+		}
+		// Unquoted words were folded to lower case by the lexer; a
+		// quoted one keeps its case (CREATE TYPE "Role" ... ; r "Role").
+		spec.Family, spec.TypeName = types.Enum, name
+		if p.consumeOp("[") || p.peekIdentWord("array") {
+			return spec, false, &SyntaxError{Msg: fmt.Sprintf("arrays of enum type %s are not supported", quoteIdentIfNeeded(spec.TypeName)), Pos: p.peek().pos, Code: "0A000"}
 		}
 		return spec, false, nil
 	}
@@ -2784,7 +2834,7 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 			return nil, p.errf("DEFAULT VALUES takes no column list")
 		}
 	}
-	if t := p.peek(); !ins.DefaultValues && ((t.kind == tkKeyword && t.text == "SELECT") || (t.kind == tkOp && t.text == "(") || (t.kind == tkIdent && t.text == "with")) {
+	if t := p.peek(); !ins.DefaultValues && ((t.kind == tkKeyword && t.text == "SELECT") || (t.kind == tkOp && t.text == "(") || (t.isWord("with"))) {
 		// INSERT INTO t [(cols)] SELECT ... | (query) | WITH ... SELECT ...
 		src, err := p.parseSetMember()
 		if err != nil {
@@ -2819,7 +2869,7 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 	}
 	// ON CONFLICT ... ("conflict", "do", "nothing" are not
 	// reserved words).
-	if p.peek().kind == tkKeyword && p.peek().text == "ON" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && p.toks[p.i+1].text == "conflict" {
+	if p.peek().kind == tkKeyword && p.peek().text == "ON" && p.i+1 < len(p.toks) && p.toks[p.i+1].isWord("conflict") {
 		if upsert {
 			return nil, p.errf("UPSERT does not take ON CONFLICT")
 		}
@@ -2962,7 +3012,7 @@ func (p *parser) parseCopy() (Statement, error) {
 	p.i++ // copy
 	// COPY BINARY t ...: the pre-7.3 spelling of FORMAT binary.
 	binaryPrefix := false
-	if t := p.peek(); t.kind == tkIdent && t.text == "binary" {
+	if t := p.peek(); t.isWord("binary") {
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent {
 			p.i++
 			binaryPrefix = true
@@ -3052,13 +3102,13 @@ func (p *parser) parseCopyQuery() (Statement, error) {
 // parseCopyToRest parses a COPY TO's target and options, after TO.
 func (p *parser) parseCopyToRest(ct *CopyTo) error {
 	switch t := p.peek(); {
-	case t.kind == tkIdent && (t.text == "stdout" || t.text == "stdin"):
+	case t.kind == tkIdent && !t.quoted && (t.text == "stdout" || t.text == "stdin"):
 		// PostgreSQL's grammar takes either word for the client side.
 		p.i++
 	case t.kind == tkString:
 		p.i++
 		ct.File = t.text
-	case t.kind == tkIdent && t.text == "program":
+	case t.isWord("program"):
 		p.i++
 		c := p.peek()
 		if c.kind != tkString {
@@ -3195,22 +3245,22 @@ func (p *parser) parseCopyLegacyOptions() ([]CopyOption, error) {
 		t := p.peek()
 		var err error
 		switch {
-		case t.kind == tkIdent && t.text == "binary":
+		case t.isWord("binary"):
 			p.i++
 			out = append(out, CopyOption{Name: "format", Arg: "binary", HasArg: true})
-		case t.kind == tkIdent && t.text == "csv":
+		case t.isWord("csv"):
 			p.i++
 			out = append(out, CopyOption{Name: "format", Arg: "csv", HasArg: true})
-		case t.kind == tkIdent && (t.text == "header" || t.text == "freeze"):
+		case t.kind == tkIdent && !t.quoted && (t.text == "header" || t.text == "freeze"):
 			p.i++
 			out = append(out, CopyOption{Name: t.text})
-		case t.kind == tkIdent && (t.text == "delimiter" || t.text == "quote" || t.text == "escape" || t.text == "encoding"):
+		case t.kind == tkIdent && !t.quoted && (t.text == "delimiter" || t.text == "quote" || t.text == "escape" || t.text == "encoding"):
 			p.i++
 			err = str(t.text)
 		case t.kind == tkKeyword && t.text == "NULL":
 			p.i++
 			err = str("null")
-		case t.kind == tkIdent && t.text == "force":
+		case t.isWord("force"):
 			p.i++
 			switch {
 			case p.consumeIdentWord("quote"):
@@ -3369,7 +3419,7 @@ func (p *parser) parseSelect() (Statement, error) {
 		// untouched; SYSTEM and TIME lex as identifiers).
 		if p.consumeKeyword("AS") {
 			for _, word := range []string{"of", "system", "time"} {
-				if t := p.peek(); t.kind == tkIdent && t.text == word {
+				if t := p.peek(); t.isWord(word) {
 					p.i++
 				} else {
 					return nil, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
@@ -3658,7 +3708,7 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 		return nil, err
 	}
 	// FOR UPDATE (FOR is not a reserved word — it lexes as an identifier).
-	if t := p.peek(); t.kind == tkIdent && t.text == "for" {
+	if t := p.peek(); t.isWord("for") {
 		p.i++
 		if err := p.expectKeyword("UPDATE"); err != nil {
 			return nil, err
@@ -3669,14 +3719,14 @@ func (p *parser) finishSelect(sel *Select) (Statement, error) {
 		sel.ForUpdate = true
 		// SKIP LOCKED | NOWAIT (neither is reserved; both lex as
 		// identifiers).
-		if t := p.peek(); t.kind == tkIdent && t.text == "skip" {
+		if t := p.peek(); t.isWord("skip") {
 			p.i++
-			if n := p.peek(); n.kind != tkIdent || n.text != "locked" {
+			if n := p.peek(); !n.isWord("locked") {
 				return nil, p.errf("expected LOCKED after FOR UPDATE SKIP, found %q", n.text)
 			}
 			p.i++
 			sel.LockWait = LockWaitSkipLocked
-		} else if t.kind == tkIdent && t.text == "nowait" {
+		} else if t.isWord("nowait") {
 			p.i++
 			sel.LockWait = LockWaitNoWait
 		}
@@ -3953,7 +4003,7 @@ func (p *parser) parseGroupingElement(exprs []SelectExpr, top bool) ([][]Expr, b
 	}
 	switch {
 	case call("rollup"), call("cube"):
-		cube := p.peek().text == "cube"
+		cube := p.peek().isWord("cube")
 		p.i += 2
 		var elems [][]Expr
 		for {
@@ -4287,7 +4337,7 @@ func (p *parser) parseSetMember() (*Select, error) {
 			return nil, err
 		}
 		return stmt.(*Select), nil
-	case t.kind == tkIdent && t.text == "with":
+	case t.isWord("with"):
 		stmt, err := p.parseWith()
 		if err != nil {
 			return nil, err
@@ -4398,7 +4448,7 @@ func (p *parser) peekIdentSeq(words ...string) bool {
 		if p.i+j >= len(p.toks) {
 			return false
 		}
-		if t := p.toks[p.i+j]; t.kind != tkIdent || t.text != w {
+		if t := p.toks[p.i+j]; !t.isWord(w) {
 			return false
 		}
 	}
@@ -4450,7 +4500,7 @@ func (p *parser) parseOptColumnAlias() (string, error) {
 
 // quoted reports whether an identifier token was written in double
 // quotes.
-func (p *parser) quoted(t token) bool { return t.pos < len(p.src) && p.src[t.pos] == '"' }
+func (p *parser) quoted(t token) bool { return t.quoted }
 
 // parseOptTableAlias consumes an optional [AS] alias after a table name.
 // In the outer-table position (allowAsOf) an AS followed by the
@@ -4469,7 +4519,7 @@ func (p *parser) parseOptTableAlias(allowAsOf bool) string {
 		p.i-- // AS not followed by an alias: leave it for the caller
 		return ""
 	}
-	if t := p.peek(); t.kind == tkIdent && !tableClauseWords[t.text] {
+	if t := p.peek(); t.kind == tkIdent && (t.quoted || !tableClauseWords[t.text]) {
 		p.i++
 		return t.text
 	}
@@ -4789,7 +4839,7 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	// ONLY: there is no table inheritance here, so the table is all
 	// there is to alter (pg_dump writes ALTER TABLE ONLY ...). It is
 	// taken as the keyword only when a table name follows it.
-	if t := p.peek(); t.kind == tkIdent && t.text == "only" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+	if t := p.peek(); t.isWord("only") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
 		p.i++
 		at.Only = true
 	}
@@ -5837,7 +5887,7 @@ func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
 			return nil, false, p.errf("expected comparison operator, found %q", t.text)
 		}
 		if t.kind == tkEOF || (t.kind == tkOp && (t.text == ")" || t.text == ";" || t.text == ",")) || t.kind == tkKeyword ||
-			(t.kind == tkIdent && (tableClauseWords[t.text] || caseWords[t.text])) {
+			(t.kind == tkIdent && !t.quoted && (tableClauseWords[t.text] || caseWords[t.text])) {
 			// A bare boolean column (WHERE a.attisdropped, ... AND NOT x).
 			base.Op, base.Value = "=", Expr{Lit: &tr}
 			return one(base)
@@ -5886,7 +5936,7 @@ func (p *parser) parseOptEscape() (string, error) {
 // keep the quantifier in the operator ("= ANY", "!= ALL").
 func (p *parser) finishComparison(cmp Comparison, op string) (Comparison, error) {
 	cmp.Op = op
-	if t := p.peek(); t.kind == tkIdent && (t.text == "any" || t.text == "some" || t.text == "all") &&
+	if t := p.peek(); t.kind == tkIdent && !t.quoted && (t.text == "any" || t.text == "some" || t.text == "all") &&
 		p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
 		quant := "ANY"
 		if t.text == "all" {
@@ -6254,16 +6304,16 @@ func (p *parser) parseCmpOp() (string, bool) {
 		return t.text, true
 	}
 	// [NOT] LIKE / ILIKE ("like" and "ilike" are not reserved words).
-	if t.kind == tkIdent && (t.text == "like" || t.text == "ilike") {
+	if t.kind == tkIdent && !t.quoted && (t.text == "like" || t.text == "ilike") {
 		p.i++
 		return strings.ToUpper(t.text), true
 	}
-	if t.kind == tkKeyword && t.text == "NOT" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent &&
+	if t.kind == tkKeyword && t.text == "NOT" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent && !p.toks[p.i+1].quoted &&
 		(p.toks[p.i+1].text == "like" || p.toks[p.i+1].text == "ilike") {
 		p.i += 2
 		return "NOT " + strings.ToUpper(p.toks[p.i-1].text), true
 	}
-	if t.kind == tkIdent && t.text == "operator" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
+	if t.isWord("operator") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
 		save := p.i
 		p.i += 2
 		if p.peek().kind == tkIdent { // schema qualifier
@@ -6303,7 +6353,7 @@ func (p *parser) parseSubquery() (*Select, bool, error) {
 		return nil, false, nil
 	}
 	nxt := p.toks[p.i+1]
-	if !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.kind == tkIdent && nxt.text == "with") {
+	if !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.isWord("with")) {
 		return nil, false, nil
 	}
 	p.i++ // (
@@ -6493,18 +6543,37 @@ func castChain(e Expr, casts []string) Expr {
 // at all is the executor's question: it may name a user-defined type.
 func (p *parser) skipTypeName() (string, error) {
 	var name string
+	// quoted: the (last part of the) name was written in double quotes,
+	// and keeps its case — "Role" names the user-defined type Role, not
+	// role. An unquoted name is folded to lower case.
+	quoted := false
 	if t := p.peek(); t.kind == tkIdent || t.kind == tkKeyword {
-		name = strings.ToLower(t.text)
+		name, quoted = t.text, t.quoted
+		if !quoted {
+			name = strings.ToLower(name)
+		}
 		p.i++
 	} else {
 		return "", p.errf("expected type name, found %q", t.text)
 	}
 	if p.consumeOp(".") {
+		t := p.peek()
 		n, err := p.expectIdent()
 		if err != nil {
 			return "", err
 		}
-		name = strings.ToLower(n)
+		name, quoted = n, t.quoted
+	}
+	if quoted && name != strings.ToLower(name) {
+		// A mixed-case quoted name is never a builtin: no typmod or
+		// multi-word spelling applies; array brackets still do.
+		for p.consumeOp("[") {
+			if err := p.expectOp("]"); err != nil {
+				return "", err
+			}
+			name += "[]"
+		}
+		return name, nil
 	}
 	switch name {
 	case "double":
@@ -6936,7 +7005,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		}
 		// A scalar subquery is "(SELECT" or "(WITH"; anything else is
 		// grouping — of a value, or of a predicate used as a boolean value.
-		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.kind == tkIdent && nxt.text == "with") {
+		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.isWord("with")) {
 			p.i++
 			e, err := p.parseValueOrBool()
 			if err != nil {
@@ -6958,7 +7027,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 	if t.kind == tkIdent || t.kind == tkKeyword {
 		// Typed literals: INTERVAL '1 day', DATE '2024-01-01', ... — a
 		// cast of the string.
-		if cast, ok := typedLiteralNames[strings.ToLower(t.text)]; ok && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkString {
+		if cast, ok := typedLiteralNames[strings.ToLower(t.text)]; ok && !(t.quoted && t.text != strings.ToLower(t.text)) && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkString {
 			d := types.NewString(p.toks[p.i+1].text)
 			p.i += 2
 			return p.applyCasts(Expr{Lit: &d, Cast: cast})
@@ -6966,17 +7035,17 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 	}
 	if t.kind == tkIdent {
 		// CASE expressions ("case" is not a reserved word).
-		if t.text == "case" {
+		if t.isWord("case") {
 			return p.parseCase()
 		}
 		// DEFAULT as a value (INSERT VALUES (DEFAULT), SET c = DEFAULT).
-		if t.text == "default" && p.i+1 < len(p.toks) && (p.toks[p.i+1].kind == tkEOF ||
+		if t.isWord("default") && p.i+1 < len(p.toks) && (p.toks[p.i+1].kind == tkEOF ||
 			p.toks[p.i+1].kind == tkKeyword || (p.toks[p.i+1].kind == tkOp && (p.toks[p.i+1].text == "," || p.toks[p.i+1].text == ")" || p.toks[p.i+1].text == ";"))) {
 			p.i++
 			return Expr{IsDefault: true}, nil
 		}
 		// CAST(expr AS type): the type is skipped, like ::type.
-		if t.text == "cast" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
+		if t.isWord("cast") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
 			p.i += 2
 			e, err := p.parseAddExpr()
 			if err != nil {
@@ -6995,7 +7064,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(castChain(e, []string{name}))
 		}
 		// ARRAY[a, b, ...]: an array value of the elements.
-		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "[" {
+		if t.isWord("array") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "[" {
 			p.i += 2
 			e := Expr{Func: "array_construct"}
 			if !p.consumeOp("]") {
@@ -7016,7 +7085,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(e)
 		}
 		// array(SELECT ...): the subquery's single column as a text array.
-		if t.text == "array" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
+		if t.isWord("array") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
 			p.i++
 			sub, ok, err := p.parseSubquery()
 			if err != nil {
@@ -7029,7 +7098,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			return p.applyCasts(e)
 		}
 		// pg_catalog.f(...): the schema qualifier is dropped.
-		if t.text == "pg_catalog" && p.i+3 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "." &&
+		if t.kind == tkIdent && t.text == "pg_catalog" && p.i+3 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "." &&
 			p.toks[p.i+2].kind == tkIdent && p.toks[p.i+3].kind == tkOp && p.toks[p.i+3].text == "(" {
 			p.i += 2
 			t = p.peek()
@@ -7059,7 +7128,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			}
 			return p.applyCasts(Expr{Agg: &se})
 		}
-		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && t.text != "array" {
+		if p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" && !t.isWord("array") {
 			arity, isFunc := scalarFuncs[t.text]
 			if !isFunc {
 				arity = -2 // unchecked
@@ -7118,6 +7187,13 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			col, err := p.expectIdent()
 			if err != nil {
 				return Expr{}, err
+			}
+			if name == "public" && p.peek().kind == tkOp && p.peek().text == "." && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+				// public.t.c: the only schema's qualifier is dropped
+				// (Prisma qualifies every column so).
+				p.i++
+				name, col = col, p.peek().text
+				p.i++
 			}
 			name += "." + col
 		}
@@ -7215,7 +7291,7 @@ func (p *parser) parseCase() (Expr, error) {
 
 func (p *parser) peekIdentWord(word string) bool {
 	t := p.peek()
-	return t.kind == tkIdent && t.text == word
+	return t.isWord(word)
 }
 
 // parseWith parses WITH [RECURSIVE] name [(cols)] AS (query) [, ...]

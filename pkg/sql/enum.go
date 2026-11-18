@@ -63,7 +63,7 @@ func (s *Session) resolveEnumColumn(ctx context.Context, txn *kvclient.Txn, col 
 // ('happy'::mood) into the enum value, when name is a type of the
 // session's database; ok is false for any other cast name.
 func (s *Session) enumLiteral(ctx context.Context, txn *kvclient.Txn, name string, lit types.Datum) (types.Datum, bool, error) {
-	if _, err := types.ParseType(name); err == nil {
+	if isBuiltinTypeName(name) {
 		return lit, false, nil
 	}
 	if strings.ContainsAny(name, "()[] ") {
@@ -87,6 +87,18 @@ func (s *Session) enumLiteral(ctx context.Context, txn *kvclient.Txn, name strin
 	return v, true, nil
 }
 
+// isBuiltinTypeName reports whether a type name, as the parser hands it
+// over (an unquoted name folded to lower case, a quoted one as
+// written), names a builtin type: a name with an upper-case letter
+// was quoted, and names a user-defined type ("Date" is not date).
+func isBuiltinTypeName(name string) bool {
+	if name != strings.ToLower(name) {
+		return false
+	}
+	_, err := types.ParseType(name)
+	return err == nil
+}
+
 func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *parser.CreateType) (*Result, error) {
 	if err := s.requireV10(types.Enum); err != nil {
 		return nil, err
@@ -102,7 +114,7 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	if _, err := types.ParseType(bare); err == nil {
+	if isBuiltinTypeName(bare) {
 		return nil, newErrf(CodeDuplicateObject, "type %q is a builtin type", bare)
 	}
 	d := &catalog.TypeDescriptor{Name: bare, DatabaseID: dbID, Labels: append([]string{}, t.Labels...), Owner: s.user}

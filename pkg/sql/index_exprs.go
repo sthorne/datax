@@ -564,12 +564,31 @@ func colSlot(id catalog.ColumnID) string { return "c" + strconv.FormatUint(uint6
 
 func exprSlot(text string) string { return "e" + text }
 
+// canonicalExprTexts caches canonicalExprText.
+var canonicalExprTexts sync.Map
+
+// canonicalExprText is a stored expression key's text as FormatExpr
+// renders it today, so a planner conjunct matches it: a key stored
+// before identifiers were quoted in that text (lower(key)) still
+// matches lower("key").
+func canonicalExprText(text string) string {
+	if v, ok := canonicalExprTexts.Load(text); ok {
+		return v.(string)
+	}
+	out := text
+	if e, err := parser.ParseExpr(text); err == nil {
+		out = parser.FormatExpr(e)
+	}
+	canonicalExprTexts.Store(text, out)
+	return out
+}
+
 // indexSlots is the slot of each key column of an index.
 func indexSlots(idx *catalog.IndexDescriptor) []string {
 	out := make([]string, len(idx.ColumnIDs))
 	for i, id := range idx.ColumnIDs {
 		if idx.IsExprKey(i) {
-			out[i] = exprSlot(idx.Exprs[i])
+			out[i] = exprSlot(canonicalExprText(idx.Exprs[i]))
 		} else {
 			out[i] = colSlot(id)
 		}

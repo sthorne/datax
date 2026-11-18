@@ -48,8 +48,8 @@ Open gaps by area and priority.
 |---|---:|---:|---:|---:|
 | [PG: Query language](#query-language) | 0 | 17 | 9 | 26 |
 | [PG: Functions and operators](#functions-and-operators) | 0 | 15 | 6 | 21 |
-| [PG: Types](#types) | 1 | 12 | 15 | 28 |
-| [PG: DDL](#ddl) | 3 | 15 | 6 | 24 |
+| [PG: Types](#types) | 0 | 12 | 16 | 28 |
+| [PG: DDL](#ddl) | 2 | 15 | 6 | 23 |
 | [PG: Programmability](#programmability) | 2 | 3 | 2 | 7 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 12 |
 | [PG: Security](#security) | 0 | 6 | 4 | 10 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 4 |
-| **PostgreSQL total** | **8** | **95** | **68** | **171** |
+| **PostgreSQL total** | **6** | **95** | **69** | **170** |
 | **CockroachDB total** | **2** | **25** | **18** | **45** |
-| **All** | **10** | **120** | **86** | **216** |
+| **All** | **8** | **120** | **87** | **215** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -181,7 +181,7 @@ which do exist: see PG-F-022.
 | PG-T-026 | Expression results lose their declared typmod and describe as the family (`DECIMAL(10,2)` arithmetic is `numeric`; `a + 1` over `INT4` is `INT8`) | silently different (Describe output) | cast | P3 | M | D | — |
 | PG-T-027 | `"char"`, `name` and other internal types behave as `text` | silently different | — | P3 | S | V | — |
 | PG-T-028 | **Cast leftovers**: a schema qualifier on a cast type is ignored (`1::foo.int8` is accepted, PostgreSQL `3F000`); over the extended protocol an unknown cast type fails at Execute, not Parse; casts written in row-level security policy text are not checked when the policy is created; `foo 'lit'` for an unknown `foo` is `42601`, not `42704`; `json` and `jsonb` are one type, so `json \|\| json` merges where PostgreSQL refuses it (`42883`): a deliberate difference, kept | silently different, or a different SQLSTATE | — | P3 | S | V | — |
-| PG-T-029 | **A quoted mixed-case type name is folded to lower case** in column definitions (`r "Role"` reads `role`), so every Prisma schema with an enum fails; `""` inside a quoted identifier is not supported | `42704 type "role" does not exist` | lower-case enum names | P1 | S | V | [#367](https://github.com/sthorne/datax/issues/367) |
+| PG-T-030 | **Identifier-case leftovers**: quoted role names are still folded to lower case; CTE and alias names are lower-cased in some executor paths; arrays of enums are not supported; `'role'::regtype` passes when only `"Role"` exists (PostgreSQL `42704`); an unquoted `nextval('Foo')` is not folded; `'idx'::regclass` does not resolve index names; `pg_get_expr` renders an enum default without its `::"Role"` cast | silently different; `0A000` | lower-case role names | P3 | S | V | — |
 
 ### DDL
 
@@ -209,8 +209,7 @@ which do exist: see PG-F-022.
 | PG-D-028 | `RENAME TO` across databases | refused (user doc) | recreate | P3 | S | D | — |
 | PG-D-029 | **Index leftovers**: pattern operator classes are accepted but do not make `LIKE 'abc%'` use the index; `pg_index.indclass` / `indcollation` are not modelled and `pg_opclass` is empty; `SHOW CREATE TABLE` does not print operator classes or collations; a duplicate index name is `42710` (PostgreSQL `42P07`); a quoted `"concurrently"` index name is read as the keyword; `CREATE INDEX` in a transaction block is refused (`25001`) unless the block created the table, since the online build spans transactions | silently different, or `25001 CREATE INDEX cannot run inside a transaction block` | build the index outside the block | P2 | M | V | — |
 | PG-D-030 | **Index-form and key leftovers**: the planner uses a partial index only when the query repeats the predicate's conjuncts (no implication, no `OR`, no parameter for a literal); an expression index serves `=` and ranges, not `ORDER BY`, `IN` or `LIKE`; zone-dependent expressions (`date_trunc`, timestamp casts) are refused in index expressions even over `timestamp without time zone`; `pg_get_indexdef` prints expressions as written, without PostgreSQL's casts; `DESC` keys are stored ascending, so a mixed-direction `ORDER BY` is sorted; `ALTER TABLE ... ADD PRIMARY KEY` on a table created without one is refused; `ADD COLUMN rowid` on such a table is `42710` | `0A000`; `42P17`; a sort instead of an index order | — | P2 | M | V | — |
-| PG-D-031 | **`ALTER TABLE` leftovers**: a volatile `ADD COLUMN` default and every action that reads rows are refused inside a transaction block (`25001`), even on a table the block created (Rails needs `disable_ddl_transaction!`); a concurrent `INSERT` during `ADD COLUMN ... NOT NULL` without a default fails `23502` instead of waiting; an interrupted online `ALTER` can only be finished by re-running it; `ADD PRIMARY KEY` on a table created without one keeps the hidden rowid as the key and shows a unique index as the primary key | `25001`; `23502` | run the statement outside a block | P2 | M | V | — |
-| PG-D-032 | **Two concurrent online `CREATE INDEX` on one table can lose an index**: both report success and one index is missing, or a build fails with "index vanished during backfill" (`pg_restore -j` hits it) | silently different (an index reported created does not exist) | build indexes on a table one at a time | P1 | M | V | [#368](https://github.com/sthorne/datax/issues/368) |
+| PG-D-031 | **`ALTER TABLE` leftovers**: a volatile `ADD COLUMN` default and every action that reads rows are refused inside a transaction block (`25001`), even on a table the block created (Rails needs `disable_ddl_transaction!`); a concurrent `INSERT` during `ADD COLUMN ... NOT NULL` without a default fails `23502` instead of waiting; an interrupted online `ALTER` can only be finished by re-running it; `DROP DATABASE ... CASCADE` against concurrent `CREATE TABLE` in that database keeps losing (each try runs for tens of seconds before its `40001`) where PostgreSQL's exclusive lock would make the creators wait; `ADD PRIMARY KEY` on a table created without one keeps the hidden rowid as the key and shows a unique index as the primary key | `25001`; `23502` | run the statement outside a block | P2 | M | V | — |
 
 ### Programmability
 
@@ -352,7 +351,7 @@ the empty list commands all render.
 | PG-O-010 | `CHECKPOINT` | `42601 unsupported statement "checkpoint"` | — | P3 | S | V | — |
 | PG-O-011 | Server-side file access: `COPY FROM 'file'`, `pg_read_file`, `pg_ls_dir`, server-side `lo_import` / `lo_export` | `42883 unknown function "pg_read_file"` | client-side `\copy`, `\lo_import` | P3 | S | V | — |
 | PG-O-012 | WAL-based tooling: `pg_basebackup`, WAL archiving, `pg_rewind`, physical standbys | not applicable: datax replicates ranges with Raft and backs up with `datax backup` | `datax backup --revision-history` for point-in-time restore | P3 | — | D | — |
-| PG-O-013 | **pg_dump leftovers**: roles are not dumped and `pg_dumpall` does not work (no `pg_authid`); `pg_restore --single-transaction` fails (`ADD CONSTRAINT` / `CREATE INDEX` refused in a block); `pg_restore -j` is not recommended (PG-D-032, and `40001` on parallel large objects); a dumped sequence resumes after its cached block (a gap); large objects are cluster-wide, so a restore into a second database of the same cluster says "already exists"; grants on `datax_*` tables dump as `ON pg_catalog.datax_x`; DDL within the clock-offset window of the dump's start can fail it with `40001`; only pg_dump 16 is tested | `0A000`; `40001` | create roles first; restore without `-j` | P2 | M | V | — |
+| PG-O-013 | **pg_dump leftovers**: roles are not dumped and `pg_dumpall` does not work (no `pg_authid`); `pg_restore --single-transaction` fails (`ADD CONSTRAINT` / `CREATE INDEX` refused in a block); `pg_restore -j` is not recommended: the catalog snapshot fails large objects with `40001`, `pg_depend` lacks the rows pg_restore orders its workers by, and a foreign key's auto-created index clashes with the dump's `CREATE INDEX` ([#371](https://github.com/sthorne/datax/issues/371)); pg_dump 17 and 18 stop on their first catalog queries ([#370](https://github.com/sthorne/datax/issues/370)); a dumped sequence resumes after its cached block (a gap); large objects are cluster-wide, so a restore into a second database of the same cluster says "already exists"; grants on `datax_*` tables dump as `ON pg_catalog.datax_x`; DDL within the clock-offset window of the dump's start can fail it with `40001`; only pg_dump 16 is tested | `0A000`; `40001` | create roles first; restore without `-j` | P2 | M | V | — |
 
 ---
 
@@ -528,11 +527,13 @@ Useful context when weighing gaps; none of these is a gap.
 ## Closed
 
 Gaps closed recently, newest first. From CHANGELOG 0.58.0 and the merged
-PRs #317–#362 (issue numbers in the changelog are given where the PR
+PRs #317–#369 (issue numbers in the changelog are given where the PR
 carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| Concurrent online `CREATE INDEX` on one table lost an index (was PG-D-032) | PR (this branch) (#368) |
+| Quoted mixed-case type names, `""` in identifiers, quoted keywords, `E''` escapes (was PG-T-029; leftovers are PG-T-030) | PR (this branch) (#367) |
 | Correlated subqueries follow PostgreSQL scoping; grouped correlated subqueries (was PG-Q-031) | PR (this branch) (#361) |
 | `JOIN ... ON` with any condition (was PG-Q-006) | PR (this branch) (#363) |
 | Several actions in one `ALTER TABLE`; `ADD COLUMN` with any default (were PG-D-007, PG-D-008; leftovers are PG-D-031) | PR (this branch) (#364) |
@@ -590,20 +591,17 @@ carried several).
 ## Priorities
 
 The gaps that would most widen what runs unmodified, in order. The
-earlier list's items 1–4 are closed (#361, #363–#366); what is left of
-them is in the rows named above.
+earlier list's items 1–2 are closed (#367, #368); pg_dump 17/18 and
+parallel restore (#370, #371) are tabled for now.
 
-1. **PG-D-032** two concurrent `CREATE INDEX` on one table can lose an
-   index (#368): an index reported created does not exist.
-2. **PG-T-029** quoted mixed-case type names are folded (#367): every
-   Prisma schema with an enum fails.
-3. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
+1. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
    missing function families.
-4. **PG-X-014** advisory locks taken per row (job queues).
-5. **PG-D-031 / PG-O-013** `ALTER TABLE` in transaction blocks and the
-   pg_dump leftovers (roles, single-transaction and parallel restore).
-6. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
-7. **PG-Q-033** a hash join, for large joins without a usable equality.
-8. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
+2. **PG-X-014** advisory locks taken per row (job queues).
+3. **PG-D-031** `ALTER TABLE` actions that read rows, inside transaction
+   blocks (Rails migrations without `disable_ddl_transaction!`).
+4. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
+5. **PG-Q-033** a hash join, for large joins without a usable equality.
+6. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
+7. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
    changefeeds: the large structural gaps that decide whether bigger
    applications can move at all; each is XL and wants a design first.

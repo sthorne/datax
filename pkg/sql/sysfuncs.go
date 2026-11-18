@@ -442,39 +442,8 @@ func (s *Session) relationNameDomain(ctx context.Context, txn *kvclient.Txn) ([]
 	return out, nil
 }
 
-// quoteIdentifier quotes a name when PostgreSQL's quote_ident would: it
-// holds anything but lower-case letters, digits and underscores, starts
-// with a digit, or is a reserved word.
-func quoteIdentifier(s string) string {
-	plain := s != ""
-	for i, r := range s {
-		if !(r == '_' || (r >= 'a' && r <= 'z') || (i > 0 && r >= '0' && r <= '9')) {
-			plain = false
-			break
-		}
-	}
-	if plain && !reservedWords[s] {
-		return s
-	}
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
-// reservedWords are PostgreSQL's reserved keywords (and the type and
-// function names that are reserved for column names), which quote_ident
-// quotes.
-var reservedWords = map[string]bool{}
-
-func init() {
-	for _, w := range strings.Fields(`all analyse analyze and any array as asc asymmetric authorization binary both case cast check collate
-		collation column concurrently constraint create cross current_catalog current_date current_role current_schema current_time
-		current_timestamp current_user default deferrable desc distinct do else end except false fetch for foreign freeze from full
-		grant group having ilike in initially inner intersect into is isnull join lateral leading left like limit localtime
-		localtimestamp natural not notnull null offset on only or order outer overlaps placing primary references returning right
-		select session_user similar some symmetric system_user table tablesample then to trailing true union unique user using
-		variadic verbose when where window with`) {
-		reservedWords[w] = true
-	}
-}
+// quoteIdentifier quotes a name when PostgreSQL's quote_ident would.
+func quoteIdentifier(s string) string { return builtins.QuoteIdent(s) }
 
 // evalSerialSequence is pg_get_serial_sequence(table, column): the
 // sequence a SERIAL, identity or OWNED BY column draws from, as

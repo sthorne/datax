@@ -166,7 +166,7 @@ func (p *parser) parseClusterSetting(show bool) (Statement, error) {
 		sc.Value = "-" + t.text
 	case neg:
 		return nil, p.errf("expected a number after - for cluster setting %s, found %q", name, t.text)
-	case t.kind == tkKeyword && t.text == "DEFAULT" || t.kind == tkIdent && t.text == "default":
+	case t.kind == tkKeyword && t.text == "DEFAULT" || t.isWord("default"):
 		p.i++
 		sc.Default = true
 	case t.kind == tkString || t.kind == tkNumber || t.kind == tkIdent:

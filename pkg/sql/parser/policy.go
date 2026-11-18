@@ -59,7 +59,7 @@ func (p *parser) peekWord(ahead int, word string) bool {
 		return false
 	}
 	t := p.toks[p.i+ahead]
-	return t.kind == tkKeyword && t.text == strings.ToUpper(word) || t.kind == tkIdent && t.text == strings.ToLower(word)
+	return t.kind == tkKeyword && t.text == strings.ToUpper(word) || t.isWord(strings.ToLower(word))
 }
 
 // parseRowSecurity parses what follows ALTER TABLE t: ENABLE | DISABLE |

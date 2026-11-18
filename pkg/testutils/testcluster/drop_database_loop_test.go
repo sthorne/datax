@@ -200,6 +200,13 @@ func TestDropDatabaseCascadeContended(t *testing.T) {
 	tc := Start(t, 3)
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
+	// The contended phase has its own budget, and the drop after it its
+	// own: a drop that keeps losing to the writers runs for tens of
+	// seconds per try before its 40001 (on a slow runner under -race,
+	// long enough to spend the whole test's deadline), and the drop that
+	// must succeed once they stop would then start with none left.
+	contended, cancelContended := context.WithTimeout(ctx, 150*time.Second)
+	defer cancelContended()
 	conn := pgConn(t, ctx, tc, 0)
 	bigDatabase(t, ctx, conn, "busy", 50)
 	id := databaseID(t, ctx, tc, "busy")
@@ -229,11 +236,14 @@ func TestDropDatabaseCascadeContended(t *testing.T) {
 	// While the writers run the drop may lose to them: then it fails
 	// with 40001, having changed nothing.
 	dropped := false
-	for try := 0; try < 3 && !dropped; try++ {
-		_, err := conn.Exec(ctx, `DROP DATABASE busy CASCADE`)
+	for try := 0; try < 3 && !dropped && contended.Err() == nil; try++ {
+		_, err := conn.Exec(contended, `DROP DATABASE busy CASCADE`)
 		if err == nil {
 			dropped = true
 			break
+		}
+		if contended.Err() != nil {
+			break // out of budget for the contended tries; the drop below must succeed
 		}
 		if code := sqlState(err); code != "40001" {
 			t.Fatalf("DROP DATABASE under contention: %v", err)
@@ -246,9 +256,14 @@ func TestDropDatabaseCascadeContended(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+	// A cancelled statement closes its pgx connection, so the rest runs on
+	// a fresh one under its own deadline.
+	final, cancelFinal := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancelFinal()
+	fconn := pgConn(t, final, tc, 0)
 	if !dropped {
-		mustExec(t, ctx, conn, `DROP DATABASE busy CASCADE`)
+		mustExec(t, final, fconn, `DROP DATABASE busy CASCADE`)
 	}
 	t.Logf("%d tables created alongside", created.Load())
-	databaseGone(t, ctx, tc, conn, "busy", id)
+	databaseGone(t, final, tc, fconn, "busy", id)
 }
