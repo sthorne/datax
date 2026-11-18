@@ -1337,8 +1337,10 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// Reads at or below the GC threshold could miss reclaimed versions:
 	// reject them outright — the data is gone at that timestamp; whether
 	// another timestamp will do is the client's to know (the typed
-	// detail lets it tell). GC commands themselves are exempt.
-	if !isGCBatch(ba) {
+	// detail lets it tell). GC commands themselves are exempt, and so are
+	// batches that read no MVCC history at their timestamp (see
+	// readsNoHistory).
+	if !isGCBatch(ba) && !readsNoHistory(ba) {
 		if thr := r.GCThreshold(); !thr.IsEmpty() && readTimestamp(ba).LessEq(thr) {
 			return nil, kvpb.NewBelowGCThresholdError(r.rangeID, readTimestamp(ba), thr)
 		}
@@ -1546,6 +1548,37 @@ func isGCBatch(ba *kvpb.BatchRequest) bool {
 		}
 	}
 	return false
+}
+
+// readsNoHistory reports whether every request in ba works on what is
+// there now — transaction records, which are not versioned, and a
+// transaction's own intents — and none reads MVCC history at the
+// batch's timestamp, so a GC threshold above that timestamp is nothing
+// to them (issue #374). Pushes and intent resolution are stamped with
+// the coordinator's clock when built; one that waits behind a purge's
+// latches, or is built before a wait on the pushee, can find the
+// threshold moved past its stamp. Refusing it left the pusher's own
+// read failing with a GC-threshold error the coordinator does not
+// expect from a push. A heartbeat, a savepoint rollback's intent
+// rewind and an abort carry the transaction's read timestamp, which a
+// purge can overtake; refusing them let the record of a transaction
+// that had already given up stay PENDING until it expired, blocking
+// everyone queued on its intents. A committing EndTxn is not exempt:
+// the commit is what the threshold refuses.
+func readsNoHistory(ba *kvpb.BatchRequest) bool {
+	if len(ba.Requests) == 0 {
+		return false
+	}
+	for _, u := range ba.Requests {
+		switch {
+		case u.PushTxn != nil, u.HeartbeatTxn != nil, u.RecoverTxn != nil,
+			u.ResolveIntent != nil, u.RollbackIntent != nil:
+		case u.EndTxn != nil && !u.EndTxn.Commit:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // mvccWriteSpans returns the spans of the batch's MVCC-writing requests
