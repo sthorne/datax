@@ -468,6 +468,11 @@ func TestDatabaseOptions(t *testing.T) {
 	execSQL(t, ctx, root, `ALTER DATABASE d1 SET TimeZone TO 'America/New_York'`)
 	execSQL(t, ctx, root, `ALTER DATABASE d1 SET app.tenant = 'acme'`)
 	expectCodeSQL(t, ctx, root, `ALTER DATABASE d1 SET nosuch_param = 1`, "42704")
+	// datax's own "database" variable switches a session's database: as a
+	// default it would move every session that connects to d1, an admin's
+	// included, into another database. It is refused as PostgreSQL refuses
+	// a parameter it does not have.
+	expectCodeSQL(t, ctx, root, `ALTER DATABASE d1 SET database = 'defaultdb'`, "42704")
 	expectCodeSQL(t, ctx, root, `ALTER DATABASE d1 SET statement_timeout = 'soon'`, "22023")
 	expectCodeSQL(t, ctx, root, `ALTER DATABASE nosuch SET statement_timeout = '5s'`, "3D000")
 	conn, err := pgx.Connect(ctx, userURL(tc, 0, "alice", "d1"))
