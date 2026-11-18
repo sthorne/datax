@@ -670,10 +670,13 @@ func (s *Session) endTxnVars() {
 }
 
 // readOnly reports whether the statement running now is in a read-only
-// transaction: SET TRANSACTION / BEGIN READ ONLY, or
-// default_transaction_read_only for an implicit or a block's start.
+// transaction: SET TRANSACTION / BEGIN READ ONLY, a historical block,
+// or default_transaction_read_only for an implicit or a block's start.
 func (s *Session) readOnly() bool {
-	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
+	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly) ||
+		// A block pinned in the past (BEGIN AS OF SYSTEM TIME, SET
+		// TRANSACTION SNAPSHOT) can only read.
+		(s.state == StateOpen && s.txn != nil && s.txn.Historical())
 }
 
 // readOnlyViolation refuses a write in a read-only transaction (25006).
@@ -698,6 +701,13 @@ func writeKind(stmt parser.Statement) string {
 		return "DELETE"
 	case *parser.CopyFrom:
 		return "COPY"
+	case *parser.Vacuum:
+		// A bare VACUUM changes nothing; with ANALYZE it writes
+		// statistics, as ANALYZE does.
+		if t.Analyze {
+			return "VACUUM"
+		}
+		return ""
 	case *parser.CopyTo:
 		// COPY (INSERT ... RETURNING) TO writes; COPY t TO reads.
 		if t.Query != nil {

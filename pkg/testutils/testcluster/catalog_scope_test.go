@@ -101,8 +101,8 @@ func TestCatalogsScopedToCurrentDatabase(t *testing.T) {
 				mineSeen := map[string]bool{}
 				for _, name := range names {
 					rows, err := rlsTryRows(ctx, c, `SELECT * FROM `+name)
-					if err != nil && user != "root" && strings.HasPrefix(name, "pg_catalog.datax_") && rlsCode(err) == "42501" {
-						continue // datax's own admin-only catalogs
+					if err != nil && user != "root" && (strings.HasPrefix(name, "pg_catalog.datax_") || name == "pg_catalog.pg_authid") && rlsCode(err) == "42501" {
+						continue // the admin-only catalogs: datax's own, and pg_authid
 					}
 					if err != nil {
 						t.Fatalf("%s: %v", name, err)

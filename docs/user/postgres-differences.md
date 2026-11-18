@@ -21,7 +21,7 @@ syntax error or `0A000` feature not supported):
 | `COPY FROM` options beyond `FORMAT`; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
-| Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
+| Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf`, role management by a `CREATEROLE` role | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; role management takes `admin`; the role attributes `SUPERUSER` (membership in `admin`), `CREATEDB` (`CREATE DATABASE` without `admin`), `CREATEROLE` and `REPLICATION` (recorded, grant nothing), `CONNECTION LIMIT`, `VALID UNTIL` and `BYPASSRLS` ([see below](#things-that-exist-but-behave-differently)) |
 | Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
 | The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT` other than `OWNER TO`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
 | Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify); so are advisory locks, `pg_advisory_lock` and its relatives, cluster-wide: [reference](sql.md#advisory-locks)) |
@@ -396,10 +396,53 @@ syntax error or `0A000` feature not supported):
   owners), takes no column list or options, and stores row counts +
   distinct estimates only — no histograms, no `pg_statistic`. `SHOW
   STATS FOR t` is the (non-PostgreSQL) way to inspect them.
+- **`VACUUM`** is accepted in every form (`VACUUM`, `VACUUM FULL`,
+  `VACUUM ANALYZE t`, `VACUUM (VERBOSE, ANALYZE) t (col)`) and reclaims
+  nothing: datax's MVCC garbage collection drops old row versions on its
+  own once they pass the table's `gc_ttl`, and `ALTER TABLE ... PURGE`
+  drops history on demand ([GC window](sql.md#gc-window-and-purge)).
+  With `ANALYZE` it refreshes statistics as `ANALYZE` does (an admin's;
+  anyone else is warned and skipped). As in PostgreSQL it cannot run in
+  a transaction block (`25001`), a table it names must exist, and a
+  table the role does not own is skipped with a warning.
+- **Role attributes** map onto datax's privilege model. `SUPERUSER` is
+  membership in the built-in `admin` role (`NOSUPERUSER` revokes it;
+  `root` always keeps it), so `rolsuper` is true for every admin.
+  `CREATEDB` lets a role run `CREATE DATABASE` (owned by itself, or by a
+  role it belongs to); it is the role's own, not inherited. `CREATEROLE`
+  and `REPLICATION` are recorded and shown but grant nothing: managing
+  roles takes `admin`, and there is no replication protocol. Only an
+  admin sets any attribute — a role may change its own password and
+  nothing else. `VALID UNTIL` is enforced for password (SCRAM) logins,
+  as in PostgreSQL; a certificate login ignores it, and `'infinity'`
+  shows as `NULL` in `rolvaliduntil`. `CONNECTION LIMIT` (a role's and a
+  database's) counts the sessions **on the node** the client connects
+  to, not the whole cluster; admins are exempt, as superusers are.
+  Nodes running an older release ignore the attributes until they are
+  upgraded. `pg_authid` exists for admins, with `rolpassword` `NULL`.
+- **`CREATE DATABASE`** accepts PostgreSQL's options: `ENCODING` must
+  name UTF8 (any other encoding is refused, `22023`; an unknown name
+  `42704`); `TEMPLATE` takes `template0` or `template1`, which both mean
+  an empty database; `LOCALE`, `LC_COLLATE` and `LC_CTYPE` take `C`,
+  `POSIX`, `C.UTF-8` or `en_US.UTF-8` and are reported in
+  `pg_database` — text still compares bytewise, as in `C`, whatever
+  they say (`42809` for any other locale); `OWNER`, `CONNECTION LIMIT`,
+  `STRATEGY`, `TABLESPACE pg_default`, `ALLOW_CONNECTIONS true` and
+  `IS_TEMPLATE false` are accepted, ICU is not. `ALTER DATABASE ... SET
+  param = value` / `RESET` set a default the database's new sessions
+  start with (applied at connection, as PostgreSQL does; `\drds` and
+  `pg_db_role_setting` do not show them yet); `ALTER DATABASE ...
+  CONNECTION LIMIT`, `SET TABLESPACE pg_default` and `REFRESH COLLATION
+  VERSION` work too.
 - **`AS OF SYSTEM TIME`** exists (CockroachDB syntax, not PostgreSQL) —
   cheap historical/follower reads, including bounded staleness:
-  `AS OF SYSTEM TIME with_max_staleness('10s')` reads the freshest data
-  the local replicas can serve within the bound.
+  `AS OF SYSTEM TIME with_max_staleness('10s')` and
+  `with_min_timestamp('...')` read the freshest data the local replicas
+  can serve within the bound (their `nearest_only` argument must be
+  `FALSE`: a range the node cannot serve goes to its leader), and
+  `follower_read_timestamp()` names a time any replica can serve.
+  `BEGIN AS OF SYSTEM TIME` and `SET TRANSACTION AS OF SYSTEM TIME` pin
+  a whole read-only block ([reference](sql.md#historical-and-follower-reads)).
 - **`LISTEN` / `NOTIFY`** behave as in PostgreSQL on one node and
   reach listeners on every node, with these differences
   ([reference](sql.md#notifications-listen-and-notify)): a notification

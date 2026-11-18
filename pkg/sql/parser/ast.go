@@ -788,6 +788,11 @@ type Select struct {
 	// and ranges that cannot serve it locally fall back to their leader.
 	// Mutually exclusive with AsOf by construction.
 	AsOfMaxStaleness string
+	// AsOfMinTimestamp is with_min_timestamp('...') ("" = none): bounded
+	// staleness with an absolute bound. AsOfNearestOnly is either
+	// form's nearest_only argument.
+	AsOfMinTimestamp string
+	AsOfNearestOnly  bool
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool
@@ -978,6 +983,14 @@ type CreateRole struct {
 	BypassRLS *bool
 	// InRoles are the roles the new role is made a member of (IN ROLE).
 	InRoles []string
+	// Superuser, CreateDB, CreateRole and Replication are the role
+	// attributes of those names (nil = not spelled; NOSUPERUSER etc.
+	// set false). SUPERUSER is membership in the built-in admin role.
+	Superuser, CreateDB, CreateRole, Replication *bool
+	// ConnLimit is CONNECTION LIMIT n (-1 = no limit); ValidUntil is
+	// VALID UNTIL 'timestamp' as written ('infinity' included).
+	ConnLimit  *int64
+	ValidUntil *string
 }
 
 // DropRole is DROP ROLE / DROP USER [IF EXISTS] name [, ...].
@@ -1053,7 +1066,30 @@ type AlterDefaultPrivileges struct {
 // (transaction-scoped SetVars), run once the block is open.
 type Begin struct {
 	Modes []*SetVar
+	// AsOf is BEGIN AS OF SYSTEM TIME (CockroachDB's): a read-only
+	// transaction pinned at a past timestamp. nil when not given.
+	AsOf *AsOfClause
 }
+
+// AsOfClause is an AS OF SYSTEM TIME operand: exactly one of Exact,
+// MaxStaleness and MinTimestamp is set.
+type AsOfClause struct {
+	// Exact is a fixed timestamp: a negative duration ('-5s'), an RFC
+	// 3339 timestamp, Unix nanoseconds, or FollowerReadTimestamp.
+	Exact string
+	// MaxStaleness and MinTimestamp are with_max_staleness('10s') and
+	// with_min_timestamp('...'): bounded staleness, the freshest
+	// timestamp the local replicas serve within the bound.
+	MaxStaleness, MinTimestamp string
+	// NearestOnly is their second argument: TRUE refuses a read the
+	// local replicas cannot serve rather than going to a leader.
+	NearestOnly bool
+}
+
+// SetTransactionAsOf is SET TRANSACTION AS OF SYSTEM TIME operand: the
+// block, before its first query, becomes a read-only transaction at
+// that timestamp.
+type SetTransactionAsOf struct{ AsOf AsOfClause }
 
 type Commit struct{}
 type Rollback struct{}
@@ -1155,6 +1191,22 @@ type Deallocate struct {
 // outside any transaction (chunked frozen-timestamp sweep); admin-only.
 type Analyze struct{ Table string }
 
+// Vacuum is VACUUM in every form PostgreSQL takes: VACUUM [FULL]
+// [FREEZE] [VERBOSE] [ANALYZE] [table [(columns)], ...] and VACUUM
+// (option [value], ...) [table [(columns)], ...]. datax's MVCC garbage
+// collection reclaims space on its own, so only the ANALYZE part does
+// anything (PG-O-003).
+type Vacuum struct {
+	Full, Freeze, Verbose, Analyze bool
+	Tables                         []VacuumTable
+}
+
+// VacuumTable is one table VACUUM names, with its optional column list.
+type VacuumTable struct {
+	Name    string
+	Columns []string
+}
+
 // ShowStats renders the stored statistics for a table (read-only).
 type ShowStats struct{ Table string }
 
@@ -1178,6 +1230,9 @@ type CreateDatabase struct {
 	Name        string
 	IfNotExists bool
 	Placement   *PlacementOptions
+	// Options are PostgreSQL's options (OWNER, ENCODING, TEMPLATE,
+	// LOCALE, CONNECTION LIMIT, ...), in the order written.
+	Options []DatabaseOption
 }
 
 // DropDatabase is DROP DATABASE [IF EXISTS] name [CASCADE | RESTRICT].
@@ -1193,6 +1248,15 @@ type AlterDatabase struct {
 	Name      string
 	NewName   string
 	Placement *PlacementOptions
+	// Set is ALTER DATABASE name SET param = value (a default for the
+	// database's new sessions) or RESET param | ALL (Reset, Name "" for
+	// ALL).
+	Set *SetVar
+	// Options are CONNECTION LIMIT, ALLOW_CONNECTIONS, IS_TEMPLATE and
+	// SET TABLESPACE.
+	Options []DatabaseOption
+	// RefreshCollation is REFRESH COLLATION VERSION.
+	RefreshCollation bool
 }
 
 // ShowPlacement is SHOW PLACEMENT FOR DATABASE name — the policy a
@@ -1271,10 +1335,12 @@ func (*DeclareCursor) stmt()          {}
 func (*Fetch) stmt()                  {}
 func (*CloseCursor) stmt()            {}
 func (*SetTransactionSnapshot) stmt() {}
+func (*SetTransactionAsOf) stmt()     {}
 func (*Unlisten) stmt()               {}
 func (*Notify) stmt()                 {}
 func (*ShowTables) stmt()             {}
 func (*Analyze) stmt()                {}
+func (*Vacuum) stmt()                 {}
 func (*ShowStats) stmt()              {}
 func (*SetVar) stmt()                 {}
 func (*CreateDatabase) stmt()         {}

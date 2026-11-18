@@ -167,7 +167,14 @@ func init() {
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		for _, d := range env.Databases {
-			rows = append(rows, Row{i64(DatabaseOID(d)), str(d.Name), i64(RoleOID(catalog.OwnerOf(d.Owner))), i64(6), str("C"), str("C"), boolean(false), boolean(true), i64(-1), i64(1663), databaseACL(d)})
+			collate, ctype := d.Collate, d.Ctype
+			if collate == "" {
+				collate = "C"
+			}
+			if ctype == "" {
+				ctype = "C"
+			}
+			rows = append(rows, Row{i64(DatabaseOID(d)), str(d.Name), i64(RoleOID(catalog.OwnerOf(d.Owner))), i64(6), str(collate), str(ctype), boolean(false), boolean(true), i64(d.ConnectionLimit()), i64(1663), databaseACL(d)})
 		}
 		return rows, nil
 	})
@@ -939,12 +946,38 @@ func init() {
 			// rolbypassrls is the unconditional exemption: root and the
 			// BYPASSRLS attribute. An admin is exempt like an owner —
 			// unless the table forces row security — so it does not count.
-			rows = append(rows, Row{i64(RoleOID(r.Name)), str(r.Name), boolean(admin), boolean(!r.NoInherit), boolean(admin), boolean(admin), boolean(r.Login), boolean(false),
-				i64(-1), str("********"), null(), boolean(r.BypassRLS || r.Name == catalog.RootRole), null()})
+			// rolsuper is the admin role (SUPERUSER is membership in it);
+			// an admin may create roles and databases whatever its own
+			// CREATEROLE and CREATEDB say.
+			rows = append(rows, Row{i64(RoleOID(r.Name)), str(r.Name), boolean(admin), boolean(!r.NoInherit), boolean(admin || r.CreateRole), boolean(admin || r.CreateDB), boolean(r.Login),
+				boolean(r.Replication || r.Name == catalog.RootRole), i64(r.ConnectionLimit()), str("********"), validUntil(r), boolean(r.BypassRLS || r.Name == catalog.RootRole), null()})
 		}
 		return rows, nil
 	}
 	pg("pg_roles", roleCols, roleRows)
+	// pg_authid: pg_roles' columns in PostgreSQL's pg_authid order, for
+	// admins only (PostgreSQL's is a superuser's); the password column
+	// is NULL, as datax keeps only SCRAM verifiers and shows none.
+	pg("pg_authid", []catalog.Column{
+		col("oid", types.Int), col("rolname", types.String), col("rolsuper", types.Bool), col("rolinherit", types.Bool),
+		col("rolcreaterole", types.Bool), col("rolcreatedb", types.Bool), col("rolcanlogin", types.Bool), col("rolreplication", types.Bool),
+		col("rolbypassrls", types.Bool), col("rolconnlimit", types.Int), col("rolpassword", types.String), col("rolvaliduntil", types.Timestamp),
+	}, func(ctx context.Context, env *Env) ([]Row, error) {
+		if !env.IsAdmin {
+			return nil, &catalog.ValueError{Code: "42501", Msg: "permission denied for table pg_authid"}
+		}
+		rs, err := roleRows(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]Row, len(rs))
+		for i, r := range rs {
+			// oid .. rolreplication, then rolbypassrls, rolconnlimit,
+			// rolpassword (NULL) and rolvaliduntil.
+			out[i] = Row{r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[11], r[8], null(), r[10]}
+		}
+		return out, nil
+	})
 	pg("pg_user", []catalog.Column{col("usename", types.String), col("usesysid", types.Int), col("usecreatedb", types.Bool), col("usesuper", types.Bool), col("userepl", types.Bool), col("usebypassrls", types.Bool), col("passwd", types.String), col("valuntil", types.Timestamp), col("useconfig", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
@@ -958,7 +991,7 @@ func init() {
 					return nil, err
 				}
 				admin := set.IsAdmin()
-				rows = append(rows, Row{str(r.Name), i64(RoleOID(r.Name)), boolean(admin), boolean(admin), boolean(false), boolean(r.BypassRLS || r.Name == catalog.RootRole), str("********"), null(), null()})
+				rows = append(rows, Row{str(r.Name), i64(RoleOID(r.Name)), boolean(admin || r.CreateDB), boolean(admin), boolean(r.Replication || r.Name == catalog.RootRole), boolean(r.BypassRLS || r.Name == catalog.RootRole), str("********"), validUntil(r), null()})
 			}
 			return rows, nil
 		})
@@ -1497,3 +1530,17 @@ func itoa(n int) string {
 
 // empty is the row function of a catalog that is always empty.
 func empty(context.Context, *Env) ([]Row, error) { return nil, nil }
+
+// validUntil is a role's VALID UNTIL for the catalogs: NULL for none
+// (and for infinity, which a timestamp column here cannot hold).
+func validUntil(r *catalog.RoleDescriptor) types.Datum {
+	switch r.ValidUntil {
+	case "", "infinity", "-infinity":
+		return null()
+	}
+	t, err := time.Parse(time.RFC3339Nano, r.ValidUntil)
+	if err != nil {
+		return null()
+	}
+	return types.NewTimestamp(t.UnixNano())
+}

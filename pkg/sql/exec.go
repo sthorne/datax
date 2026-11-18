@@ -189,9 +189,13 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execShowStats(ctx, txn, t)
 	case *parser.LockTable:
 		return s.execLockTable(ctx, txn, t)
-	case *parser.Analyze:
-		// ANALYZE runs a multi-transaction sweep and is intercepted before
-		// execStmt; reaching here means an unsupported calling context.
+	case *parser.Analyze, *parser.Vacuum:
+		// ANALYZE (and VACUUM, which may run it) sweeps in transactions
+		// of its own and is intercepted before execStmt; reaching here
+		// means an unsupported calling context.
+		if _, ok := stmt.(*parser.Vacuum); ok {
+			return nil, newErrf(CodeFeatureNotSupported, "VACUUM cannot run in this context")
+		}
 		return nil, newErrf(CodeFeatureNotSupported, "ANALYZE cannot run in this context")
 	default:
 		return nil, newErrf(CodeFeatureNotSupported, "unsupported statement %T", stmt)

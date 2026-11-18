@@ -79,7 +79,9 @@ func lex(src string) ([]token, error) {
 				l.pos++
 			}
 		case (unicode.IsLetter(rune(c)) || c == '_') && !((c == 'E' || c == 'e') && l.peekAt(1) == '\''):
-			for l.pos < len(l.src) && (unicode.IsLetter(rune(l.src[l.pos])) || unicode.IsDigit(rune(l.src[l.pos])) || l.src[l.pos] == '_') {
+			// A $ continues an identifier, as in PostgreSQL (ident_cont),
+			// so a$$b$$ is one name and never opens a dollar quote.
+			for l.pos < len(l.src) && (unicode.IsLetter(rune(l.src[l.pos])) || unicode.IsDigit(rune(l.src[l.pos])) || l.src[l.pos] == '_' || l.src[l.pos] == '$') {
 				l.pos++
 			}
 			word := l.src[start:l.pos]
@@ -125,16 +127,25 @@ func lex(src string) ([]token, error) {
 				return nil, &SyntaxError{Msg: `zero-length delimited identifier at or near """"`, Pos: start, Code: "42601"}
 			}
 			l.toks = append(l.toks, token{kind: tkIdent, text: sb.String(), pos: start, quoted: true})
-		case c == '$':
+		case c == '$' && isDigit(l.peekAt(1)):
+			// A parameter, $n. PostgreSQL's param_junk rule refuses one
+			// run into an identifier character ($1abc, $1$): it is
+			// neither a parameter nor the start of a dollar quote.
 			l.pos++
 			numStart := l.pos
-			for l.pos < len(l.src) && unicode.IsDigit(rune(l.src[l.pos])) {
+			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
 				l.pos++
 			}
-			if l.pos == numStart {
-				return nil, fmt.Errorf("invalid parameter at position %d", start)
+			if l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+				return nil, &SyntaxError{Msg: `trailing junk after parameter at or near "` + l.src[start:l.pos+1] + `"`, Pos: start, Code: "42601"}
 			}
 			l.toks = append(l.toks, token{kind: tkParam, text: l.src[numStart:l.pos], pos: start})
+		case c == '$':
+			text, err := l.dollarQuoted(start)
+			if err != nil {
+				return nil, err
+			}
+			l.toks = append(l.toks, token{kind: tkString, text: text, pos: start})
 		default:
 			// Multi-char operators first (longest match: ->> before ->,
 			// which the comment case above already can't shadow).
@@ -185,6 +196,44 @@ func lex(src string) ([]token, error) {
 		}
 	}
 }
+
+// dollarQuoted reads a dollar-quoted string literal, $$...$$ or
+// $tag$...$tag$, starting at the opening $ (PostgreSQL's dolqdelim: a
+// tag is an identifier without $, its case significant). The body is
+// taken exactly as written: no escapes, quotes and backslashes are
+// ordinary characters. A $ that opens no delimiter is a syntax error,
+// as in PostgreSQL.
+func (l *lexer) dollarQuoted(start int) (string, error) {
+	end := start + 1
+	if end < len(l.src) && isIdentStart(l.src[end]) {
+		end++
+		for end < len(l.src) && isIdentCont(l.src[end]) && l.src[end] != '$' {
+			end++
+		}
+	}
+	if end >= len(l.src) || l.src[end] != '$' {
+		return "", &SyntaxError{Msg: `syntax error at or near "$"`, Pos: start, Code: "42601"}
+	}
+	delim := l.src[start : end+1]
+	bodyStart := end + 1
+	i := strings.Index(l.src[bodyStart:], delim)
+	if i < 0 {
+		return "", &SyntaxError{Msg: `unterminated dollar-quoted string at or near "` + l.src[start:] + `"`, Pos: start, Code: "42601"}
+	}
+	l.pos = bodyStart + i + len(delim)
+	return l.src[bodyStart : bodyStart+i], nil
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// isIdentStart and isIdentCont are PostgreSQL's ident_start and
+// ident_cont: ASCII letters, _, any byte of a multibyte character, and
+// (to continue) digits and $.
+func isIdentStart(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c >= 0x80
+}
+
+func isIdentCont(c byte) bool { return isIdentStart(c) || isDigit(c) || c == '$' }
 
 func (l *lexer) peekAt(off int) byte {
 	if l.pos+off < len(l.src) {

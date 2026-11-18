@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -83,6 +84,22 @@ type RoleDescriptor struct {
 	// its row-security policies say (cluster version v21). The attribute
 	// belongs to the role itself and is not inherited through membership.
 	BypassRLS bool `json:"bypassrls,omitempty"`
+	// CreateDB: the role may create databases without the admin role
+	// (CREATEDB). Like PostgreSQL's, the attribute is the role's own and
+	// is not inherited through membership.
+	CreateDB bool `json:"createdb,omitempty"`
+	// CreateRole and Replication record CREATEROLE and REPLICATION for
+	// the catalogs; they grant nothing (role management takes the admin
+	// role, and there is no replication protocol).
+	CreateRole  bool `json:"createrole,omitempty"`
+	Replication bool `json:"replication,omitempty"`
+	// ConnLimit is CONNECTION LIMIT: how many sessions the role may have
+	// open at once on one node; nil or -1 for no limit.
+	ConnLimit *int64 `json:"conn_limit,omitempty"`
+	// ValidUntil is VALID UNTIL: the time (RFC 3339, UTC) after which
+	// the role's password no longer authenticates, or "infinity"; ""
+	// for none.
+	ValidUntil string `json:"valid_until,omitempty"`
 	// Verifier is the SCRAM verifier (security.MarshalVerifier's JSON;
 	// never a plaintext password); empty for a role without a password.
 	Verifier json.RawMessage `json:"verifier,omitempty"`
@@ -101,7 +118,33 @@ func (r *RoleDescriptor) Clone() *RoleDescriptor {
 	out := *r
 	out.Verifier = append(json.RawMessage(nil), r.Verifier...)
 	out.MemberOf = append([]RoleMembership(nil), r.MemberOf...)
+	if r.ConnLimit != nil {
+		n := *r.ConnLimit
+		out.ConnLimit = &n
+	}
 	return &out
+}
+
+// ConnectionLimit is the role's CONNECTION LIMIT, -1 for none.
+func (r *RoleDescriptor) ConnectionLimit() int64 {
+	if r.ConnLimit == nil {
+		return -1
+	}
+	return *r.ConnLimit
+}
+
+// PasswordExpired reports whether the role's VALID UNTIL has passed at
+// now: its password no longer authenticates.
+func (r *RoleDescriptor) PasswordExpired(now time.Time) bool {
+	switch r.ValidUntil {
+	case "", "infinity":
+		return false
+	case "-infinity":
+		return true
+	}
+	t, err := time.Parse(time.RFC3339Nano, r.ValidUntil)
+	// An unreadable value fails closed: the password is refused.
+	return err != nil || !now.Before(t)
 }
 
 // IsMemberOf reports whether the role is a direct member of role, and
