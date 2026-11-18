@@ -147,9 +147,29 @@ var pgVarList = []pgVar{
 		return nil
 	}},
 
-	// Preset options: what the server is, never changed.
+	// Preset options: what the server is, never changed (PostgreSQL 14's,
+	// the version datax reports: lc_collate and lc_ctype are settings
+	// there).
 	{name: "server_version_num", vartype: "integer", boot: "140000", min: 140000, max: 140000, context: "internal"},
 	{name: "max_identifier_length", vartype: "integer", boot: "63", min: 63, max: 63, context: "internal"},
+	{name: "block_size", vartype: "integer", boot: "8192", min: 8192, max: 8192, context: "internal"},
+	{name: "wal_block_size", vartype: "integer", boot: "8192", min: 8192, max: 8192, context: "internal"},
+	{name: "segment_size", vartype: "integer", unit: "8kB", boot: "131072", min: 131072, max: 131072, context: "internal"},
+	{name: "max_function_args", vartype: "integer", boot: "100", min: 100, max: 100, context: "internal"},
+	{name: "max_index_keys", vartype: "integer", boot: "32", min: 32, max: 32, context: "internal"},
+	{name: "data_checksums", vartype: "bool", boot: "off", context: "internal"},
+	{name: "lc_collate", vartype: "string", boot: "C", context: "internal"},
+	{name: "lc_ctype", vartype: "string", boot: "C", context: "internal"},
+	// A node is never a hot standby: every replica serves reads and
+	// writes through its range's leaseholder.
+	{name: "in_hot_standby", vartype: "bool", boot: "off", context: "internal"},
+	// Reported at startup (GUC_REPORT) and left out of SHOW ALL, as in
+	// PostgreSQL: whether the session user is a superuser (root or an
+	// admin) and who it is. SET SESSION AUTHORIZATION is not supported.
+	{name: "is_superuser", vartype: "bool", boot: "off", context: "internal", noShowAll: true,
+		show: func(s *Session) string { return onOff(s.superuser()) }},
+	{name: "session_authorization", vartype: "string", boot: "", context: "internal", noShowAll: true,
+		show: func(s *Session) string { return s.sessionUser }},
 }
 
 // pgVars is pgVarList by name.

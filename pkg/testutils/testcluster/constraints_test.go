@@ -88,7 +88,7 @@ func TestConstraints(t *testing.T) {
 	expect("check constraints in the catalog",
 		execSQL(t, ctx, s, `SELECT conname, contype, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'items'::regclass AND contype = 'c' ORDER BY conname`),
 		"items_name_check|c|t|CHECK (length(name) < 10)", "items_qty_check|c|t|CHECK (qty > 0)", "price_ok|c|t|CHECK (price >= 0 OR price IS NULL)")
-	expect("information_schema.check_constraints", execSQL(t, ctx, s, `SELECT check_clause FROM information_schema.check_constraints WHERE constraint_name = 'price_ok'`), "price >= 0 OR price IS NULL")
+	expect("information_schema.check_constraints", execSQL(t, ctx, s, `SELECT check_clause FROM information_schema.check_constraints WHERE constraint_name = 'price_ok'`), "(price >= 0 OR price IS NULL)")
 	if r := execSQL(t, ctx, s, `SHOW CREATE TABLE items`); !strings.Contains(r.Rows[0][1].S, "CONSTRAINT price_ok CHECK (price >= 0 OR price IS NULL)") {
 		t.Fatalf("SHOW CREATE TABLE: %s", r.Rows[0][1].S)
 	}

@@ -101,6 +101,20 @@ func (s *Session) lookupForPlan(ctx context.Context, name string) (*catalog.Tabl
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
+	cols, serr := s.planColumns(ctx, stmt)
+	if sel, ok := stmt.(*parser.Select); ok && serr == nil && len(cols) == len(sel.Exprs) {
+		// A catalog function's call is named as execution names it
+		// (resolveSelectSubs): pg_get_indexdef, not ?column?.
+		for i, se := range sel.Exprs {
+			if !se.Star && se.Alias == "" && catalogRenderingFuncs[se.Expr.Func] && cols[i].Name == "?column?" {
+				cols[i].Name = se.Expr.Func
+			}
+		}
+	}
+	return cols, serr
+}
+
+func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
 	expanded, err := s.expandViews(ctx, nil, stmt)
 	if err != nil {
 		return nil, ToSQLError(err)

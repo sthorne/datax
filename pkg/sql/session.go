@@ -174,6 +174,9 @@ type Session struct {
 	// identity. user is the current role — the session user, or the role
 	// SET ROLE selected (current_user vs session_user).
 	sessionUser string
+	// isSuperuser is whether sessionUser is a superuser, read when the
+	// connection starts (StartupParams; nil until then).
+	isSuperuser *bool
 	user        string
 	// privAs, when set, is the role privilege checks run as instead of
 	// user: a view's owner while its query executes (cte.go).
@@ -333,6 +336,7 @@ func (s *Session) SetUser(user string) {
 		user = "root"
 	}
 	s.sessionUser = user
+	s.isSuperuser = nil
 	s.vars.role = ""
 	s.applyRole()
 }
@@ -517,7 +521,7 @@ const (
 // gathered only for the tables the reader may read rows of, and a
 // sequence's counter only for one it may read.
 func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables, filtered bool) (*vtable.Env, error) {
-	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
+	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Now: s.statementTime()}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err

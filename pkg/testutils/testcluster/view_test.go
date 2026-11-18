@@ -143,7 +143,7 @@ func TestViews(t *testing.T) {
 	expect(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'names') ORDER BY attnum`, "who")
 	expect(`SELECT schemaname, viewname, definition FROM pg_views`, "public|names|SELECT name FROM customers WHERE id > 1")
 	expect(`SELECT table_name, table_type, is_insertable_into FROM information_schema.tables WHERE table_name IN ('names', 'customers') ORDER BY table_name`, "customers|BASE TABLE|YES;names|VIEW|NO")
-	expect(`SELECT table_name, view_definition FROM information_schema.views`, "names|SELECT name FROM customers WHERE id > 1")
+	expect(`SELECT table_name, view_definition FROM information_schema.views`, "names|SELECT name FROM customers WHERE id > 1;")
 	expect(`SHOW VIEWS`, "names|SELECT name FROM customers WHERE id > 1")
 	expect(`SHOW CREATE VIEW names`, "names|CREATE VIEW names (who) AS SELECT name FROM customers WHERE id > 1")
 	if r := execSQL(t, ctx, s, `SHOW TABLES`); strings.Contains(rowsText(r), "names") {

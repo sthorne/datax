@@ -337,7 +337,27 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		d := types.NewString("root")
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_table_is_visible":
-		d := types.NewBool(true)
+		// Every relation is on the search path but information_schema's
+		// views, which PostgreSQL's search path leaves out.
+		hidden := vtable.InformationSchemaClassOIDs()
+		if len(e.Args) == 1 && e.Args[0].Column != "" && len(e.Args[0].Path) == 0 && e.Args[0].BinOp == "" {
+			vals := make([]parser.Expr, len(hidden))
+			for i, oid := range hidden {
+				d := types.NewInt(oid)
+				vals[i] = parser.Expr{Lit: &d}
+			}
+			out = parser.Expr{Cmp: &parser.Comparison{Column: e.Args[0].Column, Op: "NOT IN", Values: vals}}
+			break
+		}
+		visible := true
+		if len(e.Args) == 1 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+			if oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text()); err == nil {
+				for _, h := range hidden {
+					visible = visible && oid != h
+				}
+			}
+		}
+		d := types.NewBool(visible)
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_partition_ancestors":
 		// No partitions: a relation's only ancestor is itself. The
@@ -389,21 +409,30 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
 	case "format_type", "pg_get_indexdef", "pg_get_constraintdef", "pg_get_expr", "pg_get_viewdef", "obj_description", "col_description":
-		// pg_get_viewdef(oid [, pretty]), obj_description(oid, class) and
-		// col_description(oid, attnum) on a LITERAL OID (psql's \d+)
-		// resolve from the descriptor here.
-		if literal := e.Func == "pg_get_viewdef" || e.Func == "obj_description" || e.Func == "col_description"; literal && len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
+		// pg_get_viewdef(oid [, pretty]), pg_get_indexdef(oid [, col,
+		// pretty]), pg_get_constraintdef(oid [, pretty]),
+		// obj_description(oid, class) and col_description(oid, attnum) on
+		// a LITERAL OID (psql's \d+, a tool's per-object call) resolve
+		// from the descriptor here.
+		if literal := e.Func != "format_type" && e.Func != "pg_get_expr"; literal && len(e.Args) > 0 && e.Args[0].Lit != nil && !e.Args[0].Lit.Null {
 			oid, err := s.regclassOID(ctx, txn, e.Args[0].Lit.Text())
 			if err != nil {
 				return e, err
 			}
 			d := types.DNull
-			if e.Func == "pg_get_viewdef" {
+			switch e.Func {
+			case "pg_get_viewdef":
 				if desc, rerr := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); rerr == nil && desc != nil && desc.IsView() {
 					d = types.NewString(vtable.ViewDef(desc.ViewQuery))
 				}
-			} else if text := s.descriptionOf(ctx, txn, oid, e); text != "" {
-				d = types.NewString(text)
+			case "pg_get_indexdef", "pg_get_constraintdef":
+				if text, ok := s.indexOrConstraintDef(ctx, txn, e, oid); ok {
+					d = types.NewString(text)
+				}
+			default:
+				if text := s.descriptionOf(ctx, txn, oid, e); text != "" {
+					d = types.NewString(text)
+				}
 			}
 			out.Func, out.Args, out.Lit = "", nil, &d
 			break
@@ -1019,6 +1048,12 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
 		}
 		c.Exprs[i].Expr = v
+		if se.Alias == "" && catalogRenderingFuncs[se.Expr.Func] && v.Func == "" {
+			// A catalog function that became its row's hidden rendering
+			// or a constant keeps its name as the output column's, as
+			// PostgreSQL names a call (pg_get_indexdef, not __indexdef).
+			c.Exprs[i].Alias = se.Expr.Func
+		}
 	}
 
 	having, err := s.resolveWhereSubs(ctx, txn, t.Having, params)
@@ -1650,9 +1685,74 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 		return 0, err
 	}
 	if r == nil {
+		// An index is a relation too ('t_pkey'::regclass).
+		if oid, ok, err := s.indexOIDByName(ctx, txn, text); err != nil {
+			return 0, err
+		} else if ok {
+			return oid, nil
+		}
 		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
 	}
 	return r.oid, nil
+}
+
+// catalogRenderingFuncs are the catalog functions a select item's call
+// resolves to a rendering before execution.
+var catalogRenderingFuncs = map[string]bool{
+	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
+	"pg_get_viewdef": true, "obj_description": true, "col_description": true,
+}
+
+// indexOIDByName resolves an index of the current database's public
+// schema by name to its pg_class OID.
+func (s *Session) indexOIDByName(ctx context.Context, txn *kvclient.Txn, text string) (int64, bool, error) {
+	parts, ok := parseQualifiedName(text)
+	if !ok || len(parts) > 2 || len(parts) == 2 && parts[0] != catalog.PublicSchema {
+		return 0, false, nil
+	}
+	name := parts[len(parts)-1]
+	db, err := s.cat.Database(ctx, txn, s.database)
+	if err != nil || db == nil {
+		return 0, false, nil
+	}
+	tables, err := s.cat.ListIn(ctx, txn, db)
+	if err != nil {
+		return 0, false, ToSQLError(err)
+	}
+	for _, t := range tables {
+		if oid, ok := vtable.IndexOIDByName(t, name); ok {
+			return oid, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// indexOrConstraintDef is pg_get_indexdef(oid [, col, pretty]) or
+// pg_get_constraintdef(oid [, pretty]) for a literal OID (false: no
+// index or constraint has it, and the call is NULL).
+func (s *Session) indexOrConstraintDef(ctx context.Context, txn *kvclient.Txn, e parser.Expr, oid int64) (string, bool) {
+	if oid>>16 == 0 {
+		return "", false
+	}
+	desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid>>16))
+	if err != nil || desc == nil {
+		return "", false
+	}
+	byID := func(id uint64) *catalog.TableDescriptor {
+		d, err := catalog.ReadTable(ctx, txn, id)
+		if err != nil {
+			return nil
+		}
+		return d
+	}
+	if e.Func == "pg_get_constraintdef" {
+		return vtable.ConstraintDefByOID(desc, oid, byID)
+	}
+	col := int64(0)
+	if len(e.Args) > 1 && e.Args[1].Lit != nil && e.Args[1].Lit.Fam == types.Int {
+		col = e.Args[1].Lit.I
+	}
+	return vtable.IndexDefByOID(desc, oid, int(col))
 }
 
 // descriptionOf resolves obj_description(oid, class) / col_description

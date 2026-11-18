@@ -2127,7 +2127,7 @@ invalid value `22023`:
 | `bytea_output` | `hex` (default), `escape` | the text format of a `BYTEA` column on the wire |
 | `client_min_messages` | `debug5` ... `debug1`, `log`, `notice` (default), `warning`, `error` | at `warning` or `error`, `NOTICE`s are not sent |
 | `row_security` | `on` (default), `off` | `off` refuses (`42501`) a query that a table's row-level security policies would filter, as `pg_dump` expects |
-| `server_version_num`, `max_identifier_length` | `140000`, `63` | read only (`55P02`) |
+| `server_version_num`, `max_identifier_length`, `block_size`, `max_index_keys`, `max_function_args`, `lc_collate`, `lc_ctype`, `in_hot_standby`, `is_superuser`, `session_authorization`, ... | `140000`, `63`, `8192`, `32`, `100`, `C`, `C`, `off`, whether the session user is root or an admin, its name | read only (`55P02`) |
 | PostgreSQL's other common settings: `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `lc_*`, `default_transaction_isolation`, ... | PostgreSQL's values, checked as PostgreSQL checks them | accepted, kept and reported, with no effect: the list is in [Differences from PostgreSQL](postgres-differences.md) |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
@@ -2539,10 +2539,11 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pgcrypto`, `uuid-ossp` and `vector`, always installed)
 (and empty stand-ins for the catalogs of features datax lacks —
 publications, functions, triggers, operator classes and
-families, `pg_amop`, `pg_amproc`, ...), plus
-`information_schema.schemata`, `tables`, `views`, `columns`,
-`table_constraints`, `key_column_usage`, `statistics` and
-`role_table_grants`. OIDs are stable across the cluster (a table's is its
+families, `pg_amop`, `pg_amproc`, ...), plus `pg_timezone_names` and `pg_timezone_abbrevs`, and every view of
+PostgreSQL 16's `information_schema` (`tables`, `columns`, `views`,
+`sequences`, `table_constraints`, `key_column_usage`,
+`table_privileges`, `role_table_grants`, `routines`, ..., the ones for
+features datax lacks empty) and MySQL's `information_schema.statistics`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it); a catalog whose rows have OIDs
 also has PostgreSQL's `tableoid` system column (not in `*`). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
