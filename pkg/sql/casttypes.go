@@ -42,14 +42,20 @@ func castTypeNames(stmt parser.Statement) []string {
 			w.Conds(t.Constraints[i].CheckFails)
 		}
 	case *parser.AlterTable:
-		if t.AddCol != nil {
-			column(t.AddCol)
+		cmds := t.Cmds
+		if cmds == nil {
+			cmds = []*parser.AlterTable{t}
 		}
-		if t.SetDefault != nil && t.SetDefault.Expr != nil {
-			w.WalkExpr(t.SetDefault.Expr)
-		}
-		if t.AddConstraint != nil {
-			w.Conds(t.AddConstraint.CheckFails)
+		for _, t := range cmds {
+			if t.AddCol != nil {
+				column(t.AddCol)
+			}
+			if t.SetDefault != nil && t.SetDefault.Expr != nil {
+				w.WalkExpr(t.SetDefault.Expr)
+			}
+			if t.AddConstraint != nil {
+				w.Conds(t.AddConstraint.CheckFails)
+			}
 		}
 	}
 	return names

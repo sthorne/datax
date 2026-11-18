@@ -265,3 +265,59 @@ func TestParseTextSearch(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableActionList: ALTER TABLE takes several actions
+// separated by commas (issue #364), each parsed as an AlterTable of its
+// own in written order; one action stays on the statement itself. ONLY,
+// IF EXISTS and t * are accepted; RENAME and OWNER TO stand alone.
+func TestParseAlterTableActionList(t *testing.T) {
+	at := parseOne(t, `ALTER TABLE IF EXISTS ONLY public.t ADD COLUMN a INT8, ADD "b" character varying DEFAULT 'x' NOT NULL,
+		DROP COLUMN c, ALTER COLUMN d SET DEFAULT 1, ALTER d DROP NOT NULL, ADD CONSTRAINT k CHECK (a > 0),
+		ALTER COLUMN e TYPE TEXT, DROP CONSTRAINT IF EXISTS old, ENABLE ROW LEVEL SECURITY, VALIDATE CONSTRAINT v`).(*AlterTable)
+	if at.Table != "t" || !at.IfExists || !at.Only || len(at.Cmds) != 10 || at.AddCol != nil {
+		t.Fatalf("action list: %+v", at)
+	}
+	c := at.Cmds
+	switch {
+	case c[0].AddCol == nil || c[0].AddCol.Name != "a",
+		c[1].AddCol == nil || c[1].AddCol.Name != "b" || !c[1].AddCol.NotNull || c[1].AddCol.Default == nil,
+		c[2].DropCol != "c",
+		c[3].SetDefault == nil || c[3].SetDefault.Column != "d",
+		c[4].DropNotNull != "d",
+		c[5].AddConstraint == nil || c[5].AddConstraint.Name != "k",
+		c[6].SetType == nil || c[6].SetType.Column != "e",
+		c[7].DropConstraint != "old" || !c[7].DropConstraintIfExists,
+		c[8].RowSecurity != "enable",
+		c[9].ValidateConstraint != "v":
+		t.Fatalf("actions: %+v %+v %+v %+v %+v %+v %+v %+v %+v %+v", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9])
+	}
+	for _, cmd := range c {
+		if cmd.Table != "t" || !cmd.IfExists || !cmd.Only || cmd.Cmds != nil {
+			t.Fatalf("action carries the statement's table and flags: %+v", cmd)
+		}
+	}
+
+	at = parseOne(t, `ALTER TABLE ONLY t ADD COLUMN a INT8`).(*AlterTable)
+	if !at.Only || at.Cmds != nil || at.AddCol == nil {
+		t.Fatalf("one action: %+v", at)
+	}
+	at = parseOne(t, `ALTER TABLE t * DROP COLUMN a, DROP COLUMN b`).(*AlterTable)
+	if at.Only || len(at.Cmds) != 2 {
+		t.Fatalf("t *: %+v", at)
+	}
+	// A table named only is still a table name.
+	at = parseOne(t, `ALTER TABLE only ADD COLUMN a INT8`).(*AlterTable)
+	if at.Table != "only" || at.Only {
+		t.Fatalf("table named only: %+v", at)
+	}
+	for _, q := range []string{
+		`ALTER TABLE t ADD COLUMN a INT8, RENAME COLUMN b TO c`,
+		`ALTER TABLE t RENAME COLUMN b TO c, ADD COLUMN a INT8`,
+		`ALTER TABLE t ADD COLUMN a INT8, OWNER TO bob`,
+		`ALTER TABLE t ADD COLUMN a INT8,`,
+	} {
+		if _, err := Parse(q); err == nil {
+			t.Fatalf("%s: parsed", q)
+		}
+	}
+}

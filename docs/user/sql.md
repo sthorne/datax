@@ -112,7 +112,10 @@ CREATE INDEX by_body ON t USING GIN (to_tsvector('english', body));  -- a full-t
 CREATE INDEX [IF NOT EXISTS] by_vec ON t USING ivfflat (v vector_l2_ops) WITH (lists = 100);  -- nearest-neighbour search (below)
 DROP INDEX [CONCURRENTLY] [IF EXISTS] by_b;             -- entries reclaimed after the commit
 ALTER INDEX [IF EXISTS] by_b RENAME TO by_b2;
-ALTER TABLE [IF EXISTS] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy; NOT NULL requires DEFAULT; constants only
+ALTER TABLE [IF EXISTS] [ONLY] t ADD COLUMN [IF NOT EXISTS] d INT8 DEFAULT 0; -- lazy: existing rows read the default
+ALTER TABLE t ADD COLUMN at TIMESTAMPTZ NOT NULL DEFAULT now();       -- evaluated once: every existing row gets the ALTER's time
+ALTER TABLE t ADD COLUMN ref UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE;  -- volatile: a value per existing row (online backfill)
+ALTER TABLE t ADD COLUMN a INT8, DROP COLUMN b, ALTER COLUMN c SET DEFAULT 1;  -- several actions: in order, one change (below)
 ALTER TABLE t DROP COLUMN [IF EXISTS] d;                -- refused for PK columns; drops the indexes that use d
 ALTER TABLE t RENAME TO t2;                             -- foreign keys and sequences follow (they use IDs)
 ALTER TABLE t RENAME [COLUMN] b TO body;                -- CHECK constraints, index expressions and predicates are rewritten
@@ -452,6 +455,70 @@ view uses, and columns drawing from a sequence are otherwise refused
 (`0A000`) — drop or replace those first. Not inside a transaction block
 (`25001`); cluster version v9.
 
+**Several actions in one `ALTER TABLE`** (`ALTER TABLE t ADD COLUMN a
+INT8, ADD COLUMN b TEXT NOT NULL DEFAULT '', DROP COLUMN c, ALTER COLUMN
+d SET DEFAULT 1, ADD CONSTRAINT ...`, as Rails' `change_table bulk:
+true`, Prisma and pg_dump write them) apply in written order, as one
+schema change: a later action sees the earlier ones (a column added
+first can be given a default or a constraint further on), and if any
+action fails nothing is applied. When every action only changes the
+descriptor — `ADD COLUMN` with no default, a constant one or one
+evaluated once, `DROP COLUMN`, `SET` / `DROP DEFAULT`, `DROP NOT NULL`,
+`DROP CONSTRAINT`, `ENABLE` / `DISABLE ROW LEVEL SECURITY` — the
+statement is one descriptor write, inside a transaction block too. When
+an action needs the table's rows — `ADD CONSTRAINT`, `VALIDATE
+CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`, an `ADD COLUMN` with a
+volatile default, with `NOT NULL` and no default, with `SERIAL` or with
+a constraint of its own — the statement runs online, outside a
+transaction block (`25001` inside one, naming the action): the pieces
+that need the rows are published write-only together (the new columns
+hidden, filled by every insert), the rows are read once for all of them
+in bounded chunks, and one last descriptor write makes everything
+visible and applies the rest. A failure while the rows are read (a
+`CHECK` a row breaks, a duplicate for a `UNIQUE`, a `NULL` for `NOT
+NULL`, a value a type cannot take) undoes the whole statement. A
+combination that cannot be made one change this way is refused with
+`0A000`, naming the action: `SET (...)`, `RESET`, `PURGE`, `ROTATE
+ENCRYPTION KEY`, `SPLIT AT` and `UNSPLIT` beside other actions, `ADD
+CONSTRAINT x` after `DROP CONSTRAINT x`, a constraint over a column
+the statement retypes, `ALTER COLUMN TYPE` of a column the statement
+adds, and `ADD COLUMN x` after `DROP COLUMN x` when the statement reads
+the rows. `RENAME` and `OWNER TO` stand alone (`42601`), as in
+PostgreSQL's grammar, as does altering one column's type twice.
+`ALTER TABLE ONLY t` and `ALTER TABLE t *` are accepted and the same as
+`ALTER TABLE t` (no table has descendants).
+
+**`ADD COLUMN` with a default** gives the existing rows the value
+PostgreSQL gives them. A constant, or an expression without volatile
+functions (`now()`, `current_user`, `1 + 2`), is evaluated once, by the
+`ALTER`: every existing row reads that value — `DEFAULT now()` is the
+`ALTER`'s time for all of them — and no row is rewritten; later inserts
+evaluate the expression themselves. A volatile expression
+(`gen_random_uuid()`, `random()`, `clock_timestamp()`, `nextval`, and
+`SERIAL` or an identity) is evaluated for each existing row, afresh,
+by a backfill in the shape of `CREATE INDEX`'s: the column is published
+hidden and write-only (every insert fills it; an update keeps what the
+row has), the existing rows are filled in bounded chunks, each a
+transaction of its own that re-reads its rows and fills only those that
+lack the column, and the column then becomes visible. `now()` inside a
+volatile expression is the `ALTER`'s time for every row. `NOT NULL` is
+checked as the rows are filled (`23502`, `column "c" of relation "t"
+contains null values`, and nothing is added), and a `UNIQUE` column's
+index is built and checked after the fill (`23505`). `ADD COLUMN ...
+NOT NULL` with no default succeeds on an empty table and fails with
+`23502` on one with rows, as in PostgreSQL; while it runs, an insert
+that gives the hidden column no value fails with `23502` too. The
+backfill is crash-safe: if the gateway running the statement stops,
+the table keeps working as before (the column stays hidden, inserts
+keep filling it) and the descriptor keeps the statement's plan; running
+the same statement again resumes it — rows filled already keep their
+values — and says so in a notice. Until then another `ALTER TABLE` of
+the table that reads its rows is refused (`55006`), and so is adding a
+column of the same name. A volatile default cannot be given inside a
+transaction block (`25001`); in a Rails migration, add the column in a
+migration with `disable_ddl_transaction!`. The online forms need
+cluster version v22.
+
 **`COMMENT ON TABLE | VIEW | INDEX | COLUMN ... IS 'text' | NULL`**
 and **`COMMENT ON CONSTRAINT name ON table IS ...`** store the text in
 the descriptor; `obj_description`, `col_description` and
@@ -464,7 +531,8 @@ changes and type rewrites.
 **DDL in transaction blocks.** A statement that is one descriptor
 write runs inside `BEGIN ... COMMIT` like any other and commits or rolls
 back with the block: `CREATE TABLE`, `DROP TABLE`, `ADD` / `DROP
-COLUMN`, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
+COLUMN` (except an `ADD COLUMN` that fills or checks the existing rows,
+above), an `ALTER TABLE` of several such actions, every `RENAME`, `SET` / `DROP DEFAULT`, `DROP CONSTRAINT`,
 `DROP NOT NULL`, `DROP INDEX`, `TRUNCATE`, `COMMENT ON`, `CREATE` /
 `DROP VIEW`, the sequence, database, role and ownership statements,
 `GRANT` / `REVOKE`, `CREATE` / `DROP EXTENSION`. So does `CREATE INDEX`
@@ -475,7 +543,9 @@ the table (a Rails or Django migration's `create_table` and `add_index`).
 After `ROLLBACK TO SAVEPOINT` the block no longer counts the tables it
 created as its own. The multi-transaction statements — `CREATE INDEX` on
 any other table, `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET NOT NULL`,
-`ALTER COLUMN TYPE`, `SET (shards = N)`, `CREATE TABLE ... AS`,
+`ALTER COLUMN TYPE`, `ADD COLUMN` with a volatile default, `NOT NULL`
+and no default, `SERIAL` or a constraint, an `ALTER TABLE` with any of
+these among its actions, `SET (shards = N)`, `CREATE TABLE ... AS`,
 `ANALYZE` — publish, drain and sweep (or stream) in several transactions
 of their own and are refused inside a block with `25001`; so are `SPLIT
 AT` and `UNSPLIT`, range operations rather than descriptor writes, and
@@ -615,7 +685,10 @@ and applies to rows inserted from then on; `DROP DEFAULT` makes an
 omitted column NULL. A column added by `ALTER TABLE ... ADD COLUMN ...
 DEFAULT` fills the rows that predate it from that original constant on
 read, and keeps doing so whatever its default becomes later: changing
-the default changes new inserts, never the old rows. An identity
+the default changes new inserts, never the old rows. An expression
+default given to `ADD COLUMN` is evaluated once for the existing rows
+when it has no volatile function, and once per existing row when it has
+one ([above](#ddl)). An identity
 column's default is its sequence and cannot be set (`42601`).
 
 `SERIAL` (`SMALLSERIAL`, `BIGSERIAL`) and identity columns create a

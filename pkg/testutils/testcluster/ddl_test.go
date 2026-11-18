@@ -326,7 +326,7 @@ func TestDDLCompleteness(t *testing.T) {
 		execSQL(t, ctx, s, q)
 	}
 	expectCode(`ALTER TABLE nope RENAME TO x`, sql.CodeUndefinedTable)
-	expectCode(`ALTER TABLE big ADD COLUMN v INT8`, sql.CodeDuplicateObject)
+	expectCode(`ALTER TABLE big ADD COLUMN v INT8`, sql.CodeDuplicateColumn)
 	expectCode(`ALTER TABLE big DROP COLUMN nope`, sql.CodeUndefinedColumn)
 	if d := lookupDescriptor(t, ctx, db, "big"); len(d.Columns) != 3 {
 		t.Fatalf("IF NOT EXISTS changed the columns: %+v", d.Columns)

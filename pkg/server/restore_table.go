@@ -457,6 +457,9 @@ func planTableRestore(final *backupManifest, opts RestoreOptions) (*restorePlan,
 				return nil, fmt.Errorf("table %s: a column's type was being changed when the table was backed up; restore from a backup taken after ALTER COLUMN TYPE finished", p.from())
 			}
 		}
+		if d.Alter != nil {
+			return nil, fmt.Errorf("table %s: an ALTER TABLE was in progress when the table was backed up; restore from a backup taken after it finished", p.from())
+		}
 		if targets[p.into()] {
 			return nil, fmt.Errorf("two tables would be restored as %s", p.into())
 		}
