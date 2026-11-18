@@ -415,6 +415,30 @@ func (s *Session) freshCatalog(ctx context.Context, name string, fn func(context
 	return err
 }
 
+// descriptorForChange returns table d's descriptor as txn reads it, for
+// a statement that decides from the descriptor what to change: GRANT,
+// REVOKE, the policy statements. d is usually the gateway's leased copy,
+// which may lag a change committed since — on another gateway, still
+// draining, or written by a session that took no lease. Accessor.Update
+// refuses to write a copy made from another version (issue #368), but a
+// statement that finds nothing to change in a stale copy never writes:
+// a REVOKE of a privilege granted since would report success and leave
+// the grant in place. Reading the descriptor in txn also makes it part
+// of what the transaction must find unchanged when it commits.
+func (s *Session) descriptorForChange(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
+	cur, err := catalog.ReadTable(ctx, txn, d.ID)
+	if err != nil {
+		return nil, err
+	}
+	if cur == nil {
+		return nil, &catalog.ErrTableNotFound{Name: d.Name}
+	}
+	if cur.Version != d.Version {
+		s.cat.Invalidate(d.Name)
+	}
+	return cur, nil
+}
+
 // freshTable resolves, within a freshCatalog transaction, today's
 // descriptor of the table a historical read resolved as hdesc: the
 // gateway's leased copy when it holds a live lease on it under the same
@@ -829,6 +853,9 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 				}
 				if shared.Virtual != "" {
 					return nil, newErrf(CodeInsufficientPriv, "%s is a system catalog and cannot be granted on", shared.Virtual)
+				}
+				if shared, err = s.descriptorForChange(ctx, txn, shared); err != nil {
+					return nil, err
 				}
 				descs = append(descs, shared)
 				if db, bare := catalog.SplitTableName(name); db == vtable.PgCatalog {

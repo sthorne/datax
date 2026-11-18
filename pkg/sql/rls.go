@@ -552,6 +552,9 @@ func (s *Session) policyTable(ctx context.Context, txn *kvclient.Txn, name strin
 	if err := mustBeReal(shared); err != nil {
 		return nil, err
 	}
+	if shared, err = s.descriptorForChange(ctx, txn, shared); err != nil {
+		return nil, err
+	}
 	if shared.IsView() {
 		return nil, newErrf(CodeWrongObjectType, "%q is a view: row security belongs to tables", shared.Name)
 	}
@@ -561,7 +564,7 @@ func (s *Session) policyTable(ctx context.Context, txn *kvclient.Txn, name strin
 	if err := s.checkTableOwner(ctx, txn, shared); err != nil {
 		return nil, err
 	}
-	return shared.Clone(), nil
+	return shared, nil
 }
 
 // execCreatePolicy runs CREATE POLICY: the table's owner (or an admin).

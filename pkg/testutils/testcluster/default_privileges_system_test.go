@@ -264,14 +264,12 @@ func TestDefaultPrivilegesSystemTables(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	sealedACLs(func(acl string) bool { return strings.Contains(acl, "dp_all=a*r*w*d*D*/root") })
-	// The stand-in wrote the descriptors without leases of its own, so
-	// root's leased session may hold the old ones a while yet: the
-	// revokes go through a session that reads them fresh.
-	admin := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	// The stand-in took no leases, so root's leased copies of the
+	// descriptors may still lack the grants: the REVOKE reads them in
+	// its own transaction.
 	for _, name := range sealedSystemTables {
-		expectCodeSQL(t, ctx, admin, `GRANT INSERT ON `+name+` TO dp_all`, sql.CodeInsufficientPriv)
-		execSQL(t, ctx, admin, `REVOKE ALL ON `+name+` FROM dp_all`)
+		expectCodeSQL(t, ctx, root, `GRANT INSERT ON `+name+` TO dp_all`, sql.CodeInsufficientPriv)
+		execSQL(t, ctx, root, `REVOKE ALL ON `+name+` FROM dp_all`)
 	}
 	sealedACLs(func(acl string) bool { return acl == "" })
 
