@@ -477,18 +477,55 @@ func quoteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-func quoteIdent(s string) string {
+func quoteIdent(s string) string { return QuoteIdent(s) }
+
+// QuoteIdent renders a name as PostgreSQL's quote_identifier does
+// (quote_ident, format's %I, pg_get_indexdef, format_type): bare when
+// it is lower-case letters, digits and underscores, starting with no
+// digit, and no keyword PostgreSQL reserves in any way (reserved,
+// type or function name, column name); double-quoted otherwise, with
+// each " inside doubled ("Role", "a""b", "select", "time").
+func QuoteIdent(s string) string {
 	plain := s != ""
-	for i, r := range s {
-		if !(r == '_' || unicode.IsLower(r) || (i > 0 && unicode.IsDigit(r))) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c == '_' || c >= 'a' && c <= 'z' || i > 0 && c >= '0' && c <= '9') {
 			plain = false
 			break
 		}
 	}
-	if plain {
+	if plain && !quotedKeywords[s] {
 		return s
 	}
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// IsQuotedKeyword reports whether quote_ident quotes the word because
+// it is a keyword PostgreSQL does not leave unreserved.
+func IsQuotedKeyword(s string) bool { return quotedKeywords[s] }
+
+// quotedKeywords are PostgreSQL 16's keywords of the reserved,
+// type_func_name and col_name categories (kwlist.h): every keyword but
+// the unreserved ones, which quote_identifier quotes.
+var quotedKeywords = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`
+		all analyse analyze and any array as asc asymmetric both case cast check collate column constraint create
+		current_catalog current_date current_role current_time current_timestamp current_user default deferrable
+		desc distinct do else end except false fetch for foreign from grant group having in initially intersect
+		into lateral leading limit localtime localtimestamp not null offset on only or order placing primary
+		references returning select session_user some symmetric system_user table then to trailing true union
+		unique user using variadic when where window with
+		authorization binary collation concurrently cross current_schema freeze full ilike inner is isnull join
+		left like natural notnull outer overlaps right similar tablesample verbose
+		between bigint bit boolean char character coalesce dec decimal exists extract float greatest grouping
+		inout int integer interval json json_array json_arrayagg json_object json_objectagg json_scalar
+		json_serialize least national nchar none normalize nullif numeric out overlay position precision real
+		row setof smallint substring time timestamp treat trim values varchar xmlattributes xmlconcat
+		xmlelement xmlexists xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable`) {
+		quotedKeywords[w] = true
+	}
 }
 
 // formatSQL implements format(): %s, %I, %L, %%, and the n$ position

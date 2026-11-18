@@ -2,7 +2,8 @@ package parser
 
 import (
 	"strings"
-	"unicode"
+
+	"github.com/sthorne/datax/pkg/sql/builtins"
 )
 
 // RenameColumnRefs rewrites every reference to column old in the SQL
@@ -26,17 +27,7 @@ func RenameColumnRefs(text, old, new string) (string, error) {
 		if i+1 < len(toks) && toks[i+1].kind == tkOp && toks[i+1].text == "(" {
 			continue // a call
 		}
-		end := t.pos + 1
-		if text[t.pos] == '"' {
-			for end < len(text) && text[end] != '"' {
-				end++
-			}
-			end++ // the closing quote
-		} else {
-			for end < len(text) && (unicode.IsLetter(rune(text[end])) || unicode.IsDigit(rune(text[end])) || text[end] == '_') {
-				end++
-			}
-		}
+		end := t.end
 		b.WriteString(text[last:t.pos])
 		b.WriteString(quoteIdentIfNeeded(new))
 		last = end
@@ -46,17 +37,11 @@ func RenameColumnRefs(text, old, new string) (string, error) {
 }
 
 // quoteIdentIfNeeded renders an identifier as SQL: bare when it is a
-// plain lower-case word, double-quoted otherwise.
+// plain lower-case word and no keyword, double-quoted otherwise (with
+// a " inside doubled).
 func quoteIdentIfNeeded(name string) string {
-	plain := name != ""
-	for i, r := range name {
-		if !(r == '_' || unicode.IsLower(r) || (i > 0 && unicode.IsDigit(r))) {
-			plain = false
-			break
-		}
+	if q := builtins.QuoteIdent(name); q != name || !keywords[strings.ToUpper(name)] {
+		return q
 	}
-	if plain && !keywords[strings.ToUpper(name)] {
-		return name
-	}
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	return `"` + name + `"`
 }

@@ -282,7 +282,9 @@ func KnownCastType(typ string) bool {
 // (pg_catalog.numeric(10,2)[] is numeric): the name a catalog lookup of
 // a user-defined type takes.
 func CastBaseType(typ string) string {
-	name, _ := splitTypmod(strings.ToLower(strings.TrimSpace(typ)))
+	// Case is kept: an unquoted name reaches here folded to lower case,
+	// and a quoted mixed-case one ("Role") names a user-defined type.
+	name, _ := splitTypmod(strings.TrimSpace(typ))
 	for strings.HasSuffix(name, "[]") {
 		name = strings.TrimSpace(strings.TrimSuffix(name, "[]"))
 	}

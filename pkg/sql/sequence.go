@@ -86,6 +86,18 @@ func (s *Session) requireV7(what string) error {
 // session's database.
 func (s *Session) lookupSequence(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.SequenceDescriptor, error) {
 	db, bare := catalog.SplitTableName(name)
+	if strings.Contains(name, `"`) {
+		// A name with quotes reads as SQL reads one ('"Ser_id_seq"',
+		// 'public."a""b_seq"'): what nextvalDefault writes.
+		parts, ok := parseQualifiedName(name)
+		if !ok || len(parts) > 2 {
+			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+		}
+		db, bare = "", parts[len(parts)-1]
+		if len(parts) == 2 {
+			db = parts[0]
+		}
+	}
 	if db == "" || db == catalog.PublicSchema {
 		// public.s names the schema, as a table's name may
 		// (pg_dump's setval('public.s', ...)).
@@ -104,6 +116,13 @@ func (s *Session) lookupSequence(ctx context.Context, txn *kvclient.Txn, name st
 		return nil, err
 	}
 	return d, nil
+}
+
+// nextvalDefault is the default expression of a column a sequence
+// fills: nextval('name'), the name quoted as PostgreSQL quotes it
+// where it must be (nextval('"User_id_seq"')).
+func nextvalDefault(seq string) string {
+	return "nextval('" + strings.ReplaceAll(quoteIdentifier(seq), "'", "''") + "')"
 }
 
 // applySequenceOptions folds parsed options into a descriptor.

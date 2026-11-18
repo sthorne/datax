@@ -4,6 +4,34 @@ The complete supported surface, user's-eye view. For grammar internals and
 design rationale see [docs/sql.md](../sql.md); for what's deliberately
 missing versus PostgreSQL see [Differences](postgres-differences.md).
 
+## Identifiers and string literals
+
+- **Identifiers** follow PostgreSQL's rule: an unquoted name is folded to
+  lower case (`Users` is `users`), a double-quoted one is kept exactly as
+  written (`"Users"`, `"Role"`), and `""` inside quotes is one `"`
+  (`"a""b"` names `a"b`). This holds for every name — tables, columns,
+  indexes, constraints, sequences, roles and types (`CREATE TYPE "Role"`,
+  a column `r "Role"`, `'ADMIN'::"Role"`, `CAST(x AS "public"."Role")`).
+  A quoted identifier is never a keyword: `"select"`, `"order"`,
+  `"user"` and `"concurrently"` name tables, columns and indexes. An
+  empty quoted identifier (`""`) is `42601` "zero-length delimited
+  identifier". Names print back the way PostgreSQL prints them —
+  `quote_ident`, `format('%I')`, `format_type`, `pg_get_indexdef`,
+  `pg_get_constraintdef`, `pg_get_expr` and `SHOW CREATE TABLE` quote a
+  name that is not a plain lower-case word or is a keyword (`"Role"`,
+  `"a""b"`, `"time"`). Role names are folded to lower case even when
+  quoted (a role is case-insensitive).
+- **String literals**: `'...'` takes no backslash escapes
+  (`standard_conforming_strings` is on), `''` is one quote. An `E'...'`
+  string takes PostgreSQL's escapes: `\b`, `\f`, `\n`, `\r`, `\t`, octal
+  `\o`, `\oo`, `\ooo` and hex `\xh`, `\xhh` bytes, `\uXXXX` and
+  `\UXXXXXXXX` code points (a UTF-16 surrogate pair as two `\u`), and any
+  other character after a backslash standing for itself (`\\`, `\'`).
+  The bytes the octal and hex escapes write must be valid UTF-8, so
+  `E'\0'` and `E'\x80'` are `22021` (invalid byte sequence); a short
+  `\u` / `\U` escape is `22025`, `\u0000` "invalid Unicode escape value"
+  and a lone surrogate "invalid Unicode surrogate pair" (`42601`).
+
 ## Types
 
 | Type | Aliases | Notes |
@@ -22,7 +50,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `TIMESTAMP(p)`, `TIMESTAMPTZ(p)` | | `p` in 0–6: values round to `p` fractional digits on write (half away from zero) |
 | `INTERVAL` | `INTERVAL` with field qualifiers (`DAY TO SECOND`, accepted and ignored) | PostgreSQL's months / days / clock triple, so `'1 month'` steps the calendar and `'1 day'` is a day whatever the hour; input in the verbose (`'1 year 2 mons 3 days 04:05:06'`, `'2h30m'`, `'1 day ago'`), SQL standard (`'1-2 3 04:05:06'`) and ISO 8601 (`'P1Y2M3DT4H5M6S'`) forms and as `INTERVAL '...'`; rendered as PostgreSQL does (`1 day -02:00:00`, `-1 days +12:00:00`); compares and sorts by PostgreSQL's rule (a month is 30 days, a day 24 hours: `'30 days' = '1 month'`); `interval` (OID 1186) on the wire; cluster version v10 for a column |
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
-| enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
+| enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; a quoted name keeps its case (`CREATE TYPE "Role"`, `r "Role"`, `::"Role"`), as Prisma writes it, and prints quoted (`format_type`, `'"Role"'::regtype`); described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
 | `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB`, `TSVECTOR` and `TSQUERY` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
 | `DATE` | | |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |

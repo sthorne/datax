@@ -1516,6 +1516,13 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		}
 	}
 	if e.Cast != "" {
+		if name := builtins.CastBaseType(e.Cast); name != strings.ToLower(name) {
+			// A quoted mixed-case name ("Date", "Role") is a user-defined
+			// type (an enum, checked to exist before execution), never the
+			// builtin its folded spelling would name: the value passes
+			// through, as a cast to any other enum does.
+			return base, nil
+		}
 		d, err := builtins.CastIn(base, e.Cast, e.Zone)
 		return d, builtinErr(err)
 	}

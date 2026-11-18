@@ -570,7 +570,7 @@ func TypeName(f types.Family) string {
 // type, with its typmod (numeric(p,s)).
 func FormatType(c *catalog.Column) string {
 	if c.Type == types.Enum {
-		return c.EnumName
+		return QuoteIdent(c.EnumName)
 	}
 	if c.Type.IsArray() {
 		elem := *c
@@ -631,7 +631,7 @@ func FormatType(c *catalog.Column) string {
 // NUMERIC(10,2)) over the pg_type name.
 func ColumnTypeSQL(c *catalog.Column) string {
 	if c.Type == types.Enum {
-		return c.EnumName
+		return QuoteIdent(c.EnumName)
 	}
 	if c.Type.IsArray() {
 		elem := *c
@@ -680,7 +680,7 @@ func FormatTypeOID(oid int64) string {
 // shows it: the column or expression, then a declared collation,
 // operator class and order (name COLLATE "C" text_pattern_ops DESC).
 func IndexKeyDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor, i int) string {
-	key := columnName(d, idx.ColumnIDs[i])
+	key := quotedColumnName(d, idx.ColumnIDs[i])
 	if idx.IsExprKey(i) {
 		key = ExprKeyText(idx.Exprs[i])
 	}
@@ -800,13 +800,13 @@ func IndexDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	if v := idx.Vector; v != nil {
 		// As pgvector renders it: the operator class names the distance
 		// and lists is the storage parameter.
-		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", idx.Name, d.Name, v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
+		return fmt.Sprintf("CREATE INDEX %s ON public.%s USING %s (%s %s) WITH (lists='%d')", QuoteIdent(idx.Name), QuoteIdent(d.Name), v.Method, strings.Join(cols, ", "), vector.Metric(v.Metric).OpClass(), v.Lists)
 	}
 	nulls := ""
 	if idx.Unique && idx.NullsNotDistinct {
 		nulls = " NULLS NOT DISTINCT"
 	}
-	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s%s", unique, idx.Name, d.Name, IndexMethod(idx), strings.Join(cols, ", "), nulls, IndexPredicateDef(idx))
+	return fmt.Sprintf("CREATE %sINDEX %s ON public.%s USING %s (%s)%s%s", unique, QuoteIdent(idx.Name), QuoteIdent(d.Name), IndexMethod(idx), strings.Join(cols, ", "), nulls, IndexPredicateDef(idx))
 }
 
 // IsConstraintIndex reports whether a unique index is also listed as a
@@ -850,7 +850,7 @@ func PrimaryKeyDef(d *catalog.TableDescriptor) string {
 		if c, ok := columnByID(d, id); ok && c.Hidden {
 			continue
 		}
-		cols = append(cols, columnName(d, id))
+		cols = append(cols, quotedColumnName(d, id))
 	}
 	return "PRIMARY KEY (" + strings.Join(cols, ", ") + ")"
 }
@@ -859,7 +859,7 @@ func PrimaryKeyDef(d *catalog.TableDescriptor) string {
 func UniqueDef(d *catalog.TableDescriptor, idx *catalog.IndexDescriptor) string {
 	cols := make([]string, 0, len(idx.ColumnIDs))
 	for _, id := range idx.ColumnIDs {
-		cols = append(cols, columnName(d, id))
+		cols = append(cols, quotedColumnName(d, id))
 	}
 	if idx.Primary {
 		return "PRIMARY KEY (" + strings.Join(cols, ", ") + ")"
@@ -889,7 +889,7 @@ func ConstraintDef(d *catalog.TableDescriptor, c *catalog.Constraint, byID func(
 	names := func(t *catalog.TableDescriptor, ids []catalog.ColumnID) string {
 		cols := make([]string, 0, len(ids))
 		for _, id := range ids {
-			cols = append(cols, columnName(t, id))
+			cols = append(cols, quotedColumnName(t, id))
 		}
 		return strings.Join(cols, ", ")
 	}
@@ -909,7 +909,7 @@ func ConstraintDef(d *catalog.TableDescriptor, c *catalog.Constraint, byID func(
 		}
 		refName, refCols := fmt.Sprintf("<%d>", c.RefTable), ""
 		if ref != nil {
-			refName, refCols = ref.Name, names(ref, c.RefColumns)
+			refName, refCols = QuoteIdent(ref.Name), names(ref, c.RefColumns)
 		}
 		def := "FOREIGN KEY (" + names(d, c.Columns) + ") REFERENCES " + refName + "(" + refCols + ")"
 		if c.OnUpdate != "" && c.OnUpdate != catalog.FKRestrict {
@@ -948,6 +948,15 @@ func columnByID(d *catalog.TableDescriptor, id catalog.ColumnID) (*catalog.Colum
 	return nil, false
 }
 
+// QuoteIdent renders a name as PostgreSQL's catalog functions print
+// one (quote_identifier): bare when plain, double-quoted otherwise.
+func QuoteIdent(name string) string { return builtins.QuoteIdent(name) }
+
+// quotedColumnName is columnName as SQL text: quoted where needed.
+func quotedColumnName(d *catalog.TableDescriptor, id catalog.ColumnID) string {
+	return QuoteIdent(columnName(d, id))
+}
+
 func columnName(d *catalog.TableDescriptor, id catalog.ColumnID) string {
 	if c, ok := columnByID(d, id); ok {
 		return c.Name
@@ -964,12 +973,12 @@ func CreateTableDef(d *catalog.TableDescriptor) string {
 // the table's foreign keys reference.
 func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.TableDescriptor) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", d.Name)
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", QuoteIdent(d.Name))
 	for _, c := range d.Columns {
 		if c.Hidden {
 			continue
 		}
-		fmt.Fprintf(&b, "  %s %s", c.Name, ColumnTypeSQL(&c))
+		fmt.Fprintf(&b, "  %s %s", QuoteIdent(c.Name), ColumnTypeSQL(&c))
 		if c.NotNull {
 			b.WriteString(" NOT NULL")
 		}
@@ -1006,18 +1015,18 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 			if idx.IsExprKey(i) || len(idx.Directions) > i && idx.Directions[i] != "" {
 				cols = append(cols, IndexKeyDef(d, &idx, i))
 			} else {
-				cols = append(cols, columnName(d, idx.ColumnIDs[i]))
+				cols = append(cols, quotedColumnName(d, idx.ColumnIDs[i]))
 			}
 		}
 		nulls := ""
 		if idx.Unique && idx.NullsNotDistinct {
 			nulls = " NULLS NOT DISTINCT"
 		}
-		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s%s", unique, idx.Name, strings.Join(cols, ", "), nulls, IndexPredicateDef(&idx)))
+		items = append(items, fmt.Sprintf("%sINDEX %s (%s)%s%s", unique, QuoteIdent(idx.Name), strings.Join(cols, ", "), nulls, IndexPredicateDef(&idx)))
 	}
 	for i := range d.Constraints {
 		c := &d.Constraints[i]
-		items = append(items, fmt.Sprintf("CONSTRAINT %s %s", c.Name, ConstraintDef(d, c, byID)))
+		items = append(items, fmt.Sprintf("CONSTRAINT %s %s", QuoteIdent(c.Name), ConstraintDef(d, c, byID)))
 	}
 	if len(items) > 0 {
 		fmt.Fprintf(&b, "  %s", strings.Join(items, ",\n  "))
@@ -1042,9 +1051,9 @@ func CreateTableDefWith(d *catalog.TableDescriptor, byID func(uint64) *catalog.T
 	}
 	if d.RowTTL != nil {
 		if d.RowTTL.AfterSeconds > 0 {
-			opts = append(opts, fmt.Sprintf("ttl_column = %s", columnName(d, d.RowTTL.ColumnID)), fmt.Sprintf("ttl = '%ds'", d.RowTTL.AfterSeconds))
+			opts = append(opts, fmt.Sprintf("ttl_column = %s", quotedColumnName(d, d.RowTTL.ColumnID)), fmt.Sprintf("ttl = '%ds'", d.RowTTL.AfterSeconds))
 		} else {
-			opts = append(opts, fmt.Sprintf("ttl_expiration = %s", columnName(d, d.RowTTL.ColumnID)))
+			opts = append(opts, fmt.Sprintf("ttl_expiration = %s", quotedColumnName(d, d.RowTTL.ColumnID)))
 		}
 	}
 	if len(opts) > 0 {
