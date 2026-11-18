@@ -6,10 +6,10 @@ A change merges when all four steps below pass on its head commit:
 
 1. **Lint:** `gofmt -l -s .` prints nothing. `go vet` and staticcheck (`make lint`) are clean.
 2. **Race tests:** every package except `pkg/testutils/testcluster`, under the race detector (`go test -race`).
-3. **Race cluster tests:** the in-process cluster tests in `pkg/testutils/testcluster`, under the race detector. They run in two shards, `Test[A-L]...` and the rest, each with a 30-minute limit.
+3. **Race cluster tests:** the in-process cluster tests in `pkg/testutils/testcluster`, under the race detector. They run in four shards by the first letter of the test's name, `Test[A-C]`, `Test[D-L]`, `Test[M-R]` and the rest, each with a 30-minute limit.
 4. **Vulnerability check:** govulncheck, pinned to the version in `.github/workflows/vulncheck.yaml`, finds no reachable vulnerability.
 
-On GitHub these are the `ci` workflow's `test` and `cluster (a-l)`/`cluster (m-z)` jobs, plus the `vulncheck` workflow.
+On GitHub these are the `ci` workflow's `test` and four `cluster (...)` jobs, plus the `vulncheck` workflow.
 
 ### When the hosted workflows are paused
 
@@ -18,7 +18,7 @@ The `ci`, `vulncheck` and `bench` workflows are paused while the account has no 
 While they are paused, the same gate runs locally:
 
 ```sh
-scripts/ci-local.sh            # lint, race tests, both race cluster shards
+scripts/ci-local.sh            # lint, race tests, the four race cluster shards
 scripts/ci-local.sh vulncheck  # govulncheck (needs vuln.go.dev)
 ```
 

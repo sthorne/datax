@@ -3,10 +3,10 @@
 # vulncheck.yaml run on GitHub: the gate a change passes before it is
 # merged while the hosted workflows are paused (docs/testing.md).
 #
-#   scripts/ci-local.sh            lint, unit tests and both cluster shards
+#   scripts/ci-local.sh            lint, unit tests and the four cluster shards
 #   scripts/ci-local.sh lint       gofmt, vet and staticcheck only
 #   scripts/ci-local.sh unit       go test -race on every package but testcluster
-#   scripts/ci-local.sh cluster    go test -race on testcluster, both shards
+#   scripts/ci-local.sh cluster    go test -race on testcluster, all four shards
 #   scripts/ci-local.sh vulncheck  govulncheck (needs vuln.go.dev)
 #
 # Each step's output is written to $CI_LOCAL_OUT (default ./ci-local) and
@@ -52,8 +52,17 @@ unit() {
 	go test -race -timeout 30m $(go list ./... | grep -v '/pkg/testutils/testcluster$')
 }
 
-cluster_al() { go test -race -timeout 30m -run '^Test[A-L]' ./pkg/testutils/testcluster/; }
-cluster_mz() { go test -race -timeout 30m -skip '^Test[A-L]' ./pkg/testutils/testcluster/; }
+# The four shards of ci.yaml's cluster job: every test runs in exactly one.
+cluster_ac() { go test -race -timeout 30m -run '^Test[A-C]' ./pkg/testutils/testcluster/; }
+cluster_dl() { go test -race -timeout 30m -run '^Test[D-L]' ./pkg/testutils/testcluster/; }
+cluster_mr() { go test -race -timeout 30m -run '^Test[M-R]' ./pkg/testutils/testcluster/; }
+cluster_sz() { go test -race -timeout 30m -skip '^Test[A-R]' ./pkg/testutils/testcluster/; }
+cluster_all() {
+	step cluster-a-c cluster_ac
+	step cluster-d-l cluster_dl
+	step cluster-m-r cluster_mr
+	step cluster-s-z cluster_sz
+}
 
 vulncheck() { go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -show verbose ./...; }
 
@@ -62,14 +71,12 @@ case $what in
 all)
 	step lint lint
 	step unit unit
-	step cluster-a-l cluster_al
-	step cluster-m-z cluster_mz
+	cluster_all
 	;;
 lint) step lint lint ;;
 unit) step unit unit ;;
 cluster)
-	step cluster-a-l cluster_al
-	step cluster-m-z cluster_mz
+	cluster_all
 	;;
 vulncheck) step vulncheck vulncheck ;;
 *)

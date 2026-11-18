@@ -46,9 +46,12 @@ jobs:
 
   # The in-process cluster tests are most of the suite's time, and under
   # the race detector one package outgrew the 30-minute limit. They run
-  # as two jobs side by side: one takes the tests named Test[A-L]..., the
-  # other skips exactly those, so every test runs once and a test added
-  # later lands in one of the two whatever its name.
+  # as four jobs side by side, split by the first letter of the test's
+  # name into roughly equal counts: three take Test[A-C], Test[D-L] and
+  # Test[M-R], and the last skips exactly those, so every test runs once
+  # and a test added later lands in one of the four whatever its name.
+  # Two shards stopped being enough when the A-L half reached 28 of its
+  # 30 minutes and the M-Z half passed 30.
   cluster:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -56,10 +59,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: a-l
-            select: -run '^Test[A-L]'
-          - shard: m-z
-            select: -skip '^Test[A-L]'
+          - shard: a-c
+            select: -run '^Test[A-C]'
+          - shard: d-l
+            select: -run '^Test[D-L]'
+          - shard: m-r
+            select: -run '^Test[M-R]'
+          - shard: s-z
+            select: -skip '^Test[A-R]'
     name: cluster (${{ matrix.shard }})
     steps:
       - uses: actions/checkout@v4
