@@ -451,6 +451,12 @@ func chainCut(srcs []string, mans []*backupManifest, asOf hlc.Timestamp) (n int,
 // the owner, grants, comments, other tables' foreign keys pointing here,
 // and the version counter those bump — is left out of the comparison.
 func tableStableAcross(prev, cur *backupManifest, t backupTable, cutoff hlc.Timestamp) error {
+	if t.Full {
+		// The interval's history of the table had been collected when the
+		// backup was taken (issue #376); it holds the table at its end.
+		return fmt.Errorf("cannot restore table %s to %s: the backup ending at %s holds it only as it stood then, because its history since %s had been collected (a purge, or garbage collection past the base). Restore to %s instead",
+			t.Name, describeBackupTS(cutoff), describeBackupTS(cur.EndTS), describeBackupTS(prev.EndTS), describeBackupTS(cur.EndTS))
+	}
 	layout := func(raw json.RawMessage) (string, error) {
 		var d catalog.TableDescriptor
 		if err := json.Unmarshal(raw, &d); err != nil {

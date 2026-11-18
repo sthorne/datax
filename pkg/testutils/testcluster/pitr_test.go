@@ -404,9 +404,11 @@ func TestSealedPointInTimeRestore(t *testing.T) {
 // TestRevisionHistoryLostToGC (issue #302): a backup can hold only the
 // history the cluster still has. Once garbage collection has passed the
 // base backup's timestamp, versions written since may be gone, and the
-// incremental is refused — with or without history — rather than written
-// with a hole in it. While collection stays behind the base, the
-// incremental holds every version.
+// incremental — with or without history — holds the table in full, as of
+// its end, rather than the changes since the base (issue #376; before it
+// the incremental was refused). Such a chain restores to its end and not
+// to a moment inside the interval. While collection stays behind the
+// base, the incremental holds every version.
 func TestRevisionHistoryLostToGC(t *testing.T) {
 	n, _ := startGCNode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -448,13 +450,25 @@ func TestRevisionHistoryLostToGC(t *testing.T) {
 	n.Store().RunGCOnce(ctx, 200*time.Millisecond)
 	for _, history := range []bool{true, false} {
 		dir := t.TempDir()
-		_, err := n.RunBackupWith(ctx, server.BackupOptions{Dest: dir, BasePath: dirFull, RevisionHistory: history})
-		if err == nil || !strings.Contains(err.Error(), "older than the garbage-collection window") {
+		sum, err := n.RunBackupWith(ctx, server.BackupOptions{Dest: dir, BasePath: dirFull, RevisionHistory: history})
+		if err != nil {
 			t.Fatalf("incremental (history %v) onto a base the GC has passed: %v", history, err)
 		}
-		// A refused backup is not a backup: no manifest marks it complete.
-		if _, err := n.RunRestore(ctx, []string{dir}); err == nil {
-			t.Fatalf("the refused backup (history %v) left a directory that restores", history)
+		if tbl := tableSummary(t, sum, "hist"); !tbl.Full || tbl.Records != 1 {
+			t.Fatalf("incremental (history %v) onto a base the GC has passed holds hist as %+v, want it in full", history, tbl)
+		}
+		into := "hist_end_" + strconv.FormatBool(history)
+		if _, err := n.RunRestoreOpts(ctx, server.RestoreOptions{Srcs: []string{dirFull, dir},
+			Tables: []server.RestoreTable{{Name: "hist", Into: into}}}); err != nil {
+			t.Fatal(err)
+		}
+		requireSameRows(t, "the row at the chain's end", rowsText(t, ctx, s, `SELECT v FROM `+into), []string{"6"})
+		if history {
+			_, err := n.RunRestoreOpts(ctx, server.RestoreOptions{Srcs: []string{dirFull, dir}, AsOf: mid,
+				Tables: []server.RestoreTable{{Name: "hist", Into: "hist_lost"}}})
+			if err == nil || !strings.Contains(err.Error(), "holds it only as it stood then") {
+				t.Fatalf("a restore to a moment whose history was collected: %v", err)
+			}
 		}
 	}
 	// The chain taken while the history was there still restores to the

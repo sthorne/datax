@@ -77,6 +77,13 @@ type AdminRequest struct {
 	CheckID string `json:"check_id,omitempty"`
 	// Index is the applied index wait-applied blocks for (with RangeID).
 	Index uint64 `json:"index,omitempty"`
+	// PurgeBelow is the highest threshold a purge's collection may set on
+	// a range (issue #376): just below the oldest backup in progress, or
+	// the purging node's read of the backups in progress. It travels with
+	// the op "purge-range-below", never "purge-range": a node from before
+	// it would ignore the field and collect at its own now, through the
+	// backup.
+	PurgeBelow *hlc.Timestamp `json:"purge_below,omitempty"`
 	// Version is the target for upgrade-cluster (0 = the serving node's
 	// binary version).
 	Version int `json:"version,omitempty"`
@@ -303,6 +310,12 @@ type BackupTableSummary struct {
 	// Versions is the number of versions the table's data file holds, in
 	// a backup with revision history.
 	Versions int64 `json:"versions,omitempty"`
+	// Full says an incremental backup holds this table whole, as of its
+	// end, rather than the changes since its base (issue #376): the
+	// table's history since the base had been collected (a purge, or
+	// garbage collection past the base), so a restore takes the table
+	// from this backup and from none before it.
+	Full bool `json:"full,omitempty"`
 	// From is the table's name and id in the backup, where a restore
 	// brought it back under another (a table restore).
 	From   string `json:"from,omitempty"`
@@ -329,7 +342,8 @@ type BackupSummary struct {
 	// base, so a chain through it restores to any moment in between.
 	RevisionHistory bool `json:"revision_history,omitempty"`
 	// Notes are what a table restore left out or changed on the way in:
-	// foreign keys dropped, grants to roles the cluster does not have.
+	// foreign keys dropped, grants to roles the cluster does not have;
+	// for a backup, the tables an incremental holds in full and why.
 	Notes []string `json:"notes,omitempty"`
 }
 

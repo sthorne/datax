@@ -102,6 +102,13 @@ type StoreConfig struct {
 	// the default for a span that also holds non-retention data (never
 	// delete early from a mixed range).
 	RetentionOverride func(start, end keys.Key) (ttl time.Duration, expire, ok bool)
+	// GCLimit, when set, bounds every GC threshold the housekeeping pass
+	// sets (issue #376): it returns the highest threshold collection may
+	// set — just below the oldest timestamp a backup in progress reads
+	// at — or ok=false when nothing bounds collection.
+	// Called once per pass. An error skips the pass: collection waits,
+	// which is always safe, rather than racing a backup it cannot see.
+	GCLimit func(ctx context.Context) (limit hlc.Timestamp, ok bool, err error)
 
 	// MergeBarrier, when set, labels a key span with the replica
 	// placement policy governing it (issue #176); two adjacent ranges

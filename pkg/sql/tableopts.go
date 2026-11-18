@@ -352,6 +352,20 @@ func (s *Session) execPurge(ctx context.Context, t *parser.AlterTable) (*Result,
 		// could not, and the tag must not read as an attestation.
 		res.Tag = "PURGE INCOMPLETE"
 	}
+	if len(rep.HeldBy) > 0 {
+		// A backup in progress holds the newest history (issue #376):
+		// said as a notice, since no row of the report is about it.
+		msg := fmt.Sprintf("purge held back by %d backup(s) in progress: versions deleted before %s are gone, and those deleted since remain on disk until the backups end",
+			len(rep.HeldBy), time.Unix(0, rep.HeldBelowNanos).UTC().Format(time.RFC3339Nano))
+		if rep.Rerun {
+			msg += "; the table is purged again automatically then"
+		} else {
+			msg += "; run the purge again then"
+		}
+		// Which backups, and where they write, is the operator's to read
+		// (the audit log, `datax debug purge`), not every table owner's.
+		res.Notices = append(res.Notices, msg)
+	}
 	return res, nil
 }
 

@@ -152,6 +152,21 @@ func (n *Node) RunDroppedTableReclaimOnce(ctx context.Context) int {
 				continue
 			}
 		}
+		// A backup in progress whose timestamp the drop had not yet
+		// passed reads the table: its rows stay until it ends (issue
+		// #376). The record's time precedes the drop's commit, by up to
+		// the slack.
+		if !rec.Cleared {
+			live, _, err := n.liveBackupProtections(ctx)
+			if err != nil {
+				log.Debugf("dropped-table reclaim: table %s (id %d): reading the backups in progress: %v", rec.Label(), rec.ID, err)
+				continue
+			}
+			if len(live) > 0 && live[0].TS.WallTime < rec.DroppedAt+droppedTableSlack.Nanoseconds() {
+				log.Infof("dropped-table reclaim: table %s (id %d): waiting for %s, which reads it", rec.Label(), rec.ID, live[0])
+				continue
+			}
+		}
 		opID := newOpID()
 		n.events.RecordStart("drop-reclaim", opID, "reclaiming dropped table %s (id %d)", rec.Label(), rec.ID)
 		if err := n.reclaimDroppedTable(ctx, rec); err != nil {
