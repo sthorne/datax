@@ -601,7 +601,10 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   catalogs are: `\dt` leaves them out (`\dtS` lists them), pg_dump does
   not dump them, and `pg_catalog.datax_metrics` names one as its bare
   name does. Their OIDs are 65280 and up, within the 32 bits a
-  PostgreSQL client reads an OID in.
+  PostgreSQL client reads an OID in. Unlike PostgreSQL's catalogs, most
+  are created on first use, by `root`, so `ALTER DEFAULT PRIVILEGES`
+  rules for `root` made earlier reach them — all but the audit,
+  large-object and key tables ([details](security.md#default-privileges-and-the-clusters-own-tables)).
 - **pg_dump** reads the catalogs it needs and dumps a database that
   restores into another: [Dumping and restoring with pg_dump](pg-dump.md).
 - **Which database.** The current one, as in PostgreSQL, where each

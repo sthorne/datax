@@ -213,6 +213,87 @@ Note the syntax: `CREATE USER name PASSWORD '...'` — `WITH` is optional.
 In insecure (trust) mode the session user is whatever the client
 claims, but grants still name existing roles: create them first.
 
+### Default privileges and the cluster's own tables
+
+`ALTER DEFAULT PRIVILEGES` works as in PostgreSQL: a rule made in a
+database applies to the tables (or sequences) its role — the `FOR ROLE`
+role, or the current one — creates there afterwards; tables that
+already exist are not changed.
+
+The cluster's own tables are created by the nodes themselves, as `root`,
+in the `datax` database, and most of them on first use: `datax_metrics`
+and the two shape tables (`datax_metrics_shapes`,
+`datax_statement_shapes`) on the first metrics tick, `datax_ui_prefs`
+when the first console preference is saved, `datax_audit` on the first
+audit flush, the three large-object tables soon after the cluster
+reaches v21 or on the first `lo_*` call, and `datax_keys` when the
+cluster key is enabled. So a rule for `root` in `datax` —
+`ALTER DEFAULT PRIVILEGES GRANT ...` run as `root`, or `... FOR ROLE
+root ...` run by an admin — reaches the ones created after it, as it
+reaches any table `root` creates. (PostgreSQL's system catalogs exist
+before any rule can be made, so no rule ever reaches them.) Rules for
+other roles, or made in other databases, never do.
+
+**Which tables take the grants.** `datax_metrics`, `datax_metrics_shapes`,
+`datax_statement_shapes` and `datax_ui_prefs` take them like any table:
+they show in `pg_class.relacl` and
+`information_schema.role_table_grants`, and `SELECT` lets the grantee
+read the table (`datax_ui_prefs` holds every console user's display
+choices; the shape tables hold normalised statements without their
+literals). The other privileges are recorded and open nothing: only the
+nodes and admins write these tables, as with an explicit
+`GRANT INSERT ON datax_metrics`.
+
+The sealed tables — `datax_audit`, `datax_largeobject`,
+`datax_largeobject_metadata`, `datax_largeobject_pending` and
+`datax_keys` — take none: whatever the rules say, they are created with
+no grants. A rule is a blanket grant, like the `read_all` role, and none
+of these tables may be opened that way: the audit records name people
+and where they connected from; a `SELECT` on the large-object tables
+shows every object's bytes, past the owner check of the `lo_*`
+functions; and the named keys are read by no session at all. Reading
+the audit or large-object tables is given by an admin, by name
+(`GRANT SELECT ON datax_audit TO siem_export`), as before.
+
+Before 0.58.0 the sealed tables took the rules' grants too, so a
+cluster that had a rule for `root` when one of them was created may
+have grants on it that nobody gave it on purpose. List them with
+`SELECT relname, relacl FROM pg_class WHERE relname LIKE 'datax%'` and
+take them away with `REVOKE ALL ON datax_audit FROM <role>` — on a
+sealed table only `SELECT` can be granted, but an admin may revoke any
+privilege. A grant left on `datax_keys` opens nothing (and cannot be
+revoked by name, since the name is the metadata's virtual table);
+`DROP OWNED BY` or `DROP ROLE` of the grantee clears it.
+
+**The cluster's own work does not depend on them.** No rule can take
+away access the nodes rely on, and none is checked on their way:
+
+- the nodes create, write and read these tables — metrics ticks, the
+  audit flush and its retention, console preferences, the
+  large-object sweeper — through a session of their own that acts as
+  `root`, holds every privilege, and is the one session the sealed
+  tables' refusals do not apply to;
+- the `lo_*` functions and the key service (`datax_key_wrap` and the
+  rest, `CREATE` / `ALTER ... ROTATE` / `DROP ENCRYPTION KEY`) read and
+  write their tables' rows directly, under their own checks — the
+  object's owner, the key's `WRAP`, `UNWRAP` and `USAGE` — which no
+  table grant enters;
+- advisory locks keep no table at all;
+- backup and restore are admin operations that copy the tables and
+  their rows as stored: a restore brings each table back with the
+  grants it had when it was backed up;
+- a rule can only add grants. A table holds no privilege for `PUBLIC`
+  to lose, and its owner's privileges are not grants, so
+  `ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM PUBLIC` (or
+  `FROM root`) changes nothing for these tables, or for any other.
+
+**What holds whatever the grants.** No grant lets a non-admin write any
+of the cluster's tables. Nothing changes a sealed table through SQL,
+`root` included. `read_all` does not read `datax_audit`. No session
+reads the key material: `datax_keys` names a virtual table of the keys'
+metadata, shown to admins only, with no column for the material, and
+the keys' row count is shown to admins only.
+
 ## Row-level security
 
 Table privileges decide *whether* a role may read or write a table.

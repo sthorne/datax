@@ -2511,6 +2511,13 @@ with SQL — and read by admins and by roles granted `SELECT` on them
 (which shows every object's bytes, whoever owns it).
 `pg_largeobject_metadata` lists the objects.
 
+These tables are created by the nodes as `root`, many of them on first
+use, so `ALTER DEFAULT PRIVILEGES` rules for `root` reach the ones
+created after the rule — except the sealed ones (`datax_audit`, the
+large-object tables and `datax_keys`), which take no default
+privileges: see the security guide's
+[Default privileges and the cluster's own tables](security.md#default-privileges-and-the-clusters-own-tables).
+
 ## Views
 
 ```sql

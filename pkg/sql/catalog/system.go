@@ -177,6 +177,23 @@ func IsUnreadableSystemTable(name string) bool {
 	return name == KeysTableName
 }
 
+// TakesDefaultPrivileges reports whether the ALTER DEFAULT PRIVILEGES
+// rules of its database apply to a table of this name when it is
+// created. The system tables are created by the nodes as root, in the
+// default database, many of them on first use, so root's rules reach
+// them as they reach any table root creates: a SELECT grant is how a
+// reporting role reads the metrics, and a rule granting it is honoured.
+// The sealed tables are the exception. On them a grant is never a
+// side effect: reading the audit table is given to a role by name, by
+// an admin, because its records name people (read_all does not reach
+// it either); a SELECT on the large-object tables shows every object's
+// bytes, past the owner check of the lo_* functions; and the named keys
+// are read by no session at all. A rule written for "every table root
+// creates" is the blanket grant read_all is, so it does not reach them.
+func TakesDefaultPrivileges(name string) bool {
+	return !IsSealedSystemTable(name)
+}
+
 // IsLargeObjectTable reports whether name is one of the tables large
 // objects are stored in.
 func IsLargeObjectTable(name string) bool {

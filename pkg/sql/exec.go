@@ -340,8 +340,10 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 	}
 	desc.NextColumnID = catalog.ColumnID(len(desc.Columns) + 1)
-	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
-		return nil, err
+	if catalog.TakesDefaultPrivileges(desc.Name) {
+		if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
+			return nil, err
+		}
 	}
 	for _, c := range desc.Columns {
 		if err := s.requireTextSearchTypes(c.Type); err != nil {

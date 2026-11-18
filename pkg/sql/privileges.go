@@ -841,8 +841,12 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 			if catalog.IsSealedSystemTable(shared.Name) && !s.system {
 				// The audit table: SELECT is the only privilege that
 				// means anything on it, an admin the only one who hands
-				// it out, and a reader may not pass it on.
-				if len(privs) != 1 || privs[0] != "SELECT" || t.GrantOption {
+				// it out, and a reader may not pass it on. A REVOKE only
+				// takes away, so it may name any privilege: a table
+				// created before default privileges stopped reaching the
+				// sealed tables may carry the grants a rule stamped on
+				// it, every table privilege among them.
+				if !t.Revoke && (len(privs) != 1 || privs[0] != "SELECT" || t.GrantOption) {
 					return nil, newErrf(CodeInsufficientPriv, "only SELECT can be granted on table %q, and not WITH GRANT OPTION", shared.Name)
 				}
 				if err := s.checkAdmin(ctx, txn); err != nil {

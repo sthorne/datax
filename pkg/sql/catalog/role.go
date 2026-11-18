@@ -622,6 +622,13 @@ func CanReadTable(set RoleSet, d *TableDescriptor) bool {
 // Session.rowSecurityActive next, as the catalogs do before showing a
 // table's statistics (issue #312).
 func CanSelectTable(set RoleSet, d *TableDescriptor) bool {
+	if IsUnreadableSystemTable(d.Name) {
+		// No grant reads the named keys (a session is shown their
+		// metadata only as an admin), so none shows their row count:
+		// a SELECT stamped by a default-privilege rule on a table made
+		// before such rules stopped reaching it opens nothing.
+		return set.IsAdmin()
+	}
 	if IsSealedSystemTable(d.Name) {
 		return set.IsAdmin() || HasPrivilege(d.Privileges, set, "SELECT")
 	}

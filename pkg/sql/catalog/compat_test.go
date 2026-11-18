@@ -311,3 +311,35 @@ func TestRowSecurityConfines(t *testing.T) {
 		t.Fatal("root is confined")
 	}
 }
+
+// TestSystemTablesAndGrants: which system tables default privileges
+// reach, and that a SELECT grant on the named keys — which only a
+// default-privilege rule could ever have put there, on a table created
+// before such rules stopped reaching it — opens nothing for a
+// non-admin, not even the row count, while one on the audit table is
+// still the way a reader is given it.
+func TestSystemTablesAndGrants(t *testing.T) {
+	for _, name := range []string{MetricsTableName, ShapesMetricsTableName, StatementShapesTableName, PrefsTableName, "orders"} {
+		if !TakesDefaultPrivileges(name) {
+			t.Errorf("%s does not take default privileges", name)
+		}
+	}
+	for _, name := range []string{AuditTableName, LargeObjectTableName, LargeObjectMetadataTableName, LargeObjectPendingTableName, KeysTableName} {
+		if TakesDefaultPrivileges(name) {
+			t.Errorf("sealed %s takes default privileges", name)
+		}
+	}
+	reader := RoleSet{"reader": true, PublicRole: true}
+	admin := RoleSet{"ops": true, AdminRole: true, PublicRole: true}
+	keysDesc := &TableDescriptor{Name: KeysTableName, Owner: RootRole, Privileges: map[string][]string{"reader": {"SELECT"}, PublicRole: {"SELECT"}}}
+	if CanSelectTable(reader, keysDesc) || CanReadTable(reader, keysDesc) {
+		t.Fatal("a SELECT grant on datax_keys opens it")
+	}
+	if !CanSelectTable(admin, keysDesc) {
+		t.Fatal("an admin is shown less of datax_keys than before")
+	}
+	auditDesc := &TableDescriptor{Name: AuditTableName, Owner: RootRole, Privileges: map[string][]string{"reader": {"SELECT"}}}
+	if !CanSelectTable(reader, auditDesc) || CanSelectTable(RoleSet{"other": true, ReadAllRole: true}, auditDesc) {
+		t.Fatal("the audit table's readers changed")
+	}
+}
