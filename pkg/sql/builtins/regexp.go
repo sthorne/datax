@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -16,8 +17,9 @@ import (
 // which takes the common syntax (classes, [[:alpha:]], quantifiers,
 // groups, alternation, anchors) as it is. The word-boundary escapes
 // \m \M \y \Y and \Z are translated; what RE2 cannot do — back
-// references, lookahead and lookbehind — is refused as an invalid
-// regular expression (2201B).
+// references, lookahead and lookbehind — is refused as unsupported
+// (0A000): PostgreSQL accepts those patterns, so they are not invalid
+// (2201B is kept for a pattern PostgreSQL refuses too).
 
 // reFlags are a call's parsed option letters.
 type reFlags struct {
@@ -72,6 +74,9 @@ func regexCompile(pattern, flags string) (reFlags, error) {
 	default:
 		if expanded {
 			body = stripExpanded(body)
+		}
+		if err := refuseLookaround(body); err != nil {
+			return out, err
 		}
 		var err error
 		if body, err = translateARE(body); err != nil {
@@ -134,13 +139,205 @@ func translateARE(p string) (string, error) {
 		case n == 'Z':
 			b.WriteString(`\z`)
 		case n >= '1' && n <= '9':
-			return "", errf(CodeInvalidRegexp, "invalid regular expression: back references (\\%c) are not supported", n)
+			return "", errf(CodeNotSupported, "regular expression back references (\\%c) are not supported", n)
 		default:
 			b.WriteByte('\\')
 			b.WriteByte(n)
 		}
 	}
 	return b.String(), nil
+}
+
+// refuseLookaround refuses the lookahead and lookbehind constraints
+// (?= (?! (?<= (?<!, outside bracket expressions: RE2 has none.
+func refuseLookaround(p string) error {
+	inClass := false
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c == '\\':
+			i++
+		case inClass:
+			if c == ']' {
+				inClass = false
+			}
+		case c == '[':
+			inClass = true
+			if i+1 < len(p) && p[i+1] == '^' {
+				i++
+			}
+			if i+1 < len(p) && p[i+1] == ']' {
+				i++ // a leading ] is a member
+			}
+		case c == '(' && strings.HasPrefix(p[i:], "(?"):
+			rest := p[i+2:]
+			kind := ""
+			switch {
+			case strings.HasPrefix(rest, "="):
+				kind = "lookahead"
+			case strings.HasPrefix(rest, "!"):
+				kind = "negative lookahead"
+			case strings.HasPrefix(rest, "<="):
+				kind = "lookbehind"
+			case strings.HasPrefix(rest, "<!"):
+				kind = "negative lookbehind"
+			}
+			if kind != "" {
+				return errf(CodeNotSupported, "regular expression %s constraints are not supported", kind)
+			}
+		}
+	}
+	return nil
+}
+
+// RegexpMatch is the ~ and ~* operators: whether the POSIX pattern
+// matches anywhere in s, compiled as the regexp_* functions compile it.
+func RegexpMatch(s, pattern string, fold bool) (bool, error) {
+	flags := ""
+	if fold {
+		flags = "i"
+	}
+	f, err := regexCompile(pattern, flags)
+	if err != nil {
+		return false, err
+	}
+	return f.re.MatchString(s), nil
+}
+
+// charPos is the 1-based character position of the byte offset off.
+func charPos(s string, off int) int64 {
+	return int64(utf8.RuneCountInString(s[:off])) + 1
+}
+
+// regexSubstring is substring(s FROM pattern): the part of s the first
+// match of the POSIX pattern covers, or of its first parenthesized
+// subexpression when it has one; NULL when nothing matches.
+func regexSubstring(s, pattern string) (types.Datum, error) {
+	f, err := regexCompile(pattern, "")
+	if err != nil {
+		return types.Datum{}, err
+	}
+	return firstGroup(f.re, s), nil
+}
+
+func firstGroup(re *regexp.Regexp, s string) types.Datum {
+	m := re.FindStringSubmatchIndex(s)
+	switch {
+	case m == nil:
+		return types.DNull
+	case len(m) > 2:
+		if m[2] < 0 {
+			return types.DNull
+		}
+		return str(s[m[2]:m[3]])
+	}
+	return str(s[m[0]:m[1]])
+}
+
+// similarSubstring is substring(s SIMILAR pattern ESCAPE e) (and
+// substring(s FROM pattern FOR e)): the pattern, a SIMILAR TO pattern,
+// must match the whole string, and the result is the part between the
+// two escape-double-quote separators (all of it without separators);
+// NULL when it does not match.
+func similarSubstring(s, pattern, escape string) (types.Datum, error) {
+	esc := []rune(escape)
+	if len(esc) > 1 {
+		return types.Datum{}, errf(CodeInvalidEscape, "invalid escape string")
+	}
+	body, err := similarRegexp(pattern, esc)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	re, err := regexp.Compile("(?s)" + body)
+	if err != nil {
+		return types.Datum{}, errf(CodeInvalidRegexp, "invalid regular expression: %v", err)
+	}
+	return firstGroup(re, s), nil
+}
+
+// similarRegexp translates a SIMILAR TO pattern into RE2 as
+// PostgreSQL's similar_escape does: anchored, % and _ as .* and ., the
+// SQL metacharacters | * + ? {m,n} [...] kept, parentheses
+// non-capturing, the regular-expression ones (. ^ $ \) literal, and the
+// escape-double-quote separators splitting it into a lazily matched
+// head, the captured middle and a tail.
+func similarRegexp(pattern string, esc []rune) (string, error) {
+	var b strings.Builder
+	b.WriteString("^(?:")
+	quotes := 0
+	escaped, inClass := false, false
+	for _, r := range pattern {
+		switch {
+		case escaped:
+			escaped = false
+			if r == '"' {
+				switch quotes {
+				case 0:
+					b.WriteString("){1,1}?(")
+				case 1:
+					b.WriteString("){1,1}(?:")
+				default:
+					return "", errf(CodeInvalidEscapeUse, "SQL regular expression may not contain more than two escape-double-quote separators")
+				}
+				quotes++
+				continue
+			}
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		case len(esc) == 1 && r == esc[0]:
+			escaped = true
+		case inClass:
+			if r == ']' {
+				inClass = false
+			}
+			if r == '\\' {
+				b.WriteString(`\\`)
+				continue
+			}
+			b.WriteRune(r)
+		case r == '[':
+			inClass = true
+			b.WriteRune(r)
+		case r == '%':
+			b.WriteString(".*")
+		case r == '_':
+			b.WriteString(".")
+		case r == '(':
+			b.WriteString("(?:")
+		case strings.ContainsRune("|*+?{})", r):
+			b.WriteRune(r)
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	if escaped {
+		return "", errf(CodeInvalidEscape, "invalid escape string")
+	}
+	b.WriteString(")$")
+	return b.String(), nil
+}
+
+// substringPattern is substring's pattern forms, taken when its second
+// argument is text: substring(s FROM pattern) and substring(s, pattern)
+// (POSIX), substring(s SIMILAR pattern ESCAPE e) and
+// substring(s FROM pattern FOR e) (SIMILAR TO).
+func substringPattern(a []types.Datum) (types.Datum, bool, error) {
+	if len(a) < 2 || a[1].Null || a[1].Fam != types.String || a[0].Fam == types.Bytes {
+		return types.Datum{}, false, nil
+	}
+	for _, d := range a {
+		if d.Null {
+			return types.DNull, true, nil
+		}
+	}
+	if len(a) == 2 {
+		d, err := regexSubstring(a[0].Text(), a[1].S)
+		return d, true, err
+	}
+	if a[2].Fam != types.String {
+		return types.Datum{}, true, errf(CodeUndefined, "function substring(%s) does not exist", familiesText(a))
+	}
+	d, err := similarSubstring(a[0].Text(), a[1].S, a[2].S)
+	return d, true, err
 }
 
 // stripExpanded drops the white space and #-comments of an expanded
@@ -460,6 +657,50 @@ func init() {
 				return types.Datum{}, err
 			}
 			return i64(int64(len(matchesFrom(f.re, a[0].S, byteOffset(a[0].S, start))))), nil
+		}})
+	register(&Builtin{Name: "regexp_instr", Args: []types.Family{types.String, types.String, types.Int, types.Int, types.Int, types.String, types.Int}, MinArgs: 2, Ret: types.Int, Category: catString,
+		Doc: "The 1-based character position of the n-th match (the first by default) of the POSIX pattern from the character start, or of its subexpr-th subexpression: where it begins, or just after it ends with endoption 1; 0 when there is none.",
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			start, nth, endopt, sub := int64(1), int64(1), int64(0), int64(0)
+			var err error
+			if len(a) > 2 {
+				if start, err = positiveArg("start", a[2], 1); err != nil {
+					return types.Datum{}, err
+				}
+			}
+			if len(a) > 3 {
+				if nth, err = positiveArg("n", a[3], 1); err != nil {
+					return types.Datum{}, err
+				}
+			}
+			if len(a) > 4 {
+				if endopt = a[4].I; endopt != 0 && endopt != 1 {
+					return types.Datum{}, errf(CodeInvalidArgument, "invalid value for parameter \"endoption\": %d", endopt)
+				}
+			}
+			if len(a) > 6 {
+				if sub, err = positiveArg("subexpr", a[6], 0); err != nil {
+					return types.Datum{}, err
+				}
+			}
+			f, err := regexCompile(a[1].S, flagsArg(a, 5))
+			if err != nil {
+				return types.Datum{}, err
+			}
+			if err := noGlobal("regexp_instr", f); err != nil {
+				return types.Datum{}, err
+			}
+			s := a[0].S
+			ms := matchesFrom(f.re, s, byteOffset(s, start))
+			if int64(len(ms)) < nth {
+				return i64(0), nil
+			}
+			m := ms[nth-1]
+			g := int(sub) * 2
+			if g+1 >= len(m) || m[g] < 0 {
+				return i64(0), nil
+			}
+			return i64(charPos(s, m[g+int(endopt)])), nil
 		}})
 	register(&Builtin{Name: "regexp_like", Args: []types.Family{types.String, types.String, types.String}, MinArgs: 2, Ret: types.Bool, Category: catString,
 		Doc: "Whether the POSIX pattern matches anywhere in the string (the ~ operator, with flags).",

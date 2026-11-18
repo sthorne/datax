@@ -115,11 +115,10 @@ func TestAggregateOrderBy(t *testing.T) {
 		{sql: `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM ev`, code: "0A000"},
 		{sql: `SELECT array_agg(x ORDER BY count(*)) FROM ev`, code: "42803"},
 		{sql: `SELECT array_agg(x ORDER BY nope) FROM ev`, code: "42703"},
-		// datax difference: jsonb has no order, so ordering by one is
-		// refused and DISTINCT over one keeps the input order
-		// (PostgreSQL sorts jsonb).
-		{sql: `SELECT array_agg(x ORDER BY j) FROM ev`, code: "0A000"},
-		{sql: `SELECT jsonb_agg(DISTINCT j) FROM ev`, want: `[{"k":1},{"k":2},[1],"x",true,null]`},
+		// jsonb sorts in PostgreSQL's order (string < boolean < array
+		// < object; NULL last), as an ORDER BY and DISTINCT see it.
+		{sql: `SELECT array_agg(x ORDER BY j) FROM ev`, want: "{5,4,NULL,3,1,2}"},
+		{sql: `SELECT jsonb_agg(DISTINCT j) FROM ev`, want: `["x",true,[1],{"k":1},{"k":2},null]`},
 	})
 
 	if _, serr := trySQL(ctx, s, `SELECT sum(x ORDER BY y) OVER () FROM ev`); serr == nil || serr.Msg != "aggregate ORDER BY is not implemented for window functions" {

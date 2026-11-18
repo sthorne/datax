@@ -2948,6 +2948,21 @@ func (p *parser) parseSetClauses() ([]SetClause, error) {
 		if err != nil {
 			return nil, err
 		}
+		// col[sub]...: a subscripted assignment (jsonb).
+		var subs []Expr
+		for p.consumeOp("[") {
+			sub, err := p.parseAddExpr()
+			if err != nil {
+				return nil, err
+			}
+			if p.peek().kind == tkOp && p.peek().text == ":" {
+				return nil, p.errf("array slices (v[i:j]) are not supported")
+			}
+			if err := p.expectOp("]"); err != nil {
+				return nil, err
+			}
+			subs = append(subs, sub)
+		}
 		if err := p.expectOp("="); err != nil {
 			return nil, err
 		}
@@ -2955,12 +2970,34 @@ func (p *parser) parseSetClauses() ([]SetClause, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SetClause{Column: col, Value: e})
+		if len(subs) == 0 {
+			out = append(out, SetClause{Column: col, Value: e})
+		} else {
+			out = appendSubscriptSet(out, col, e, subs)
+		}
 		if !p.consumeOp(",") {
 			break
 		}
 	}
 	return out, nil
+}
+
+// appendSubscriptSet adds SET col[subs] = v as an assignment of the
+// whole column, col = subscript_assign(col, 'col', v, subs...). A
+// further subscripted assignment to the same column applies to the
+// result of the earlier ones (SET j['a'] = 1, j['b'] = 2 sets both),
+// as in PostgreSQL.
+func appendSubscriptSet(out []SetClause, col string, v Expr, subs []Expr) []SetClause {
+	name := types.NewString(col)
+	target := Expr{Column: col}
+	for i := range out {
+		if out[i].Column == col && out[i].Value.Func == builtins.SubscriptAssignFunc && out[i].Value.BinOp == "" && out[i].Value.Cast == "" {
+			prev := out[i].Value
+			out[i].Value = Expr{Func: builtins.SubscriptAssignFunc, Args: append([]Expr{prev, {Lit: &name}, v}, subs...)}
+			return out
+		}
+	}
+	return append(out, SetClause{Column: col, Value: Expr{Func: builtins.SubscriptAssignFunc, Args: append([]Expr{target, {Lit: &name}, v}, subs...)}})
 }
 
 // parseOptReturning parses RETURNING * | expr [AS alias], ... ("returning"
@@ -5868,7 +5905,10 @@ func (p *parser) continuesValue() bool {
 	t := p.peek()
 	if t.kind == tkOp {
 		switch t.text {
-		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>", "<->", "<=>", "<#>":
+		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>":
+			return true
+		}
+		if otherOps[t.text] {
 			return true
 		}
 	}
@@ -5927,6 +5967,18 @@ func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
 				return nil, false, err
 			}
 			base.Op, base.Value = neg("IS DISTINCT FROM"), v
+		case p.peekIdentWord("normalized") || (unicodeForms[p.peek().text] && p.peek().kind == tkIdent && p.i+1 < len(p.toks) && p.toks[p.i+1].isWord("normalized")):
+			// x IS [NOT] [NFC | NFD | NFKC | NFKD] NORMALIZED is
+			// is_normalized(x, form) (NULL for a NULL x).
+			form := "NFC"
+			if !p.peekIdentWord("normalized") {
+				form = strings.ToUpper(p.peek().text)
+				p.i++
+			}
+			p.i++ // normalized
+			f := types.NewString(form)
+			want := types.NewBool(!not)
+			return one(Comparison{Expr: &Expr{Func: "is_normalized", Args: []Expr{lhs, {Lit: &f}}}, Op: "=", Value: Expr{Lit: &want}})
 		default:
 			return nil, false, p.errf("expected NULL, TRUE, FALSE or DISTINCT FROM after IS, found %q", p.peek().text)
 		}
@@ -6855,6 +6907,24 @@ func (p *parser) parseSQLFuncForm(name string) (Expr, bool, error) {
 	switch name {
 	case "substring", "substr":
 		s, err := p.parseAddExpr()
+		if err == nil && name == "substring" && p.consumeIdentWord("similar") {
+			// substring(s SIMILAR pattern ESCAPE e).
+			pat, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			if !p.consumeIdentWord("escape") {
+				return Expr{}, false, p.errf("expected ESCAPE after the SIMILAR pattern, found %q", p.peek().text)
+			}
+			esc, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return Expr{}, false, err
+			}
+			return Expr{Func: "substring", Args: []Expr{s, pat, esc}}, true, nil
+		}
 		if err != nil || !p.consumeKeyword("FROM") {
 			return plain()
 		}
@@ -6874,6 +6944,49 @@ func (p *parser) parseSQLFuncForm(name string) (Expr, bool, error) {
 			return Expr{}, false, err
 		}
 		return Expr{Func: name, Args: args}, true, nil
+	case "overlay":
+		// overlay(s PLACING r FROM start [FOR n]).
+		s, err := p.parseAddExpr()
+		if err != nil || !p.consumeIdentWord("placing") {
+			return plain()
+		}
+		r, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		if err := p.expectKeyword("FROM"); err != nil {
+			return Expr{}, false, err
+		}
+		from, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		args := []Expr{s, r, from}
+		if p.consumeIdentWord("for") {
+			n, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			args = append(args, n)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		return Expr{Func: "overlay", Args: args}, true, nil
+	case "normalize":
+		// normalize(s [, NFC | NFD | NFKC | NFKD]): the form is a
+		// keyword, passed as text.
+		s, err := p.parseAddExpr()
+		if err != nil || !p.consumeOp(",") {
+			return plain()
+		}
+		t := p.peek()
+		if t.kind != tkIdent || t.quoted || !unicodeForms[t.text] || !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == ")") {
+			return Expr{}, false, p.errf("syntax error at or near %q: normalize() takes NFC, NFD, NFKC or NFKD", t.text)
+		}
+		p.i += 2
+		f := types.NewString(strings.ToUpper(t.text))
+		return Expr{Func: "normalize", Args: []Expr{s, {Lit: &f}}}, true, nil
 	case "position":
 		needle, err := p.parseAddExpr()
 		if err != nil || !p.consumeIdentWord("in") {
@@ -6963,7 +7076,7 @@ func (p *parser) parseAddExpr() (Expr, error) {
 	}
 	for {
 		op := p.peek()
-		if op.kind != tkOp || (op.text != "<->" && op.text != "<=>" && op.text != "<#>") {
+		if op.kind != tkOp || !otherOps[op.text] {
 			return e, nil
 		}
 		p.i++
@@ -6974,6 +7087,23 @@ func (p *parser) parseAddExpr() (Expr, error) {
 		e = foldBinOp(e, op.text, rhs)
 	}
 }
+
+// unicodeForms are the Unicode normal forms normalize() and IS
+// NORMALIZED name as keywords.
+var unicodeForms = map[string]bool{"nfc": true, "nfd": true, "nfkc": true, "nfkd": true}
+
+// otherOps are the binary operators PostgreSQL has no precedence rule
+// for, which all bind alike (looser than + and -, tighter than the
+// comparisons) and associate to the left: the vector distances, the
+// integer bitwise operators & | # << >>, and jsonb's #- (delete path).
+var otherOps = map[string]bool{"<->": true, "<=>": true, "<#>": true, "&": true, "|": true, "#": true, "<<": true, ">>": true, "#-": true}
+
+// prefixOps are the prefix operators, as the functions they call: ~
+// (bitwise not), @ (absolute value), |/ (square root), ||/ (cube
+// root). Like PostgreSQL's, a prefix operator takes the operand that
+// follows up to + and - (~ 1 + 2 is ~3), and binds tighter than the
+// other operators (~1 & 2 is (~1) & 2).
+var prefixOps = map[string]string{"~": "int8not", "@": "abs", "|/": "sqrt", "||/": "cbrt"}
 
 func (p *parser) parseSumExpr() (Expr, error) {
 	e, err := p.parseMulExpr()
@@ -7117,6 +7247,14 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 	}
 	defer p.leave()
 	t := p.peek()
+	if fn, ok := prefixOps[t.text]; ok && t.kind == tkOp {
+		p.i++
+		x, err := p.parseSumExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Func: fn, Args: []Expr{x}}, nil
+	}
 	if t.kind == tkKeyword && t.text == "KEY" {
 		// KEY is a keyword only in key definitions; as a value it is a
 		// column, as in PostgreSQL (jsonb_each's key column).

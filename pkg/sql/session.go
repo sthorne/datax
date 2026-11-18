@@ -1576,6 +1576,17 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	if l.Null || r.Null {
 		return types.DNull, nil
 	}
+	switch {
+	case op == "-" && l.Fam == types.Jsonb:
+		d, _, err := builtins.JSONBDelete(l, r)
+		return d, builtinErr(err)
+	case op == "#-":
+		d, err := builtins.JSONBDeletePath(l, r)
+		return d, builtinErr(err)
+	case builtins.IsBitwiseOp(op):
+		d, err := builtins.Bitwise(l, op, r)
+		return d, builtinErr(err)
+	}
 	if d, ok, err := builtins.DateArithIn(l, op, r, loc); ok {
 		return d, builtinErr(err)
 	}
@@ -2373,11 +2384,13 @@ func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
 func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
 	switch op {
 	case "~", "!~", "~*", "!~*":
-		re, err := regexFor(rhs.Text(), op == "~*" || op == "!~*")
+		// Compiled as the regexp_* functions compile a pattern: the
+		// ARE escapes translated, back references and lookaround
+		// refused (0A000), an invalid pattern 2201B.
+		m, err := builtins.RegexpMatch(lhs.Text(), rhs.Text(), op == "~*" || op == "!~*")
 		if err != nil {
-			return false, err
+			return false, builtinErr(err)
 		}
-		m := re.MatchString(lhs.Text())
 		return m == (op == "~" || op == "~*"), nil
 	}
 	switch op {
