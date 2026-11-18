@@ -11,6 +11,18 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Quoted identifiers as in PostgreSQL** (#367): a quoted type name keeps
+  its case (`CREATE TYPE "Role"`, a column `r "Role"`, `::"Role"`, `CAST(x
+  AS "public"."Role")`, `ALTER COLUMN ... TYPE "Role"`, `regtype`,
+  `format_type`), so Prisma's enums work; `""` inside a quoted identifier is
+  one `"`, for every kind of object; a quoted identifier is never a keyword
+  (`"concurrently"`, `"select"`, `"user"`). `quote_ident`, `format('%I')`,
+  `pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_expr`, `format_type`
+  and `SHOW CREATE TABLE` quote names as PostgreSQL does, with its keyword
+  list; serial defaults read `nextval('"T_id_seq"')`, and mixed-case columns
+  work in expression indexes and stored defaults. `E''` strings take `\b`,
+  `\f`, `\xHH`, octal `\ooo`, `\uXXXX` and `\UXXXXXXXX`, with PostgreSQL's
+  errors (`22021`, `22025`, `42601`). Quoted role names are still folded.
 - **pg_dump and pg_restore** (#366): PostgreSQL 16's `pg_dump` dumps a datax
   database and the output restores into another: plain, custom and
   directory formats, `--schema-only` / `--data-only`, `--snapshot`, and
@@ -1723,6 +1735,19 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Concurrent online `CREATE INDEX` on one table could lose an index**
+  (#368): every phase of an online schema change wrote the table descriptor
+  from the gateway's cached copy, a blind write, so one build could write
+  the table back without the other's index (and reuse its index ID) while
+  both reported success, or fail with "index vanished during backfill".
+  Descriptor writes now compare the version they replace and retry instead
+  of overwriting, and the phases re-read the descriptor in their own
+  transaction and change only their own index; this covers `DROP INDEX`,
+  `ALTER TABLE`, `ADD CONSTRAINT` and `TRUNCATE` too. An explicit
+  transaction whose DDL follows another session's change to the same table
+  now gets `40001` rather than writing over it.
+- **Online `CREATE INDEX` failed with "conflicting write intents"** (#368)
+  when a concurrent writer had an open transaction as the build drained.
 - **Catalog values pg_dump reads** (#366): a table whose only index is its
   primary key reported `relhasindex` false, so a dump lost the key;
   `pg_get_viewdef` lacked the trailing `;`, so pg_dump cut the view's last
