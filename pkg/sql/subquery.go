@@ -77,12 +77,12 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 // resolveValueNode is resolveValueExprOpts before the time-zone
 // annotation (zoneNode).
 func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum, keepVolatile bool) (parser.Expr, error) {
-	if e.Func != "" && splicedFuncs[e.Func] && argsNeedSplice(e.Args) {
-		// A session function whose argument is itself one, or a
-		// subquery (pg_cancel_backend(pg_backend_pid()),
-		// set_config('a.b', current_user, false)): the splice below
-		// evaluates its arguments as constants, so they resolve first,
-		// innermost out, as PostgreSQL evaluates a nested call.
+	if constArgFuncs[e.Func] && argsNeedSplice(e.Args) {
+		// A session function that evaluates its arguments as constants
+		// here, given another session function or a subquery as one
+		// (pg_cancel_backend(pg_backend_pid()), set_config('a.b',
+		// current_user, false)): the arguments resolve first, innermost
+		// out, as PostgreSQL evaluates a nested call.
 		args := make([]parser.Expr, len(e.Args))
 		for i, a := range e.Args {
 			ra, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
@@ -1847,6 +1847,14 @@ func (s *Session) enumTypeByText(ctx context.Context, txn *kvclient.Txn, text st
 		return nil, false, nil
 	}
 	return td, true, nil
+}
+
+// constArgFuncs are the spliced functions whose splice evaluates their
+// arguments as constants (the others take their arguments as columns,
+// subqueries or sets themselves).
+var constArgFuncs = map[string]bool{
+	"pg_cancel_backend": true, "pg_terminate_backend": true, "pg_sleep": true, "pg_notify": true,
+	"set_config": true, "current_setting": true, "nextval": true, "currval": true, "setval": true,
 }
 
 // argsNeedSplice reports whether a call's arguments hold a spliced

@@ -1127,7 +1127,11 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
   `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
   `mode() WITHIN GROUP (ORDER BY x)`, `json[b]_agg`,
-  `json[b]_object_agg` — over a column or an expression (`SUM(qty *
+  `json[b]_object_agg` (and their `_strict` / `_unique` forms),
+  `corr`, `covar_pop` / `covar_samp`, `regr_avgx`, `regr_avgy`,
+  `regr_count`, `regr_intercept`, `regr_r2`, `regr_slope`, `regr_sxx`,
+  `regr_sxy`, `regr_syy`, `bit_and` / `bit_or` / `bit_xor`,
+  `any_value` — over a column or an expression (`SUM(qty *
   price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER (WHERE
   ...)`, whole-table or per `GROUP BY` group, including over joins. An
   `ORDER BY` among the arguments sets the order an aggregate takes its
