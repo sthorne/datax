@@ -18,6 +18,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
@@ -1557,7 +1558,25 @@ func namespaceKey(dbID uint64, name string) keys.Key {
 
 // Update rewrites an existing table's descriptor within txn (DDL like
 // CREATE INDEX / ALTER TABLE), bumping its version.
+//
+// The write is a compare-and-swap on the version (issue #368). d is
+// usually a copy of the gateway's leased descriptor, which the
+// statement did not read in its transaction: written blindly, a copy
+// taken before another schema change committed would put back the
+// table as it was, and the other change — an index another session had
+// just published, its ID handed out a second time — would be gone with
+// nothing to say so. So the descriptor is read here, in txn: a version
+// other than the one d was made from means d is stale, and the
+// transaction restarts (an implicit statement, or a phase of an online
+// schema change, does so by itself and then reads the table afresh;
+// the stale cache entry is dropped first). The read also makes the
+// descriptor part of what txn must find unchanged when it commits, so
+// two schema changes that both pass this check still cannot both
+// commit: serializable isolation restarts the second.
 func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+	if err := a.checkCurrent(ctx, txn, d); err != nil {
+		return err
+	}
 	d.Version++
 	raw, err := json.Marshal(d)
 	if err != nil {
@@ -1568,6 +1587,46 @@ func (a *Accessor) Update(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	}
 	a.Invalidate(d.Name)
 	return nil
+}
+
+// checkCurrent reads table d's descriptor in txn and refuses, with a
+// retryable error, a d made from another version of it (see Update).
+func (a *Accessor) checkCurrent(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor) error {
+	raw, err := txn.Get(ctx, keys.TableDescKey(d.ID))
+	if err != nil {
+		return err
+	}
+	if raw == nil {
+		// Dropped since d was read: writing d would bring it back
+		// without its name entry.
+		a.invalidateID(d.ID)
+		return &ErrTableNotFound{Name: d.Name}
+	}
+	var stored struct {
+		Version uint64 `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return fmt.Errorf("corrupt descriptor %d: %w", d.ID, err)
+	}
+	if stored.Version == d.Version {
+		return nil
+	}
+	a.invalidateID(d.ID)
+	return &kvclient.RetryableError{Cause: &kvpb.Error{Message: fmt.Sprintf(
+		"table %q was changed by a concurrent schema change (this statement read descriptor version %d, the table is at version %d)",
+		d.Name, d.Version, stored.Version)}}
+}
+
+// invalidateID drops every cache entry holding descriptor id, under
+// whatever name.
+func (a *Accessor) invalidateID(id uint64) {
+	a.mu.Lock()
+	for k, c := range a.cache {
+		if c.desc != nil && c.desc.ID == id {
+			delete(a.cache, k)
+		}
+	}
+	a.mu.Unlock()
 }
 
 // RenameTable moves a table's name entry and rewrites its descriptor

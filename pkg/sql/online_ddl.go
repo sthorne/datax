@@ -2,6 +2,8 @@ package sql
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
@@ -139,6 +141,48 @@ func isComputedKind(kind inverted.Kind) bool {
 	return fn != ""
 }
 
+// lookupForSchemaChange resolves the table a phase of an online schema
+// change is about to rewrite, as s.lookup does (a view, a sequence or a
+// catalog table is refused), and returns its descriptor as read in txn
+// itself, never the gateway's leased copy, ready to be changed: the
+// phase then edits the table as it is at that moment, its own index by
+// ID among whatever other indexes concurrent statements have added or
+// removed since, and catalog's Update makes sure it still is when the
+// phase commits (issue #368).
+func (s *Session) lookupForSchemaChange(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
+	d, err := s.lookup(ctx, txn, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := mustBeReal(d); err != nil {
+		return nil, err
+	}
+	return s.cat.LookupFreshIn(ctx, txn, s.database, name)
+}
+
+// TestingCreateIndexHook, when set, is called by an online CREATE INDEX
+// at the points named by the CreateIndex* constants, with the index's
+// name: a test's window to run another schema change in between. It
+// may be called more than once at a point, when the transaction around
+// it restarts.
+var TestingCreateIndexHook func(point, index string)
+
+// The points TestingCreateIndexHook is called at.
+const (
+	// CreateIndexBeforePublishWrite: in the transaction that publishes
+	// the write-only index, just before the descriptor is written.
+	CreateIndexBeforePublishWrite = "before-publish-write"
+	// CreateIndexPublished: the write-only index has committed; its
+	// drain has not begun.
+	CreateIndexPublished = "published"
+	// CreateIndexDrained: every gateway writes the write-only index; the
+	// backfill has not begun.
+	CreateIndexDrained = "drained"
+	// CreateIndexBeforePublicWrite: in the transaction that makes the
+	// backfilled index public, just before the descriptor is written.
+	CreateIndexBeforePublicWrite = "before-public-write"
+)
+
 // backfillChunkSize bounds each backfill chunk: rows scanned, KV batch
 // size, raft entry size, and refresh-span width per transaction.
 const backfillChunkSize = 64
@@ -189,14 +233,10 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	exists := false
 	err = s.db.RunTxn(ctx, "create-index-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		exists = false
-		shared, err := s.lookup(ctx, txn, t.Table)
+		desc, err := s.lookupForSchemaChange(ctx, txn, t.Table)
 		if err != nil {
 			return err
 		}
-		if err := mustBeReal(shared); err != nil {
-			return err
-		}
-		desc := shared.Clone()
 		if desc.Reshard != nil {
 			// The re-shard allocated shadow IDs for the indexes it saw at
 			// publish time; an index appearing mid-flight would miss the
@@ -239,6 +279,9 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		if desc.Sealed() {
 			notices = []string{sealedIndexNotice(desc, idx)}
 		}
+		if TestingCreateIndexHook != nil {
+			TestingCreateIndexHook(CreateIndexBeforePublishWrite, t.Name)
+		}
 		return s.cat.Update(ctx, txn, desc)
 	})
 	if vec != nil && (err != nil || exists) {
@@ -251,8 +294,14 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	if exists {
 		return &Result{Tag: "CREATE INDEX"}, nil
 	}
+	if TestingCreateIndexHook != nil {
+		TestingCreateIndexHook(CreateIndexPublished, t.Name)
+	}
 	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
+	}
+	if TestingCreateIndexHook != nil {
+		TestingCreateIndexHook(CreateIndexDrained, t.Name)
 	}
 
 	// Step 2: chunked backfill (see the file comment for the liveness and
@@ -261,13 +310,15 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	// Step 3: flip public in its own small transaction.
 	if backfillErr == nil {
 		backfillErr = s.db.RunTxn(ctx, "create-index-public", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.lookup(ctx, txn, t.Table)
+			desc, err := s.lookupForSchemaChange(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
-			desc := shared.Clone()
 			for i := range desc.Indexes {
 				if desc.Indexes[i].ID == indexID {
+					if TestingCreateIndexHook != nil {
+						TestingCreateIndexHook(CreateIndexBeforePublicWrite, t.Name)
+					}
 					desc.Indexes[i].State = catalog.IndexStatePublic
 					return s.cat.Update(ctx, txn, desc)
 				}
@@ -282,11 +333,11 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 		// wasted space), then surface the original failure.
 		var tableID uint64
 		_ = s.db.RunTxn(ctx, "create-index-abandon", func(ctx context.Context, txn *kvclient.Txn) error {
-			shared, err := s.lookup(ctx, txn, t.Table)
+			tableID = 0
+			desc, err := s.lookupForSchemaChange(ctx, txn, t.Table)
 			if err != nil {
 				return err
 			}
-			desc := shared.Clone()
 			tableID = desc.ID
 			kept := desc.Indexes[:0]
 			for _, ix := range desc.Indexes {
@@ -405,7 +456,7 @@ func (s *Session) clearDrainEntries(ctx context.Context, tableID, indexID uint64
 	const chunk = 256
 	lo, hi := keys.TableIndexSpan(tableID, indexID)
 	for {
-		kvs, err := s.db.Scan(ctx, lo, hi, chunk)
+		kvs, err := s.scanPastIntents(ctx, lo, hi, chunk)
 		if err != nil {
 			return err
 		}
@@ -425,6 +476,36 @@ func (s *Session) clearDrainEntries(ctx context.Context, tableID, indexID uint64
 			return nil
 		}
 		lo = kvs[len(kvs)-1].Key.Next()
+	}
+}
+
+// scanPastIntents is a non-transactional scan of [lo, hi) that waits
+// out the intents it runs into instead of failing on them: a writer
+// that maintains the write-only index lays intents in its span, and the
+// scan used to hand the client "conflicting write intents" (issue #368,
+// seen under pg_restore -j, whose COPY loads a table while its indexes
+// are built). The owners of intents found are pushed timidly, so that a
+// finished transaction's are resolved and the scan sees what it
+// committed; a live owner is waited for, as a transactional read would.
+func (s *Session) scanPastIntents(ctx context.Context, lo, hi keys.Key, max int64) ([]kvpb.KeyValue, error) {
+	for {
+		kvs, err := s.db.Scan(ctx, lo, hi, max)
+		var kerr *kvpb.Error
+		if err == nil || !errors.As(err, &kerr) || kerr.WriteIntent == nil || len(kerr.WriteIntent.Intents) == 0 {
+			return kvs, err
+		}
+		resolved, perr := s.db.PushAndResolveIntents(ctx, kerr.WriteIntent.Intents)
+		if perr != nil {
+			return nil, perr
+		}
+		if resolved {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 

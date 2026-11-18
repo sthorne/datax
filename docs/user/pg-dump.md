@@ -122,10 +122,14 @@ A restored database dumps exactly as its source did.
   identifier stays good for as long as that moment is within the
   cluster's GC window (`gc_ttl`). Parallel dumps (`-Fd -j N`) use the
   same mechanism for their workers.
-- **Parallel restore** (`pg_restore -j N`) is not recommended yet: it
-  builds several indexes of one table at the same time, which datax does
-  not handle reliably, and the first large object it restores can fail
-  with `40001`. Restore without `-j`.
+- **Parallel restore** (`pg_restore -j N`) is not recommended yet.
+  Building several indexes of one table at the same time, as it does,
+  is safe. But datax does not yet report the dependencies pg_restore
+  orders its workers by (an index or constraint on its table, a foreign
+  key on the key it references), so one worker can build an index while
+  another is still loading the table, or add a foreign key before the
+  key it references exists, and fail; and the first large object it
+  restores can fail with `40001`. Restore without `-j`.
 - **`LOCK TABLE`.** pg_dump locks the tables it dumps `IN ACCESS SHARE
   MODE`; datax's schema changes are online and never wait for readers,
   so that lock (and `ROW SHARE` / `ROW EXCLUSIVE`) is checked and
