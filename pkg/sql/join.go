@@ -339,6 +339,12 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cmp.Op == "FALSE" {
 			return false, nil
 		}
+		if cmp.Sub != nil {
+			// A subquery is resolved before the join runs, or split off
+			// to be evaluated per row (splitCorrelatedOn): one reaching
+			// here was not, and must not read as no match.
+			return false, newErrf(CodeFeatureNotSupported, "subquery in a join condition is not supported here")
+		}
 		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
 			// Containment is single-table only. This must stay an explicit
 			// refusal: an unhandled operator below would silently drop
@@ -775,12 +781,21 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		joined = append(joined, joinedRow{rows: []map[catalog.ColumnID]types.Datum{fr.row}})
 	}
 
+	// onc is level k's correlated ON conjuncts, if any: bound to the
+	// syntactic side order, which correlation keeps (no reordering).
+	onc := func(k int) *onCorr {
+		if jc == nil || k-1 >= len(jc.on) {
+			return nil
+		}
+		return jc.on[k-1]
+	}
+
 	// One left-deep level at a time: every partial row either fans out
 	// over that side's matches, NULL-extends (LEFT), or drops (INNER).
 	for k := 1; k < len(sides); k++ {
 		if lat := s.lateralAt(sides[k].desc); lat != nil {
 			// A lateral side: its query runs per partial row.
-			if joined, err = s.joinLateral(ctx, txn, sides, k, lat, ons[k-1], t.Joins[k-1].Filter, joined, params); err != nil {
+			if joined, err = s.joinLateral(ctx, txn, sides, k, lat, ons[k-1], t.Joins[k-1].Filter, onc(k), joined, params); err != nil {
 				return nil, err
 			}
 			s.note("join level %d (%s, lateral %s): %d rows", k, sides[k].alias, levelKindName(sides, t, keys, k), len(joined))
@@ -809,6 +824,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 		// fails them is a miss, so a LEFT side NULL-extends. They see
 		// only the sides joined so far.
 		filter := t.Joins[k-1].Filter
+		corrOn := onc(k)
 		scope := sides[:k+1]
 		for i, jr := range joined {
 			if i&1023 == 1023 {
@@ -848,6 +864,15 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 				ext := jr.extend(ifr.row)
 				if len(filter) > 0 {
 					ok, err := evalJoinWhere(scope, filter, ext, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				if corrOn != nil {
+					ok, err := s.onMatches(ctx, txn, corrOn, ext, params)
 					if err != nil {
 						return nil, err
 					}
