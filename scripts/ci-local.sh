@@ -44,7 +44,7 @@ lint() {
 		echo "$fmt"
 		return 1
 	fi
-	go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+	go vet ./... && GOTOOLCHAIN=$(go env GOVERSION) go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
 }
 
 unit() {
