@@ -38,6 +38,7 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		operands []setOperand
 		head     *Result
 		members  []*Result // in list order, for ORDER BY name lookup
+		asts     []*parser.Select
 		total    int
 	)
 	op, all := "", false
@@ -62,12 +63,18 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		}
 		operands = append(operands, setOperand{rows: res.Rows, op: op, all: all})
 		members = append(members, res)
+		asts = append(asts, m)
 		op, all = setOpName(m.SetOp), m.UnionAll
 	}
 
 	// Unify the column types across members and conform every value.
 	cols := make([]ResultColumn, len(head.Columns))
 	copy(cols, head.Columns)
+	if valuesList(asts) {
+		if err := resolveValuesTypes(asts, members, cols); err != nil {
+			return nil, err
+		}
+	}
 	for _, res := range members[1:] {
 		for i := range cols {
 			cols[i].Type = unifyFamily(cols[i].Type, res.Columns[i].Type)
@@ -132,6 +139,83 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	}
 	rows = trimRows(rows, t)
 	return &Result{Columns: cols, Rows: rows, Tag: fmt.Sprintf("SELECT %d", len(rows))}, nil
+}
+
+// valuesList reports set members that are the rows of one VALUES list.
+func valuesList(asts []*parser.Select) bool {
+	for _, m := range asts {
+		if !m.Values {
+			return false
+		}
+	}
+	return true
+}
+
+// untypedLiteral reports a VALUES item whose type is PostgreSQL's
+// "unknown": a bare string literal or NULL, which takes the type the
+// list's other rows give the column.
+func untypedLiteral(e parser.Expr) bool {
+	return e.Lit != nil && (e.Lit.Null || e.Lit.Fam == types.String) && e.Cast == "" && e.BinOp == "" &&
+		e.Left == nil && len(e.Path) == 0
+}
+
+// resolveValuesTypes gives each column of a VALUES list one type, as
+// PostgreSQL's select_common_type does: the first typed row's, lifted
+// within the numeric (or date and time) category by a later row's, the
+// untyped literals ('...', NULL) converted to it (22P02 when one is not
+// a valid input of it), and text when no row is typed; rows of types
+// of different categories are refused (42804). Every value is
+// converted to its column's type, and members and cols record it.
+func resolveValuesTypes(asts []*parser.Select, members []*Result, cols []ResultColumn) error {
+	for i := range cols {
+		pick, err := valuesColumnType(asts, i, func(mi int) types.Family { return members[mi].Columns[i].Type })
+		if err != nil {
+			return err
+		}
+		for mi, res := range members {
+			for _, row := range res.Rows {
+				d := row[i]
+				if d.Null || d.Fam == pick {
+					continue
+				}
+				c, err := d.Coerce(pick)
+				if err != nil {
+					return newErrf(CodeInvalidTextRepresentation, "invalid input syntax for type %s: %q", pgTypeName(pick), d.Text())
+				}
+				row[i] = c
+			}
+			members[mi].Columns[i].Type = pick
+		}
+		cols[i].Type = pick
+	}
+	return nil
+}
+
+// valuesColumnType is the type of column i of a VALUES list whose rows
+// are asts, row mi's value of type typeOf(mi) (see resolveValuesTypes).
+func valuesColumnType(asts []*parser.Select, i int, typeOf func(mi int) types.Family) (types.Family, error) {
+	pick := types.Unknown
+	for mi, m := range asts {
+		if i >= len(m.Exprs) || untypedLiteral(m.Exprs[i].Expr) {
+			continue
+		}
+		f := typeOf(mi)
+		switch {
+		case f == types.Unknown || f == pick:
+		case pick == types.Unknown:
+			pick = f
+		case numericFam(f) && numericFam(pick):
+			pick = unifyFamily(pick, f)
+		case (f == types.Date || f == types.Timestamp) && (pick == types.Date || pick == types.Timestamp):
+			pick = types.Timestamp
+		default:
+			return types.Unknown, newErrf(CodeDatatypeMismatch, "VALUES types %s and %s cannot be matched", pgTypeName(pick), pgTypeName(f))
+		}
+	}
+	if pick == types.Unknown {
+		pick = types.String
+	}
+	return pick, nil
 }
 
 // setOpName normalizes a member's SetOp ("" is UNION).

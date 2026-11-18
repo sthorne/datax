@@ -102,8 +102,9 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 		return
 	}
 	cols := ci.Columns()
+	opts := ci.Options()
 	var code uint16
-	if cf.Format == parser.CopyFormatBinary {
+	if opts.Format == parser.CopyFormatBinary {
 		code = 1
 	}
 	resp := &pgproto3.CopyInResponse{OverallFormat: byte(code), ColumnFormatCodes: make([]uint16, len(cols))}
@@ -118,13 +119,13 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	r := &copyDataReader{backend: c.backend}
 	br := bufio.NewReaderSize(r, 64<<10)
 	var derr error
-	switch cf.Format {
+	switch opts.Format {
 	case parser.CopyFormatBinary:
 		derr = copyBinaryLoop(ctx, ci, br, cols)
 	case parser.CopyFormatCSV:
-		derr = copyCSVLoop(ctx, ci, br, cols)
+		derr = copyCSVLoop(ctx, ci, br, cols, opts)
 	default:
-		derr = copyTextLoop(ctx, ci, br, cols)
+		derr = copyTextLoop(ctx, ci, br, cols, opts)
 	}
 	if derr == nil {
 		n, ferr := ci.Finish(ctx)
@@ -172,7 +173,8 @@ func rowFmtErr(ci *sql.CopyIn, code string, format string, args ...any) error {
 // ---------------------------------------------------------------------------
 // Text format.
 
-func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []catalog.Column) error {
+func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []catalog.Column, opts *sql.CopyOut) error {
+	header := opts.Header
 	for {
 		line, err := readTextLine(br)
 		if err == io.EOF {
@@ -181,15 +183,38 @@ func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []
 		if err != nil {
 			return err
 		}
+		if header {
+			// HEADER: the first line names the columns; skipped, or with
+			// MATCH checked against them.
+			header = false
+			if opts.HeaderMatch {
+				var names []*string
+				for _, f := range splitTextLine(line, opts.Delim) {
+					if f == opts.Null {
+						names = append(names, nil)
+						continue
+					}
+					raw, derr := decodeTextField(f)
+					if derr != nil {
+						return rowFmtErr(ci, sql.CodeBadCopyFormat, "%v", derr)
+					}
+					names = append(names, &raw)
+				}
+				if err := matchCopyHeader(names, cols, opts.Null); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if line == `\.` {
 			// End-of-data marker: ignore anything after it.
 			discardToEOF(br)
 			return nil
 		}
-		fields := strings.Split(line, "\t")
+		fields := splitTextLine(line, opts.Delim)
 		vals := make([]types.Datum, len(fields))
 		for i, f := range fields {
-			if f == `\N` {
+			if f == opts.Null {
 				vals[i] = types.DNull
 				continue
 			}
@@ -211,6 +236,44 @@ func copyTextLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []
 			return err
 		}
 	}
+}
+
+// splitTextLine splits a text-format line at each delimiter that no
+// backslash escapes, leaving every field as written (the NULL string is
+// matched before de-escaping, as PostgreSQL does).
+func splitTextLine(line string, delim byte) []string {
+	var fields []string
+	start := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			i++
+		case delim:
+			fields = append(fields, line[start:i])
+			start = i + 1
+		}
+	}
+	return append(fields, line[start:])
+}
+
+// matchCopyHeader checks a header line's fields (nil: the NULL string)
+// against the columns, as HEADER MATCH does, with PostgreSQL's errors.
+func matchCopyHeader(names []*string, cols []catalog.Column, null string) error {
+	if len(names) != len(cols) {
+		return &sql.Error{Code: sql.CodeBadCopyFormat,
+			Msg: fmt.Sprintf("wrong number of fields in header line: got %d, expected %d", len(names), len(cols))}
+	}
+	for i, n := range names {
+		if n == nil {
+			return &sql.Error{Code: sql.CodeBadCopyFormat,
+				Msg: fmt.Sprintf("column name mismatch in header line field %d: got null value (%q), expected %q", i+1, null, cols[i].Name)}
+		}
+		if *n != cols[i].Name {
+			return &sql.Error{Code: sql.CodeBadCopyFormat,
+				Msg: fmt.Sprintf("column name mismatch in header line field %d: got %q, expected %q", i+1, *n, cols[i].Name)}
+		}
+	}
+	return nil
 }
 
 // readTextLine reads one \n-terminated line (tolerating \r\n), returning
@@ -310,14 +373,30 @@ type csvField struct {
 	quoted bool
 }
 
-func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []catalog.Column) error {
+func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []catalog.Column, opts *sql.CopyOut) error {
+	header := opts.Header
 	for {
-		fields, err := readCSVRecord(br)
+		fields, err := readCSVRecord(br, opts.Delim, opts.Quote, opts.Escape)
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return rowFmtErr(ci, sql.CodeBadCopyFormat, "%v", err)
+		}
+		if header {
+			header = false
+			if opts.HeaderMatch {
+				names := make([]*string, len(fields))
+				for i := range fields {
+					if fields[i].quoted || fields[i].text != opts.Null {
+						names[i] = &fields[i].text
+					}
+				}
+				if err := matchCopyHeader(names, cols, opts.Null); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if len(fields) == 1 && !fields[0].quoted && fields[0].text == `\.` {
 			discardToEOF(br)
@@ -325,7 +404,16 @@ func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []c
 		}
 		vals := make([]types.Datum, len(fields))
 		for i, f := range fields {
-			if !f.quoted && f.text == "" {
+			// An unquoted NULL string is NULL (FORCE_NOT_NULL: the
+			// string); a quoted one is the string (FORCE_NULL: NULL).
+			isNull := !f.quoted && f.text == opts.Null
+			if i < len(opts.ForceNotNull) && opts.ForceNotNull[i] {
+				isNull = false
+			}
+			if i < len(opts.ForceNull) && opts.ForceNull[i] && f.text == opts.Null {
+				isNull = true
+			}
+			if isNull {
 				vals[i] = types.DNull
 				continue
 			}
@@ -345,10 +433,13 @@ func copyCSVLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols []c
 	}
 }
 
-// readCSVRecord reads one CSV record, streaming: quoted fields may embed
-// commas, newlines, and "" escapes; records end at an unquoted newline.
+// readCSVRecord reads one CSV record, streaming, as PostgreSQL's CSV
+// reader does: a quote starts a quoted section anywhere in a field,
+// which may embed delimiters and newlines; inside it the escape
+// character before the quote or itself stands for that character (the
+// doubled quote, by default); records end at an unquoted newline.
 // Returns io.EOF only at a clean end of stream.
-func readCSVRecord(br *bufio.Reader) ([]csvField, error) {
+func readCSVRecord(br *bufio.Reader, delim, quote, escape byte) ([]csvField, error) {
 	var (
 		fields   []csvField
 		cur      strings.Builder
@@ -378,15 +469,17 @@ func readCSVRecord(br *bufio.Reader) ([]csvField, error) {
 		}
 		read = true
 		if inQuotes {
-			if ch == '"' {
+			if ch == escape {
 				nxt, nerr := br.ReadByte()
-				if nerr == nil && nxt == '"' {
-					cur.WriteByte('"')
+				if nerr == nil && (nxt == escape || nxt == quote) {
+					cur.WriteByte(nxt)
 					continue
 				}
 				if nerr == nil {
 					_ = br.UnreadByte()
 				}
+			}
+			if ch == quote {
 				inQuotes = false
 				continue
 			}
@@ -394,14 +487,10 @@ func readCSVRecord(br *bufio.Reader) ([]csvField, error) {
 			continue
 		}
 		switch ch {
-		case '"':
-			if cur.Len() == 0 && !quoted {
-				quoted = true
-				inQuotes = true
-				continue
-			}
-			cur.WriteByte(ch)
-		case ',':
+		case quote:
+			quoted = true
+			inQuotes = true
+		case delim:
 			endField()
 		case '\n':
 			endField()

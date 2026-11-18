@@ -951,6 +951,8 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return s.execFetch(t)
 	case *parser.CloseCursor:
 		return s.execCloseCursor(t)
+	case *parser.Discard:
+		return s.execDiscard(t)
 
 	default:
 		if s.state == StateOpen {
@@ -1951,7 +1953,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if err != nil {
 			return false, err
 		}
-		if lhs.Null || rhs.Null {
+		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil // NULL comparisons never match
 		}
 		if !plainCmpOp(cmp.Op) {
@@ -2110,7 +2112,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 			}
 			continue
 		}
-		if lhs.Null || rhs.Null {
+		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil
 		}
 		ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
@@ -2195,6 +2197,9 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 	if nullAwareOp(cmp.Op) {
 		ok, err := applyNullAware(cmp.Op, lhs, rhs)
 		return ok, false, err
+	}
+	if _, _, q := parser.SplitQuantified(cmp.Op); q {
+		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape)
 	}
 	if lhs.Null || rhs.Null {
 		return false, true, nil
@@ -2408,38 +2413,11 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		return ok == !strings.HasPrefix(op, "NOT "), nil
 	}
-	if i := strings.IndexByte(op, ' '); i >= 0 {
+	if _, _, ok := parser.SplitQuantified(op); ok {
 		// Quantified comparison over an array value (or a text array
-		// literal '{a,b}'): ANY holds when some element does, ALL when
-		// every element does.
-		base, quant := op[:i], op[i+1:]
-		var elems []types.Datum
-		if rhs.Fam.IsArray() {
-			elems = rhs.A
-		} else {
-			for _, el := range arrayElems(rhs.Text()) {
-				elems = append(elems, types.NewString(el))
-			}
-		}
-		for _, ed := range elems {
-			if ed.Null {
-				continue // never holds, never fails (three-valued: UNKNOWN)
-			}
-			if c, err := ed.Coerce(lhs.Fam); err == nil {
-				ed = c
-			}
-			ok, err := applyCmpOp(base, lhs, ed)
-			if err != nil {
-				return false, err
-			}
-			if ok && quant == "ANY" {
-				return true, nil
-			}
-			if !ok && quant == "ALL" {
-				return false, nil
-			}
-		}
-		return quant == "ALL", nil
+		// literal '{a,b}'); UNKNOWN is not a match.
+		ok, _, err := quantCmp3(op, lhs, rhs, escape)
+		return ok, err
 	}
 	if lhs.Fam != rhs.Fam {
 		if c, err := rhs.Coerce(lhs.Fam); err == nil {
@@ -2451,6 +2429,74 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		return false, err
 	}
 	return cmpHolds(op, c), nil
+}
+
+// quantCmp3 evaluates a quantified comparison, x op ANY | ALL (array),
+// under three-valued logic, as PostgreSQL does: (value, false), or (_,
+// true) when it is UNKNOWN. ANY holds when some element does and is
+// UNKNOWN when none does but some comparison is UNKNOWN (a NULL); ALL
+// fails when some element fails and is UNKNOWN when none does but some
+// is UNKNOWN. Over no elements ANY is false and ALL true, whatever x
+// is; a NULL array is UNKNOWN.
+func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, error) {
+	base, quant, _ := parser.SplitQuantified(op)
+	if rhs.Null {
+		return false, true, nil
+	}
+	var elems []types.Datum
+	if rhs.Fam.IsArray() {
+		elems = rhs.A
+	} else {
+		for _, el := range arrayElems(rhs.Text()) {
+			elems = append(elems, types.NewString(el))
+		}
+	}
+	if len(elems) == 0 {
+		return quant == "ALL", false, nil
+	}
+	if lhs.Null {
+		return false, true, nil
+	}
+	unknown := false
+	for _, ed := range elems {
+		if ed.Null {
+			unknown = true
+			continue
+		}
+		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) {
+			if c, err := ed.Coerce(lhs.Fam); err == nil {
+				ed = c
+			}
+		}
+		ok, err := applyCmpOpEsc(base, lhs, ed, escape)
+		if err != nil {
+			return false, false, err
+		}
+		if ok && quant == "ANY" {
+			return true, false, nil
+		}
+		if !ok && quant == "ALL" {
+			return false, false, nil
+		}
+	}
+	if unknown {
+		return false, true, nil
+	}
+	return quant == "ALL", false, nil
+}
+
+// numericFam reports the numeric families, which compare with each
+// other as they are.
+func numericFam(f types.Family) bool {
+	return f == types.Int || f == types.Decimal || f == types.Float
+}
+
+// quantDecides reports a quantified comparison whose result a NULL
+// operand does not settle (an empty array: ANY false, ALL true), for
+// the evaluators that refuse a NULL operand up front.
+func quantDecides(op string, lhs, rhs types.Datum) bool {
+	_, _, ok := parser.SplitQuantified(op)
+	return ok && lhs.Null && !rhs.Null
 }
 
 // escapeRune resolves a pattern's ESCAPE character: backslash by
