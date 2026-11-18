@@ -1058,7 +1058,7 @@ func constOp(b bool) string {
 // compareDatums applies a scalar comparison with SQL NULL semantics
 // (NULL never matches).
 func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
-	if l.Null || r.Null {
+	if (l.Null || r.Null) && !quantDecides(op, l, r) {
 		return false, nil
 	}
 	if !plainCmpOp(op) {

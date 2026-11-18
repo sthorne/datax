@@ -2363,6 +2363,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Union != nil {
 		return s.execSetOps(ctx, txn, t, params)
 	}
+	if fromlessGrouped(t) {
+		// SELECT count(*), SELECT max(1) ... HAVING ...: an aggregate in
+		// a select without FROM groups the one row such a select reads,
+		// as PostgreSQL's does. It runs over a one-row derived table.
+		return s.execSelect(ctx, txn, oneRowFrom(t), params)
+	}
 	// Correlated conjuncts leave the WHERE clause before eager subquery
 	// resolution and access planning ever see them; they come back as a
 	// per-row filter after the fetch. Only the plain single-table path

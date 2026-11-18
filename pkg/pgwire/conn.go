@@ -343,6 +343,10 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	ctx, done := c.beginStatement(ctx)
 	defer done()
 	_, isSet := stmt.(*parser.SetVar)
+	discardAll := false
+	if d, ok := stmt.(*parser.Discard); ok && d.Kind == "all" {
+		isSet, discardAll = true, true
+	}
 	var before [][2]string
 	if isSet {
 		before = c.session.ReportedParams()
@@ -377,6 +381,15 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 		tok.scanned = c.session.TakeScanned()
 		tok.end(rows, serr, c.session.State() == sql.StateOpen)
 		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
+	}
+	if discardAll && serr == nil {
+		// DISCARD ALL deallocates every prepared statement: the named
+		// protocol-level ones too (they share PostgreSQL's one table).
+		for name := range c.stmts {
+			if name != "" {
+				delete(c.stmts, name)
+			}
+		}
 	}
 	if isSet && serr == nil {
 		// A changed reported parameter (application_name, TimeZone, ...)
@@ -1314,7 +1327,7 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 func (c *conn) handleBind(m *pgproto3.Bind) {
 	p, ok := c.stmts[m.PreparedStatement]
 	if !ok {
-		c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown prepared statement %q", m.PreparedStatement)})
+		c.extError(&sql.Error{Code: sql.CodeInvalidSQLStatementName, Msg: fmt.Sprintf("prepared statement %q does not exist", m.PreparedStatement)})
 		return
 	}
 	if len(m.Parameters) != p.nParams {
@@ -1378,7 +1391,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 	case 'S':
 		p, ok := c.stmts[m.Name]
 		if !ok {
-			c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown prepared statement %q", m.Name)})
+			c.extError(&sql.Error{Code: sql.CodeInvalidSQLStatementName, Msg: fmt.Sprintf("prepared statement %q does not exist", m.Name)})
 			return
 		}
 		pd := &pgproto3.ParameterDescription{}
@@ -1398,7 +1411,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 	case 'P':
 		pt, ok := c.portals[m.Name]
 		if !ok {
-			c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown portal %q", m.Name)})
+			c.extError(&sql.Error{Code: sql.CodeInvalidCursorName, Msg: fmt.Sprintf("portal %q does not exist", m.Name)})
 			return
 		}
 		if pt.stmt.cols != nil {
@@ -1412,7 +1425,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	pt, ok := c.portals[m.Portal]
 	if !ok {
-		c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown portal %q", m.Portal)})
+		c.extError(&sql.Error{Code: sql.CodeInvalidCursorName, Msg: fmt.Sprintf("portal %q does not exist", m.Portal)})
 		return
 	}
 	if pt.stmt.stmt == nil {

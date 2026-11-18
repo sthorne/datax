@@ -41,7 +41,7 @@ func TestReadCSVRecord(t *testing.T) {
 		br := bufio.NewReader(strings.NewReader(src))
 		var recs [][]csvField
 		for {
-			rec, err := readCSVRecord(br)
+			rec, err := readCSVRecord(br, ',', '"', '"')
 			if err == io.EOF {
 				return recs
 			}
@@ -82,7 +82,50 @@ func TestReadCSVRecord(t *testing.T) {
 
 	// Unterminated quote errors.
 	br := bufio.NewReader(strings.NewReader("\"open\n"))
-	if _, err := readCSVRecord(br); err == nil {
+	if _, err := readCSVRecord(br, ',', '"', '"'); err == nil {
 		t.Fatal("unterminated quote accepted")
+	}
+}
+
+// TestCopyOptionsDecode covers the COPY FROM options' decoding (gap
+// PG-Q-019): CSV with another delimiter, quote and escape, a quote
+// opening mid-field as PostgreSQL's reader allows, and the text
+// format's split at unescaped delimiters only.
+func TestCopyOptionsDecode(t *testing.T) {
+	br := bufio.NewReader(strings.NewReader("a;'b;c';'it\\'s';x'y;z'w;\\\\\n'q''q'\n"))
+	rec, err := readCSVRecord(br, ';', '\'', '\\')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range rec {
+		got = append(got, f.text)
+	}
+	if want := "a|b;c|it's|xy;zw|\\\\"; strings.Join(got, "|") != want {
+		t.Fatalf("fields %q, want %q", strings.Join(got, "|"), want)
+	}
+	if rec[0].quoted || !rec[1].quoted || !rec[3].quoted {
+		t.Fatalf("quotedness: %+v", rec)
+	}
+	// With an escape other than the quote, a doubled quote ends the
+	// section and opens another: 'q''q' is qq.
+	rec, err = readCSVRecord(br, ';', '\'', '\\')
+	if err != nil || len(rec) != 1 || rec[0].text != "qq" {
+		t.Fatalf("doubled quote: %+v, %v", rec, err)
+	}
+
+	for _, c := range []struct {
+		line  string
+		delim byte
+		want  string
+	}{
+		{"a\tb\t\\N", '\t', `a / b / \N`},
+		{`a\|b|c`, '|', `a\|b / c`},
+		{`x,,y,`, ',', `x /  / y / `},
+		{`a\\|b`, '|', `a\\ / b`},
+	} {
+		if got := strings.Join(splitTextLine(c.line, c.delim), " / "); got != c.want {
+			t.Errorf("splitTextLine(%q, %q) = %q, want %q", c.line, c.delim, got, c.want)
+		}
 	}
 }

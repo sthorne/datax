@@ -162,6 +162,7 @@ var describeSamples = []struct {
 	{"Listen", []describeSample{{sql: `LISTEN shapes_ch`}}},
 	{"Notify", []describeSample{{sql: `NOTIFY shapes_ch`}}},
 	{"Unlisten", []describeSample{{sql: `UNLISTEN shapes_ch`}}},
+	{"Discard", []describeSample{{sql: `DISCARD PLANS`}, {sql: `DISCARD ALL`}}},
 	{"CopyFrom", []describeSample{{sql: `COPY shapes FROM STDIN`, fails: true}}},
 	{"CopyTo", []describeSample{
 		{sql: `COPY shapes TO STDOUT`},

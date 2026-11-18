@@ -18,7 +18,7 @@ syntax error or `0A000` feature not supported):
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY` on a table that has one, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | A volatile `DEFAULT` (`gen_random_uuid()`, `random()`), `SERIAL`, or a constraint on `ADD COLUMN`, and `ALTER TABLE` actions that read the rows (`ADD CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`), inside a transaction block (`25001`) | run the statement outside the block (Rails: `disable_ddl_transaction!`); `ADD COLUMN` with any default, several actions in one `ALTER TABLE`, and the descriptor-only actions in a block **are supported** ([reference](sql.md#ddl)) |
 | `DROP` of a primary key declared in `CREATE TABLE` (one added by `ADD PRIMARY KEY` to a table keyed by its hidden `rowid` is an index, and drops as one: [reference](sql.md#tables-without-a-primary-key)), `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
-| `COPY FROM` options beyond `FORMAT`; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
+| `COPY FROM`'s `DEFAULT` and `ON_ERROR` options; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work) with `HEADER [MATCH]`, `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL` and `FORCE_NOT_NULL` ([reference](sql.md#bulk-loading-with-copy)), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf`, role management by a `CREATEROLE` role | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; role management takes `admin`; the role attributes `SUPERUSER` (membership in `admin`), `CREATEDB` (`CREATE DATABASE` without `admin`), `CREATEROLE` and `REPLICATION` (recorded, grant nothing), `CONNECTION LIMIT`, `VALID UNTIL` and `BYPASSRLS` ([see below](#things-that-exist-but-behave-differently)) |
@@ -321,8 +321,7 @@ syntax error or `0A000` feature not supported):
   failure partway leaves the earlier chunks committed — the error names
   the failing row and how many rows were already committed. Inside
   `BEGIN` it writes in the block's transaction and is atomic with it, as
-  in PostgreSQL (mind the transaction's size for a large load). Only the
-  `FORMAT` option is accepted.
+  in PostgreSQL (mind the transaction's size for a large load).
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
@@ -354,6 +353,13 @@ syntax error or `0A000` feature not supported):
   `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are refused
   in any block. The index name may be left out (`<table>_<columns>_idx`).
   There is no `REINDEX`.
+- **Strings compare bytewise**, the order of the `C` collation, in
+  comparisons, `ORDER BY`, `min` / `max` and indexes alike (`'B' <
+  'a'`); PostgreSQL's database default is usually a locale
+  (`en_US.UTF-8`) that orders case-insensitively first. `COLLATE "C"`,
+  `"POSIX"`, `"default"` and `ucs_basic` are accepted in expressions and
+  change nothing; any other collation is `42704`, as PostgreSQL reports
+  one it does not have ([reference](sql.md#reading)).
 - **Index keys compare bytewise**, the order of the `C` collation. The
   string types' operator classes (`text_pattern_ops`,
   `varchar_pattern_ops`, `bpchar_pattern_ops`, and the defaults

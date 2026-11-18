@@ -1245,6 +1245,19 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   wide `ROWS` frame over a large partition costs its width. `DISTINCT`,
   an `ORDER BY` among the arguments and `WITHIN GROUP` are refused on
   a window call (`0A000`), as in PostgreSQL; `FILTER` is too.
+- **Quantified comparisons**: `expr op ANY | SOME | ALL (SELECT ...)`
+  and `(array)`, for `= <> < <= > >=` and `[NOT] LIKE / ILIKE`, with
+  PostgreSQL's NULL rules: `ANY` is NULL when no element matches and
+  one comparison is NULL, `ALL` when none fails and one is NULL; over no
+  rows `ANY` is false and `ALL` true, whatever the left side. The
+  subquery may be correlated, and must return one column (`42601`).
+- **`COLLATE`**: `expr COLLATE "C"` (also `"POSIX"`, `"default"` and
+  `ucs_basic`, optionally `pg_catalog.`-qualified) in any expression,
+  `ORDER BY` and `GROUP BY`. Every string compares bytewise, which is
+  each of these collations' order, so the clause changes nothing; any
+  other collation is `42704` (`collation "x" for encoding "UTF8" does
+  not exist`), as in a PostgreSQL that lacks it, and a collation on a
+  number or boolean literal is `42804`.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
@@ -1269,7 +1282,10 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   and laterals chain and nest. A reference to a member further right is
   `42P01`; `RIGHT` and `FULL JOIN LATERAL` are refused (`42P10`). The
   lateral subquery is a plain select (over a table, a join or no
-  table; not over a derived table or a set operation of its own) and
+  table; not over a derived table or a set operation of its own) or a
+  `VALUES` list (`CROSS JOIN LATERAL (VALUES ('a', t.a), ('b', t.b))
+  AS v(k, val)` unpivots; a list of several rows whose values are
+  arrays is `0A000`), and
   reads the outer row anywhere but its `ORDER BY`, `GROUP BY` and
   aggregate arguments. Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
@@ -1285,6 +1301,21 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   (`FROM t AS a` hides `t`), so `t.x` inside a subquery over `t AS a`
   reads an enclosing `t`, and is `42P01` (invalid reference to
   FROM-clause entry) when there is none.
+- **`VALUES` and `TABLE`**: `VALUES (1, 'a'), (2, 'b')` is a query of
+  its own and a `FROM` item, `(VALUES ...) [AS] v(x, y)` (the columns
+  are `column1`, `column2`, ... unless aliased; more aliases than
+  columns is `42P10`), joined like a table or `LATERAL`. Each column
+  takes one type across the rows, as in PostgreSQL: a quoted literal
+  or `NULL` takes the type of the other rows (`VALUES ('1'), (2)` is
+  `INT8`; `'x'` there is `22P02`), numbers lift (`1` and `2.5` make
+  `DECIMAL`), all-literal columns are text, and other mixes are `42804`
+  (`VALUES types bigint and boolean cannot be matched`); rows of
+  different lengths are `42601`. `TABLE t` is `SELECT * FROM t`, as a
+  statement, a set-operation member, a subquery and an `INSERT`
+  source, with its own `ORDER BY` / `LIMIT`.
+- **No `FROM`**: `SELECT count(*)`, `SELECT max(1) WHERE false`, `SELECT
+  sum(2) HAVING sum(2) > 1` aggregate the one row a select without
+  `FROM` reads, as in PostgreSQL.
 - **Set operations**: `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL]`,
   between selects, `VALUES` lists and parenthesized queries (which may
   carry their own `ORDER BY` / `LIMIT`) with the same number of
@@ -1416,7 +1447,15 @@ UPDATE orders o SET status = s.status FROM staging s WHERE o.id = s.id;   -- val
 DELETE FROM posts p USING users u WHERE p.uid = u.id AND u.banned;
 UPDATE t SET c = c + v.d FROM (VALUES (1, 10), (2, 20)) AS v(a, d)
   WHERE t.a = v.a RETURNING *;                                  -- t's columns, then v's
+UPDATE t SET (b, c) = ('z', DEFAULT) WHERE a = 1;              -- several columns; also = ROW(...)
+UPDATE t SET (b, c) = (SELECT y, z FROM u WHERE u.a = t.a);   -- one row (21000 for more; none sets NULLs)
 ```
+
+A multiple-column assignment, `SET (a, b) = (x, y)`, `= ROW(x, y)` or
+`= (SELECT x, y ...)`, works in `UPDATE`, `UPDATE ... FROM` and `ON
+CONFLICT DO UPDATE`; the subquery may be correlated. A row of the
+wrong length, a subquery with the wrong number of columns and a
+single parenthesized value are `42601`, as in PostgreSQL.
 
 `UPDATE ... FROM` and `DELETE ... USING` join the target (with an
 optional alias, `UPDATE t [AS] x`) to a `FROM` (`USING`) list that takes
@@ -1471,6 +1510,8 @@ one replication round; 100 single-row statements are 100.
 ```sql
 COPY t (a, b) FROM STDIN;                  -- text format (psql \copy sends this)
 COPY t FROM STDIN WITH (FORMAT csv);
+COPY t FROM STDIN WITH (FORMAT csv, HEADER match, DELIMITER ';', NULL 'NA', FORCE_NULL (b));
+COPY t FROM STDIN WITH CSV HEADER QUOTE '''' ESCAPE '\';  -- the pre-9.0 spelling
 ```
 
 ```sh
@@ -1486,8 +1527,14 @@ mid-load failure keeps the chunks already committed (the error reports
 the failing row and the committed count). Inside `BEGIN` the chunks
 are written in the block's transaction instead, so the load commits or
 rolls back with it (pg_restore's `BEGIN; TRUNCATE ONLY t; COPY t ...;
-COMMIT`). Only the `FORMAT text|csv|binary` option is supported on
-`COPY FROM`.
+COMMIT`). The options are PostgreSQL's, in either spelling (`WITH
+(FORMAT csv, HEADER true)` or `WITH CSV HEADER`), checked as PostgreSQL
+checks them: `FORMAT text | csv | binary`, `HEADER` (the first line is
+skipped; `HEADER MATCH` checks that it names the columns, `22P04`
+otherwise), `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL` and
+`FORCE_NOT_NULL` (a column list or `*`), `FREEZE` (accepted, no
+effect) and `ENCODING` (`UTF8` only; another encoding is `0A000`).
+`DEFAULT` and PostgreSQL 17's `ON_ERROR` are not supported.
 
 ### Exporting with COPY TO
 
@@ -2134,11 +2181,24 @@ SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / 
 SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006); BEGIN READ ONLY does the same
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
+DISCARD ALL;                                  -- a pooler's reset: RESET ALL and drop the session's state (below)
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;   -- source 'session' where this session changed it (psql's \dconfig)
 SET app.tenant = 'acme';                      -- a custom setting: any class.name
 SELECT set_config('app.tenant', $1, false);   -- the same, with the value as a parameter
 SELECT current_setting('app.tenant');         -- 42704 if never set; current_setting(name, true) gives NULL
 ```
+
+`DISCARD ALL` hands a connection on clean, as PostgreSQL's does: it
+closes every cursor, runs `RESET ALL` (the role included; as with
+`RESET ALL` here, an `application_name` the client gave at startup goes
+back to the default too, where PostgreSQL restores it), deallocates
+every prepared statement — `PREPARE`d ones and the named statements of
+the extended protocol — stops listening (`UNLISTEN *`), releases the
+session's advisory locks (`pg_advisory_unlock_all()`) and forgets its
+cached plans and `currval` / `lastval`. It is refused inside a
+transaction block (`25001`). `DISCARD PLANS`, `DISCARD SEQUENCES` and
+`DISCARD TEMP` (there are no temporary tables: nothing to drop) do one
+part each, in a block too.
 
 `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
 `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`, `RESET name`, `RESET

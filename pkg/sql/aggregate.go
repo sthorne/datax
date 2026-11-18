@@ -34,6 +34,50 @@ func hasAggregates(exprs []parser.SelectExpr) bool {
 	return false
 }
 
+// fromlessGrouped reports a select without FROM that groups: one with
+// an aggregate call in its select list, HAVING or ORDER BY, or a GROUP
+// BY.
+func fromlessGrouped(t *parser.Select) bool {
+	if t.Table != "" || t.Derived != nil || t.FuncTable != nil || len(t.Joins) > 0 || t.Union != nil {
+		return false
+	}
+	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 || len(t.Having) > 0 {
+		return true
+	}
+	for _, oc := range t.OrderBy {
+		if oc.Agg != nil || oc.Expr != nil && exprHasAgg(*oc.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// oneRowFrom is a select without FROM rewritten to read the one row it
+// stands for from a derived table: the grouped executor then runs it.
+// A HAVING without an aggregate anywhere is the grouped query's one
+// group kept or not, which is a WHERE over that row.
+func oneRowFrom(t *parser.Select) *parser.Select {
+	one := types.NewInt(1)
+	c := *t
+	c.Derived = &parser.Select{Limit: -1, Exprs: []parser.SelectExpr{{Expr: parser.Expr{Lit: &one}, Alias: "?column?"}}}
+	c.Alias = "*SELECT*"
+	if len(c.Having) > 0 && !hasAggregates(c.Exprs) && len(c.GroupBy) == 0 && !condsHaveAgg(c.Having) {
+		c.Where = append(append([]parser.Comparison(nil), c.Where...), c.Having...)
+		c.Having = nil
+	}
+	return &c
+}
+
+// condsHaveAgg reports an aggregate call anywhere in conditions.
+func condsHaveAgg(conds []parser.Comparison) bool {
+	for _, c := range conds {
+		if condHas(c, func(x parser.Expr) bool { return x.Agg != nil }) {
+			return true
+		}
+	}
+	return false
+}
+
 // exprHasAgg reports whether an aggregate call (not a window call)
 // appears in an expression, outside its subqueries.
 func exprHasAgg(e parser.Expr) bool {
