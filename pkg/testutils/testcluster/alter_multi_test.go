@@ -217,7 +217,7 @@ func TestAlterTableMultiAction(t *testing.T) {
 	h.expect(`SELECT data_type FROM information_schema.columns WHERE table_name = 't' AND column_name = 'b'`, "text")
 	h.exec(`UPDATE t SET b = 'x' WHERE b IS NULL`)
 	h.exec(`ALTER TABLE t ALTER COLUMN b TYPE VARCHAR(20), ALTER COLUMN b SET DEFAULT 'none', ALTER COLUMN b SET NOT NULL, DROP CONSTRAINT h_k`)
-	h.expect(`SELECT column_name, data_type, character_maximum_length, is_nullable, column_default FROM information_schema.columns WHERE table_name = 't' AND column_name = 'b'`, "b|character varying(20)|20|NO|'none'")
+	h.expect(`SELECT column_name, data_type, character_maximum_length, is_nullable, column_default FROM information_schema.columns WHERE table_name = 't' AND column_name = 'b'`, "b|character varying|20|NO|'none'")
 	h.exec(`INSERT INTO t (id, a, d) VALUES (3000, 1, 0)`)
 	h.expect(`SELECT b, h, k FROM t WHERE id = 3000`, "none|NULL|NULL")
 	h.expect(`SELECT count(*) FROM pg_constraint WHERE conrelid = 't'::regclass AND conname = 'h_k'`, "0")
@@ -307,7 +307,7 @@ func TestAlterTableMultiActionMatrix(t *testing.T) {
 				h.expect(col(tb, "s"), "bigint YES -")
 			}},
 		{name: "widen", action: "ALTER COLUMN w TYPE VARCHAR(50)", rows: true,
-			check: func(h *alterHarness, tb string) { h.expect(col(tb, "w"), "character varying(50) YES -") }},
+			check: func(h *alterHarness, tb string) { h.expect(col(tb, "w"), "character varying YES -") }},
 		{name: "validate", action: "VALIDATE CONSTRAINT nv", rows: true, setup: "ALTER TABLE %s ADD CONSTRAINT nv CHECK (a > 0) NOT VALID",
 			check: func(h *alterHarness, tb string) {
 				h.expect(fmt.Sprintf(`SELECT convalidated FROM pg_constraint WHERE conrelid = '%s'::regclass AND conname = 'nv'`, tb), "t")
@@ -439,8 +439,8 @@ ALTER COLUMN "title" SET DATA TYPE VARCHAR(255),
 ALTER COLUMN "content" DROP NOT NULL`)
 	h.exec(`ALTER TABLE "Post" ADD CONSTRAINT "Post_authorId_fkey" FOREIGN KEY ("authorId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE`)
 	h.exec(`ALTER TABLE "User" ALTER COLUMN "email" SET DATA TYPE VARCHAR(100), ALTER COLUMN "bio" SET DEFAULT ''`)
-	h.expect(h.columnsQuery("Post"), "id integer;title character varying(255);content text;authorId integer;views integer")
-	h.expect(h.columnsQuery("User"), "id integer;email character varying(100);bio text;role USER-DEFINED;uuid uuid;updatedAt timestamp(3) without time zone")
+	h.expect(h.columnsQuery("Post"), "id integer;title character varying;content text;authorId integer;views integer")
+	h.expect(h.columnsQuery("User"), "id integer;email character varying;bio text;role USER-DEFINED;uuid uuid;updatedAt timestamp without time zone")
 
 	// pg_dump: ALTER TABLE ONLY.
 	h.exec(`ALTER TABLE ONLY public."Post" ALTER COLUMN "views" SET DEFAULT 1`)

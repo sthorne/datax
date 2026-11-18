@@ -121,6 +121,14 @@ type Env struct {
 	// an admin's by the few views that filter by it).
 	RoleSet catalog.RoleSet
 
+	// Now is the statement's time (Unix nanoseconds; 0 = the clock's):
+	// the instant pg_timezone_names describes each zone at.
+	Now int64
+
+	// graph and effective cache role membership for roleHasRole.
+	graph     *catalog.RoleGraph
+	effective map[string]catalog.RoleSet
+
 	User        string // the current role (current_user)
 	SessionUser string // the authenticated user (session_user)
 	Database    string // the session's current database
@@ -1179,4 +1187,86 @@ func HiddenColumnFor(fn string) string {
 
 func hidden(name string) catalog.Column {
 	return catalog.Column{Name: name, Type: types.String, Hidden: true}
+}
+
+// pkIndex is the primary key as an index (pg_index lists it with ID 1);
+// nil for a table whose only key is the hidden rowid, which PostgreSQL
+// would not have.
+func pkIndex(d *catalog.TableDescriptor) *catalog.IndexDescriptor {
+	if !hasVisiblePK(d) {
+		return nil
+	}
+	return &catalog.IndexDescriptor{ID: 1, Name: d.Name + "_pkey", Unique: true, Primary: true, ColumnIDs: visiblePK(d)}
+}
+
+// indexByOID finds the index (the primary key's included) of d with
+// pg_class OID oid.
+func indexByOID(d *catalog.TableDescriptor, oid int64) *catalog.IndexDescriptor {
+	if oid>>16 != relOID(d.ID) || oid&(1<<15) != 0 {
+		return nil
+	}
+	id := uint64(oid & 0xffff)
+	if id == 1 {
+		return pkIndex(d)
+	}
+	for i := range d.Indexes {
+		if d.Indexes[i].ID == id {
+			return &d.Indexes[i]
+		}
+	}
+	return nil
+}
+
+// IndexOIDByName is the pg_class OID of d's index named name.
+func IndexOIDByName(d *catalog.TableDescriptor, name string) (int64, bool) {
+	if pk := pkIndex(d); pk != nil && pk.Name == name {
+		return IndexOID(d, 1), true
+	}
+	for i := range d.Indexes {
+		if d.Indexes[i].Name == name {
+			return IndexOID(d, d.Indexes[i].ID), true
+		}
+	}
+	return 0, false
+}
+
+// IndexDefByOID is pg_get_indexdef(oid, col) for an index of d: the
+// whole definition (col 0) or key column col's (from 1); false when d
+// has no such index or key column.
+func IndexDefByOID(d *catalog.TableDescriptor, oid int64, col int) (string, bool) {
+	idx := indexByOID(d, oid)
+	if idx == nil {
+		return "", false
+	}
+	if col == 0 {
+		return IndexDef(d, idx), true
+	}
+	if col < 1 || col > len(idx.ColumnIDs) {
+		return "", true // PostgreSQL's: an empty string past the last key
+	}
+	return IndexKeyDef(d, idx, col-1), true
+}
+
+// ConstraintDefByOID is pg_get_constraintdef(oid) for a constraint of d
+// (its primary key, a unique index that is a constraint, a CHECK or a
+// FOREIGN KEY); false when d has none with that OID.
+func ConstraintDefByOID(d *catalog.TableDescriptor, oid int64, byID func(uint64) *catalog.TableDescriptor) (string, bool) {
+	if oid&(1<<15) != 0 {
+		for i := range d.Constraints {
+			if c := &d.Constraints[i]; ConstraintOID(d, c) == oid {
+				return ConstraintDef(d, c, byID), true
+			}
+		}
+		return "", false
+	}
+	idx := indexByOID(d, oid)
+	switch {
+	case idx == nil:
+		return "", false
+	case idx.ID == 1:
+		return PrimaryKeyDef(d), true
+	case IsConstraintIndex(idx):
+		return UniqueDef(d, idx), true
+	}
+	return "", false
 }

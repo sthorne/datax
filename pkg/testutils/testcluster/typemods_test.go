@@ -99,8 +99,8 @@ func TestColumnTypeModifiers(t *testing.T) {
 	got = text(execSQL(t, ctx, s, `SELECT column_name, data_type, character_maximum_length, numeric_precision, udt_name
 		FROM information_schema.columns WHERE table_name = 'ty' ORDER BY ordinal_position`))
 	want = "id|integer||32|int4\nsm|smallint||16|int2\nbig|bigint||64|int8\nn|integer||32|int4\n" +
-		"v|character varying(5)|5||varchar\nc|character(3)|3||bpchar\n" +
-		"ts|timestamp without time zone|||timestamp\ntz|timestamp(3) with time zone|||timestamptz\nt0|timestamp(0) without time zone|||timestamp\n"
+		"v|character varying|5||varchar\nc|character|3||bpchar\n" +
+		"ts|timestamp without time zone|||timestamp\ntz|timestamp with time zone|||timestamptz\nt0|timestamp without time zone|||timestamp\n"
 	if got != want {
 		t.Fatalf("information_schema.columns:\n%s\nwant:\n%s", got, want)
 	}

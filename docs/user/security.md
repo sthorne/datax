@@ -210,8 +210,11 @@ table of the current database — names, columns, defaults, constraints,
 view definitions and policy expressions — whatever the reader holds;
 `information_schema.tables`, `columns` and the other views list the
 tables of the current database the reader holds some privilege on
-(none, in a database whose `public` schema it may not use), and `role_table_grants` the
-grants made to or by one of its roles. What would describe the rows
+(none, in a database whose `public` schema it may not use), each by
+its PostgreSQL rule — `table_privileges` the grants made to or by one
+of its roles or to `PUBLIC`, `role_table_grants` those made to or by
+one of its roles, `check_constraints` and the `*_usage` views its own
+tables only. What would describe the rows
 rather than the schema is shown only to a role that may read them:
 `reltuples` and `n_live_tup` read `0` for a table the reader holds no
 `SELECT` on (or whose row security filters it), `pg_sequences.last_value`

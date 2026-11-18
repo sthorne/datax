@@ -149,7 +149,7 @@ func TestIntervalTime(t *testing.T) {
 		}
 	}
 	if got := one(`SELECT column_name, data_type, udt_name FROM information_schema.columns WHERE table_name = 'ev' AND column_name IN ('dur', 'at', 't3') ORDER BY ordinal_position`); got !=
-		"dur|interval|interval\nat|time without time zone|time\nt3|time(3) without time zone|time" {
+		"dur|interval|interval\nat|time without time zone|time\nt3|time without time zone|time" {
 		t.Fatalf("information_schema.columns: %q", got)
 	}
 	if got := one(`SELECT attname, atttypid, atttypmod, attlen FROM pg_attribute WHERE attrelid = 'ev'::regclass AND attname IN ('dur', 'at', 't3') ORDER BY attnum`); got != "dur|1186|-1|16\nat|1083|-1|8\nt3|1083|3|8" {

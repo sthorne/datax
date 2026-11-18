@@ -484,7 +484,21 @@ syntax error or `0A000` feature not supported):
   every level and `SHOW` reports `serializable`, the only one there is.
   `server_version` reports a PostgreSQL-14-compatible string (and
   `server_version_num` `140000`), so `psql` and drivers use their
-  PostgreSQL-14 query flavors.
+  PostgreSQL-14 query flavors; it stays 14 because `pg_dump` 16 run
+  against a server reporting 16 takes catalog queries that find no
+  tables in datax and dumps nothing. A new connection is told
+  PostgreSQL 14's reported parameters (`application_name`,
+  `client_encoding`, `DateStyle`, `default_transaction_read_only`,
+  `in_hot_standby`, `integer_datetimes`, `IntervalStyle`,
+  `is_superuser`, `server_encoding`, `server_version`,
+  `session_authorization`, `standard_conforming_strings`, `TimeZone`)
+  with the session's values, and of a changed one again after `SET`.
+  The preset options `server_version_num`, `max_identifier_length`,
+  `block_size`, `wal_block_size`, `segment_size`, `max_function_args`,
+  `max_index_keys`, `data_checksums`, `lc_collate`, `lc_ctype`,
+  `in_hot_standby`, `is_superuser` and `session_authorization` are
+  settings that cannot be changed (`55P02`); `SET SESSION
+  AUTHORIZATION` is not supported.
 - **Settings accepted with no effect.** These take PostgreSQL 18's
   values, are checked as PostgreSQL checks them, are kept per session
   and reported by `SHOW`, `current_setting()` and `pg_settings`, and
@@ -515,8 +529,7 @@ syntax error or `0A000` feature not supported):
   wire and in `COPY TO`, though not of `::text` casts, arrays or JSON;
   `client_min_messages` at `warning` or `error` keeps `NOTICE`s from
   the client; `row_security = off` refuses a query a policy would
-  filter (below). `max_identifier_length` reports `63` and, like
-  `server_version_num`, cannot be changed (`55P02`).
+  filter (below). `max_identifier_length` reports `63`.
   `pg_stat_activity` and `SHOW SESSIONS` list the serving node's
   sessions only.
 
@@ -653,6 +666,36 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
+  `pg_get_indexdef` and `pg_get_constraintdef` also take an OID
+  directly (`pg_get_indexdef('t_pkey'::regclass)`, `pg_class.oid`); a
+  table created without a primary key (keyed by the hidden `rowid`)
+  has no primary key in any of them, as in PostgreSQL.
+- **information_schema** has every view of PostgreSQL 16's, with its
+  columns in its order (`sql_identifier` and `character_data` columns
+  are `text`, `yes_or_no` `varchar(3)`, `cardinal_number` `integer`),
+  and each lists what PostgreSQL's would show the reader: the
+  `*_privileges` views a grant whose grantor or grantee is one of the
+  reader's roles or that went to `PUBLIC` (with the owner's implicit
+  privileges, as `aclexplode` gives them), `role_*_grants` the
+  former, `table_constraints` a table the reader holds a privilege
+  other than `SELECT` on, `check_constraints`, `constraint_*_usage`
+  and `view_*_usage` the reader's own tables, `views.view_definition`
+  its own views. NOT NULL columns appear as `CHECK` constraints named
+  `<namespace>_<table>_<attnum>_not_null`, as PostgreSQL 14 to 17
+  show them. `sequences` leaves out an identity column's sequence;
+  `data_type` is always `bigint`. The views of what datax has no
+  equivalent of — `routines`, `parameters`, `triggers`, `domains`,
+  `attributes`, `user_defined_types`, the foreign-data views — are
+  empty (datax's built-in functions are not listed as routines, nor
+  information_schema's own domains); `collations` lists `default`, `C`
+  and `POSIX`. `view_column_usage` names the columns of a view's
+  tables that its query text mentions. datax's own tables are listed
+  under `pg_catalog`.
+- **Time zones**: `pg_timezone_names` lists the zones of the IANA
+  database datax carries (Go's), each with its abbreviation, offset and
+  daylight-saving state now; `pg_timezone_abbrevs` the abbreviations
+  `AT TIME ZONE` accepts. PostgreSQL reads its own copy of the database
+  and a configurable abbreviation set, so the lists differ a little.
 - **datax's own tables** (`datax_metrics`, `datax_audit`, the
   large-object tables) are listed in `pg_catalog`, as PostgreSQL's system
   catalogs are: `\dt` leaves them out (`\dtS` lists them), pg_dump does

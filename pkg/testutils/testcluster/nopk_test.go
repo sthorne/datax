@@ -199,7 +199,7 @@ func TestNoPrimaryKeyTables(t *testing.T) {
 	h.exec(`ALTER TABLE t ADD PRIMARY KEY (a)`)
 	h.expect(`SELECT conname, contype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 't'::regclass`, "t_pkey|p|PRIMARY KEY (a)")
 	h.expect(`SELECT i.indisprimary, i.indisunique, c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = 't'::regclass`, "t|t|t_pkey")
-	h.expect(`SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 't'`, "PRIMARY KEY")
+	h.expect(`SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 't' ORDER BY 1`, "CHECK;PRIMARY KEY") // the key column's NOT NULL is a CHECK there, as in PostgreSQL
 	h.expect(`SELECT attnotnull FROM pg_attribute WHERE attrelid = 't'::regclass AND attname = 'a'`, "t")
 	h.expect(`SELECT relhasindex FROM pg_class WHERE relname = 't'`, "t")
 	h.code(`INSERT INTO t VALUES (5, 1)`, sql.CodeUniqueViolation)

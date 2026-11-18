@@ -716,29 +716,16 @@ func (c *conn) handleStartup(ctx context.Context) error {
 				return fmt.Errorf("startup refused: %v", serr)
 			}
 			// ALTER DATABASE ... SET's defaults, before the client's own
-			// parameters, as PostgreSQL applies them.
+			// parameters, as PostgreSQL applies them; the reported
+			// parameters below carry their values.
 			c.session.ApplyDatabaseDefaults(ctx, info.Settings)
-			reported := map[string]string{}
-			for _, kv := range c.session.ReportedParams() {
-				reported[kv[0]] = kv[1]
-			}
-			for _, kv := range [][2]string{
-				{"server_version", "14.0 datax"},
-				{"server_encoding", "UTF8"},
-				{"client_encoding", "UTF8"},
-				{"DateStyle", "ISO"},
-				{"IntervalStyle", "postgres"},
-				{"integer_datetimes", "on"},
-				{"standard_conforming_strings", "on"},
-				{"TimeZone", "UTC"},
-			} {
-				if v, ok := reported[kv[0]]; ok && v != "" {
-					kv[1] = v
-				}
-				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
-			}
 			if app := m.Parameters["application_name"]; app != "" {
 				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
+			}
+			// PostgreSQL 14's reported parameters, with the session's
+			// values (application_name as the startup packet set it).
+			for _, kv := range c.session.StartupParams(ctx) {
+				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
 			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: uint32(c.pid), SecretKey: binary.BigEndian.AppendUint32(nil, c.secret)})
 			c.sendReady()

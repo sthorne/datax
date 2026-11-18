@@ -203,6 +203,8 @@ func init() {
 		col("relpartbound", types.String), hidden("__expr"), hidden("__viewdef"), hidden("__obj_description"),
 		// pg_dump's: NULL on every row (withTableOID pads them).
 		col("relfrozenxid", types.Int), col("relminmxid", types.Int),
+		// pg_get_indexdef(oid) on an index's row (NULL on the others).
+		hidden("__indexdef"),
 	}, func(ctx context.Context, env *Env) ([]Row, error) {
 		var rows []Row
 		for _, t := range env.currentTables() {
@@ -242,12 +244,14 @@ func init() {
 			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
 				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(ns), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
-					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
+					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null(),
+					null(), null(), str(IndexDef(t, pkIndex(t)))})
 			}
 			for _, idx := range t.Indexes {
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(ns), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(IndexMethodOID(&idx)), i64(IndexOID(t, idx.ID)), i64(0),
 					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
-					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment)})
+					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment),
+					null(), null(), str(IndexDef(t, &idx))})
 			}
 		}
 		for _, sq := range env.currentSequences() {
@@ -256,7 +260,12 @@ func init() {
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), ObjectACL(sq.Owner, "rwU", sq.Privileges, sq.GrantOptions), null(), null(), null(), null(), null()})
 		}
 		for i, name := range Names() {
-			rows = append(rows, Row{i64(classOIDAt(i, name)), str(name[len(PgCatalog)+1:]), i64(OIDPgCatalog), i64(0), i64(10), i64(0), i64(0), i64(0),
+			sch, bare, _ := strings.Cut(name, ".")
+			ns := int64(OIDPgCatalog)
+			if sch == InformationSchema {
+				ns = OIDInformationSchema
+			}
+			rows = append(rows, Row{i64(classOIDAt(i, name)), str(bare), i64(ns), i64(0), i64(10), i64(0), i64(0), i64(0),
 				i64(0), types.NewFloat(0), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(0),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null()})
 		}
@@ -1180,215 +1189,8 @@ func init() {
 			return rows, nil
 		})
 
-	// information_schema.
-	is("schemata", []catalog.Column{col("catalog_name", types.String), col("schema_name", types.String), col("schema_owner", types.String), col("default_character_set_name", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, sch := range []string{catalog.PublicSchema, PgCatalog, InformationSchema} {
-				rows = append(rows, Row{str(env.Database), str(sch), str("root"), str("UTF8")})
-			}
-			return rows, nil
-		})
-	is("tables", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("table_type", types.String), col("is_insertable_into", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				kind, insertable := "BASE TABLE", "YES"
-				if t.IsView() {
-					kind, insertable = "VIEW", "NO"
-				}
-				rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(kind), str(insertable)})
-			}
-			for _, name := range Names() {
-				sch, bare := name[:len(PgCatalog)], name[len(PgCatalog)+1:]
-				if len(name) > len(InformationSchema) && name[:len(InformationSchema)] == InformationSchema {
-					sch, bare = InformationSchema, name[len(InformationSchema)+1:]
-				}
-				rows = append(rows, Row{str(env.Database), str(sch), str(bare), str("VIEW"), str("NO")})
-			}
-			return rows, nil
-		})
-	is("views", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("view_definition", types.String), col("check_option", types.String), col("is_updatable", types.String), col("is_insertable_into", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				if t.IsView() {
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(t.ViewQuery), str("NONE"), str("NO"), str("NO")})
-				}
-			}
-			return rows, nil
-		})
-	is("columns", []catalog.Column{
-		col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("column_name", types.String),
-		col("ordinal_position", types.Int), col("column_default", types.String), col("is_nullable", types.String), col("data_type", types.String),
-		col("character_maximum_length", types.Int), col("numeric_precision", types.Int), col("numeric_scale", types.Int), col("udt_name", types.String), col("is_identity", types.String), col("is_generated", types.String),
-	}, func(ctx context.Context, env *Env) ([]Row, error) {
-		var rows []Row
-		for _, t := range env.currentTables() {
-			n := int64(0)
-			for i := range t.Columns {
-				c := &t.Columns[i]
-				if c.Hidden {
-					continue
-				}
-				n++
-				def, nullable := null(), "YES"
-				if text := ColumnDefault(c); text != "" {
-					def = str(text)
-				}
-				if c.NotNull {
-					nullable = "NO"
-				}
-				prec, scale, maxLen := null(), null(), null()
-				switch {
-				case c.Type == types.Decimal && c.Precision > 0:
-					prec, scale = i64(int64(c.Precision)), i64(int64(c.Scale))
-				case c.Type == types.Int:
-					prec = i64(int64(c.IntWidth()) * 8)
-				case c.Type == types.String && c.MaxLen > 0:
-					maxLen = i64(int64(c.MaxLen))
-				}
-				dataType := FormatType(c)
-				if c.Type.IsArray() {
-					dataType = "ARRAY"
-				} else if c.Type == types.Enum {
-					dataType = "USER-DEFINED"
-				}
-				rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(c.Name), i64(n), def, str(nullable), str(dataType),
-					maxLen, prec, scale, str(ColumnTypeName(c)), str(yesNo(c.Identity != "")), str("NEVER")})
-			}
-		}
-		return rows, nil
-	})
-	is("table_constraints", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("constraint_type", types.String), col("is_deferrable", types.String), col("initially_deferred", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name + "_pkey"), str(env.Database), str(catalog.PublicSchema), str(t.Name), str("PRIMARY KEY"), str("NO"), str("NO")})
-				}
-				for _, idx := range t.Indexes {
-					if idx.Unique {
-						kind := "UNIQUE"
-						if idx.Primary {
-							kind = "PRIMARY KEY"
-						}
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(idx.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(kind), str("NO"), str("NO")})
-					}
-				}
-				for i := range t.Constraints {
-					c := &t.Constraints[i]
-					kind := ""
-					switch c.Kind {
-					case catalog.ConstraintCheck:
-						kind = "CHECK"
-					case catalog.ConstraintForeign:
-						kind = "FOREIGN KEY"
-					default:
-						continue // unique constraints are listed as their index
-					}
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(kind), str("NO"), str("NO")})
-				}
-			}
-			return rows, nil
-		})
-	is("check_constraints", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("check_clause", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				for i := range t.Constraints {
-					if c := &t.Constraints[i]; c.Kind == catalog.ConstraintCheck {
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(c.Expr)})
-					}
-				}
-			}
-			return rows, nil
-		})
-	is("referential_constraints", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("unique_constraint_catalog", types.String), col("unique_constraint_schema", types.String), col("unique_constraint_name", types.String), col("match_option", types.String), col("update_rule", types.String), col("delete_rule", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			rule := func(a string) string {
-				switch a {
-				case catalog.FKCascade:
-					return "CASCADE"
-				case catalog.FKSetNull:
-					return "SET NULL"
-				}
-				return "NO ACTION"
-			}
-			for _, t := range env.currentTables() {
-				for i := range t.Constraints {
-					c := &t.Constraints[i]
-					if c.Kind != catalog.ConstraintForeign {
-						continue
-					}
-					ref := t
-					if c.RefTable != t.ID {
-						ref = env.tableByID(c.RefTable)
-					}
-					unique := null()
-					if ref != nil {
-						unique = str(uniqueConstraintNameFor(ref, c.RefColumns))
-					}
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), unique, str("NONE"), str(rule(c.OnUpdate)), str(rule(c.OnDelete))})
-				}
-			}
-			return rows, nil
-		})
-	is("constraint_column_usage", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("column_name", types.String), col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				for i := range t.Constraints {
-					c := &t.Constraints[i]
-					switch c.Kind {
-					case catalog.ConstraintCheck, catalog.ConstraintUnique:
-						for _, id := range c.Columns {
-							rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), str(env.Database), str(catalog.PublicSchema), str(c.Name)})
-						}
-					case catalog.ConstraintForeign:
-						ref := t
-						if c.RefTable != t.ID {
-							ref = env.tableByID(c.RefTable)
-						}
-						if ref == nil {
-							continue
-						}
-						for _, id := range c.RefColumns {
-							rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(ref.Name), str(columnName(ref, id)), str(env.Database), str(catalog.PublicSchema), str(c.Name)})
-						}
-					}
-				}
-			}
-			return rows, nil
-		})
-	is("key_column_usage", []catalog.Column{col("constraint_catalog", types.String), col("constraint_schema", types.String), col("constraint_name", types.String), col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("column_name", types.String), col("ordinal_position", types.Int)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				for i, id := range visiblePK(t) {
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name + "_pkey"), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
-				}
-				for _, idx := range t.Indexes {
-					if !IsConstraintIndex(&idx) {
-						continue
-					}
-					for i, id := range idx.ColumnIDs {
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(idx.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
-					}
-				}
-				for ci := range t.Constraints {
-					c := &t.Constraints[ci]
-					if c.Kind != catalog.ConstraintForeign {
-						continue
-					}
-					for i, id := range c.Columns {
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(c.Name), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(columnName(t, id)), i64(int64(i + 1))})
-					}
-				}
-			}
-			return rows, nil
-		})
+	// information_schema's views are in infoschema.go; statistics is
+	// MySQL's, which some tools read.
 	is("statistics", []catalog.Column{col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("non_unique", types.Bool), col("index_schema", types.String), col("index_name", types.String), col("seq_in_index", types.Int), col("column_name", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
@@ -1403,37 +1205,6 @@ func init() {
 							name = idx.Exprs[i]
 						}
 						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), boolean(!idx.Unique), str(catalog.PublicSchema), str(idx.Name), i64(int64(i + 1)), str(name)})
-					}
-				}
-			}
-			return rows, nil
-		})
-	is("role_table_grants", []catalog.Column{col("grantor", types.String), col("grantee", types.String), col("table_catalog", types.String), col("table_schema", types.String), col("table_name", types.String), col("privilege_type", types.String), col("is_grantable", types.String)},
-		func(ctx context.Context, env *Env) ([]Row, error) {
-			var rows []Row
-			for _, t := range env.currentTables() {
-				users := make([]string, 0, len(t.Privileges))
-				for u := range t.Privileges {
-					// PostgreSQL's view shows the grants whose grantee or
-					// grantor is one of the reader's roles (PUBLIC is
-					// everyone's).
-					if env.RoleSet != nil && !env.IsAdmin && !env.RoleSet.Has(u) && !env.RoleSet.Has(catalog.OwnerOf(t.Owner)) {
-						continue
-					}
-					users = append(users, u)
-				}
-				sort.Strings(users)
-				for _, u := range users {
-					opts := map[string]bool{}
-					for _, p := range t.GrantOptions[u] {
-						opts[p] = true
-					}
-					for _, p := range t.Privileges[u] {
-						grantable := "NO"
-						if opts[p] {
-							grantable = "YES"
-						}
-						rows = append(rows, Row{str(catalog.OwnerOf(t.Owner)), str(u), str(env.Database), str(catalog.PublicSchema), str(t.Name), str(p), str(grantable)})
 					}
 				}
 			}
