@@ -116,9 +116,9 @@ func TestAlterTable(t *testing.T) {
 	if res.Rows[0][0].I != 7 {
 		t.Fatalf("new row: %+v", res.Rows[0])
 	}
-	// NOT NULL adds are refused.
-	if _, serr := trySQL(ctx, s, `ALTER TABLE t ADD COLUMN c INT NOT NULL`); serr == nil {
-		t.Fatal("NOT NULL ADD COLUMN accepted")
+	// A NOT NULL add with no DEFAULT fails over existing rows (23502).
+	if _, serr := trySQL(ctx, s, `ALTER TABLE t ADD COLUMN c INT NOT NULL`); serr == nil || serr.Code != sql.CodeNotNullViolation {
+		t.Fatalf("NOT NULL ADD COLUMN over a row: %v", serr)
 	}
 
 	// DROP COLUMN: lazy — old bytes ignored; re-add gets a fresh column ID,

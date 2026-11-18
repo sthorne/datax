@@ -925,6 +925,19 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
 	// and then sweep the existing rows: multi-transaction, like CREATE
 	// INDEX.
+	// Several actions of which one needs the table's rows, and ADD
+	// COLUMN with a volatile default (or another that needs them), run
+	// online too (alter_multi.go); several that need nothing but the
+	// descriptor run below, in the statement's transaction.
+	if at, ok := stmt.(*parser.AlterTable); ok && alterRunsOnline(at) {
+		if at.IfExists && !s.tableExists(ctx, at.Table) {
+			return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("relation %q does not exist, skipping", at.Table)}}, nil
+		}
+		if s.state == StateOpen {
+			return nil, alterInBlockError(alterCmds(at))
+		}
+		return s.execAlterTableOnline(ctx, at)
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil || at.SetType != nil) && !s.tableExists(ctx, at.Table) {
 		return &Result{Tag: "ALTER TABLE"}, nil
 	}

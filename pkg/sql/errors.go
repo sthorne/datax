@@ -20,6 +20,7 @@ const (
 	CodeUndefinedTable       = "42P01"
 	CodeDuplicateTable       = "42P07"
 	CodeUndefinedColumn      = "42703"
+	CodeDuplicateColumn      = "42701"
 	CodeUndefinedFunction    = "42883"
 	CodeUniqueViolation      = "23505"
 	CodeNotNullViolation     = "23502"

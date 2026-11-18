@@ -185,7 +185,7 @@ func TestNoPrimaryKeyTables(t *testing.T) {
 	h.expect(`SELECT * FROM t ORDER BY a`, "5|7;5|7;6|7")
 	h.expect(`SELECT attname FROM pg_attribute WHERE attrelid = 't'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum`, "a;n")
 	h.code(`ALTER TABLE t DROP COLUMN rowid`, sql.CodeUndefinedColumn)
-	h.code(`ALTER TABLE t ADD COLUMN rowid INT`, sql.CodeDuplicateObject)
+	h.code(`ALTER TABLE t ADD COLUMN rowid INT`, sql.CodeDuplicateColumn)
 
 	// ---- ADD PRIMARY KEY: refused ----
 	serr := h.code(`ALTER TABLE t ADD PRIMARY KEY (a)`, sql.CodeFeatureNotSupported)

@@ -787,14 +787,22 @@ type Update struct {
 	Returning []SelectExpr
 }
 
-// AlterTable is ALTER TABLE [IF EXISTS] t <action>: one of the fields
-// below is set.
+// AlterTable is ALTER TABLE [IF EXISTS] [ONLY] t <action> [, ...]: one
+// of the action fields below is set, or, for several actions, Cmds.
 type AlterTable struct {
 	Table string
 	// IfExists makes a missing table a no-op.
 	IfExists bool
-	AddCol   *ColumnDef // set for ADD COLUMN
-	DropCol  string     // set for DROP COLUMN
+	// Only is ALTER TABLE ONLY t: accepted, and the same as without it
+	// (no table has descendants).
+	Only bool
+	// Cmds are the actions of ALTER TABLE t action, action [, ...], in
+	// written order, each an AlterTable with one action field set (and
+	// Table, IfExists and Only copied). Nil for a single action, which
+	// is set on this AlterTable itself.
+	Cmds    []*AlterTable
+	AddCol  *ColumnDef // set for ADD COLUMN
+	DropCol string     // set for DROP COLUMN
 	// AddColIfNotExists / DropColIfExists are ADD COLUMN IF NOT EXISTS /
 	// DROP COLUMN IF EXISTS: an existing / missing column is a no-op.
 	AddColIfNotExists bool

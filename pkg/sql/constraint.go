@@ -1178,6 +1178,13 @@ func (s *Session) abandonConstraint(ctx context.Context, table string, cID uint6
 // returning that table (nil when none, or when it is desc itself) for
 // the caller to write.
 func (s *Session) removeConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, c *catalog.Constraint) (*catalog.TableDescriptor, error) {
+	return s.removeConstraintIn(ctx, txn, desc, c, nil)
+}
+
+// removeConstraintIn is removeConstraint taking the referenced table
+// from parents when it is there (a statement changing it twice), and
+// leaving it there.
+func (s *Session) removeConstraintIn(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, c *catalog.Constraint, parents map[uint64]*catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
 	removed := *c
 	kept := desc.Constraints[:0]
 	for _, x := range desc.Constraints {
@@ -1200,14 +1207,21 @@ func (s *Session) removeConstraint(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	parent := desc
 	if removed.RefTable != desc.ID {
-		p, err := catalog.ReadTable(ctx, txn, removed.RefTable)
-		if err != nil {
-			return nil, err
+		if p, ok := parents[removed.RefTable]; ok {
+			parent = p
+		} else {
+			p, err := catalog.ReadTable(ctx, txn, removed.RefTable)
+			if err != nil {
+				return nil, err
+			}
+			if p == nil {
+				return nil, nil
+			}
+			parent = p.Clone()
+			if parents != nil {
+				parents[parent.ID] = parent
+			}
 		}
-		if p == nil {
-			return nil, nil
-		}
-		parent = p.Clone()
 	}
 	kr := parent.InboundFKs[:0]
 	for _, r := range parent.InboundFKs {
@@ -1335,42 +1349,37 @@ func (s *Session) execValidateConstraintOnline(ctx context.Context, t *parser.Al
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
-// execDropConstraint is ALTER TABLE ... DROP CONSTRAINT [IF EXISTS], in
-// the statement's transaction; the dropped index's entries are wiped
-// after commit by the caller (dropConstraintCleanup).
-func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.AlterTable) (*Result, error) {
+// applyDropConstraint is ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]'s
+// change to desc, in the statement's transaction, with the referenced
+// table's change and the index to wipe after commit left in eff.
+func (s *Session) applyDropConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.AlterTable, eff *alterEffects) error {
 	c, ok := desc.Constraint(t.DropConstraint)
 	if !ok {
 		if t.DropConstraintIfExists {
-			return &Result{Tag: "ALTER TABLE"}, nil
+			eff.notices = append(eff.notices, fmt.Sprintf("constraint %q of relation %q does not exist, skipping", t.DropConstraint, desc.Name))
+			return nil
 		}
 		if t.DropConstraint == desc.Name+"_pkey" {
-			return nil, newErrf(CodeFeatureNotSupported, "cannot drop the primary key of table %q", desc.Name)
+			return newErrf(CodeFeatureNotSupported, "cannot drop the primary key of table %q", desc.Name)
 		}
-		return nil, newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", t.DropConstraint, desc.Name)
+		return newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", t.DropConstraint, desc.Name)
 	}
 	indexID := c.IndexID
 	if c.Kind == catalog.ConstraintForeign && !c.AutoIndex {
 		indexID = 0
 	}
-	parent, err := s.removeConstraint(ctx, txn, desc, c)
+	parent, err := s.removeConstraintIn(ctx, txn, desc, c, eff.parents)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if parent != nil {
-		if err := s.cat.Update(ctx, txn, parent); err != nil {
-			return nil, err
-		}
-		s.noteDDL(parent.Name)
-	}
-	if err := s.cat.Update(ctx, txn, desc); err != nil {
-		return nil, err
+		eff.parents[parent.ID] = parent
 	}
 	if indexID != 0 {
-		s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
+		eff.wipes = append(eff.wipes, indexWipe{tableID: desc.ID, indexID: indexID})
 	}
-	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.sessionUser, "role", s.user)
-	return &Result{Tag: "ALTER TABLE"}, nil
+	eff.audit("constraint-ddl", "DROP CONSTRAINT", desc.Name+"."+t.DropConstraint)
+	return nil
 }
 
 // indexWipe is an index whose entries are reclaimed once the dropping

@@ -4280,55 +4280,105 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.IfExists = true
 	}
+	// ONLY: there is no table inheritance here, so the table is all
+	// there is to alter (pg_dump writes ALTER TABLE ONLY ...). It is
+	// taken as the keyword only when a table name follows it.
+	if t := p.peek(); t.kind == tkIdent && t.text == "only" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+		p.i++
+		at.Only = true
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
 	at.Table = name
-	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
-		return nil, err
-	} else if at.RowSecurity != "" {
-		return at, nil
+	// t * names the table and its descendants, which are none.
+	if !at.Only {
+		p.consumeOp("*")
 	}
 	switch {
 	case p.consumeIdentWord("owner"):
 		return p.parseOwnerTo("table", name)
 	case p.consumeIdentWord("rename"):
-		switch {
-		case p.consumeKeyword("TO"):
-			if at.RenameTo, err = p.expectIdent(); err != nil {
-				return nil, err
-			}
-		case p.consumeKeyword("CONSTRAINT"):
-			r, err := p.parseRename()
-			if err != nil {
-				return nil, err
-			}
-			at.RenameConstraint = r
-		default:
-			p.consumeKeyword("COLUMN")
-			r, err := p.parseRename()
-			if err != nil {
-				return nil, err
-			}
-			at.RenameCol = r
+		// RENAME is a statement of its own in PostgreSQL's grammar: it
+		// takes no other action beside it.
+		if err := p.parseAlterTableRename(at); err != nil {
+			return nil, err
 		}
+		return at, nil
+	}
+	// One action, or several separated by commas (ALTER TABLE t ADD
+	// COLUMN a INT, DROP COLUMN b, ...): each is parsed into an
+	// AlterTable of its own, and several are carried in Cmds.
+	var cmds []*AlterTable
+	for {
+		cmd := &AlterTable{Table: at.Table, IfExists: at.IfExists, Only: at.Only}
+		if err := p.parseAlterTableAction(cmd); err != nil {
+			return nil, err
+		}
+		cmds = append(cmds, cmd)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if len(cmds) == 1 {
+		return cmds[0], nil
+	}
+	at.Cmds = cmds
+	return at, nil
+}
+
+// parseAlterTableRename parses what follows ALTER TABLE t RENAME.
+func (p *parser) parseAlterTableRename(at *AlterTable) error {
+	var err error
+	switch {
+	case p.consumeKeyword("TO"):
+		if at.RenameTo, err = p.expectIdent(); err != nil {
+			return err
+		}
+	case p.consumeKeyword("CONSTRAINT"):
+		r, err := p.parseRename()
+		if err != nil {
+			return err
+		}
+		at.RenameConstraint = r
+	default:
+		p.consumeKeyword("COLUMN")
+		r, err := p.parseRename()
+		if err != nil {
+			return err
+		}
+		at.RenameCol = r
+	}
+	return nil
+}
+
+// parseAlterTableAction parses one action of ALTER TABLE into at.
+func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
+	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
+		return err
+	} else if at.RowSecurity != "" {
+		return nil
+	}
+	switch {
+	case p.peekIdentWord("rename") || p.peekIdentWord("owner"):
+		return p.errf("%s cannot be combined with other ALTER TABLE actions", strings.ToUpper(p.peek().text))
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
 			// IF NOT EXISTS: a datax extension (PostgreSQL has none here).
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("NOT"); err != nil {
-					return nil, err
+					return err
 				}
 				if err := p.expectKeyword("EXISTS"); err != nil {
-					return nil, err
+					return err
 				}
 				at.AddConstraintIfNotExists = true
 			}
 			n, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			cname, named = n, true
 		}
@@ -4337,22 +4387,22 @@ func (p *parser) parseAlterTable() (Statement, error) {
 				// Parsed so the executor can refuse it against the
 				// table (42P16 or 0A000) rather than as a syntax error.
 				if err := p.expectKeyword("KEY"); err != nil {
-					return nil, err
+					return err
 				}
 				cols, err := p.parseColumnList()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				at.AddConstraint = &ConstraintDef{Name: cname, Kind: "primary", Columns: cols}
 				break
 			}
 			cd, err := p.parseTableConstraint(cname)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if p.consumeKeyword("NOT") {
 				if !p.consumeIdentWord("valid") {
-					return nil, p.errf("expected VALID after NOT, found %q", p.peek().text)
+					return p.errf("expected VALID after NOT, found %q", p.peek().text)
 				}
 				cd.NotValid = true
 			}
@@ -4362,29 +4412,29 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		p.consumeKeyword("COLUMN")
 		if p.consumeKeyword("IF") {
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, err
+				return err
 			}
 			if err := p.expectKeyword("EXISTS"); err != nil {
-				return nil, err
+				return err
 			}
 			at.AddColIfNotExists = true
 		}
 		def, err := p.parseColumnDef()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.AddCol = &def
 	case p.consumeKeyword("DROP"):
 		if p.consumeKeyword("CONSTRAINT") {
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("EXISTS"); err != nil {
-					return nil, err
+					return err
 				}
 				at.DropConstraintIfExists = true
 			}
 			n, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.DropConstraint = n
 			break
@@ -4392,13 +4442,13 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		p.consumeKeyword("COLUMN")
 		if p.consumeKeyword("IF") {
 			if err := p.expectKeyword("EXISTS"); err != nil {
-				return nil, err
+				return err
 			}
 			at.DropColIfExists = true
 		}
 		col, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.DropCol = col
 		if !p.consumeIdentWord("cascade") {
@@ -4406,43 +4456,43 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 	case p.consumeIdentWord("validate"):
 		if err := p.expectKeyword("CONSTRAINT"); err != nil {
-			return nil, err
+			return err
 		}
 		n, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.ValidateConstraint = n
 	case p.consumeKeyword("ALTER"):
 		p.consumeKeyword("COLUMN")
 		col, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		switch {
 		case p.consumeIdentWord("type"):
 			spec, serial, err := p.parseColumnType()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if serial {
-				return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+				return p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 			}
 			at.SetType = setTypeOf(col, spec)
 			if p.consumeIdentWord("using") {
-				return nil, p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
+				return p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
 			}
 		case p.consumeKeyword("SET"):
 			if p.consumeIdentWord("data") {
 				if !p.consumeIdentWord("type") {
-					return nil, p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
+					return p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
 				}
 				spec, serial, err := p.parseColumnType()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if serial {
-					return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+					return p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 				}
 				at.SetType = setTypeOf(col, spec)
 				break
@@ -4450,17 +4500,17 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			if p.consumeIdentWord("default") {
 				sd, err := p.parseDefaultValue()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				sd.Column = col
 				at.SetDefault = sd
 				break
 			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
+				return p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
-				return nil, err
+				return err
 			}
 			at.SetNotNull = col
 		case p.consumeKeyword("DROP"):
@@ -4469,29 +4519,29 @@ func (p *parser) parseAlterTable() (Statement, error) {
 				break
 			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
+				return p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
-				return nil, err
+				return err
 			}
 			at.DropNotNull = col
 		default:
-			return nil, p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.SetOptions = opts
 	case p.consumeIdentWord("reset"):
 		if err := p.expectOp("("); err != nil {
-			return nil, err
+			return err
 		}
 		for {
 			name, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.ResetOptions = append(at.ResetOptions, name)
 			if !p.consumeOp(",") {
@@ -4499,39 +4549,39 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			}
 		}
 		if err := p.expectOp(")"); err != nil {
-			return nil, err
+			return err
 		}
 	case p.consumeIdentWord("purge"):
 		at.Purge = true
 	case p.consumeIdentWord("rotate"):
 		if !p.peekEncryptionKey(0) {
-			return nil, p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
+			return p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
 		}
 		p.i += 2
 		at.RotateKey = true
 		if p.peekWord(0, "keep") {
 			if !p.peekWord(1, "old") || !p.peekWord(2, "versions") {
-				return nil, p.errf("expected KEEP OLD VERSIONS")
+				return p.errf("expected KEEP OLD VERSIONS")
 			}
 			p.i += 3
 			at.RotateKeepOld = true
 		}
 	case p.consumeIdentWord("split"):
 		if !p.consumeIdentWord("at") {
-			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
+			return p.errf("expected AT after SPLIT, found %q", p.peek().text)
 		}
 		tuples, err := p.parseSplitTuples()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.SplitAt = tuples
 		if p.consumeIdentWord("with") {
 			if !p.consumeIdentWord("expiration") {
-				return nil, p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
+				return p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
 			}
 			e, err := p.parseValueOrColumnExpr()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.SplitExpiration = &e
 		}
@@ -4541,17 +4591,17 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		if !p.consumeIdentWord("at") {
-			return nil, p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
+			return p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
 		}
 		tuples, err := p.parseSplitTuples()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+		return p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
-	return at, nil
+	return nil
 }
 
 // parseSplitTuples parses VALUES (k, ...), (k, ...): the key tuples of

@@ -1588,7 +1588,7 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 			row[col.ID] = d
 		}
 		if d.Null && col.NotNull {
-			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", col.Name)
+			return nil, nil, newErrf(CodeNotNullViolation, "null value in column %q violates not-null constraint", columnDisplayName(col))
 		}
 		// Type modifiers (DECIMAL(p,s), widths, lengths, TIMESTAMP forms):
 		// apply before the key encoding below — PK columns precede the
@@ -3134,11 +3134,6 @@ func (s *Session) applyDelete(ctx context.Context, txn *kvclient.Txn, desc *cata
 	return res, nil
 }
 
-// execAlterTable adds or drops a column. Adds are nullable-only (existing
-// rows simply decode the new column as NULL); drops are lazy (the bytes
-// stay in old row values and are skipped on decode) and refused for
-// primary-key or indexed columns. Column IDs are never reused, so a
-// drop-then-re-add cannot resurrect old values.
 // mustBeReal refuses a write or DDL against a virtual catalog table.
 func mustBeReal(desc *catalog.TableDescriptor) error {
 	if desc.Virtual != "" {
@@ -3172,171 +3167,40 @@ func (s *Session) execAlterTable(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, err
 	}
 	desc := shared.Clone()
-	if desc.NextColumnID == 0 {
-		var max catalog.ColumnID
-		for _, c := range desc.Columns {
-			if c.ID > max {
-				max = c.ID
-			}
-		}
-		desc.NextColumnID = max + 1
-	}
+	normalizeNextColumnID(desc)
 	switch {
-	case t.RowSecurity != "":
-		if err := s.applyRowSecurity(desc, t.RowSecurity); err != nil {
-			return nil, err
-		}
-	case t.AddConstraint != nil || t.ValidateConstraint != "" || t.SetNotNull != "":
-		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
-	case t.DropConstraint != "":
-		return s.execDropConstraint(ctx, txn, desc, t)
 	case t.RenameTo != "":
 		return s.execRenameTable(ctx, txn, desc, t)
 	case t.RenameCol != nil:
 		return s.execRenameColumn(ctx, txn, desc, t.RenameCol)
 	case t.RenameConstraint != nil:
 		return s.execRenameConstraint(ctx, txn, desc, t.RenameConstraint)
-	case t.SetDefault != nil:
-		return s.execSetDefault(ctx, txn, desc, t.SetDefault.Column, t.SetDefault)
-	case t.DropDefault != "":
-		return s.execSetDefault(ctx, txn, desc, t.DropDefault, nil)
-	case t.DropNotNull != "":
-		col, ok := desc.Col(t.DropNotNull)
-		if !ok {
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropNotNull)
-		}
-		if desc.IsPKCol(col.ID) {
-			return nil, newErrf(CodeInvalidColumnReference, "column %q is in the primary key and cannot be nullable", t.DropNotNull)
-		}
-		if col.Identity != "" {
-			return nil, newErrf(CodeSyntaxError, "column %q is an identity column and cannot be nullable", t.DropNotNull)
-		}
-		for i := range desc.Columns {
-			if desc.Columns[i].ID == col.ID {
-				desc.Columns[i].NotNull = false
-			}
-		}
-	case t.AddCol != nil:
-		def := t.AddCol
-		if len(def.Constraints) > 0 {
-			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot carry a constraint: add the column, then ALTER TABLE ... ADD CONSTRAINT")
-		}
-		if def.PrimaryKey {
-			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN cannot add a primary key column")
-		}
-		if def.DefaultExpr != nil || def.Serial || def.Identity != "" {
-			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN takes a constant DEFAULT only (existing rows would each need the expression evaluated)")
-		}
-		if def.NotNull && (def.Default == nil || def.Default.Null) {
-			return nil, newErrf(CodeFeatureNotSupported, "ADD COLUMN ... NOT NULL requires a DEFAULT (existing rows need a value)")
-		}
-		if _, exists := desc.Col(def.Name); exists {
-			if t.AddColIfNotExists {
-				return &Result{Tag: "ALTER TABLE"}, nil
-			}
-			return nil, newErrf(CodeDuplicateObject, "column %q already exists", def.Name)
-		}
-		col := catalog.Column{
-			ID: desc.NextColumnID, Name: def.Name, Type: def.Type, NotNull: def.NotNull,
-			Precision: def.Precision, Scale: def.Scale,
-			Width: def.Width, MaxLen: def.MaxLen, Char: def.Char, NoTZ: def.NoTZ, TimePrecision: def.TimePrecision,
-		}
-		s.stripTypeAttrs(&col)
-		if err := s.requireV10(col.Type); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if err := s.resolveEnumColumn(ctx, txn, &col, def.TypeName); err != nil {
-			return nil, ToSQLError(err)
-		}
-		if def.Default != nil && !def.Default.Null {
-			d, cerr := coerceColumn(col, *def.Default)
-			if cerr != nil {
-				return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, cerr.Msg)
-			}
-			d, terr := enforceTypmod(col, d)
-			if terr != nil {
-				return nil, terr
-			}
-			// Fill-on-read: rows written before this ADD lack the column and
-			// decode as the default; NULLs written afterwards are stored
-			// explicitly so they stay NULL.
-			col.Default, col.FillDefault = &d, true
-		}
-		if err := s.requireTextSearchTypes(col.Type); err != nil {
-			return nil, err
-		}
-		desc.Columns = append(desc.Columns, col)
-		desc.NextColumnID++
-	case t.DropCol != "":
-		col, ok := desc.Col(t.DropCol)
-		if !ok || col.Hidden {
-			if t.DropColIfExists {
-				return &Result{Tag: "ALTER TABLE"}, nil
-			}
-			return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", t.DropCol)
-		}
-		if desc.IsPKCol(col.ID) {
-			return nil, newErrf(CodeFeatureNotSupported, "cannot drop primary key column %q", t.DropCol)
-		}
-		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
-			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", t.DropCol)
-		}
-		if err := s.refuseIfViewed(ctx, txn, desc, "drop column "+t.DropCol); err != nil {
-			return nil, err
-		}
-		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
-			return nil, err
-		} else if len(uses) > 0 {
-			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by constraint %s (drop the constraint first)", t.DropCol, strings.Join(uses, ", "))
-		}
-		if uses := policyColumnUses(desc, col.Name); len(uses) > 0 {
-			return nil, newErrf(CodeDependentObjectsExist, "cannot drop column %q: used by policy %s (drop the policy first)", t.DropCol, strings.Join(uses, ", "))
-		}
-		// The indexes that read the column — as a key, in an
-		// expression key or in a predicate — are dropped with it, as in
-		// PostgreSQL. (One a constraint owns was refused above.)
-		var keptIndexes []catalog.IndexDescriptor
-		var wipes []indexWipe
-		for _, idx := range desc.Indexes {
-			if !indexColumnUses(&idx, col) {
-				keptIndexes = append(keptIndexes, idx)
-				continue
-			}
-			if !idx.Public() {
-				return nil, newErrf(CodeObjectInUse, "cannot drop column %q: index %q, which uses it, is still being built", t.DropCol, idx.Name)
-			}
-			if desc.Reshard != nil {
-				return nil, newErrf(CodeObjectInUse, "cannot drop column %q of table %q while a re-shard is in progress: index %q uses it", t.DropCol, desc.Name, idx.Name)
-			}
-			w := indexWipe{tableID: desc.ID, indexID: idx.ID}
-			if idx.IsVector() {
-				w.vectorBuild = idx.Vector.Build
-			}
-			wipes = append(wipes, w)
-		}
-		desc.Indexes = keptIndexes
-		s.pendingWipes = append(s.pendingWipes, wipes...)
-		kept := desc.Columns[:0]
-		for _, c := range desc.Columns {
-			if c.ID != col.ID {
-				kept = append(kept, c)
-			}
-		}
-		desc.Columns = kept
-		if col.SequenceID != 0 {
-			if sd, err := catalog.ReadSequence(ctx, txn, col.SequenceID); err == nil {
-				if err := catalog.DropSequence(ctx, txn, sd); err != nil {
-					return nil, err
-				}
-			}
-		}
-	default:
-		return nil, newErrf(CodeSyntaxError, "ALTER TABLE requires an action (ADD, DROP, RENAME, ALTER COLUMN, SET)")
+	case t.Cmds == nil && (t.AddConstraint != nil || t.ValidateConstraint != "" || t.SetNotNull != ""):
+		return nil, newErrf(CodeActiveTransaction, "ALTER TABLE ... ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL cannot run inside a transaction block")
 	}
-	if err := s.cat.Update(ctx, txn, desc); err != nil {
+	// The actions, in written order, applied to one copy of the
+	// descriptor and written once (alter_multi.go). One that needs the
+	// table's rows runs online, outside a transaction block: reaching it
+	// here means the statement is in one.
+	cmds := alterCmds(t)
+	if err := checkAlterCombination(cmds); err != nil {
 		return nil, err
 	}
-	return &Result{Tag: "ALTER TABLE"}, nil
+	for _, c := range cmds {
+		if alterActionNeedsRows(c) {
+			return nil, alterInBlockError(cmds)
+		}
+	}
+	eff := newAlterEffects()
+	for _, c := range cmds {
+		if err := s.applyAlterAction(ctx, txn, desc, c, eff); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.commitAlterEffects(ctx, txn, desc, eff); err != nil {
+		return nil, err
+	}
+	return &Result{Tag: "ALTER TABLE", Notices: eff.notices}, nil
 }
 
 // execExplain describes the access plan of a SELECT without executing it.

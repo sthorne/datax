@@ -108,86 +108,27 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			return err
 		}
 		desc := shared.Clone()
-		col, ok := desc.Col(st.Column)
-		if !ok || col.Hidden {
-			return newErrf(CodeUndefinedColumn, "column %q does not exist", st.Column)
-		}
-		if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
-			// A rewrite gives the column a new ID, which the expiry
-			// would go on naming the old one of.
-			return newErrf(CodeDependentObjectsExist, "cannot change the type of column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", st.Column)
-		}
-		target := catalog.Column{
-			Type: st.Type, Precision: st.Precision, Scale: st.Scale,
-			Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,
-		}
-		if err := s.resolveEnumColumn(ctx, txn, &target, st.TypeName); err != nil {
+		col, target, how, err := s.retypePlan(ctx, txn, desc, st)
+		if err != nil {
 			return err
 		}
-		if col.Type == target.Type && col.Precision == target.Precision && col.Scale == target.Scale &&
-			col.IntWidth() == target.IntWidth() && col.MaxLen == target.MaxLen && col.Char == target.Char && col.NoTZ == target.NoTZ &&
-			col.TimePrecision == target.TimePrecision && col.EnumType == target.EnumType {
+		switch how {
+		case retypeNoop:
 			return nil // nothing to do
-		}
-		if pureWidening(col, target) {
+		case retypeWiden:
 			// Every stored value stays valid: a descriptor write in this
 			// transaction is the whole statement (INT4 → INT8, VARCHAR(10)
 			// → VARCHAR(20) or TEXT, TIMESTAMP(3) → TIMESTAMP).
-			for i := range desc.Columns {
-				if desc.Columns[i].ID == col.ID {
-					c := &desc.Columns[i]
-					c.Width, c.MaxLen, c.Char, c.NoTZ, c.TimePrecision, c.Precision, c.Scale = target.Width, target.MaxLen, target.Char, target.NoTZ, target.TimePrecision, target.Precision, target.Scale
-					c.EnumType, c.EnumName, c.EnumLabels = target.EnumType, target.EnumName, target.EnumLabels
-				}
-			}
+			retypeWidenInPlace(desc, col.ID, target)
 			widened = true
 			return s.cat.Update(ctx, txn, desc)
-		}
-		if err := s.requireTextSearchTypes(st.Type); err != nil {
-			return err
-		}
-		if !retypeAllowed(col.Type, st.Type) {
-			return newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.TypeSQL(), target.TypeSQL())
-		}
-		if desc.Reshard != nil {
-			return newErrf(CodeObjectInUse, "cannot alter a column of table %q while a re-shard is in progress", desc.Name)
 		}
 		for _, c := range desc.Columns {
 			if c.RetypeFrom != 0 {
 				return newErrf(CodeObjectInUse, "another ALTER COLUMN TYPE on table %q is in progress", desc.Name)
 			}
 		}
-		if desc.IsPKCol(col.ID) {
-			return newErrf(CodeFeatureNotSupported, "cannot change the type of primary key column %q", col.Name)
-		}
-		if col.Identity != "" || col.SequenceID != 0 {
-			return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: it draws from a sequence", col.Name)
-		}
-		for _, idx := range desc.Indexes {
-			if indexColumnUses(&idx, col) {
-				return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by index %q (drop it first)", col.Name, idx.Name)
-			}
-		}
-		if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
-			return err
-		} else if len(uses) > 0 {
-			return newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by constraint %s (drop it first)", col.Name, uses[0])
-		}
-		if err := s.refuseIfViewed(ctx, txn, desc, "change the type of column "+col.Name); err != nil {
-			return err
-		}
-		if desc.NextColumnID == 0 {
-			for _, c := range desc.Columns {
-				if c.ID >= desc.NextColumnID {
-					desc.NextColumnID = c.ID + 1
-				}
-			}
-		}
-		shadow := target
-		shadow.ID, shadow.Name, shadow.Hidden, shadow.RetypeFrom = desc.NextColumnID, fmt.Sprintf("__retype_%d", col.ID), true, col.ID
-		desc.NextColumnID++
-		desc.Columns = append(desc.Columns, shadow)
-		shadowID, oldID, tableID, changed = shadow.ID, col.ID, desc.ID, true
+		shadowID, oldID, tableID, changed = addRetypeShadow(desc, col, target), col.ID, desc.ID, true
 		return s.cat.Update(ctx, txn, desc)
 	})
 	if err != nil {
@@ -237,34 +178,9 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			return err
 		}
 		desc := shared.Clone()
-		oi, si := -1, -1
-		for i, c := range desc.Columns {
-			switch c.ID {
-			case oldID:
-				oi = i
-			case shadowID:
-				si = i
-			}
+		if err := retypeSwapIDs(desc, oldID, shadowID); err != nil {
+			return err
 		}
-		if oi < 0 || si < 0 {
-			return newErrf(CodeInternal, "column vanished during ALTER COLUMN TYPE")
-		}
-		old, shadow := desc.Columns[oi], desc.Columns[si]
-		shadow.Name, shadow.Hidden, shadow.RetypeFrom = old.Name, false, 0
-		shadow.NotNull, shadow.Comment = old.NotNull, old.Comment
-		if old.Default != nil {
-			d, cerr := old.Default.ConvertTo(shadow.Type)
-			if cerr != nil {
-				return newErrf(CodeInvalidTextRepresentation, "the DEFAULT of column %q cannot convert to %s: %v", old.Name, shadow.Type, cerr)
-			}
-			if d, cerr = enforceTypmod(shadow, d); cerr != nil {
-				return cerr
-			}
-			shadow.Default, shadow.FillDefault = &d, old.FillDefault
-		}
-		shadow.DefaultExpr = old.DefaultExpr
-		desc.Columns[oi] = shadow
-		desc.Columns = append(desc.Columns[:si], desc.Columns[si+1:]...)
 		return s.cat.Update(ctx, txn, desc)
 	})
 	if err != nil {
@@ -368,4 +284,146 @@ func (s *Session) retypeBackfill(ctx context.Context, table string, tableID uint
 		}
 		cursor = chunkEnd
 	}
+}
+
+// How an ALTER COLUMN TYPE changes its column (retypePlan).
+const (
+	retypeNoop    = iota // the column has the type already
+	retypeWiden          // every stored value stays valid: a descriptor change
+	retypeRewrite        // the values convert: the online rewrite
+)
+
+// retypePlan checks ALTER COLUMN st.Column TYPE ... against desc and
+// returns the column, its new type as a column, and how it changes.
+// The refusals are the statement's: a type it cannot convert to, a
+// column a key, index, constraint, sequence, view or the row expiry
+// depends on.
+func (s *Session) retypePlan(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, st *parser.SetType) (catalog.Column, catalog.Column, int, error) {
+	col, ok := desc.Col(st.Column)
+	if !ok || col.Hidden {
+		return col, catalog.Column{}, 0, newErrf(CodeUndefinedColumn, "column %q does not exist", st.Column)
+	}
+	if desc.RowTTL != nil && desc.RowTTL.ColumnID == col.ID {
+		// A rewrite gives the column a new ID, which the expiry
+		// would go on naming the old one of.
+		return col, catalog.Column{}, 0, newErrf(CodeDependentObjectsExist, "cannot change the type of column %q: the table's row expiry reads it (ALTER TABLE ... RESET (ttl) first)", st.Column)
+	}
+	target := catalog.Column{
+		Type: st.Type, Precision: st.Precision, Scale: st.Scale,
+		Width: st.Width, MaxLen: st.MaxLen, Char: st.Char, NoTZ: st.NoTZ, TimePrecision: st.TimePrecision,
+	}
+	if err := s.resolveEnumColumn(ctx, txn, &target, st.TypeName); err != nil {
+		return col, target, 0, err
+	}
+	if col.Type == target.Type && col.Precision == target.Precision && col.Scale == target.Scale &&
+		col.IntWidth() == target.IntWidth() && col.MaxLen == target.MaxLen && col.Char == target.Char && col.NoTZ == target.NoTZ &&
+		col.TimePrecision == target.TimePrecision && col.EnumType == target.EnumType {
+		return col, target, retypeNoop, nil
+	}
+	if pureWidening(col, target) {
+		return col, target, retypeWiden, nil
+	}
+	if err := s.requireTextSearchTypes(st.Type); err != nil {
+		return col, target, 0, err
+	}
+	if !retypeAllowed(col.Type, st.Type) {
+		return col, target, 0, newErrf(CodeFeatureNotSupported, "column %q cannot be converted from %s to %s in place: only widening and text conversions are supported (recreate the column)", col.Name, col.TypeSQL(), target.TypeSQL())
+	}
+	if desc.Reshard != nil {
+		return col, target, 0, newErrf(CodeObjectInUse, "cannot alter a column of table %q while a re-shard is in progress", desc.Name)
+	}
+	if desc.IsPKCol(col.ID) {
+		return col, target, 0, newErrf(CodeFeatureNotSupported, "cannot change the type of primary key column %q", col.Name)
+	}
+	if col.Identity != "" || col.SequenceID != 0 {
+		return col, target, 0, newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: it draws from a sequence", col.Name)
+	}
+	for _, idx := range desc.Indexes {
+		if indexColumnUses(&idx, col) {
+			return col, target, 0, newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by index %q (drop it first)", col.Name, idx.Name)
+		}
+	}
+	if uses, err := s.constraintUses(ctx, txn, desc, col.ID); err != nil {
+		return col, target, 0, err
+	} else if len(uses) > 0 {
+		return col, target, 0, newErrf(CodeFeatureNotSupported, "cannot change the type of column %q: used by constraint %s (drop it first)", col.Name, uses[0])
+	}
+	if err := s.refuseIfViewed(ctx, txn, desc, "change the type of column "+col.Name); err != nil {
+		return col, target, 0, err
+	}
+	return col, target, retypeRewrite, nil
+}
+
+// retypeWidenInPlace gives column id the type attributes of target.
+func retypeWidenInPlace(desc *catalog.TableDescriptor, id catalog.ColumnID, target catalog.Column) {
+	for i := range desc.Columns {
+		if desc.Columns[i].ID == id {
+			c := &desc.Columns[i]
+			c.Width, c.MaxLen, c.Char, c.NoTZ, c.TimePrecision, c.Precision, c.Scale = target.Width, target.MaxLen, target.Char, target.NoTZ, target.TimePrecision, target.Precision, target.Scale
+			c.EnumType, c.EnumName, c.EnumLabels = target.EnumType, target.EnumName, target.EnumLabels
+		}
+	}
+}
+
+// retypeSetInPlace gives column id target's type outright: what the
+// table looks like once a rewrite is done, for a statement checked
+// without running it (alter_multi.go's dry run).
+func retypeSetInPlace(desc *catalog.TableDescriptor, id catalog.ColumnID, target catalog.Column) {
+	retypeWidenInPlace(desc, id, target)
+	for i := range desc.Columns {
+		if desc.Columns[i].ID == id {
+			desc.Columns[i].Type = target.Type
+		}
+	}
+}
+
+// addRetypeShadow adds col's hidden shadow column of the new type to
+// desc and returns its ID.
+func addRetypeShadow(desc *catalog.TableDescriptor, col, target catalog.Column) catalog.ColumnID {
+	if desc.NextColumnID == 0 {
+		for _, c := range desc.Columns {
+			if c.ID >= desc.NextColumnID {
+				desc.NextColumnID = c.ID + 1
+			}
+		}
+	}
+	shadow := target
+	shadow.ID, shadow.Name, shadow.Hidden, shadow.RetypeFrom = desc.NextColumnID, fmt.Sprintf("__retype_%d", col.ID), true, col.ID
+	desc.NextColumnID++
+	desc.Columns = append(desc.Columns, shadow)
+	return shadow.ID
+}
+
+// retypeSwapIDs makes shadow column shadowID the column oldID was: its
+// name, position, NOT NULL, comment and defaults (converted).
+func retypeSwapIDs(desc *catalog.TableDescriptor, oldID, shadowID catalog.ColumnID) error {
+	oi, si := -1, -1
+	for i, c := range desc.Columns {
+		switch c.ID {
+		case oldID:
+			oi = i
+		case shadowID:
+			si = i
+		}
+	}
+	if oi < 0 || si < 0 {
+		return newErrf(CodeInternal, "column vanished during ALTER COLUMN TYPE")
+	}
+	old, shadow := desc.Columns[oi], desc.Columns[si]
+	shadow.Name, shadow.Hidden, shadow.RetypeFrom = old.Name, false, 0
+	shadow.NotNull, shadow.Comment = old.NotNull, old.Comment
+	if old.Default != nil {
+		d, cerr := old.Default.ConvertTo(shadow.Type)
+		if cerr != nil {
+			return newErrf(CodeInvalidTextRepresentation, "the DEFAULT of column %q cannot convert to %s: %v", old.Name, shadow.Type, cerr)
+		}
+		if d, cerr = enforceTypmod(shadow, d); cerr != nil {
+			return cerr
+		}
+		shadow.Default, shadow.FillDefault = &d, old.FillDefault
+	}
+	shadow.DefaultExpr = old.DefaultExpr
+	desc.Columns[oi] = shadow
+	desc.Columns = append(desc.Columns[:si], desc.Columns[si+1:]...)
+	return nil
 }
