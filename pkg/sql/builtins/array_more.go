@@ -12,12 +12,6 @@ import (
 // one dimension and a lower bound of 1, so the dimension arguments
 // accept that shape and refuse any other (0A000).
 
-// CodeArraySubscript is array_subscript_error.
-const CodeArraySubscript = "2202E"
-
-// CodeNullNotAllowed is null_value_not_allowed.
-const CodeNullNotAllowed = "22004"
-
 // arrayOrNull reads a possibly NULL array argument of a function that
 // handles NULLs itself.
 func arrayOrNull(d types.Datum) (types.Datum, bool, error) {

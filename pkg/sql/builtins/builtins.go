@@ -64,6 +64,10 @@ type Builtin struct {
 	NotStrict bool
 	// Fn evaluates the call on coerced arguments.
 	Fn func(args []types.Datum) (types.Datum, error)
+	// Alt, when set, sees the arguments before coercion and may take
+	// the call (ok true) for a form the declared families do not
+	// describe: substring's text pattern in place of its position.
+	Alt func(args []types.Datum) (d types.Datum, ok bool, err error)
 	// Category and Doc feed the reference: a section and one line.
 	Category string
 	Doc      string
@@ -121,6 +125,8 @@ const (
 	CodeNotSupported    = "0A000"
 	CodeInvalidRegexp   = "2201B"
 	CodeInvalidEscape   = "22025"
+	// CodeInvalidEscapeUse is invalid_use_of_escape_character.
+	CodeInvalidEscapeUse = "2200C"
 )
 
 func errf(code, format string, args ...any) error {
@@ -225,6 +231,11 @@ func (b *Builtin) ZoneSensitive() bool { return b.ZFn != nil || b.ZRows != nil }
 func (b *Builtin) CallIn(args []types.Datum, loc *time.Location) (types.Datum, error) {
 	if b.Rows != nil {
 		return types.Datum{}, errf(CodeNotSupported, "set-returning function %s() is only supported in FROM or in a select list without FROM", b.Name)
+	}
+	if b.Alt != nil && b.ArityOK(len(args)) {
+		if d, ok, err := b.Alt(args); ok {
+			return d, err
+		}
 	}
 	coerced, null, err := b.coerceArgs(args)
 	if err != nil || null {

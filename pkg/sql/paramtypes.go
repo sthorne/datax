@@ -693,7 +693,7 @@ func (pt *paramTyper) expr(e parser.Expr, sc *paramScope) {
 	// A parameter that is an operand of arithmetic with a number takes
 	// the number's type, as PostgreSQL resolves an unknown operand
 	// (ORDER BY abs(x - $1) inside an aggregate, SELECT price * $1).
-	if e.Right != nil && (e.BinOp == "+" || e.BinOp == "-" || e.BinOp == "*" || e.BinOp == "/") {
+	if e.Right != nil && (e.BinOp == "+" || e.BinOp == "-" || e.BinOp == "*" || e.BinOp == "/" || builtins.IsBitwiseOp(e.BinOp)) {
 		lhs := e
 		lhs.BinOp, lhs.Right, lhs.Cast = "", nil, ""
 		bareParam := func(x parser.Expr) bool {

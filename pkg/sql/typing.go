@@ -37,7 +37,10 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		}
 		fam = types.ArrayOf(elem)
 	case e.Func == "array_subscript" && len(e.Args) == 2:
-		fam = exprFamily(e.Args[0], colType).Elem()
+		fam = exprFamily(e.Args[0], colType)
+		if fam != types.Jsonb {
+			fam = fam.Elem()
+		}
 	case e.Func == "array" && len(e.Args) == 1 && e.Args[0].Sub != nil:
 		fam = types.ArrayOf(types.String)
 	case e.Func != "":
@@ -107,6 +110,14 @@ func arithFamily(op string, l, r types.Family) types.Family {
 	switch op {
 	case "<->", "<=>", "<#>":
 		return types.Float // a distance between two vectors
+	case "&", "|", "#", "<<", ">>":
+		return types.Int
+	case "#-":
+		return types.Jsonb
+	case "-":
+		if l == types.Jsonb {
+			return types.Jsonb
+		}
 	case "||":
 		if l == types.Tsvector || r == types.Tsvector {
 			return types.Tsvector

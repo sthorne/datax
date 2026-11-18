@@ -1,13 +1,17 @@
 name: vulncheck
 on:
-  push:
-    branches: [main, master, 'claude/**']
-  pull_request:
-  schedule:
-    # Weekly (issue #143): advisories appear against code that has not
-    # changed, so a push-triggered run alone misses them until the next
-    # commit.
-    - cron: '41 6 * * 1'
+  # Paused (automatic triggers removed): the account is out of GitHub
+  # Actions minutes, so every run would fail. Run by hand (workflow
+  # dispatch) or locally (docs/testing.md); restore the triggers below
+  # when minutes are available again.
+  #   push:
+  #     branches: [main, master, 'claude/**']
+  #   pull_request:
+  #   schedule:
+  #     # Weekly (issue #143): advisories appear against code that has not
+  #     # changed, so a push-triggered run alone misses them until the next
+  #     # commit.
+  #     - cron: '41 6 * * 1'
   workflow_dispatch:
 
 # govulncheck reports only vulnerabilities whose symbols this module

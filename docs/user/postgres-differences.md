@@ -13,7 +13,7 @@ syntax error or `0A000` feature not supported):
 
 | Missing | Workaround |
 |---|---|
-| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `row_to_json` and other whole-row functions; named arguments (`make_interval(days => 1)`); a set-returning function (`generate_series`, `jsonb_array_elements`, ...) in the select list of a query with `FROM`, or with arguments that read another `FROM` member (`0A000`); regular expressions with back references or lookaround (`2201B`: datax runs them on RE2); `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres` in `::text` casts, arrays and JSON (the wire's text format of an `INTERVAL` column follows it); user-defined functions | compute client-side or in a derived table; the regular-expression, set-returning and jsonb processing functions **are supported** ([set-returning functions](sql.md#set-returning-functions)); `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
+| Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `row_to_json` and other whole-row functions; named arguments (`make_interval(days => 1)`); a set-returning function (`generate_series`, `jsonb_array_elements`, ...) in the select list of a query with `FROM`, or with arguments that read another `FROM` member (`0A000`); regular expressions with back references or lookaround (`0A000`: datax runs them on RE2); `setseed` (`random()` cannot be seeded); `to_ascii` without an encoding (as in PostgreSQL on a UTF8 database, `0A000`); `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres` in `::text` casts, arrays and JSON (the wire's text format of an `INTERVAL` column follows it); user-defined functions | compute client-side or in a derived table; the regular-expression, set-returning and jsonb processing functions **are supported** ([set-returning functions](sql.md#set-returning-functions)); `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), expressions over aggregates and `GROUP BY` expressions, `ROLLUP` / `CUBE` / `GROUPING SETS`, `DISTINCT ON`, `FILTER (WHERE ...)` and `DISTINCT` on aggregate calls, window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY` on a table that has one, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
 | A volatile `DEFAULT` (`gen_random_uuid()`, `random()`), `SERIAL`, or a constraint on `ADD COLUMN`, and `ALTER TABLE` actions that read the rows (`ADD CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`), inside a transaction block (`25001`) | run the statement outside the block (Rails: `disable_ddl_transaction!`); `ADD COLUMN` with any default, several actions in one `ALTER TABLE`, and the descriptor-only actions in a block **are supported** ([reference](sql.md#ddl)) |
@@ -105,14 +105,28 @@ syntax error or `0A000` feature not supported):
   `TIME WITH TIME ZONE` is refused at parse (`42601`).
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
+- **Integer and float function results**: the bitwise operators work
+  on INT8 whatever the operands' declared widths, so a shift that
+  overflows an `INT2` or `INT4` (`1 << 31`) yields the INT8 value
+  where PostgreSQL wraps in the narrower type. The float functions
+  (`sin`, `exp`, `ln`, `cbrt`, ...) come from Go's math library and
+  can differ from PostgreSQL's (the C library's) in the last digit;
+  the degree-based ones (`sind`, `cosd`, ...) are exact at the special
+  angles as in PostgreSQL. A `NUMERIC` holds no trailing zeros, so
+  `scale(1.50)` is `1` where PostgreSQL says `2` (`min_scale` and
+  `trim_scale` agree).
 - **JSONB**: `->`/`->>` extraction (single-table queries, joins and
   grouped select lists), containment `@>` / `<@` and key
   existence `?` / `?|` / `?&` (single-table only), equality comparison,
-  and `IS [NOT] NULL`; no ordering comparisons. `@>` is not accepted in
+  ordering comparisons and `ORDER BY` (PostgreSQL's jsonb order, with
+  two documents it ties — `1` and `1.0` — ordered by their text, since
+  `=` compares text), `-`, `#-`, subscripting (`j['a'][0]`, also in
+  `UPDATE ... SET j['a'] = ...`), and `IS [NOT] NULL`. `min` / `max`
+  over jsonb are refused (`0A000`; PostgreSQL has neither, `42883`). `@>` is not accepted in
   `HAVING` or after a computed left-hand side. `jsonb || jsonb` merges
   as in PostgreSQL. `json` and `jsonb` are one type in datax (a `JSON`
   column is stored as `JSONB`), so `json || json` merges too, where
-  PostgreSQL has no `||` on `json` and refuses it (`42883`). `-`, `#-` and subscripting (`j['a']`) are refused.
+  PostgreSQL has no `||` on `json` and refuses it (`42883`).
 - **GIN indexes: JSONB and full-text search.** `CREATE INDEX ... USING GIN
   (col)` on a JSONB column serves `@>`, `?`, `?|` and `?&`. It indexes
   each value with its path (closer to PostgreSQL's `jsonb_path_ops` than

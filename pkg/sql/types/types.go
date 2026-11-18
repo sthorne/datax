@@ -680,11 +680,17 @@ func (d Datum) Compare(o Datum) (int, error) {
 	case Decimal:
 		return 0, fmt.Errorf("unreachable") // handled above
 	case Jsonb:
-		// Equality by canonical text; no defined ordering.
+		// Equality by canonical text; the order is PostgreSQL's jsonb
+		// order, with documents it ties (1 and 1.0) ordered by their
+		// text so that only equal texts compare equal.
 		if d.S == o.S {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("JSONB values have no order")
+		c, ok := compareJSONB(d.S, o.S)
+		if !ok || c == 0 {
+			return strings.Compare(d.S, o.S), nil
+		}
+		return c, nil
 	case Tsvector, Tsquery:
 		// Equality by canonical text, like JSONB.
 		if d.S == o.S {

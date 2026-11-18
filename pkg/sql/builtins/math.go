@@ -155,15 +155,15 @@ func init() {
 		Fn: func(a []types.Datum) (types.Datum, error) { return Power(a[0], a[1]) }})
 	unaryFloat("sqrt", "The square root (an error below zero).", func(x float64) (float64, error) {
 		if x < 0 {
-			return 0, errf(CodeInvalidArgument, "cannot take square root of a negative number")
+			return 0, errf(CodeInvalidArgPower, "cannot take square root of a negative number")
 		}
 		return math.Sqrt(x), nil
 	})
 	unaryFloat("cbrt", "The cube root.", func(x float64) (float64, error) { return math.Cbrt(x), nil })
 	unaryFloat("exp", "e raised to the argument.", func(x float64) (float64, error) { return math.Exp(x), nil })
 	unaryFloat("ln", "The natural logarithm (an error at or below zero).", func(x float64) (float64, error) {
-		if x <= 0 {
-			return 0, errf(CodeInvalidArgument, "cannot take logarithm of a nonpositive number")
+		if err := logDomain(x); err != nil {
+			return 0, err
 		}
 		return math.Log(x), nil
 	})
@@ -180,8 +180,11 @@ func init() {
 					return types.Datum{}, err
 				}
 			}
-			if x <= 0 || base <= 0 {
-				return types.Datum{}, errf(CodeInvalidArgument, "cannot take logarithm of a nonpositive number")
+			if err := logDomain(base); err != nil {
+				return types.Datum{}, err
+			}
+			if err := logDomain(x); err != nil {
+				return types.Datum{}, err
 			}
 			if base == 1 {
 				return types.Datum{}, errf(CodeDivisionByZero, "division by zero")
@@ -190,9 +193,26 @@ func init() {
 		}})
 	register(&Builtin{Name: "pi", Args: nil, Ret: types.Float, Category: catMath, Doc: "π.",
 		Fn: func([]types.Datum) (types.Datum, error) { return f64(math.Pi), nil }})
-	register(&Builtin{Name: "random", Args: nil, Ret: types.Float, Vol: Volatile, Category: catMath,
-		Doc: "A random value in [0, 1), fresh per row.",
-		Fn:  func([]types.Datum) (types.Datum, error) { return f64(rand.Float64()), nil }})
+	register(&Builtin{Name: "random", Args: []types.Family{Any, Any}, MinArgs: 0, Ret: types.Float, Vol: Volatile, Category: catMath,
+		Doc: "A random value in [0, 1), fresh per row; random(min, max) one in [min, max]: an integer for integer bounds, else a numeric at the larger of their scales.",
+		RetOf: func(args []types.Family) types.Family {
+			switch {
+			case len(args) == 0:
+				return types.Float
+			case args[0] == types.Int && args[1] == types.Int:
+				return types.Int
+			}
+			return types.Decimal
+		},
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			switch len(a) {
+			case 0:
+				return f64(rand.Float64()), nil
+			case 2:
+				return randomBetween(a[0], a[1])
+			}
+			return types.Datum{}, errf(CodeUndefined, "function random(%s) does not exist", familiesText(a))
+		}})
 	register(&Builtin{Name: "width_bucket", Args: []types.Family{Any, Any, Any, types.Int}, MinArgs: 4, Ret: types.Int, Category: catMath,
 		Doc: "The bucket (1..count) the operand falls in when [low, high) is split into count equal buckets; 0 below, count+1 above.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
@@ -428,16 +448,28 @@ func Power(l, r types.Datum) (types.Datum, error) {
 		return types.Datum{}, err
 	}
 	if x == 0 && y < 0 {
-		return types.Datum{}, errf(CodeInvalidArgument, "zero raised to a negative power is undefined")
+		return types.Datum{}, errf(CodeInvalidArgPower, "zero raised to a negative power is undefined")
 	}
 	if x < 0 && y != math.Trunc(y) {
-		return types.Datum{}, errf(CodeInvalidArgument, "a negative number raised to a non-integer power yields a complex result")
+		return types.Datum{}, errf(CodeInvalidArgPower, "a negative number raised to a non-integer power yields a complex result")
 	}
 	v := math.Pow(x, y)
 	if math.IsInf(v, 0) || math.IsNaN(v) {
 		return types.Datum{}, errf(CodeOutOfRange, "value out of range: overflow")
 	}
 	return f64(v), nil
+}
+
+// logDomain refuses a logarithm's argument at or below zero, as
+// PostgreSQL does (2201E).
+func logDomain(x float64) error {
+	switch {
+	case x == 0:
+		return errf(CodeInvalidArgLog, "cannot take logarithm of zero")
+	case x < 0:
+		return errf(CodeInvalidArgLog, "cannot take logarithm of a negative number")
+	}
+	return nil
 }
 
 func decimalOf(d types.Datum) (decimal.Dec, error) {

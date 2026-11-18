@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -95,8 +96,8 @@ func init() {
 			return str(strings.Join(parts, a[0].S)), nil
 		}})
 	register(&Builtin{Name: "substring", Args: []types.Family{types.String, types.Int, types.Int}, MinArgs: 2, Ret: types.String, Category: catString,
-		Doc: "The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes.", Aliases: []string{"substr"},
-		Bytea: true, RetOf: stringOrBytes,
+		Doc: "The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes. With a text pattern in place of the position, substring(s FROM pattern) is the part the first match of the POSIX pattern covers (of its first parenthesized subexpression, if any), and substring(s SIMILAR pattern ESCAPE e) (or substring(s FROM pattern FOR e)) the part between the escape-double-quote separators of a SIMILAR TO pattern matching the whole string; NULL when it does not match.", Aliases: []string{"substr"},
+		Bytea: true, RetOf: stringOrBytes, Alt: substringPattern,
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			if a[0].Fam == types.Bytes {
 				from, to, err := substringWindow(a, int64(len(a[0].S)))
@@ -311,7 +312,7 @@ func init() {
 		Doc: "The integer in hexadecimal.",
 		Fn:  func(a []types.Datum) (types.Datum, error) { return str(strconv.FormatUint(uint64(a[0].I), 16)), nil }})
 	register(&Builtin{Name: "format", Args: []types.Family{types.String, Any}, MinArgs: 1, Variadic: true, Ret: types.String, NotStrict: true, Category: catString,
-		Doc: "Formats with %s (text), %I (an identifier, quoted when needed), %L (a literal, quoted; NULL for NULL) and %%.",
+		Doc: "Formats with %s (text), %I (an identifier, quoted when needed), %L (a literal, quoted; NULL for NULL) and %%; a specifier may take an argument position (%2$s), the flag - (left-justify) and a width (%10s, %-10s, %*s, %*3$s).",
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			if a[0].Null {
 				return types.DNull, nil
@@ -557,11 +558,26 @@ func init() {
 	}
 }
 
-// formatSQL implements format(): %s, %I, %L, %%, and the n$ position
-// form.
+// formatSQL implements format() as PostgreSQL's text_format does:
+// %[position$][flags][width]type with the types s, I and L, the flag -
+// (left-justify), a width given directly, as * (the next argument) or
+// as *n$ (the n-th), and %%. A position also moves the sequence: the
+// next plain specifier takes the argument after it.
 func formatSQL(f string, args []types.Datum) (types.Datum, error) {
 	var b strings.Builder
-	next := 0
+	next := 0 // the next argument, 0-based
+	unterminated := func() error { return errf(CodeInvalidArgument, "unterminated format() type specifier") }
+	digits := func(i int) (n int, end int, ok bool, err error) {
+		end = i
+		for end < len(f) && f[end] >= '0' && f[end] <= '9' {
+			if n > (math.MaxInt32-int(f[end]-'0'))/10 {
+				return 0, end, false, errf(CodeOutOfRange, "number is out of range")
+			}
+			n = n*10 + int(f[end]-'0')
+			end++
+		}
+		return n, end, end > i, nil
+	}
 	for i := 0; i < len(f); i++ {
 		c := f[i]
 		if c != '%' {
@@ -570,51 +586,125 @@ func formatSQL(f string, args []types.Datum) (types.Datum, error) {
 		}
 		i++
 		if i >= len(f) {
-			return types.Datum{}, errf(CodeInvalidArgument, "unterminated format() type specifier")
+			return types.Datum{}, unterminated()
 		}
 		if f[i] == '%' {
 			b.WriteByte('%')
 			continue
 		}
-		// Optional n$ position.
-		pos := -1
-		j := i
-		for j < len(f) && f[j] >= '0' && f[j] <= '9' {
-			j++
+		argpos, widthpos, width, minus := -1, -1, 0, false
+		n, end, ok, err := digits(i)
+		if err != nil {
+			return types.Datum{}, err
 		}
-		if j > i && j < len(f) && f[j] == '$' {
-			n, _ := strconv.Atoi(f[i:j])
-			pos = n - 1
-			i = j + 1
+		if ok && end < len(f) && f[end] != '$' {
+			width, i = n, end // a width, then the type
+		} else {
+			if ok {
+				if end >= len(f) {
+					return types.Datum{}, unterminated()
+				}
+				if n == 0 {
+					return types.Datum{}, errf(CodeInvalidArgument, "format specifies argument 0, but arguments are numbered from 1")
+				}
+				argpos, i = n, end+1
+			}
+			for i < len(f) && f[i] == '-' {
+				minus = true
+				i++
+			}
+			if i < len(f) && f[i] == '*' {
+				i++
+				n, end, ok, err := digits(i)
+				if err != nil {
+					return types.Datum{}, err
+				}
+				widthpos = 0
+				if ok {
+					if end >= len(f) || f[end] != '$' {
+						if end >= len(f) {
+							return types.Datum{}, unterminated()
+						}
+						return types.Datum{}, errf(CodeInvalidArgument, "width argument position must be ended by \"$\"")
+					}
+					if n == 0 {
+						return types.Datum{}, errf(CodeInvalidArgument, "format specifies argument 0, but arguments are numbered from 1")
+					}
+					widthpos, i = n, end+1
+				}
+			} else if n, end, ok, err := digits(i); err != nil {
+				return types.Datum{}, err
+			} else if ok {
+				width, i = n, end
+			}
 		}
 		if i >= len(f) {
-			return types.Datum{}, errf(CodeInvalidArgument, "unterminated format() type specifier")
+			return types.Datum{}, unterminated()
 		}
-		if pos < 0 {
-			pos = next
+		conv := f[i]
+		if conv != 's' && conv != 'I' && conv != 'L' {
+			r, _ := utf8.DecodeRuneInString(f[i:])
+			return types.Datum{}, errf(CodeInvalidArgument, "unrecognized format() type specifier \"%c\"", r)
+		}
+		if widthpos >= 0 {
+			if widthpos > 0 {
+				next = widthpos - 1
+			}
+			if next >= len(args) {
+				return types.Datum{}, errf(CodeInvalidArgument, "too few arguments for format()")
+			}
+			w := args[next]
 			next++
+			width = 0
+			if !w.Null {
+				v, err := toInt(w)
+				if err != nil {
+					return types.Datum{}, err
+				}
+				if v.I > math.MaxInt32 || v.I < math.MinInt32 {
+					return types.Datum{}, errf(CodeOutOfRange, "integer out of range")
+				}
+				width = int(v.I)
+				if width < 0 {
+					if width == math.MinInt32 {
+						return types.Datum{}, errf(CodeOutOfRange, "number is out of range")
+					}
+					minus, width = true, -width
+				}
+			}
 		}
-		if pos >= len(args) {
+		if argpos > 0 {
+			next = argpos - 1
+		}
+		if next >= len(args) {
 			return types.Datum{}, errf(CodeInvalidArgument, "too few arguments for format()")
 		}
-		arg := args[pos]
-		switch f[i] {
+		arg := args[next]
+		next++
+		var out string
+		switch conv {
 		case 's':
-			b.WriteString(text(arg))
+			out = text(arg)
 		case 'I':
 			if arg.Null {
-				return types.Datum{}, errf(CodeInvalidArgument, "null values cannot be formatted as an SQL identifier")
+				return types.Datum{}, errf(CodeNullNotAllowed, "null values cannot be formatted as an SQL identifier")
 			}
-			b.WriteString(quoteIdent(text(arg)))
+			out = quoteIdent(text(arg))
 		case 'L':
 			if arg.Null {
-				b.WriteString("NULL")
+				out = "NULL"
 			} else {
-				b.WriteString(quoteLiteral(text(arg)))
+				out = quoteLiteral(text(arg))
 			}
-		default:
-			return types.Datum{}, errf(CodeInvalidArgument, "unrecognized format() type specifier %q", f[i])
 		}
+		if pad := width - utf8.RuneCountInString(out); pad > 0 {
+			if minus {
+				out += strings.Repeat(" ", pad)
+			} else {
+				out = strings.Repeat(" ", pad) + out
+			}
+		}
+		b.WriteString(out)
 	}
 	return str(b.String()), nil
 }
