@@ -320,10 +320,24 @@ func groupedJoinQuery(sides []joinSide, t *parser.Select) (*catalog.TableDescrip
 
 // execGroupedJoin wraps the joined rows as synthetic-descriptor rows and
 // hands them to the grouped executor.
-func (s *Session) execGroupedJoin(sides []joinSide, joined []joinedRow, t *parser.Select, params []types.Datum) (*Result, error) {
+//
+// gc, if set, substitutes the select's correlated subqueries per group
+// (over t's written names): each group's select is canonicalized as t
+// is.
+func (s *Session) execGroupedJoin(sides []joinSide, joined []joinedRow, t *parser.Select, params []types.Datum, gc *groupedCorr) (*Result, error) {
 	desc, refs, sel, err := groupedJoinQuery(sides, t)
 	if err != nil {
 		return nil, err
+	}
+	if gc != nil {
+		written := gc
+		gc = &groupedCorr{selectFor: func(keys []types.Datum) (*parser.Select, error) {
+			g, err := written.selectFor(keys)
+			if err != nil {
+				return nil, err
+			}
+			return groupedJoinSelect(sides, g)
+		}}
 	}
 	rows := make([]fetchedRow, 0, len(joined))
 	for _, jr := range joined {
@@ -336,5 +350,5 @@ func (s *Session) execGroupedJoin(sides []joinSide, joined []joinedRow, t *parse
 		}
 		rows = append(rows, fetchedRow{row: row})
 	}
-	return s.execGroupedOver(desc, rows, sel, params)
+	return s.execGroupedOver(desc, rows, sel, params, gc)
 }

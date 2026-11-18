@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -576,8 +577,12 @@ func (s *Session) execAlterOwner(ctx context.Context, txn *kvclient.Txn, t *pars
 		if err != nil {
 			return nil, err
 		}
-		if err := mustBeReal(shared); err != nil {
-			return nil, err
+		if shared.Virtual != "" {
+			// A view's owner changes too: by ALTER VIEW, or by ALTER
+			// TABLE, which PostgreSQL accepts for a view.
+			if err := mustBeReal(shared); err != nil {
+				return nil, err
+			}
 		}
 		if t.Kind == "view" && !shared.IsView() {
 			return nil, newErrf(CodeWrongObjectType, "%q is not a view", t.Name)
@@ -648,6 +653,35 @@ func (s *Session) execAlterOwner(ctx context.Context, txn *kvclient.Txn, t *pars
 		if err := s.cat.UpdateDatabase(ctx, txn, db); err != nil {
 			return nil, err
 		}
+	case "large object":
+		loid, perr := strconv.ParseInt(t.Name, 10, 64)
+		if perr != nil {
+			return nil, newErrf(CodeSyntaxError, "invalid large object id %q", t.Name)
+		}
+		if err := s.checkNewOwner(ctx, txn, owner); err != nil {
+			return nil, err
+		}
+		if err := s.loSetOwner(ctx, txn, loid, owner); err != nil {
+			return nil, err
+		}
+	case "schema":
+		// The public schema, the only one, is the database's owner's
+		// (PostgreSQL 15's pg_database_owner): naming that owner, or
+		// pg_database_owner itself, changes nothing — what pg_dump
+		// writes for it — and any other role is refused rather than
+		// ignored.
+		if t.Name != catalog.PublicSchema {
+			return nil, newErrf(CodeInvalidSchemaName, "schema %q does not exist", t.Name)
+		}
+		db, err := catalog.LookupDatabase(ctx, txn, s.database)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		dbOwner := catalog.OwnerOf(db.Owner)
+		if owner != dbOwner && owner != "pg_database_owner" {
+			return nil, newErrf(CodeFeatureNotSupported, "the public schema is owned by the database's owner, %q: change that with ALTER DATABASE %s OWNER TO", dbOwner, s.database)
+		}
+		return &Result{Tag: tag}, nil
 	default:
 		return nil, newErrf(CodeSyntaxError, "cannot change the owner of a %s", t.Kind)
 	}

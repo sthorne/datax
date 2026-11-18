@@ -313,6 +313,228 @@ func (p *parser) expectIdent() (string, error) {
 // NOTIFY channel [, 'payload']. The channel is an identifier, and — as
 // in PostgreSQL, where it is a ColId — may be a word this grammar
 // otherwise reserves.
+// parseCursor parses DECLARE ... CURSOR FOR query, FETCH / MOVE and
+// CLOSE.
+func (p *parser) parseCursor(verb string) (Statement, error) {
+	p.i++
+	switch verb {
+	case "declare":
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		dc := &DeclareCursor{Name: name}
+		for {
+			switch {
+			case p.consumeIdentWord("binary"):
+				return nil, p.errf("binary cursors are not supported")
+			case p.consumeKeyword("NOT") || p.consumeIdentWord("no"):
+				if !p.consumeIdentWord("scroll") {
+					return nil, p.errf("expected SCROLL, found %q", p.peek().text)
+				}
+				continue
+			case p.consumeIdentWord("scroll"), p.consumeIdentWord("asensitive"), p.consumeIdentWord("insensitive"):
+				continue
+			}
+			break
+		}
+		if !p.consumeIdentWord("cursor") {
+			return nil, p.errf("expected CURSOR, found %q", p.peek().text)
+		}
+		switch {
+		case p.consumeIdentWord("with"):
+			if !p.consumeIdentWord("hold") {
+				return nil, p.errf("expected HOLD after WITH, found %q", p.peek().text)
+			}
+			dc.Hold = true
+		case p.consumeIdentWord("without"):
+			if !p.consumeIdentWord("hold") {
+				return nil, p.errf("expected HOLD after WITHOUT, found %q", p.peek().text)
+			}
+		}
+		if !p.consumeIdentWord("for") && !p.consumeKeyword("FOR") {
+			return nil, p.errf("expected FOR, found %q", p.peek().text)
+		}
+		q, err := p.parseStatement()
+		if err != nil {
+			return nil, err
+		}
+		dc.Query = q
+		return dc, nil
+	case "fetch", "move":
+		f := &Fetch{Count: 1, Move: verb == "move"}
+		num := func() (int64, bool) {
+			t := p.peek()
+			if t.kind != tkNumber {
+				return 0, false
+			}
+			v, err := strconv.ParseInt(t.text, 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			p.i++
+			return v, true
+		}
+		switch {
+		case p.consumeIdentWord("next"):
+		case p.consumeIdentWord("forward"):
+			if n, ok := num(); ok {
+				f.Count = n
+			} else if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+				f.Count = -1
+			}
+		case p.consumeKeyword("ALL") || p.consumeIdentWord("all"):
+			f.Count = -1
+		default:
+			if n, ok := num(); ok {
+				f.Count = n
+			}
+		}
+		if f.Count < -1 {
+			return nil, p.errf("backward FETCH is not supported")
+		}
+		_ = p.consumeKeyword("FROM") || p.consumeIdentWord("in") // optional
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		f.Name = name
+		return f, nil
+	}
+	if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+		return &CloseCursor{All: true}, nil
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	return &CloseCursor{Name: name}, nil
+}
+
+// parsePrepared parses PREPARE name [(type, ...)] AS statement,
+// EXECUTE name [(value, ...)] and DEALLOCATE [PREPARE] {name | ALL}.
+func (p *parser) parsePrepared(verb string) (Statement, error) {
+	p.i++
+	if verb == "deallocate" {
+		p.consumeIdentWord("prepare")
+		if p.consumeKeyword("ALL") || p.consumeIdentWord("all") {
+			return &Deallocate{All: true}, nil
+		}
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &Deallocate{Name: name}, nil
+	}
+	name, err := p.expectIdent()
+	if err != nil {
+		return nil, err
+	}
+	if verb == "execute" {
+		ex := &ExecutePrepared{Name: name}
+		if p.consumeOp("(") {
+			for {
+				a, err := p.parseValueOrBool()
+				if err != nil {
+					return nil, err
+				}
+				ex.Args = append(ex.Args, a)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		}
+		return ex, nil
+	}
+	pr := &Prepare{Name: name}
+	if p.consumeOp("(") {
+		// Each type as written, up to the comma or closing parenthesis
+		// at its own depth: pg_catalog.oid, numeric(10,2), text[].
+		var b strings.Builder
+		depth := 0
+		for {
+			t := p.peek()
+			if t.kind == tkEOF {
+				return nil, p.errf("expected \")\" after PREPARE's parameter types")
+			}
+			p.i++
+			if t.kind == tkOp && depth == 0 && (t.text == "," || t.text == ")") {
+				pr.Types = append(pr.Types, strings.ToLower(strings.TrimSpace(b.String())))
+				b.Reset()
+				if t.text == ")" {
+					break
+				}
+				continue
+			}
+			if t.kind == tkOp && t.text == "(" {
+				depth++
+			} else if t.kind == tkOp && t.text == ")" {
+				depth--
+			}
+			b.WriteString(t.text)
+		}
+	}
+	if err := p.expectKeyword("AS"); err != nil {
+		return nil, err
+	}
+	st, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	pr.Stmt = st
+	return pr, nil
+}
+
+// lockModes are PostgreSQL's table lock modes, as LOCK spells them.
+var lockModes = map[string]bool{
+	"ACCESS SHARE": true, "ROW SHARE": true, "ROW EXCLUSIVE": true, "SHARE UPDATE EXCLUSIVE": true,
+	"SHARE": true, "SHARE ROW EXCLUSIVE": true, "EXCLUSIVE": true, "ACCESS EXCLUSIVE": true,
+}
+
+// parseLockTable parses LOCK [TABLE] [ONLY] name [*] [, ...] [IN mode
+// MODE] [NOWAIT].
+func (p *parser) parseLockTable() (Statement, error) {
+	p.i++
+	p.consumeKeyword("TABLE")
+	lt := &LockTable{Mode: "ACCESS EXCLUSIVE"}
+	for {
+		p.consumeIdentWord("only")
+		name, err := p.parseTableName()
+		if err != nil {
+			return nil, err
+		}
+		p.consumeOp("*")
+		lt.Tables = append(lt.Tables, name)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if p.consumeIdentWord("in") {
+		var words []string
+		for {
+			t := p.peek()
+			if t.kind != tkIdent && t.kind != tkKeyword {
+				return nil, p.errf("expected a lock mode, found %q", t.text)
+			}
+			p.i++
+			w := strings.ToUpper(t.text)
+			if w == "MODE" {
+				break
+			}
+			words = append(words, w)
+		}
+		lt.Mode = strings.Join(words, " ")
+		if !lockModes[lt.Mode] {
+			return nil, p.errf("unrecognized lock mode %q", strings.ToLower(lt.Mode))
+		}
+	}
+	lt.NoWait = p.consumeIdentWord("nowait")
+	return lt, nil
+}
+
 func (p *parser) parseListenNotify(verb string) (Statement, error) {
 	p.i++
 	if verb == "unlisten" && p.consumeOp("*") {
@@ -690,6 +912,32 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return as, nil
 		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "large" {
+			p.i += 2 // ALTER LARGE OBJECT oid OWNER TO role
+			if !p.consumeIdentWord("object") {
+				return nil, p.errf("expected OBJECT after ALTER LARGE, found %q", p.peek().text)
+			}
+			t := p.peek()
+			if t.kind != tkNumber {
+				return nil, p.errf("expected a large object id, found %q", t.text)
+			}
+			p.i++
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER LARGE OBJECT supports only OWNER TO")
+			}
+			return p.parseOwnerTo("large object", t.text)
+		}
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "schema" {
+			p.i += 2 // ALTER SCHEMA name OWNER TO role
+			name, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			if !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER SCHEMA supports only OWNER TO")
+			}
+			return p.parseOwnerTo("schema", name)
+		}
 		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent && nxt.text == "view" {
 			p.i += 2 // ALTER VIEW name OWNER TO role
 			name, err := p.parseTableName()
@@ -794,6 +1042,12 @@ func (p *parser) parseStatement() (Statement, error) {
 		return &ReleaseSavepoint{Name: name}, nil
 	case "listen", "unlisten", "notify": // not reserved words; they lex as identifiers
 		return p.parseListenNotify(t.text)
+	case "lock": // not a reserved word; lexes as an identifier
+		return p.parseLockTable()
+	case "prepare", "execute", "deallocate": // not reserved words; they lex as identifiers
+		return p.parsePrepared(t.text)
+	case "declare", "fetch", "move", "close": // not reserved words; they lex as identifiers
+		return p.parseCursor(t.text)
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -1839,6 +2093,14 @@ func (p *parser) parseSet() (Statement, error) {
 		// ignored. A transaction-scoped SET applies to the block.
 		if !characteristics {
 			sv.Local = true
+			if p.consumeIdentWord("snapshot") {
+				t := p.peek()
+				if t.kind != tkString {
+					return nil, p.errf("expected a snapshot identifier string, found %q", t.text)
+				}
+				p.i++
+				return &SetTransactionSnapshot{ID: t.text}, nil
+			}
 		}
 		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
 		if err != nil {
@@ -2070,6 +2332,16 @@ func (p *parser) parseSequenceOptions(o *SequenceOptions, alter bool) error {
 	}
 	for {
 		switch {
+		case p.consumeIdentWord("sequence"):
+			// SEQUENCE NAME name: an identity column's sequence.
+			if !p.consumeIdentWord("name") {
+				return p.errf("expected NAME after SEQUENCE, found %q", p.peek().text)
+			}
+			name, err := p.parseTableName()
+			if err != nil {
+				return err
+			}
+			o.SeqName = name
 		case p.consumeKeyword("AS"):
 			// AS int2 | int4 | int8: the type is accepted and ignored
 			// (every sequence is 64-bit).
@@ -2135,6 +2407,17 @@ func (p *parser) parseSequenceOptions(o *SequenceOptions, alter bool) error {
 			ref, err := p.parseColumnRef()
 			if err != nil {
 				return err
+			}
+			if p.consumeOp(".") {
+				// schema.table.column (pg_dump's public.t.c).
+				col, err := p.expectIdent()
+				if err != nil {
+					return err
+				}
+				if ref.Table != "public" {
+					return p.errf("schema %q does not exist (public is the only schema)", ref.Table)
+				}
+				ref = ColumnRef{Table: ref.Column, Column: col}
 			}
 			if ref.Table == "" {
 				return p.errf("OWNED BY takes table.column")
@@ -2665,8 +2948,9 @@ func (p *parser) parseOptReturning() ([]SelectExpr, error) {
 	return out, nil
 }
 
-// parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause].
-// Accepted format spellings — all of them appear in the wild:
+// parseCopy parses COPY table [(col, ...)] FROM STDIN [format clause]
+// and COPY {table [(col, ...)] | (query)} TO target [options].
+// Accepted COPY FROM format spellings — all of them appear in the wild:
 //
 //	COPY t FROM STDIN                        -- text (default)
 //	COPY t FROM STDIN [WITH] (FORMAT csv)    -- PostgreSQL 9.0+ option list
@@ -2676,19 +2960,29 @@ func (p *parser) parseOptReturning() ([]SelectExpr, error) {
 // identifiers.
 func (p *parser) parseCopy() (Statement, error) {
 	p.i++ // copy
-	cf := &CopyFrom{Format: CopyFormatText}
+	// COPY BINARY t ...: the pre-7.3 spelling of FORMAT binary.
+	binaryPrefix := false
+	if t := p.peek(); t.kind == tkIdent && t.text == "binary" {
+		if nxt := p.toks[p.i+1]; nxt.kind == tkIdent {
+			p.i++
+			binaryPrefix = true
+		}
+	}
+	if !binaryPrefix && p.consumeOp("(") {
+		return p.parseCopyQuery()
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
-	cf.Table = name
+	var cols []string
 	if p.consumeOp("(") {
 		for {
 			col, err := p.expectIdent()
 			if err != nil {
 				return nil, err
 			}
-			cf.Columns = append(cf.Columns, col)
+			cols = append(cols, col)
 			if !p.consumeOp(",") {
 				break
 			}
@@ -2698,7 +2992,15 @@ func (p *parser) parseCopy() (Statement, error) {
 		}
 	}
 	if p.consumeKeyword("TO") {
-		return nil, p.errf("COPY TO is not supported")
+		ct := &CopyTo{Table: name, Columns: cols}
+		if binaryPrefix {
+			ct.Options = append(ct.Options, CopyOption{Name: "format", Arg: "binary", HasArg: true})
+		}
+		return ct, p.parseCopyToRest(ct)
+	}
+	cf := &CopyFrom{Format: CopyFormatText, Table: name, Columns: cols}
+	if binaryPrefix {
+		cf.Format = CopyFormatBinary
 	}
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
@@ -2720,6 +3022,216 @@ func (p *parser) parseCopy() (Statement, error) {
 		}
 	}
 	return cf, nil
+}
+
+// parseCopyQuery parses the rest of COPY (query) TO ... after the
+// opening paren. The query is a SELECT, VALUES or WITH, or an INSERT,
+// UPDATE or DELETE (which must have RETURNING: the session checks).
+func (p *parser) parseCopyQuery() (Statement, error) {
+	start := p.peek()
+	q, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	switch q.(type) {
+	case *Select, *Insert, *Update, *Delete:
+	default:
+		return nil, &SyntaxError{Msg: fmt.Sprintf("syntax error at or near %q", strings.ToLower(start.text)), Pos: start.pos}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if t := p.peek(); !(t.kind == tkKeyword && t.text == "TO") {
+		return nil, p.errf("syntax error at or near %q", strings.ToLower(t.text))
+	}
+	p.i++
+	ct := &CopyTo{Query: q}
+	return ct, p.parseCopyToRest(ct)
+}
+
+// parseCopyToRest parses a COPY TO's target and options, after TO.
+func (p *parser) parseCopyToRest(ct *CopyTo) error {
+	switch t := p.peek(); {
+	case t.kind == tkIdent && (t.text == "stdout" || t.text == "stdin"):
+		// PostgreSQL's grammar takes either word for the client side.
+		p.i++
+	case t.kind == tkString:
+		p.i++
+		ct.File = t.text
+	case t.kind == tkIdent && t.text == "program":
+		p.i++
+		c := p.peek()
+		if c.kind != tkString {
+			return p.errf("syntax error at or near %q", c.text)
+		}
+		p.i++
+		ct.File, ct.Program = c.text, true
+	default:
+		return p.errf("syntax error at or near %q", t.text)
+	}
+	hasWith := p.consumeIdentWord("with")
+	if p.consumeOp("(") {
+		opts, err := p.parseCopyGenericOptions()
+		if err != nil {
+			return err
+		}
+		ct.Options = append(ct.Options, opts...)
+		return nil
+	}
+	_ = hasWith
+	opts, err := p.parseCopyLegacyOptions()
+	if err != nil {
+		return err
+	}
+	ct.Options = append(ct.Options, opts...)
+	return nil
+}
+
+// copyWord reads a bare word or keyword (lower-cased) or a string; ok is
+// false for any other token, which is left unread.
+func (p *parser) copyWord() (string, bool) {
+	t := p.peek()
+	switch t.kind {
+	case tkIdent, tkString, tkNumber:
+		p.i++
+		return t.text, true
+	case tkKeyword:
+		p.i++
+		return strings.ToLower(t.text), true
+	}
+	return "", false
+}
+
+// parseCopyGenericOptions parses the PostgreSQL 9.0+ option list after
+// its opening paren: name [argument], ... where the argument is a word,
+// a string, a number, * or a parenthesized list.
+func (p *parser) parseCopyGenericOptions() ([]CopyOption, error) {
+	var out []CopyOption
+	for {
+		t := p.peek()
+		if t.kind != tkIdent && t.kind != tkKeyword {
+			return nil, p.errf("syntax error at or near %q", t.text)
+		}
+		p.i++
+		opt := CopyOption{Name: strings.ToLower(t.text)}
+		switch nxt := p.peek(); {
+		case nxt.kind == tkOp && (nxt.text == "," || nxt.text == ")"):
+		case p.consumeOp("*"):
+			opt.Star = true
+		case p.consumeOp("("):
+			opt.HasList = true
+			for {
+				w, ok := p.copyWord()
+				if !ok {
+					return nil, p.errf("syntax error at or near %q", p.peek().text)
+				}
+				opt.List = append(opt.List, w)
+				if !p.consumeOp(",") {
+					break
+				}
+			}
+			if err := p.expectOp(")"); err != nil {
+				return nil, err
+			}
+		case nxt.kind == tkOp && (nxt.text == "-" || nxt.text == "+"):
+			p.i++
+			num := p.peek()
+			if num.kind != tkNumber {
+				return nil, p.errf("syntax error at or near %q", num.text)
+			}
+			p.i++
+			opt.Arg, opt.HasArg = nxt.text+num.text, true
+		default:
+			w, ok := p.copyWord()
+			if !ok {
+				return nil, p.errf("syntax error at or near %q", nxt.text)
+			}
+			opt.Arg, opt.HasArg = w, true
+		}
+		out = append(out, opt)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	return out, p.expectOp(")")
+}
+
+// parseCopyLegacyOptions parses the pre-9.0 option keywords (BINARY,
+// CSV, HEADER, DELIMITER [AS] 'c', NULL [AS] 's', QUOTE [AS] 'q',
+// ESCAPE [AS] 'e', FORCE QUOTE cols|*, FORCE NOT NULL cols, FORCE NULL
+// cols, ENCODING 'e', FREEZE), mapping each to its option name.
+func (p *parser) parseCopyLegacyOptions() ([]CopyOption, error) {
+	var out []CopyOption
+	str := func(name string) error {
+		p.consumeKeyword("AS")
+		t := p.peek()
+		if t.kind != tkString {
+			return p.errf("syntax error at or near %q", t.text)
+		}
+		p.i++
+		out = append(out, CopyOption{Name: name, Arg: t.text, HasArg: true})
+		return nil
+	}
+	cols := func(name string, star bool) error {
+		if star && p.consumeOp("*") {
+			out = append(out, CopyOption{Name: name, Star: true})
+			return nil
+		}
+		opt := CopyOption{Name: name, HasList: true}
+		for {
+			c, err := p.expectIdent()
+			if err != nil {
+				return err
+			}
+			opt.List = append(opt.List, c)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+		out = append(out, opt)
+		return nil
+	}
+	for !p.atStatementEnd() {
+		t := p.peek()
+		var err error
+		switch {
+		case t.kind == tkIdent && t.text == "binary":
+			p.i++
+			out = append(out, CopyOption{Name: "format", Arg: "binary", HasArg: true})
+		case t.kind == tkIdent && t.text == "csv":
+			p.i++
+			out = append(out, CopyOption{Name: "format", Arg: "csv", HasArg: true})
+		case t.kind == tkIdent && (t.text == "header" || t.text == "freeze"):
+			p.i++
+			out = append(out, CopyOption{Name: t.text})
+		case t.kind == tkIdent && (t.text == "delimiter" || t.text == "quote" || t.text == "escape" || t.text == "encoding"):
+			p.i++
+			err = str(t.text)
+		case t.kind == tkKeyword && t.text == "NULL":
+			p.i++
+			err = str("null")
+		case t.kind == tkIdent && t.text == "force":
+			p.i++
+			switch {
+			case p.consumeIdentWord("quote"):
+				err = cols("force_quote", true)
+			case p.consumeKeyword("NOT"):
+				if err = p.expectKeyword("NULL"); err == nil {
+					err = cols("force_not_null", false)
+				}
+			case p.consumeKeyword("NULL"):
+				err = cols("force_null", false)
+			default:
+				err = p.errf("syntax error at or near %q", p.peek().text)
+			}
+		default:
+			err = p.errf("syntax error at or near %q", t.text)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // parseCopyOptions parses the body of a COPY option list after its opening
@@ -3042,10 +3554,6 @@ func (p *parser) parseFromList(sel *Select) error {
 			jc.Table = jt
 			jc.Alias = p.parseOptTableAlias(false)
 		}
-		jt := jc.Table
-		if jt == "" {
-			jt = jc.Alias
-		}
 		if cross || jk.natural {
 			sel.Joins = append(sel.Joins, jc)
 			continue
@@ -3073,10 +3581,13 @@ func (p *parser) parseFromList(sel *Select) error {
 		if err := p.expectKeyword("ON"); err != nil {
 			return err
 		}
-		// The ON clause is a full boolean expression (parentheses,
-		// AND/OR/NOT, IN, IS NULL ...). Top-level equalities between
-		// two column references are the join keys; every other
-		// conjunct is a filter evaluated per candidate match.
+		// The ON clause is any boolean expression (parentheses,
+		// AND/OR/NOT, IN, IS NULL, ON true ...). Top-level equalities
+		// between two column references are join-key candidates (the
+		// executor keeps those that equate the joined member with an
+		// earlier one and moves the rest to the filter); every other
+		// conjunct is a filter evaluated per candidate match. A
+		// condition with no usable key joins by nested loop.
 		n, err := p.parseBoolOr()
 		if err != nil {
 			return err
@@ -3091,11 +3602,6 @@ func (p *parser) parseFromList(sel *Select) error {
 				continue
 			}
 			jc.Filter = append(jc.Filter, c)
-		}
-		// A lateral member's ON may be any condition (LEFT JOIN
-		// LATERAL ... ON true): it is evaluated per candidate row.
-		if len(jc.On) == 0 && !jc.Lateral {
-			return p.errf("JOIN ... ON must equate a column of %s with one from an earlier table", jt)
 		}
 		sel.Joins = append(sel.Joins, jc)
 	}
@@ -4280,55 +4786,105 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 		at.IfExists = true
 	}
+	// ONLY: there is no table inheritance here, so the table is all
+	// there is to alter (pg_dump writes ALTER TABLE ONLY ...). It is
+	// taken as the keyword only when a table name follows it.
+	if t := p.peek(); t.kind == tkIdent && t.text == "only" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+		p.i++
+		at.Only = true
+	}
 	name, err := p.parseTableName()
 	if err != nil {
 		return nil, err
 	}
 	at.Table = name
-	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
-		return nil, err
-	} else if at.RowSecurity != "" {
-		return at, nil
+	// t * names the table and its descendants, which are none.
+	if !at.Only {
+		p.consumeOp("*")
 	}
 	switch {
 	case p.consumeIdentWord("owner"):
 		return p.parseOwnerTo("table", name)
 	case p.consumeIdentWord("rename"):
-		switch {
-		case p.consumeKeyword("TO"):
-			if at.RenameTo, err = p.expectIdent(); err != nil {
-				return nil, err
-			}
-		case p.consumeKeyword("CONSTRAINT"):
-			r, err := p.parseRename()
-			if err != nil {
-				return nil, err
-			}
-			at.RenameConstraint = r
-		default:
-			p.consumeKeyword("COLUMN")
-			r, err := p.parseRename()
-			if err != nil {
-				return nil, err
-			}
-			at.RenameCol = r
+		// RENAME is a statement of its own in PostgreSQL's grammar: it
+		// takes no other action beside it.
+		if err := p.parseAlterTableRename(at); err != nil {
+			return nil, err
 		}
+		return at, nil
+	}
+	// One action, or several separated by commas (ALTER TABLE t ADD
+	// COLUMN a INT, DROP COLUMN b, ...): each is parsed into an
+	// AlterTable of its own, and several are carried in Cmds.
+	var cmds []*AlterTable
+	for {
+		cmd := &AlterTable{Table: at.Table, IfExists: at.IfExists, Only: at.Only}
+		if err := p.parseAlterTableAction(cmd); err != nil {
+			return nil, err
+		}
+		cmds = append(cmds, cmd)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if len(cmds) == 1 {
+		return cmds[0], nil
+	}
+	at.Cmds = cmds
+	return at, nil
+}
+
+// parseAlterTableRename parses what follows ALTER TABLE t RENAME.
+func (p *parser) parseAlterTableRename(at *AlterTable) error {
+	var err error
+	switch {
+	case p.consumeKeyword("TO"):
+		if at.RenameTo, err = p.expectIdent(); err != nil {
+			return err
+		}
+	case p.consumeKeyword("CONSTRAINT"):
+		r, err := p.parseRename()
+		if err != nil {
+			return err
+		}
+		at.RenameConstraint = r
+	default:
+		p.consumeKeyword("COLUMN")
+		r, err := p.parseRename()
+		if err != nil {
+			return err
+		}
+		at.RenameCol = r
+	}
+	return nil
+}
+
+// parseAlterTableAction parses one action of ALTER TABLE into at.
+func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
+	if at.RowSecurity, err = p.parseRowSecurity(); err != nil {
+		return err
+	} else if at.RowSecurity != "" {
+		return nil
+	}
+	switch {
+	case p.peekIdentWord("rename") || p.peekIdentWord("owner"):
+		return p.errf("%s cannot be combined with other ALTER TABLE actions", strings.ToUpper(p.peek().text))
 	case p.consumeKeyword("ADD"):
 		cname, named := "", false
 		if p.consumeKeyword("CONSTRAINT") {
 			// IF NOT EXISTS: a datax extension (PostgreSQL has none here).
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("NOT"); err != nil {
-					return nil, err
+					return err
 				}
 				if err := p.expectKeyword("EXISTS"); err != nil {
-					return nil, err
+					return err
 				}
 				at.AddConstraintIfNotExists = true
 			}
 			n, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			cname, named = n, true
 		}
@@ -4337,22 +4893,22 @@ func (p *parser) parseAlterTable() (Statement, error) {
 				// Parsed so the executor can refuse it against the
 				// table (42P16 or 0A000) rather than as a syntax error.
 				if err := p.expectKeyword("KEY"); err != nil {
-					return nil, err
+					return err
 				}
 				cols, err := p.parseColumnList()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				at.AddConstraint = &ConstraintDef{Name: cname, Kind: "primary", Columns: cols}
 				break
 			}
 			cd, err := p.parseTableConstraint(cname)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if p.consumeKeyword("NOT") {
 				if !p.consumeIdentWord("valid") {
-					return nil, p.errf("expected VALID after NOT, found %q", p.peek().text)
+					return p.errf("expected VALID after NOT, found %q", p.peek().text)
 				}
 				cd.NotValid = true
 			}
@@ -4362,29 +4918,29 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		p.consumeKeyword("COLUMN")
 		if p.consumeKeyword("IF") {
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, err
+				return err
 			}
 			if err := p.expectKeyword("EXISTS"); err != nil {
-				return nil, err
+				return err
 			}
 			at.AddColIfNotExists = true
 		}
 		def, err := p.parseColumnDef()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.AddCol = &def
 	case p.consumeKeyword("DROP"):
 		if p.consumeKeyword("CONSTRAINT") {
 			if p.consumeKeyword("IF") {
 				if err := p.expectKeyword("EXISTS"); err != nil {
-					return nil, err
+					return err
 				}
 				at.DropConstraintIfExists = true
 			}
 			n, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.DropConstraint = n
 			break
@@ -4392,13 +4948,13 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		p.consumeKeyword("COLUMN")
 		if p.consumeKeyword("IF") {
 			if err := p.expectKeyword("EXISTS"); err != nil {
-				return nil, err
+				return err
 			}
 			at.DropColIfExists = true
 		}
 		col, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.DropCol = col
 		if !p.consumeIdentWord("cascade") {
@@ -4406,43 +4962,43 @@ func (p *parser) parseAlterTable() (Statement, error) {
 		}
 	case p.consumeIdentWord("validate"):
 		if err := p.expectKeyword("CONSTRAINT"); err != nil {
-			return nil, err
+			return err
 		}
 		n, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.ValidateConstraint = n
 	case p.consumeKeyword("ALTER"):
 		p.consumeKeyword("COLUMN")
 		col, err := p.expectIdent()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		switch {
 		case p.consumeIdentWord("type"):
 			spec, serial, err := p.parseColumnType()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if serial {
-				return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+				return p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 			}
 			at.SetType = setTypeOf(col, spec)
 			if p.consumeIdentWord("using") {
-				return nil, p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
+				return p.errf("ALTER COLUMN TYPE ... USING is not supported: the values convert with the type's cast")
 			}
 		case p.consumeKeyword("SET"):
 			if p.consumeIdentWord("data") {
 				if !p.consumeIdentWord("type") {
-					return nil, p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
+					return p.errf("expected TYPE after SET DATA, found %q", p.peek().text)
 				}
 				spec, serial, err := p.parseColumnType()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if serial {
-					return nil, p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
+					return p.errf("ALTER COLUMN TYPE cannot make a column SERIAL")
 				}
 				at.SetType = setTypeOf(col, spec)
 				break
@@ -4450,17 +5006,17 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			if p.consumeIdentWord("default") {
 				sd, err := p.parseDefaultValue()
 				if err != nil {
-					return nil, err
+					return err
 				}
 				sd.Column = col
 				at.SetDefault = sd
 				break
 			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
+				return p.errf("expected SET DEFAULT or SET NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
-				return nil, err
+				return err
 			}
 			at.SetNotNull = col
 		case p.consumeKeyword("DROP"):
@@ -4469,29 +5025,62 @@ func (p *parser) parseAlterTable() (Statement, error) {
 				break
 			}
 			if err := p.expectKeyword("NOT"); err != nil {
-				return nil, p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
+				return p.errf("expected DROP DEFAULT or DROP NOT NULL, found %q", p.peek().text)
 			}
 			if err := p.expectKeyword("NULL"); err != nil {
-				return nil, err
+				return err
 			}
 			at.DropNotNull = col
+		case p.consumeKeyword("ADD"):
+			// ADD GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY [(options)]
+			if !p.consumeIdentWord("generated") {
+				return p.errf("expected GENERATED after ADD, found %q", p.peek().text)
+			}
+			ai := &AddIdentity{Column: col}
+			switch {
+			case p.consumeIdentWord("always"):
+				ai.Identity = "always"
+			case p.consumeKeyword("BY"):
+				if !p.consumeIdentWord("default") {
+					return p.errf("expected DEFAULT after GENERATED BY, found %q", p.peek().text)
+				}
+				ai.Identity = "by default"
+			default:
+				return p.errf("expected ALWAYS or BY DEFAULT after GENERATED, found %q", p.peek().text)
+			}
+			if err := p.expectKeyword("AS"); err != nil {
+				return err
+			}
+			if !p.consumeIdentWord("identity") {
+				return p.errf("expected IDENTITY, found %q", p.peek().text)
+			}
+			if p.consumeOp("(") {
+				ai.Seq = &SequenceOptions{}
+				if err := p.parseSequenceOptions(ai.Seq, false); err != nil {
+					return err
+				}
+				if err := p.expectOp(")"); err != nil {
+					return err
+				}
+			}
+			at.AddIdentity = ai
 		default:
-			return nil, p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL or DROP NOT NULL, found %q", p.peek().text)
+			return p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL, DROP NOT NULL or ADD GENERATED, found %q", p.peek().text)
 		}
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.SetOptions = opts
 	case p.consumeIdentWord("reset"):
 		if err := p.expectOp("("); err != nil {
-			return nil, err
+			return err
 		}
 		for {
 			name, err := p.expectIdent()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.ResetOptions = append(at.ResetOptions, name)
 			if !p.consumeOp(",") {
@@ -4499,39 +5088,39 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			}
 		}
 		if err := p.expectOp(")"); err != nil {
-			return nil, err
+			return err
 		}
 	case p.consumeIdentWord("purge"):
 		at.Purge = true
 	case p.consumeIdentWord("rotate"):
 		if !p.peekEncryptionKey(0) {
-			return nil, p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
+			return p.errf("expected ENCRYPTION KEY after ROTATE, found %q", p.peek().text)
 		}
 		p.i += 2
 		at.RotateKey = true
 		if p.peekWord(0, "keep") {
 			if !p.peekWord(1, "old") || !p.peekWord(2, "versions") {
-				return nil, p.errf("expected KEEP OLD VERSIONS")
+				return p.errf("expected KEEP OLD VERSIONS")
 			}
 			p.i += 3
 			at.RotateKeepOld = true
 		}
 	case p.consumeIdentWord("split"):
 		if !p.consumeIdentWord("at") {
-			return nil, p.errf("expected AT after SPLIT, found %q", p.peek().text)
+			return p.errf("expected AT after SPLIT, found %q", p.peek().text)
 		}
 		tuples, err := p.parseSplitTuples()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.SplitAt = tuples
 		if p.consumeIdentWord("with") {
 			if !p.consumeIdentWord("expiration") {
-				return nil, p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
+				return p.errf("expected EXPIRATION after WITH, found %q", p.peek().text)
 			}
 			e, err := p.parseValueOrColumnExpr()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			at.SplitExpiration = &e
 		}
@@ -4541,17 +5130,17 @@ func (p *parser) parseAlterTable() (Statement, error) {
 			break
 		}
 		if !p.consumeIdentWord("at") {
-			return nil, p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
+			return p.errf("expected AT or ALL after UNSPLIT, found %q", p.peek().text)
 		}
 		tuples, err := p.parseSplitTuples()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		at.UnsplitAt = tuples
 	default:
-		return nil, p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
+		return p.errf("expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found %q", p.peek().text)
 	}
-	return at, nil
+	return nil
 }
 
 // parseSplitTuples parses VALUES (k, ...), (k, ...): the key tuples of
@@ -4860,10 +5449,14 @@ func (p *parser) parseTruncate() (Statement, error) {
 	p.consumeKeyword("TABLE")
 	tr := &Truncate{}
 	for {
+		// [ONLY] name [*]: no table has descendants, so both mean the
+		// table (pg_restore's TRUNCATE TABLE ONLY t).
+		p.consumeIdentWord("only")
 		name, err := p.parseTableName()
 		if err != nil {
 			return nil, err
 		}
+		p.consumeOp("*")
 		tr.Tables = append(tr.Tables, name)
 		if !p.consumeOp(",") {
 			break

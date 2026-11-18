@@ -764,6 +764,8 @@ func (c *conn) sendError(serr *sql.Error) {
 		SeverityUnlocalized: "ERROR",
 		Code:                serr.Code,
 		Message:             serr.Msg,
+		Detail:              serr.Detail,
+		Hint:                serr.Hint,
 	})
 }
 
@@ -830,6 +832,12 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			return
 		}
 		res, serr := c.execute(ctx, stmt, q, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+			if res.Copy != nil {
+				// COPY ... TO STDOUT: the rows go out in copy-out mode.
+				// It reads nothing from the client, so unlike COPY FROM
+				// it may stand anywhere in a multi-statement query.
+				return c.sendCopyOut(ctx, res)
+			}
 			if res.Columns == nil {
 				return 0, nil
 			}
@@ -907,9 +915,9 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 // and its TIMESTAMP / CHAR(n) modifiers the text rendering (what
 // Describe promised, whatever hint the datum carries).
 // encodeDatumIn is encodeDatum with the session's text settings: a
-// TIMESTAMPTZ renders in its time zone, an INTERVAL in its IntervalStyle
-// and a BYTEA in its bytea_output, in text format (the binary forms are
-// the same whatever the settings).
+// TIMESTAMPTZ renders in its time zone, an INTERVAL in its IntervalStyle,
+// a BYTEA in its bytea_output and a FLOAT8 at its extra_float_digits, in
+// text format (the binary forms are the same whatever the settings).
 func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, ts textStyle) []byte {
 	if format == 0 && !d.Null {
 		switch {
@@ -919,6 +927,8 @@ func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, ts textSty
 			return []byte(d.IntervalVal().Format(ts.intervalStyle))
 		case d.Fam == types.Bytes && ts.byteaEscape:
 			return []byte(types.FormatByteaEscape([]byte(d.S)))
+		case d.Fam == types.Float && ts.extraFloatDigits <= 0:
+			return []byte(types.FormatFloat8Digits(d.F, ts.extraFloatDigits))
 		}
 	}
 	return encodeDatum(d, format, col)
@@ -927,13 +937,15 @@ func encodeDatumIn(d types.Datum, format int16, col sql.ResultColumn, ts textSty
 // textStyle is the session's settings that change how a value renders
 // in text format.
 type textStyle struct {
-	loc           *time.Location
-	intervalStyle string
-	byteaEscape   bool
+	loc              *time.Location
+	intervalStyle    string
+	byteaEscape      bool
+	extraFloatDigits int
 }
 
 func (c *conn) textStyle() textStyle {
-	return textStyle{loc: c.session.TimeZone(), intervalStyle: c.session.IntervalStyle(), byteaEscape: c.session.ByteaEscape()}
+	return textStyle{loc: c.session.TimeZone(), intervalStyle: c.session.IntervalStyle(), byteaEscape: c.session.ByteaEscape(),
+		extraFloatDigits: c.session.ExtraFloatDigits()}
 }
 
 func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
@@ -965,6 +977,11 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 		}
 		return binary.BigEndian.AppendUint64(nil, uint64(d.I))
 	case types.Float:
+		if math.IsNaN(d.F) {
+			// PostgreSQL's NaN (get_float8_nan): Go's math.NaN() sets
+			// the low mantissa bit as well.
+			return binary.BigEndian.AppendUint64(nil, 0x7ff8000000000000)
+		}
 		return binary.BigEndian.AppendUint64(nil, math.Float64bits(d.F))
 	case types.Bool:
 		if d.B {
@@ -1124,13 +1141,22 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		}
 		return types.Datum{}, fmt.Errorf("bad binary int length %d", len(raw))
 	case types.Float:
-		if len(raw) == 8 {
-			return types.NewFloat(math.Float64frombits(binary.BigEndian.Uint64(raw))), nil
+		var f float64
+		switch len(raw) {
+		case 8:
+			f = math.Float64frombits(binary.BigEndian.Uint64(raw))
+		case 4:
+			f = float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))
+		default:
+			return types.Datum{}, fmt.Errorf("bad binary float length %d", len(raw))
 		}
-		if len(raw) == 4 {
-			return types.NewFloat(float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))), nil
+		if math.IsNaN(f) {
+			// Every NaN is the one NaN, as in PostgreSQL (and as the
+			// text form 'NaN' reads): equal to itself in comparisons,
+			// grouping and EXCEPT whatever its payload bits.
+			f = math.NaN()
 		}
-		return types.Datum{}, fmt.Errorf("bad binary float length %d", len(raw))
+		return types.NewFloat(f), nil
 	case types.Bool:
 		if len(raw) == 1 {
 			return types.NewBool(raw[0] != 0), nil
@@ -1222,8 +1248,10 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 		if _, ok := stmts[0].(*parser.CopyFrom); ok {
 			// pgx's CopyFrom sends the COPY statement itself via a simple
 			// Query; only its preliminary column-discovery SELECT arrives
-			// here. Copy mode inside the extended protocol is undefined
-			// territory no client needs.
+			// here. Copy-in mode inside the extended protocol is
+			// territory no client needs. (COPY TO runs in either
+			// protocol: it is described as NoData, takes no parameters,
+			// and its Execute answers in copy-out mode.)
 			c.extError(&sql.Error{Code: sql.CodeFeatureNotSupported,
 				Msg: "COPY FROM STDIN is only supported in the simple query protocol"})
 			return
@@ -1375,6 +1403,16 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		var suspended bool
 		_, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			pt.res = res
+			if res.Copy != nil {
+				// COPY ... TO STDOUT runs to completion in one Execute
+				// whatever its row limit, as in PostgreSQL.
+				pt.done = true
+				n, serr := c.sendCopyOut(ctx, res)
+				if serr != nil {
+					pt.close(context.Background())
+				}
+				return n, serr
+			}
 			if serr := resultMatchesDescribe(pt.stmt.cols, res); serr != nil {
 				pt.done = true
 				pt.close(context.Background())
@@ -1395,6 +1433,10 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		})
 		if serr != nil {
 			c.extError(serr)
+			return
+		}
+		if pt.res.Copy != nil {
+			c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
 			return
 		}
 		if pt.res.Stream != nil {

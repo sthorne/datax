@@ -15,15 +15,15 @@ syntax error or `0A000` feature not supported):
 |---|---|
 | Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `row_to_json` and other whole-row functions; named arguments (`make_interval(days => 1)`); a set-returning function (`generate_series`, `jsonb_array_elements`, ...) in the select list of a query with `FROM`, or with arguments that read another `FROM` member (`0A000`); regular expressions with back references or lookaround (`2201B`: datax runs them on RE2); `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres` in `::text` casts, arrays and JSON (the wire's text format of an `INTERVAL` column follows it); user-defined functions | compute client-side or in a derived table; the regular-expression, set-returning and jsonb processing functions **are supported** ([set-returning functions](sql.md#set-returning-functions)); `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), expressions over aggregates and `GROUP BY` expressions, `ROLLUP` / `CUBE` / `GROUPING SETS`, `DISTINCT ON`, `FILTER (WHERE ...)` and `DISTINCT` on aggregate calls, window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
-| `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY`, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
-| `ALTER TABLE ... ADD COLUMN` with an expression default (`DEFAULT now()`) | sequences (with `OWNED BY`), `SERIAL`, identity columns, expression defaults and `ALTER COLUMN SET / DROP DEFAULT` **are supported** ([reference](sql.md#defaults-serial-identity-columns-and-sequences)); recreate the table for the rest |
-| `ADD PRIMARY KEY` (a table created without one is keyed by a hidden `rowid`, [reference](sql.md#tables-without-a-primary-key); `0A000`) / `DROP` of the primary key, `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
-| `COPY ... TO`, COPY options beyond `FORMAT` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work); export with `SELECT` instead |
+| `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY` on a table that has one, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
+| A volatile `DEFAULT` (`gen_random_uuid()`, `random()`), `SERIAL`, or a constraint on `ADD COLUMN`, and `ALTER TABLE` actions that read the rows (`ADD CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`), inside a transaction block (`25001`) | run the statement outside the block (Rails: `disable_ddl_transaction!`); `ADD COLUMN` with any default, several actions in one `ALTER TABLE`, and the descriptor-only actions in a block **are supported** ([reference](sql.md#ddl)) |
+| `DROP` of a primary key declared in `CREATE TABLE` (one added by `ADD PRIMARY KEY` to a table keyed by its hidden `rowid` is an index, and drops as one: [reference](sql.md#tables-without-a-primary-key)), `ALTER TABLE ... SET SCHEMA`, `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
+| `COPY FROM` options beyond `FORMAT`; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
 | Schemas | `public` is the only schema: `db.public.t` and `public.t` are accepted, any other schema name is an error; `search_path` is accepted and ignored. Databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
 | Materialized views, `WITH CHECK OPTION`, updatable views, `SECURITY INVOKER` views, renaming a table or column a view reads (refused; replace the view) | Views **are supported** ([reference](sql.md#views)): `CREATE [OR REPLACE] VIEW`, `DROP VIEW [CASCADE]`, dependency tracking, definer semantics (the query runs with the owner's privileges), `pg_views`, `information_schema.views`, `\dv` |
 | Column-level privileges, `REFERENCES` / `TRIGGER` / `MAINTAIN` privileges, `CREATEDB` / `CREATEROLE` / `SUPERUSER` role attributes, `VALID UNTIL`, `CONNECTION LIMIT`, `ALTER ROLE ... SET`, `SET SESSION AUTHORIZATION`, `pg_hba.conf` | Roles **are supported** ([security guide](security.md#roles-and-privileges)): `CREATE / ALTER / DROP ROLE` and `USER` (`LOGIN`, `PASSWORD`, `INHERIT`, `IN ROLE`), membership with `ADMIN OPTION`, `SET ROLE`, ownership (`OWNER TO`, `REASSIGN OWNED`, `DROP OWNED`), grants on tables, views, sequences, databases and `public` with `GRANT OPTION`, `ALL TABLES IN SCHEMA`, `ALTER DEFAULT PRIVILEGES`, `PUBLIC`, the built-in `admin`, `read_all`, `write_all` and `metrics` roles; `CREATE DATABASE` and role management take `admin`; the `BYPASSRLS` attribute |
 | Subqueries in a policy expression, `SECURITY INVOKER` views over protected tables, policies on views | Row-level security **is supported** ([reference](sql.md#row-level-security), [security guide](security.md#row-level-security)): `ENABLE` / `DISABLE` / `FORCE` / `NO FORCE ROW LEVEL SECURITY`, `CREATE` / `ALTER` / `DROP POLICY` (permissive and restrictive, `FOR`, `TO`, `USING`, `WITH CHECK`), default deny, custom settings with `current_setting` / `set_config`. See below for where it differs |
-| The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
+| The fast-path function call for functions other than the large-object ones; `lo_import` / `lo_export` (server-side files), `GRANT ... ON LARGE OBJECT`, `ALTER LARGE OBJECT` other than `OWNER TO`, `lo_compat_privileges`, the `pg_largeobject` table itself, `COMMENT ON LARGE OBJECT` | Large objects **are supported** ([reference](sql.md#large-objects)): `lo_create`, `lo_creat`, `lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek[64]`, `lo_tell[64]`, `lo_truncate[64]`, `lo_unlink`, `lo_get`, `lo_put`, `lo_from_bytea`, and `pg_largeobject_metadata`; import and export client-side (psql's `\lo_import` / `\lo_export` do) |
 | Triggers, stored procedures | — (`LISTEN` / `NOTIFY` / `pg_notify` **are supported**, across nodes: [reference](sql.md#notifications-listen-and-notify); so are advisory locks, `pg_advisory_lock` and its relatives, cluster-wide: [reference](sql.md#advisory-locks)) |
 
 ## Things that exist but behave differently
@@ -262,14 +262,18 @@ syntax error or `0A000` feature not supported):
   sampler), INNER joins are cost-reordered greedily; LEFT joins,
   self-joins, cross joins and joins carrying ON filters, correlated
   subqueries or `LATERAL` members always run in the written order, so
-  put the most selective table first there. `ON` must include an
-  equality against an earlier table (`ON true` is not accepted; use
-  `CROSS JOIN` or `FROM a, b`), except on a `LATERAL` member, whose `ON`
-  may be any condition.
+  put the most selective table first there. `ON` may be any boolean
+  condition (`ON true`, `u.tid < t.id`, `BETWEEN`, `OR`, a condition
+  on one side, expressions), for every join type. An `ON` with an
+  equality between the joined table and an earlier one looks rows up
+  by it (through an index when there is one) and applies the rest per
+  match; one without is a nested loop over the joined table, read once
+  and tried against every row so far, so it costs rows × rows: add an
+  equality on large tables where you can.
 - **Correlated subqueries are nested loops.** Each is re-run per row of
-  the enclosing query (memoized on the referenced values), so a
-  correlated subquery over a large outer table costs outer rows × inner
-  query. Prefer a `JOIN` when the outer side is big. A `LATERAL`
+  the enclosing query (memoized on the referenced values), or once per
+  group of a grouped one, so a correlated subquery over a large outer
+  table costs outer rows × inner query. Prefer a `JOIN` when the outer side is big. A `LATERAL`
   subquery or a table function reading another `FROM` member's columns
   is the same nested loop. A lateral subquery must be a plain select
   (not over a derived table or a set operation of its own) and cannot
@@ -292,11 +296,13 @@ syntax error or `0A000` feature not supported):
   `to_regclass`, `to_regproc`, `to_regprocedure`, `to_regnamespace`
   and `to_regrole` lookups return the OID the same way (`NULL` where
   the cast would fail), not the name.
-- **`COPY FROM STDIN` is not atomic.** It commits in chunks (128 rows /
-  1 MiB) as the stream arrives, so a failure partway leaves the earlier
-  chunks committed — the error names the failing row and how many rows
-  were already committed. For the same reason COPY is refused inside
-  `BEGIN` (SQLSTATE `25001`) and only the `FORMAT` option is accepted.
+- **`COPY FROM STDIN` outside a transaction block is not atomic.** It
+  commits in chunks (128 rows / 1 MiB) as the stream arrives, so a
+  failure partway leaves the earlier chunks committed — the error names
+  the failing row and how many rows were already committed. Inside
+  `BEGIN` it writes in the block's transaction and is atomic with it, as
+  in PostgreSQL (mind the transaction's size for a large load). Only the
+  `FORMAT` option is accepted.
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
@@ -312,15 +318,14 @@ syntax error or `0A000` feature not supported):
   statement. `UPSERT INTO`
   (CockroachDB syntax) is the primary-key shorthand.
 - **`UPDATE ... FROM` and `DELETE ... USING`** work as in PostgreSQL
-  ([reference](sql.md#writing)), with three differences. A target row
+  ([reference](sql.md#writing)), with two differences. A target row
   that joins several rows takes its new values from the first of them
   in the order the join reads the `FROM` list (a table by primary key,
   or by the index it is looked up through; a `VALUES` list as
   written), where PostgreSQL uses an unspecified one. The target needs
   only the `UPDATE` (`DELETE`) privilege, as a plain `UPDATE ... WHERE`
   does here; PostgreSQL also asks for `SELECT` on the target columns
-  the statement reads. And the `FROM` list's joins have a plain
-  `SELECT`'s limits (`ON` must equate columns, above).
+  the statement reads.
 - **`CREATE INDEX` is always online** (like `CONCURRENTLY`, which is
   accepted and changes nothing) and cannot run inside a transaction
   block (`25001`) — except on a table created in the same block, where
@@ -436,20 +441,21 @@ syntax error or `0A000` feature not supported):
   `enable_sort`, `enable_hashagg` and `enable_material`,
   `synchronous_commit` (every commit is durable and replicated),
   `default_transaction_deferrable` and `SET SESSION CHARACTERISTICS AS
-  TRANSACTION DEFERRABLE`, `extra_float_digits` (a float always prints
-  in its shortest exact form, which is what `1` to `3` give; `0` and
-  below do not round), `lc_messages`, `lc_monetary`, `lc_numeric` and
+  TRANSACTION DEFERRABLE`, `lc_messages`, `lc_monetary`, `lc_numeric` and
   `lc_time` (messages, numbers, money and dates stay in the C locale;
   `C`, `POSIX` and names shaped like `en_US.UTF-8` are accepted),
   `escape_string_warning`, `array_nulls` (`off` does not make a
   `NULL` in array input a string), `quote_all_identifiers`,
-  `synchronize_seqscans` (pg_dump sets it `off`) and
+  `synchronize_seqscans` (pg_dump sets it `off`),
+  `default_table_access_method` (only `heap` exists; pg_dump sets it) and
   `session_replication_role` (`replica` does not disable foreign keys).
   `default_with_oids` takes only `off`, as in PostgreSQL 12 and later.
   The ones that do act: `IntervalStyle` (`postgres`, `iso_8601`,
-  `sql_standard`, `postgres_verbose`) and `bytea_output` (`hex`,
-  `escape`) set the text format of `INTERVAL` and `BYTEA` columns on the
-  wire, though not of `::text` casts, arrays or JSON;
+  `sql_standard`, `postgres_verbose`), `bytea_output` (`hex`,
+  `escape`) and `extra_float_digits` (`1` to `3` print a `FLOAT8` in its
+  shortest exact form, `0` and below round it to `15 + n` digits) set
+  the text format of `INTERVAL`, `BYTEA` and `FLOAT8` columns on the
+  wire and in `COPY TO`, though not of `::text` casts, arrays or JSON;
   `client_min_messages` at `warning` or `error` keeps `NOTICE`s from
   the client; `row_security = off` refuses a query a policy would
   filter (below). `max_identifier_length` reports `63` and, like
@@ -590,6 +596,14 @@ in the select list, `CASE`, `::casts`, `OPERATOR(pg_catalog.~)`,
   `pg_sequences`, `pg_sequence` and `pg_class` rows with `relkind =
   'S'` list the sequences, and `pg_constraint` (with
   `pg_get_constraintdef`, `conrelid::regclass`) the constraints.
+- **datax's own tables** (`datax_metrics`, `datax_audit`, the
+  large-object tables) are listed in `pg_catalog`, as PostgreSQL's system
+  catalogs are: `\dt` leaves them out (`\dtS` lists them), pg_dump does
+  not dump them, and `pg_catalog.datax_metrics` names one as its bare
+  name does. Their OIDs are 65280 and up, within the 32 bits a
+  PostgreSQL client reads an OID in.
+- **pg_dump** reads the catalogs it needs and dumps a database that
+  restores into another: [Dumping and restoring with pg_dump](pg-dump.md).
 - **Which database.** The current one, as in PostgreSQL, where each
   database has catalogs of its own: `information_schema` (with
   `table_catalog` the current database's name) and the per-database

@@ -124,6 +124,10 @@ type Result struct {
 	// scan-shaped SELECT on a streaming session, see stream.go); the
 	// consumer pulls it with Next, closes it, and takes the tag from it.
 	Stream *RowStream
+	// Copy, when set, is a COPY TO's output format: the rows are the
+	// COPY's, sent as CopyData rather than DataRows, and the command tag
+	// is COPY n (see copyto.go).
+	Copy *CopyOut
 }
 
 // AddScanned records KV rows read while executing the current
@@ -146,8 +150,18 @@ const (
 
 // Session executes statements for one client connection.
 type Session struct {
-	db  *kvclient.DB
-	cat *catalog.Accessor
+	// txnQueried marks a transaction block that has run a statement
+	// against data: SET TRANSACTION SNAPSHOT must come before one.
+	txnQueried bool
+	// cursors are the session's open SQL cursors (cursor.go).
+	cursors map[string]*sqlCursor
+	// preparedSQL are the session's PREPARE'd statements (prepare.go).
+	preparedSQL map[string]*preparedSQL
+	// rowFuncIDs are the per-row closures this session registered for
+	// its current statement (registerRowFunc).
+	rowFuncIDs []int64
+	db         *kvclient.DB
+	cat        *catalog.Accessor
 	// scanned counts the KV rows this session's current statement has
 	// read, so the cost of a full scan is attributable to the statement
 	// shape that caused it rather than only to a cluster-wide counter
@@ -385,7 +399,13 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		if vt, ok := vtable.Lookup(name); ok {
 			return vt.Descriptor(), nil
 		}
-		return nil, &catalog.ErrTableNotFound{Name: name}
+		if db != vtable.PgCatalog || !catalog.IsSystemTable(bare) {
+			return nil, &catalog.ErrTableNotFound{Name: name}
+		}
+		// pg_catalog.datax_metrics: the cluster's own tables are listed
+		// in pg_catalog (pg_class), so they answer to that name too
+		// (pg_dump's GRANT ... ON TABLE pg_catalog.datax_metrics).
+		name = bare
 	}
 	// A descriptor this transaction's DDL wrote is read through the
 	// transaction and never cached: the cache is shared with other
@@ -687,6 +707,7 @@ func (s *Session) Close(ctx context.Context) {
 	}
 	s.discardNotify()
 	s.advisoryClose()
+	s.releaseRowFuncs()
 	s.state = StateIdle
 }
 
@@ -694,6 +715,7 @@ func (s *Session) Close(ctx context.Context) {
 // under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	params = s.zoneParams(params)
+	s.releaseRowFuncs()
 	s.stmtNow = 0
 	s.memUsed = 0
 	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
@@ -762,6 +784,24 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 	}
+	// COPY ... TO runs as its query (copyto.go); the result carries the
+	// COPY's format.
+	if ct, ok := stmt.(*parser.CopyTo); ok {
+		inner, co, err := s.planCopyTo(ctx, ct)
+		if err != nil {
+			if s.state == StateOpen {
+				s.state = StateFailed
+				s.extraDDL, s.pendingWipes = nil, nil
+			}
+			return nil, ToSQLError(err)
+		}
+		stmt = inner
+		defer func() {
+			if res != nil {
+				res.Copy = co
+			}
+		}()
+	}
 	// A cast to a type that does not exist fails the statement before it
 	// runs (and, in a transaction block, the block).
 	{
@@ -785,6 +825,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		}
 		s.txn = s.db.NewTxn("sql")
 		s.state = StateOpen
+		s.txnQueried = false
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
 		// BEGIN's modes run as the SET TRANSACTION they stand for.
 		for _, m := range t.Modes {
@@ -810,6 +851,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.txn = nil
 		s.state = StateIdle
 		s.endTxnVars()
+		s.endTxnCursors(err == nil)
 		s.advisoryEndTxn()
 		pending := s.pendingDDL
 		if err != nil {
@@ -885,6 +927,20 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 
 	case *parser.Listen, *parser.Unlisten, *parser.Notify:
 		return s.execListenNotify(stmt)
+	case *parser.Prepare:
+		return s.execPrepare(t)
+	case *parser.Deallocate:
+		return s.execDeallocate(t)
+	case *parser.ExecutePrepared:
+		return s.execExecutePrepared(ctx, t, params)
+	case *parser.SetTransactionSnapshot:
+		return s.execSetTransactionSnapshot(t)
+	case *parser.DeclareCursor:
+		return s.execDeclareCursor(ctx, t, params)
+	case *parser.Fetch:
+		return s.execFetch(t)
+	case *parser.CloseCursor:
+		return s.execCloseCursor(t)
 
 	default:
 		if s.state == StateOpen {
@@ -911,6 +967,9 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 // executeData runs a data statement in the session transaction (explicit)
 // or an auto-retrying implicit one.
 func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params []types.Datum) (*Result, *Error) {
+	if s.state == StateOpen {
+		s.txnQueried = true
+	}
 	// The key service's statements (keyservice.go) change the datax_keys
 	// row in transactions of their own.
 	if isKeyStatement(stmt) {
@@ -925,6 +984,26 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ADD CONSTRAINT, VALIDATE CONSTRAINT and SET NOT NULL publish, drain
 	// and then sweep the existing rows: multi-transaction, like CREATE
 	// INDEX.
+	// Several actions of which one needs the table's rows, and ADD
+	// COLUMN with a volatile default (or another that needs them), run
+	// online too (alter_multi.go); several that need nothing but the
+	// descriptor run below, in the statement's transaction.
+	if at, ok := stmt.(*parser.AlterTable); ok {
+		r, serr := s.rewriteAddPrimaryKey(ctx, at)
+		if serr != nil {
+			return nil, serr
+		}
+		stmt = r
+	}
+	if at, ok := stmt.(*parser.AlterTable); ok && alterRunsOnline(at) {
+		if at.IfExists && !s.tableExists(ctx, at.Table) {
+			return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("relation %q does not exist, skipping", at.Table)}}, nil
+		}
+		if s.state == StateOpen {
+			return nil, alterInBlockError(alterCmds(at))
+		}
+		return s.execAlterTableOnline(ctx, at)
+	}
 	if at, ok := stmt.(*parser.AlterTable); ok && at.IfExists && (at.AddConstraint != nil || at.ValidateConstraint != "" || at.SetNotNull != "" || at.SetOptions != nil || at.SetType != nil) && !s.tableExists(ctx, at.Table) {
 		return &Result{Tag: "ALTER TABLE"}, nil
 	}
@@ -1278,6 +1357,7 @@ func (s *Session) rollback(ctx context.Context) {
 		s.txn = nil
 	}
 	s.endTxnVars()
+	s.endTxnCursors(false)
 	s.forgetDDL()
 	s.pendingDDL, s.extraDDL, s.pendingWipes = nil, nil, nil
 	s.keyLeaseAfterCommit = false
@@ -1598,7 +1678,7 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		if args[0].Null {
 			return types.DNull, nil
 		}
-		return types.NewString(`"` + strings.ReplaceAll(args[0].Text(), `"`, `""`) + `"`), nil
+		return types.NewString(quoteIdentifier(args[0].Text())), nil
 	case "pg_typeof":
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
 	case "to_regtype":
@@ -1642,6 +1722,8 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		"pg_get_function_result", "pg_get_function_arguments", "pg_get_function_identity_arguments",
 		"pg_get_functiondef", "pg_get_triggerdef", "pg_get_ruledef":
 		return types.DNull, nil
+	case rowSessionFunc:
+		return callRowFunc(args)
 	case unrecognizedSettingFunc:
 		// current_setting(name [, missing_ok]) per row, for a name that
 		// is none of the session's settings: NULL for a NULL name or

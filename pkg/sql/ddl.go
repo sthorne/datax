@@ -291,21 +291,20 @@ func (s *Session) execRenameConstraint(ctx context.Context, txn *kvclient.Txn, d
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
-// execSetDefault is ALTER TABLE t ALTER [COLUMN] c SET DEFAULT value and
+// applySetDefault is ALTER TABLE t ALTER [COLUMN] c SET DEFAULT value and
 // DROP DEFAULT (sd nil). A column added with a DEFAULT fills its
 // pre-existing rows from that constant on read, so its fill value must
 // survive a new default: the new insert default is stored as the
 // expression default (a literal's text, or "NULL" for none), which
 // inserts prefer, while the constant keeps filling the old rows.
-func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, colName string, sd *parser.SetDefault) (*Result, error) {
+func (s *Session) applySetDefault(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, colName string, sd *parser.SetDefault) error {
 	col, ok := desc.Col(colName)
 	if !ok || col.Hidden {
-		return nil, newErrf(CodeUndefinedColumn, "column %q does not exist", colName)
+		return newErrf(CodeUndefinedColumn, "column %q does not exist", colName)
 	}
 	if col.Identity != "" {
-		return nil, newErrf(CodeSyntaxError, "column %q is an identity column; its default is its sequence", colName)
+		return newErrf(CodeSyntaxError, "column %q is an identity column; its default is its sequence", colName)
 	}
-	stmt := "DROP DEFAULT"
 	switch {
 	case sd == nil:
 		if col.FillDefault {
@@ -314,7 +313,6 @@ func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *c
 			col.Default, col.DefaultExpr = nil, ""
 		}
 	case sd.Default != nil:
-		stmt = "SET DEFAULT"
 		if sd.Default.Null {
 			if col.FillDefault {
 				col.DefaultExpr = "NULL"
@@ -325,26 +323,25 @@ func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *c
 		}
 		d, cerr := coerceColumn(col, *sd.Default)
 		if cerr != nil {
-			return nil, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, cerr.Msg)
+			return newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", colName, cerr.Msg)
 		}
 		d, terr := enforceTypmod(col, d)
 		if terr != nil {
-			return nil, terr
+			return terr
 		}
 		if col.FillDefault {
 			text, err := s.validateDefaultExpr(ctx, txn, colName, col.Type, parser.Expr{Lit: &d})
 			if err != nil {
-				return nil, err
+				return err
 			}
 			col.DefaultExpr = text
 		} else {
 			col.Default, col.DefaultExpr = &d, ""
 		}
 	default:
-		stmt = "SET DEFAULT"
 		text, err := s.validateDefaultExpr(ctx, txn, colName, col.Type, *sd.Expr)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		col.DefaultExpr = text
 		if !col.FillDefault {
@@ -356,11 +353,7 @@ func (s *Session) execSetDefault(ctx context.Context, txn *kvclient.Txn, desc *c
 			desc.Columns[i] = col
 		}
 	}
-	if err := s.cat.Update(ctx, txn, desc); err != nil {
-		return nil, err
-	}
-	log.Audit("table-ddl", "stmt", "ALTER COLUMN "+stmt, "target", desc.Name+"."+colName, "principal", s.sessionUser, "role", s.user)
-	return &Result{Tag: "ALTER TABLE"}, nil
+	return nil
 }
 
 // execTruncate is TRUNCATE [TABLE] t [, ...] [RESTART IDENTITY] [CASCADE]:

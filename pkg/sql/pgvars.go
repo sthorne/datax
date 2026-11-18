@@ -89,6 +89,14 @@ var pgVarList = []pgVar{
 		}
 		return newErrf(CodeUndefinedObject, "invalid value for parameter %q: %q", name, value)
 	}},
+	{name: "default_table_access_method", vartype: "string", boot: "heap", context: "user", check: func(name, value string) *Error {
+		// pg_dump sets it before each CREATE TABLE; heap is the only
+		// table access method there is.
+		if value == "heap" {
+			return nil
+		}
+		return newErrf(CodeInvalidParameterValue, "invalid value for parameter %q: %q", name, value)
+	}},
 	boolVar("row_security", "on"),
 	{name: "bytea_output", vartype: "enum", boot: "hex", context: "user", enum: []string{"escape", "hex"}},
 	boolVar("default_transaction_deferrable", "off"),
@@ -424,6 +432,17 @@ func (s *Session) pgVarString(name string) string { return s.vars.pgVarValue(pgV
 // IntervalStyle is the session's IntervalStyle: how an INTERVAL renders
 // in text on the wire.
 func (s *Session) IntervalStyle() string { return s.pgVarString("IntervalStyle") }
+
+// ExtraFloatDigits is the session's extra_float_digits: 1 to 3 print a
+// float8 in its shortest exact form, 0 and below round it to 15 + n
+// significant digits, in text on the wire.
+func (s *Session) ExtraFloatDigits() int {
+	n, err := strconv.Atoi(s.pgVarString("extra_float_digits"))
+	if err != nil {
+		return 1
+	}
+	return n
+}
 
 // ByteaEscape reports bytea_output = escape: a BYTEA renders in
 // PostgreSQL's escape format in text on the wire, not as \x hex.

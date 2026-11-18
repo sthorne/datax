@@ -125,7 +125,9 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			t = bound
 		}
 		// Execution addresses a single table's columns by bare name.
-		stripTableAlias(t)
+		if err := stripTableAlias(t); err != nil {
+			return nil, ToSQLError(err)
+		}
 		if err := checkDistinctOn(t); err != nil {
 			return nil, ToSQLError(err)
 		}
@@ -324,16 +326,18 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		if len(t.From) > 0 {
 			return s.dmlReturningColumns(ctx, t.Table, t.Alias, t.From, t.Returning)
 		}
-		if t.Alias != "" {
-			t = stripUpdateAlias(t)
+		t, err := stripUpdateAlias(t)
+		if err != nil {
+			return nil, ToSQLError(err)
 		}
 		return s.planReturning(ctx, t.Table, t.Returning)
 	case *parser.Delete:
 		if len(t.Using) > 0 {
 			return s.dmlReturningColumns(ctx, t.Table, t.Alias, t.Using, t.Returning)
 		}
-		if t.Alias != "" {
-			t = stripDeleteAlias(t)
+		t, err := stripDeleteAlias(t)
+		if err != nil {
+			return nil, ToSQLError(err)
 		}
 		return s.planReturning(ctx, t.Table, t.Returning)
 
@@ -358,8 +362,19 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.ShowStats:
 		return showStatsColumns(), nil
 
-	case *parser.Analyze:
+	case *parser.Analyze, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot:
 		return nil, nil
+	case *parser.Fetch:
+		if c, ok := s.cursors[t.Name]; ok && !t.Move {
+			return c.cols, nil
+		}
+		return nil, nil
+	case *parser.ExecutePrepared:
+		inner, _, serr := s.executePrepared(t, nil)
+		if serr != nil {
+			return nil, serr
+		}
+		return s.PlanColumns(ctx, inner)
 
 	case *parser.ShowEncryptionKeys:
 		return showEncryptionKeysColumns(), nil

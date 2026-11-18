@@ -20,6 +20,7 @@ const (
 	CodeUndefinedTable       = "42P01"
 	CodeDuplicateTable       = "42P07"
 	CodeUndefinedColumn      = "42703"
+	CodeDuplicateColumn      = "42701"
 	CodeUndefinedFunction    = "42883"
 	CodeUniqueViolation      = "23505"
 	CodeNotNullViolation     = "23502"
@@ -116,6 +117,10 @@ const (
 type Error struct {
 	Code string
 	Msg  string
+	// Detail and Hint are the error's DETAIL and HINT fields ("" =
+	// none).
+	Detail string
+	Hint   string
 }
 
 func (e *Error) Error() string { return e.Msg }

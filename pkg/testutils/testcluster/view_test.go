@@ -139,7 +139,7 @@ func TestViews(t *testing.T) {
 	// ---- catalogs and SHOW ----
 	execSQL(t, ctx, s, `CREATE VIEW names (who) AS SELECT name FROM customers WHERE id > 1`)
 	expect(`SELECT relname, relkind FROM pg_class WHERE relname = 'names'`, "names|v")
-	expect(`SELECT pg_get_viewdef(c.oid, true) FROM pg_class c WHERE c.relname = 'names'`, "SELECT name FROM customers WHERE id > 1")
+	expect(`SELECT pg_get_viewdef(c.oid, true) FROM pg_class c WHERE c.relname = 'names'`, "SELECT name FROM customers WHERE id > 1;")
 	expect(`SELECT attname FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'names') ORDER BY attnum`, "who")
 	expect(`SELECT schemaname, viewname, definition FROM pg_views`, "public|names|SELECT name FROM customers WHERE id > 1")
 	expect(`SELECT table_name, table_type, is_insertable_into FROM information_schema.tables WHERE table_name IN ('names', 'customers') ORDER BY table_name`, "customers|BASE TABLE|YES;names|VIEW|NO")

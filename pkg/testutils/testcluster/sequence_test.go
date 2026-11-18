@@ -72,7 +72,11 @@ func TestSequencesAndDefaults(t *testing.T) {
 	expect("SET DEFAULT", execSQL(t, ctx, s, `UPDATE t SET n = DEFAULT, name = DEFAULT WHERE id = 100 RETURNING n, name`), "3|none")
 	code("default referencing a column", `CREATE TABLE bad (a INT8 PRIMARY KEY, b INT8 DEFAULT a + 1)`, sql.CodeSyntaxError)
 	code("unknown default function", `CREATE TABLE bad (a INT8 PRIMARY KEY, b INT8 DEFAULT nosuch())`, sql.CodeSyntaxError)
-	code("ADD COLUMN expression default", `ALTER TABLE t ADD COLUMN c INT8 DEFAULT unique_rowid()`, sql.CodeFeatureNotSupported)
+	// ADD COLUMN with a volatile default fills each existing row (issue
+	// #364).
+	execSQL(t, ctx, s, `ALTER TABLE t ADD COLUMN c INT8 DEFAULT unique_rowid()`)
+	expect("ADD COLUMN expression default", execSQL(t, ctx, s, `SELECT count(c), count(DISTINCT c) FROM t`), "5|5")
+	execSQL(t, ctx, s, `ALTER TABLE t DROP COLUMN c`)
 
 	// The owned sequence: nextval/currval/lastval/setval, the relation
 	// view, SHOW SEQUENCES, and that it cannot be dropped out from under

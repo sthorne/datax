@@ -78,8 +78,8 @@ func hasConstraintNamed(desc *catalog.TableDescriptor, name string) bool {
 // taken), else PostgreSQL's <table>_<col>_<suffix>, numbered when taken.
 func constraintName(desc *catalog.TableDescriptor, given string, cols []string, suffix string) (string, error) {
 	taken := func(n string) bool {
-		if n == desc.Name+"_pkey" {
-			return true
+		if n == desc.Name+"_pkey" && len(visiblePKIDs(desc)) > 0 {
+			return true // the declared key's (a rowid-keyed table's is free)
 		}
 		if _, ok := desc.Constraint(n); ok {
 			return true
@@ -166,7 +166,14 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		if err != nil {
 			return nil, nil, err
 		}
-		name, err := constraintName(desc, cd.Name, cd.Columns, "key")
+		suffixCols, suffix := cd.Columns, "key"
+		if cd.PrimaryKey {
+			if desc.PrimaryKeyIndex() != nil {
+				return nil, nil, newErrf(CodeInvalidTableDefinition, "multiple primary keys for table %q are not allowed", desc.Name)
+			}
+			suffixCols, suffix = nil, "pkey"
+		}
+		name, err := constraintName(desc, cd.Name, suffixCols, suffix)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -181,7 +188,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 				return nil, nil, err
 			}
 		}
-		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState, NullsNotDistinct: cd.NullsNotDistinct}
+		idx := catalog.IndexDescriptor{ID: desc.NextIndexID, Name: name, Unique: true, ColumnIDs: c.Columns, State: indexState, NullsNotDistinct: cd.NullsNotDistinct, Primary: cd.PrimaryKey}
 		desc.NextIndexID++
 		desc.Indexes = append(desc.Indexes, idx)
 		c.Name, c.IndexID, c.Validated = name, idx.ID, true
@@ -266,7 +273,7 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		}
 		refNames := cd.RefColumns
 		if len(refNames) == 0 {
-			for _, id := range visiblePKIDs(ref) {
+			for _, id := range declaredKeyIDs(ref) {
 				col, _ := ref.ColByID(id)
 				refNames = append(refNames, col.Name)
 			}
@@ -340,6 +347,19 @@ func visiblePKIDs(d *catalog.TableDescriptor) []catalog.ColumnID {
 		out = append(out, id)
 	}
 	return out
+}
+
+// declaredKeyIDs is the key a foreign key without columns references:
+// the visible primary key, or a rowid-keyed table's Primary index's
+// columns (empty when it has neither).
+func declaredKeyIDs(d *catalog.TableDescriptor) []catalog.ColumnID {
+	if ids := visiblePKIDs(d); len(ids) > 0 {
+		return ids
+	}
+	if idx := d.PrimaryKeyIndex(); idx != nil && idx.Public() {
+		return idx.ColumnIDs
+	}
+	return nil
 }
 
 // uniqueKeyOf reports whether cols (as a set) are the table's primary
@@ -1178,6 +1198,13 @@ func (s *Session) abandonConstraint(ctx context.Context, table string, cID uint6
 // returning that table (nil when none, or when it is desc itself) for
 // the caller to write.
 func (s *Session) removeConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, c *catalog.Constraint) (*catalog.TableDescriptor, error) {
+	return s.removeConstraintIn(ctx, txn, desc, c, nil)
+}
+
+// removeConstraintIn is removeConstraint taking the referenced table
+// from parents when it is there (a statement changing it twice), and
+// leaving it there.
+func (s *Session) removeConstraintIn(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, c *catalog.Constraint, parents map[uint64]*catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
 	removed := *c
 	kept := desc.Constraints[:0]
 	for _, x := range desc.Constraints {
@@ -1200,14 +1227,21 @@ func (s *Session) removeConstraint(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	parent := desc
 	if removed.RefTable != desc.ID {
-		p, err := catalog.ReadTable(ctx, txn, removed.RefTable)
-		if err != nil {
-			return nil, err
+		if p, ok := parents[removed.RefTable]; ok {
+			parent = p
+		} else {
+			p, err := catalog.ReadTable(ctx, txn, removed.RefTable)
+			if err != nil {
+				return nil, err
+			}
+			if p == nil {
+				return nil, nil
+			}
+			parent = p.Clone()
+			if parents != nil {
+				parents[parent.ID] = parent
+			}
 		}
-		if p == nil {
-			return nil, nil
-		}
-		parent = p.Clone()
 	}
 	kr := parent.InboundFKs[:0]
 	for _, r := range parent.InboundFKs {
@@ -1335,42 +1369,37 @@ func (s *Session) execValidateConstraintOnline(ctx context.Context, t *parser.Al
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
 
-// execDropConstraint is ALTER TABLE ... DROP CONSTRAINT [IF EXISTS], in
-// the statement's transaction; the dropped index's entries are wiped
-// after commit by the caller (dropConstraintCleanup).
-func (s *Session) execDropConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.AlterTable) (*Result, error) {
+// applyDropConstraint is ALTER TABLE ... DROP CONSTRAINT [IF EXISTS]'s
+// change to desc, in the statement's transaction, with the referenced
+// table's change and the index to wipe after commit left in eff.
+func (s *Session) applyDropConstraint(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.AlterTable, eff *alterEffects) error {
 	c, ok := desc.Constraint(t.DropConstraint)
 	if !ok {
 		if t.DropConstraintIfExists {
-			return &Result{Tag: "ALTER TABLE"}, nil
+			eff.notices = append(eff.notices, fmt.Sprintf("constraint %q of relation %q does not exist, skipping", t.DropConstraint, desc.Name))
+			return nil
 		}
 		if t.DropConstraint == desc.Name+"_pkey" {
-			return nil, newErrf(CodeFeatureNotSupported, "cannot drop the primary key of table %q", desc.Name)
+			return newErrf(CodeFeatureNotSupported, "cannot drop the primary key of table %q", desc.Name)
 		}
-		return nil, newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", t.DropConstraint, desc.Name)
+		return newErrf(CodeUndefinedObject, "constraint %q for table %q does not exist", t.DropConstraint, desc.Name)
 	}
 	indexID := c.IndexID
 	if c.Kind == catalog.ConstraintForeign && !c.AutoIndex {
 		indexID = 0
 	}
-	parent, err := s.removeConstraint(ctx, txn, desc, c)
+	parent, err := s.removeConstraintIn(ctx, txn, desc, c, eff.parents)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if parent != nil {
-		if err := s.cat.Update(ctx, txn, parent); err != nil {
-			return nil, err
-		}
-		s.noteDDL(parent.Name)
-	}
-	if err := s.cat.Update(ctx, txn, desc); err != nil {
-		return nil, err
+		eff.parents[parent.ID] = parent
 	}
 	if indexID != 0 {
-		s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: desc.ID, indexID: indexID})
+		eff.wipes = append(eff.wipes, indexWipe{tableID: desc.ID, indexID: indexID})
 	}
-	log.Audit("constraint-ddl", "stmt", "DROP CONSTRAINT", "target", desc.Name+"."+t.DropConstraint, "principal", s.sessionUser, "role", s.user)
-	return &Result{Tag: "ALTER TABLE"}, nil
+	eff.audit("constraint-ddl", "DROP CONSTRAINT", desc.Name+"."+t.DropConstraint)
+	return nil
 }
 
 // indexWipe is an index whose entries are reclaimed once the dropping

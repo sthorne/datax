@@ -10,6 +10,7 @@ it works inside, the design docs live one level up in [`docs/`](../).
 | [Security](security.md) | Certificates, secure vs insecure mode, users, `GRANT`/`REVOKE`, Prometheus auth |
 | [SQL reference](sql.md) | Every supported statement with examples, the type table, transactions and the retry loop, bulk loading with `COPY`, follower reads, timeseries tables |
 | [Differences from PostgreSQL](postgres-differences.md) | What's missing, what behaves differently, and workarounds |
+| [Dumping and restoring with pg_dump](pg-dump.md) | PostgreSQL's `pg_dump` / `pg_restore` against datax: how, and what is and isn't carried over |
 | [Operations](operations.md) | The dashboard, metrics and alerting, backup/restore, rolling upgrades, `datax debug`, decommission, capacity planning |
 
 All examples in these pages were run against a live cluster before being

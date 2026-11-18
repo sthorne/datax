@@ -164,6 +164,30 @@ func TestJoinChains(t *testing.T) {
 	}
 }
 
+// TestJoinOnAnyCondition: JOIN ... ON takes any boolean condition (issue
+// #363). Column = column conjuncts are key candidates (On); everything
+// else is the join filter (Filter).
+func TestJoinOnAnyCondition(t *testing.T) {
+	for q, want := range map[string][2]int{ // {len(On), len(Filter)}
+		`SELECT * FROM t JOIN u ON true`:                               {0, 1},
+		`SELECT * FROM t LEFT JOIN u ON u.tid < t.id`:                  {0, 1},
+		`SELECT * FROM t RIGHT JOIN u ON t.ts BETWEEN u.lo AND u.hi`:   {0, 2},
+		`SELECT * FROM t FULL JOIN u ON u.a = t.a OR u.b = t.b`:        {0, 1},
+		`SELECT * FROM t JOIN u ON u.active`:                           {0, 1},
+		`SELECT * FROM t JOIN u ON lower(t.x) = lower(u.y)`:            {0, 1},
+		`SELECT * FROM t JOIN u ON u.id = t.id AND u.lo < t.ts`:        {1, 1},
+		`SELECT * FROM t JOIN u ON u.a = u.b`:                          {1, 0},
+		`SELECT * FROM t JOIN u ON NOT (u.a = t.a)`:                    {0, 1},
+		`SELECT * FROM t JOIN u ON u.a = t.a JOIN v ON v.x > u.a + $1`: {0, 1},
+	} {
+		sel := parseOne(t, q).(*Select)
+		j := sel.Joins[len(sel.Joins)-1]
+		if len(j.On) != want[0] || (want[1] > 0) != (len(j.Filter) > 0) {
+			t.Errorf("%s: On %+v, Filter %+v", q, j.On, j.Filter)
+		}
+	}
+}
+
 // TestJSONBPathParsing: ->/->> chains attach to column references in the
 // SELECT list and WHERE conjuncts; ->> is terminal (it yields text).
 func TestJSONBPathParsing(t *testing.T) {
@@ -363,7 +387,6 @@ func TestCopyFrom(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"COPY t TO STDOUT",
 		"COPY t FROM '/tmp/f'",
 		"COPY t FROM STDIN WITH (DELIMITER ',')",
 		"COPY t FROM STDIN WITH (FORMAT nope)",

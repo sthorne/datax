@@ -107,6 +107,33 @@ type Column struct {
 	// backfill and concurrent writers converge; the swap makes the
 	// shadow the column. Cluster version v9.
 	RetypeFrom ColumnID `json:"retype_from,omitempty"`
+	// Adding, on a hidden column, is the name of the column an ALTER
+	// TABLE ... ADD COLUMN is adding online (pkg/sql/alter_multi.go):
+	// the column is write-only — every INSERT fills it from its default,
+	// no statement reads it — under a placeholder name until the
+	// statement's last step gives it this name and makes it visible.
+	// Cluster version v22.
+	Adding string `json:"adding,omitempty"`
+	// Backfill, on such a column, marks a volatile default (random(),
+	// gen_random_uuid(), nextval): the rows that predate the column lack
+	// it, and the statement's backfill evaluates the default for each
+	// of them. A row that has the column — explicit NULLs are stored,
+	// FillDefault is set — is not touched again.
+	Backfill bool `json:"backfill,omitempty"`
+}
+
+// PendingAlter is an online ALTER TABLE in progress on the table
+// (pkg/sql/alter_multi.go): its published, write-only pieces are in the
+// descriptor, and Plan records what is left to do. A crash of the
+// gateway running it leaves it here: the table works as before, its
+// writers keep the pieces up to date, and running the same statement
+// again resumes it. Cluster version v22.
+type PendingAlter struct {
+	// Statement identifies the statement: a digest of its parsed form.
+	Statement string `json:"statement"`
+	// Plan is the statement's steps and the IDs it published, in the
+	// SQL layer's own encoding.
+	Plan []byte `json:"plan"`
 }
 
 // ValueError is a value the column's declared type refuses; Code is the
@@ -427,6 +454,13 @@ type IndexDescriptor struct {
 	// index without them.
 	OpClasses  []string `json:"opclasses,omitempty"`
 	Collations []string `json:"collations,omitempty"`
+	// Primary marks the unique index of a PRIMARY KEY added by ALTER
+	// TABLE to a table keyed by its hidden rowid (what pg_dump's restore
+	// does): the rows stay keyed by the rowid, and this index, over
+	// columns made NOT NULL, is the key the catalogs show and a foreign
+	// key without columns references. A node that does not know the
+	// field keeps it as the unique index it also is.
+	Primary bool `json:"primary,omitempty"`
 	// Exprs, when set, is parallel to ColumnIDs: the SQL text of a key
 	// that is an expression over the row's columns (lower(email),
 	// b + 1), as parser.FormatExpr renders it, and "" for a key that is
@@ -685,6 +719,9 @@ type TableDescriptor struct {
 	// dual-writes rows to NewIndexID with the bucket recomputed mod
 	// NewBuckets while the backfill copies history.
 	Reshard *ReshardState `json:"reshard,omitempty"`
+	// Alter, when non-nil, is an online ALTER TABLE in progress (see
+	// PendingAlter).
+	Alter *PendingAlter `json:"pending_alter,omitempty"`
 	// ReshardedAt is the HLC wall time of the last completed re-shard
 	// swap. Historical reads below it route through the retired layout
 	// current at their timestamp (the historical descriptor read supplies
@@ -939,6 +976,11 @@ func (d *TableDescriptor) Clone() *TableDescriptor {
 		rs := *d.Reshard
 		rs.NewIndexIDs = append([]uint64(nil), d.Reshard.NewIndexIDs...)
 		out.Reshard = &rs
+	}
+	if d.Alter != nil {
+		pa := *d.Alter
+		pa.Plan = append([]byte(nil), d.Alter.Plan...)
+		out.Alter = &pa
 	}
 	if d.RetiredLayouts != nil {
 		out.RetiredLayouts = make([]RetiredLayout, len(d.RetiredLayouts))
@@ -1622,4 +1664,15 @@ func (a *Accessor) List(ctx context.Context, txn *kvclient.Txn) ([]*TableDescrip
 		out = append(out, &d)
 	}
 	return out, nil
+}
+
+// PrimaryKeyIndex is the table's Primary unique index (a PRIMARY KEY added
+// to a rowid-keyed table), or nil.
+func (d *TableDescriptor) PrimaryKeyIndex() *IndexDescriptor {
+	for i := range d.Indexes {
+		if d.Indexes[i].Primary {
+			return &d.Indexes[i]
+		}
+	}
+	return nil
 }

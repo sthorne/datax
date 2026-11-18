@@ -247,8 +247,10 @@ func TestColumnDefaults(t *testing.T) {
 		t.Fatalf("explicit NULL opt = %+v", res.Rows[0][0])
 	}
 
-	// NOT NULL without a DEFAULT still has no value for existing rows.
-	if _, serr := trySQL(ctx, s, `ALTER TABLE cfg ADD COLUMN bad INT NOT NULL`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
+	// NOT NULL without a DEFAULT has no value for the existing rows: the
+	// rows are checked, as in PostgreSQL (issue #364), and the column is
+	// not added.
+	if _, serr := trySQL(ctx, s, `ALTER TABLE cfg ADD COLUMN bad INT NOT NULL`); serr == nil || serr.Code != sql.CodeNotNullViolation || serr.Msg != `column "bad" of relation "cfg" contains null values` {
 		t.Fatalf("NOT NULL without DEFAULT: %v", serr)
 	}
 	// Typed defaults coerce (and bad ones are rejected).

@@ -74,6 +74,9 @@ func (w *Walker) Statement(stmt Statement) {
 			w.SelectStmt(t.Query)
 		}
 	case *AlterTable:
+		for _, c := range t.Cmds {
+			w.Statement(c)
+		}
 		for _, tuple := range t.SplitAt {
 			for i := range tuple {
 				w.WalkExpr(&tuple[i])

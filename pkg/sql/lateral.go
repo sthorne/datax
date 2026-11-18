@@ -91,6 +91,9 @@ func (s *Session) lateralScope(ctx context.Context, txn *kvclient.Txn, t *parser
 	if err != nil {
 		return scopeLevel{}, err
 	}
+	if _, err := expandUsing(sides, &left); err != nil {
+		return scopeLevel{}, err
+	}
 	scope, _ := joinScope(sides)
 	return scope, nil
 }
@@ -223,7 +226,7 @@ func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []jo
 			}
 			ext := jr.extend(r)
 			if len(filter) > 0 {
-				ok, err := evalJoinWhere(sides, filter, ext, params)
+				ok, err := evalJoinWhere(sides[:k+1], filter, ext, params)
 				if err != nil {
 					return nil, err
 				}

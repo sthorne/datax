@@ -65,9 +65,27 @@ jobs:
       # skips where there is no Chrome, which is right on a laptop and
       # wrong here — the runner image ships one, and if that ever stops
       # being true the test must fail rather than quietly stop running.
+      # DATAX_REQUIRE_PGDUMP (issue #366): likewise for pg_dump,
+      # pg_restore and psql: TestPgDumpRestore must run here, not skip.
+      # It runs PostgreSQL 16's tools, the release datax is tested
+      # against; the runner image's default client is newer (18), whose
+      # catalog queries datax does not answer yet (issue #370), so the
+      # 16 client is installed beside it and DATAX_PG_DUMP names it.
+      # The runner has no PGDG apt source configured, so add it with
+      # postgresql-common's own script (it picks the release's codename)
+      # before installing the 16 client.
+      - name: PostgreSQL 16 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-16
+          /usr/lib/postgresql/16/bin/pg_dump --version
       - name: test
         env:
           DATAX_REQUIRE_BROWSER: "1"
+          DATAX_REQUIRE_PGDUMP: "1"
+          DATAX_PG_DUMP: /usr/lib/postgresql/16/bin/pg_dump
         run: |
           set -o pipefail
           go test -race -timeout 30m ${{ matrix.select }} ./pkg/testutils/testcluster/ 2>&1 | tee test.log

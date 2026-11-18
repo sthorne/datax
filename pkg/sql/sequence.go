@@ -86,7 +86,9 @@ func (s *Session) requireV7(what string) error {
 // session's database.
 func (s *Session) lookupSequence(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.SequenceDescriptor, error) {
 	db, bare := catalog.SplitTableName(name)
-	if db == "" {
+	if db == "" || db == catalog.PublicSchema {
+		// public.s names the schema, as a table's name may
+		// (pg_dump's setval('public.s', ...)).
 		db = s.database
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
@@ -196,6 +198,31 @@ func (s *Session) execAlterSequence(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 	if err := applySequenceOptions(d, &t.Options, false); err != nil {
 		return nil, err
+	}
+	switch t.Options.OwnedBy {
+	case "":
+	case "none":
+		d.OwnerTable, d.OwnerColumn = 0, 0
+	default:
+		// OWNED BY t.c (pg_dump's, after the table and the sequence
+		// exist): the sequence goes with the column. As in PostgreSQL the
+		// table must have the sequence's owner.
+		table, col, _ := strings.Cut(t.Options.OwnedBy, ".")
+		owner, err := s.lookup(ctx, txn, table)
+		if err != nil {
+			return nil, err
+		}
+		if owner.IsView() || owner.Virtual != "" {
+			return nil, newErrf(CodeWrongObjectType, "sequence cannot be owned by relation %q", table)
+		}
+		c, ok := owner.Col(col)
+		if !ok || c.Hidden {
+			return nil, newErrf(CodeUndefinedColumn, "column %q of relation %q does not exist", col, table)
+		}
+		if catalog.OwnerOf(owner.Owner) != catalog.OwnerOf(d.Owner) {
+			return nil, newErrf(CodeObjectNotInState, "sequence must have same owner as table it is linked to")
+		}
+		d.OwnerTable, d.OwnerColumn = owner.ID, c.ID
 	}
 	if err := catalog.UpdateSequence(ctx, txn, d); err != nil {
 		return nil, err

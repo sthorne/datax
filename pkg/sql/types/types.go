@@ -716,6 +716,47 @@ func PadTo(s string, n int32) string {
 	return s
 }
 
+// FormatFloat8 renders a float8 as PostgreSQL's float8out does at the
+// default extra_float_digits (1 to 3): the shortest text that reads back
+// exactly, in fixed notation when the decimal exponent of its leading
+// digit is in [-4, 15) and in scientific notation (at least two exponent
+// digits) otherwise; NaN, Infinity and -Infinity by name.
+func FormatFloat8(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	e := strconv.FormatFloat(f, 'e', -1, 64)
+	exp, err := strconv.Atoi(e[strings.LastIndexByte(e, 'e')+1:])
+	if err == nil && exp >= -4 && exp < 15 {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return e
+}
+
+// FormatFloat8Digits renders a float8 as float8out does at
+// extra_float_digits 0 and below: rounded to 15 + extra significant
+// digits, printf's %g.
+func FormatFloat8Digits(f float64, extra int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+	prec := 15 + extra
+	if prec < 1 {
+		prec = 1
+	}
+	return strconv.FormatFloat(f, 'g', prec, 64)
+}
+
 func (d Datum) Text() string {
 	if d.Null {
 		return "" // callers render NULL specially (wire: -1 length)
@@ -727,7 +768,7 @@ func (d Datum) Text() string {
 	case Int:
 		return strconv.FormatInt(d.I, 10)
 	case Float:
-		return strconv.FormatFloat(d.F, 'g', -1, 64)
+		return FormatFloat8(d.F)
 	case String:
 		if d.Pad > 0 {
 			return PadTo(d.S, d.Pad)

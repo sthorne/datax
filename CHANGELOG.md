@@ -11,6 +11,55 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **pg_dump and pg_restore** (#366): PostgreSQL 16's `pg_dump` dumps a datax
+  database and the output restores into another: plain, custom and
+  directory formats, `--schema-only` / `--data-only`, `--snapshot`, and
+  `-Fd -j N` dumps. `TestPgDumpRestore` runs the real tools in CI. On the
+  way: `LOCK TABLE` (weak modes), `PREPARE` / `EXECUTE` / `DEALLOCATE`,
+  cursors (`DECLARE` / `FETCH` / `MOVE` / `CLOSE`), `pg_export_snapshot()` /
+  `SET TRANSACTION SNAPSHOT` (over timestamped reads), `ALTER COLUMN ... ADD
+  GENERATED AS IDENTITY`, `ALTER VIEW / SCHEMA public / LARGE OBJECT ...
+  OWNER TO`, `ALTER SEQUENCE ... OWNED BY` (it was ignored), `ADD PRIMARY
+  KEY` on a table created without one, `COPY FROM` inside a transaction
+  block, ACL columns filled from grants, and `datax_*` tables listed in
+  `pg_catalog` with 32-bit OIDs. Roles are not dumped, and `pg_restore -j` is
+  not recommended yet. See docs/user/pg-dump.md.
+- **`JOIN ... ON` takes any boolean condition** (#363): `ON true`, non-equi
+  (`u.tid < t.id`, `BETWEEN`), `OR`, conditions on one side, expressions
+  (`lower(a.x) = lower(b.y)`), for `INNER`, `LEFT`, `RIGHT` and `FULL` joins,
+  in chains and beside `LATERAL`. With a usable equality the key lookup is
+  kept and the rest filters matched pairs; without one the join is a nested
+  loop over the joined table, read once (`EXPLAIN`: `fetched once, every row
+  tried`, `+ join filter`). An `ON` naming a table joined after it is
+  `42P01` / `42703`, as in PostgreSQL.
+- **Several actions in one `ALTER TABLE`** (#364), as Rails `bulk: true`,
+  Prisma and pg_dump write them: applied in order as one atomic schema
+  change (one descriptor write when only the descriptor changes, otherwise
+  one online publish and flip); a combination that cannot be atomic is
+  `0A000`, naming the action. `ALTER TABLE ONLY t` and `t *` are accepted.
+- **`ADD COLUMN` with any default** (#364): a stable expression (`now()`) is
+  evaluated once by the `ALTER`; a volatile one (`gen_random_uuid()`,
+  `random()`, `SERIAL`, identity) is backfilled per existing row online, in
+  crash-safe, resumable chunks, with `NOT NULL` and `UNIQUE` checked over
+  the rows. `ADD COLUMN ... NOT NULL` without a default works on an empty
+  table (`23502` otherwise), and a duplicate `ADD COLUMN` is `42701`.
+  Volatile defaults and row-reading actions are refused inside a
+  transaction block (`25001`).
+- **`COPY ... TO STDOUT`** (#365): `COPY t [(cols)] TO STDOUT` and `COPY
+  (query) TO STDOUT` in text, CSV and binary, over both protocols, with
+  every PostgreSQL option (`FORMAT`, `DELIMITER`, `NULL`, `HEADER`, `QUOTE`,
+  `ESCAPE`, `FORCE_QUOTE`, `ENCODING`, and the `WITH CSV HEADER` spelling);
+  the output is PostgreSQL's, byte for byte. A table streams in bounded
+  memory under one snapshot, with `SELECT` privileges and row-level security
+  applied; psql's `\copy ... to` and pgx `CopyTo` work. `TO 'file'` and `TO
+  PROGRAM` are refused (`42501`, `0A000` for admins). `COPY FROM` accepts
+  enum labels.
+- **Correlated subqueries in grouped queries** (#361): in the select list,
+  `HAVING` and `ORDER BY`, over one table or a join, they run once per
+  group; a column that is not grouped is `42803`. An ungrouped `SELECT` can
+  `ORDER BY` a correlated subquery, and a plain `UPDATE`'s `SET` can read
+  the row being updated in a subquery.
+- **Errors carry `DETAIL` and `HINT`** where datax sets them.
 - **Advisory locks** (#353): `pg_advisory_lock`, `pg_try_advisory_lock`,
   `pg_advisory_unlock`, `pg_advisory_unlock_all`, `pg_advisory_xact_lock`,
   `pg_try_advisory_xact_lock` and their `_shared` variants, keyed by one
@@ -1674,6 +1723,31 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Catalog values pg_dump reads** (#366): a table whose only index is its
+  primary key reported `relhasindex` false, so a dump lost the key;
+  `pg_get_viewdef` lacked the trailing `;`, so pg_dump cut the view's last
+  character (`price < 10` became `price < 1`); `format_type` dropped the
+  typmod; a policy's `USING` clause was lost; `set_config` over
+  `pg_settings` ran once instead of per row.
+- **A correlated subquery bound a table's name hidden by its alias**
+  (#361): `SELECT grp, (SELECT count(*) FROM ev e2 WHERE e2.grp = ev.grp)
+  FROM ev GROUP BY grp` counted the whole table, the inner `ev` answering to
+  `ev.`. An aliased `FROM` item now answers only to its alias, as in
+  PostgreSQL, and the name behind it is `42P01 invalid reference to
+  FROM-clause entry`, with PostgreSQL's hint. The same rule fixed `ORDER BY`
+  a correlated subquery or its alias, an `UPDATE` whose `SET` subquery reads
+  the row, and queries PostgreSQL rejects that datax accepted; an ambiguous
+  outer reference is `42702` (was `42703`).
+- **A `FROM`-less `SELECT` ignored its `WHERE`**: `SELECT 1 WHERE false`
+  returned a row, so `EXISTS (SELECT 1 WHERE ...)` was always true.
+- **Float output is PostgreSQL's** (#365): fixed notation up to 1e15
+  (`123456789.125`, not `1.23456789125e+08`) and `Infinity` / `-Infinity`;
+  `extra_float_digits` 0 and below rounds; binary `NaN` has PostgreSQL's bit
+  pattern.
+- **Joins** (#363): an `ON` equality in a correlated subquery that reads the
+  enclosing row failed with `42P01`; `x = a.col OR x = b.col` across joined
+  tables failed with `42703`; a `RIGHT` or `FULL` join from an always-empty
+  catalog table returned no rows.
 - **A statement no longer plans against a schema a drain has written
   off.** A gateway's lease renewal published the new version, and a
   schema change's drain returned on seeing it, a moment before the

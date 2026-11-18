@@ -22,13 +22,15 @@ import (
 // AST is never mutated — resolution builds modified copies — so a prepared
 // statement re-evaluates its subqueries on every execution.
 
-// execSubSelect executes a subquery. A column that fails to resolve inside
-// the subquery's own scope is (almost always) a correlated reference,
-// which is not supported.
+// execSubSelect executes a subquery. A column or qualifier that fails to
+// resolve inside the subquery's own scope is (almost always) a
+// correlated reference of a shape the correlation analysis does not
+// cover, which is not supported. (Covered shapes resolve every name
+// before they run: a genuine typo there is reported as such.)
 func (s *Session) execSubSelect(ctx context.Context, txn *kvclient.Txn, sub *parser.Select, params []types.Datum) (*Result, error) {
 	res, err := s.execSelect(ctx, txn, sub, params)
 	if err != nil {
-		if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedColumn {
+		if serr, ok := err.(*Error); ok && (serr.Code == CodeUndefinedColumn || serr.Code == CodeUndefinedTable && strings.Contains(serr.Msg, "FROM-clause entry")) {
 			return nil, newErrf(CodeFeatureNotSupported, "correlated subqueries are not supported (%s)", serr.Msg)
 		}
 		return nil, err
@@ -203,6 +205,22 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		if len(e.Args) != 3 {
 			return e, newErrf(CodeSyntaxError, "set_config() takes a name, a value and is_local")
 		}
+		if exprHasColumn(e.Args[0]) || exprHasColumn(e.Args[1]) || exprHasColumn(e.Args[2]) {
+			// Arguments read from the row (pg_dump's set_config(name,
+			// ...) FROM pg_settings WHERE name = ...): SET once per
+			// row, through a closure evalFunc calls.
+			args := make([]parser.Expr, len(e.Args))
+			for i, a := range e.Args {
+				r, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
+				if err != nil {
+					return e, err
+				}
+				args[i] = r
+			}
+			return s.registerRowFunc(func(vals []types.Datum) (types.Datum, error) {
+				return s.setConfig(ctx, vals)
+			}, args), nil
+		}
 		var vals [3]types.Datum
 		for i := range vals {
 			d, err := evalExpr(e.Args[i], nil, nil, params)
@@ -211,21 +229,10 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			}
 			vals[i] = d
 		}
-		if vals[0].Null {
-			return e, newErrf(CodeInvalidParameterValue, "set_config: the setting's name is NULL")
+		d, err := s.setConfig(ctx, vals[:])
+		if err != nil {
+			return e, err
 		}
-		value := ""
-		if !vals[1].Null {
-			value = vals[1].Text()
-		}
-		local, cerr := vals[2].Coerce(types.Bool)
-		if cerr != nil {
-			return e, newErrf(CodeInvalidTextRepresentation, "set_config: is_local: %v", cerr)
-		}
-		if _, serr := s.execSetVar(ctx, &parser.SetVar{Name: vals[0].Text(), Value: value, Local: !local.Null && local.B}); serr != nil {
-			return e, serr
-		}
-		d := types.NewString(value)
 		out.Func, out.Args, out.Lit = "", nil, &d
 	case "pg_sleep":
 		// pg_sleep(seconds): waits, honoring cancellation and the
@@ -316,6 +323,15 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			return e, err
 		}
 		out.Func, out.Args, out.Lit, out.Case = "", nil, r.Lit, r.Case
+	case "pg_export_snapshot":
+		id, err := s.evalExportSnapshot(txn)
+		if err != nil {
+			return e, err
+		}
+		d := types.NewString(id)
+		out.Func, out.Args, out.Lit = "", nil, &d
+	case "acldefault":
+		return s.spliceACLDefault(ctx, txn, e, params, keepVolatile)
 	case "pg_get_userbyid":
 		// Every object is owned by root (there is no ownership yet).
 		d := types.NewString("root")
@@ -383,8 +399,8 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			}
 			d := types.DNull
 			if e.Func == "pg_get_viewdef" {
-				if desc, rerr := catalog.ReadTable(ctx, txn, uint64(oid)); rerr == nil && desc != nil && desc.IsView() {
-					d = types.NewString(desc.ViewQuery)
+				if desc, rerr := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); rerr == nil && desc != nil && desc.IsView() {
+					d = types.NewString(vtable.ViewDef(desc.ViewQuery))
 				}
 			} else if text := s.descriptionOf(ctx, txn, oid, e); text != "" {
 				d = types.NewString(text)
@@ -400,7 +416,24 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			if i := strings.LastIndexByte(e.Args[0].Column, '.'); i >= 0 {
 				prefix = e.Args[0].Column[:i+1]
 			}
-			out.Func, out.Args, out.Column = "", nil, prefix+vtable.HiddenColumnFor(e.Func)
+			hidden := vtable.HiddenColumnFor(e.Func)
+			switch _, bare := splitQualified(e.Args[0].Column); {
+			case e.Func == "format_type":
+				// format_type(t.oid, a.atttypmod) (pg_dump's, over pg_type
+				// joined to pg_attribute on the type): the typmod's row
+				// renders the type with it.
+				if i := strings.LastIndexByte(e.Args[1].Column, '.'); i >= 0 {
+					prefix = e.Args[1].Column[:i+1]
+				} else {
+					prefix = ""
+				}
+			case e.Func == "pg_get_expr" && (bare == "polqual" || bare == "polwithcheck"):
+				// A policy's expressions are kept as their SQL text: the
+				// column is its own rendering (two per row, so no one
+				// hidden column can stand for both).
+				hidden = bare
+			}
+			out.Func, out.Args, out.Column = "", nil, prefix+hidden
 		}
 	}
 	if e.Left != nil {
@@ -884,6 +917,34 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 	if len(where) > 0 && &where[0] != &t.Where[0] {
 		cloned().Where = where
+	}
+	// A join's ON conjuncts beyond its key equalities resolve as WHERE's
+	// do (pg_dump's d.classid = 'pg_class'::regclass in a LEFT JOIN),
+	// all but those holding a subquery, which the join evaluates per
+	// candidate row.
+	for i, j := range t.Joins {
+		var f []parser.Comparison
+		for k, cmp := range j.Filter {
+			if cmp.Sub != nil || len(cmp.Or) > 0 || exprHasSubquery(cmp.Value) || cmp.Expr != nil && exprHasSubquery(*cmp.Expr) || !s.cmpNeedsResolve(cmp) {
+				continue
+			}
+			r, err := s.resolveWhereSubs(ctx, txn, []parser.Comparison{cmp}, params)
+			if err != nil {
+				return nil, err
+			}
+			if f == nil {
+				f = append([]parser.Comparison(nil), j.Filter...)
+			}
+			f[k] = r[0]
+		}
+		if f == nil {
+			continue
+		}
+		c := cloned()
+		if len(c.Joins) > 0 && &c.Joins[0] == &t.Joins[0] {
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+		}
+		c.Joins[i].Filter = f
 	}
 
 	for i, se := range t.Exprs {
@@ -1460,7 +1521,7 @@ func (s *Session) execMaterialized(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 
 	if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
-		return s.execGroupedOver(desc, rows, t, params)
+		return s.execGroupedOver(desc, rows, t, params, nil)
 	}
 	if len(t.Having) > 0 {
 		return nil, newErrf(CodeGrouping, "HAVING requires GROUP BY or aggregate functions")
@@ -1528,7 +1589,7 @@ var splicedFuncs = map[string]bool{
 	"pg_encoding_to_char": true, "obj_description": true, "col_description": true, "shobj_description": true,
 	"array_to_string": true, "pg_get_viewdef": true, "current_schemas": true, "current_setting": true, "set_config": true, "pg_get_triggerdef": true,
 	"format_type": true, "pg_get_indexdef": true, "pg_get_constraintdef": true, "pg_get_expr": true,
-	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true,
+	"pg_get_statisticsobjdef_columns": true, "pg_relation_is_publishable": true, "array": true, "acldefault": true, "pg_export_snapshot": true,
 	"nextval": true, "currval": true, "lastval": true, "setval": true, "unique_rowid": true, "gen_random_uuid": true, "uuid_generate_v4": true,
 	// The text-search functions take the session's default
 	// configuration when the call names none.
@@ -1558,9 +1619,9 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 // (oid, attnum) for a literal OID: a table's, an index's or a column's
 // COMMENT ("" when none).
 func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int64, e parser.Expr) string {
-	tableID, indexID := uint64(oid), uint64(0)
+	tableID, indexID := vtable.TableIDOfOID(oid), uint64(0)
 	if oid>>16 != 0 {
-		tableID, indexID = uint64(oid>>16), uint64(oid&0xffff)
+		tableID, indexID = vtable.TableIDOfOID(oid>>16), uint64(oid&0xffff)
 	}
 	desc, err := catalog.ReadTable(ctx, txn, tableID)
 	if err != nil || desc == nil {
