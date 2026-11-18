@@ -931,6 +931,64 @@ func substituteConds(conds []parser.Comparison, node *scopeNode, row map[catalog
 				return nil, err
 			}
 			*cmp = parser.Comparison{Op: constOp(match)}
+		case "IN", "NOT IN":
+			if cmp.Sub != nil {
+				return nil, newErrf(CodeFeatureNotSupported, "correlated reference on the left of %s is not supported", cmp.Op)
+			}
+			// outer.x IN (a, b, ...) — what (outer.x = t.a OR outer.x =
+			// t.b) parses to (pg_dump's pg_transform probe) — is the OR
+			// of other_col = <literal> (or a constant) per value; NOT IN
+			// the AND of !=. A NULL on the left matches nothing.
+			if lhs.Null {
+				*cmp = parser.Comparison{Op: "FALSE"}
+				break
+			}
+			op := "="
+			if cmp.Op == "NOT IN" {
+				op = "!="
+			}
+			var conds []parser.Comparison
+			for _, v := range cmp.Values {
+				lit := lhs
+				var rhs types.Datum
+				if v.Column != "" && v.BinOp == "" && v.Cast == "" {
+					vl, err := node.scope.classify(v.Column)
+					if err != nil {
+						return nil, err
+					}
+					switch vl {
+					case 0:
+						col := v.Column
+						if len(node.scope.more) == 0 {
+							_, col = splitQualified(col)
+						}
+						conds = append(conds, parser.Comparison{Column: col, Op: op, Value: parser.Expr{Lit: &lit}})
+						continue
+					case bind:
+						rhs = node.scope.bindDatum(v.Column, row)
+					default:
+						return nil, newErrf(CodeFeatureNotSupported, "correlated reference on the left of %s is not supported", cmp.Op)
+					}
+				} else if d, err := evalExpr(v, nil, nil, params); err != nil {
+					return nil, err
+				} else {
+					rhs = d
+				}
+				match, err := compareDatums(lhs, op, rhs)
+				if err != nil {
+					return nil, err
+				}
+				conds = append(conds, parser.Comparison{Op: constOp(match)})
+			}
+			if op == "=" {
+				or := make([][]parser.Comparison, len(conds))
+				for i := range conds {
+					or[i] = conds[i : i+1]
+				}
+				*cmp = parser.Comparison{Or: or}
+			} else {
+				*cmp = parser.Comparison{Or: [][]parser.Comparison{conds}}
+			}
 		default:
 			return nil, newErrf(CodeFeatureNotSupported, "correlated reference on the left of %s is not supported", cmp.Op)
 		}

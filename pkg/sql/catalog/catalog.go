@@ -454,6 +454,13 @@ type IndexDescriptor struct {
 	// index without them.
 	OpClasses  []string `json:"opclasses,omitempty"`
 	Collations []string `json:"collations,omitempty"`
+	// Primary marks the unique index of a PRIMARY KEY added by ALTER
+	// TABLE to a table keyed by its hidden rowid (what pg_dump's restore
+	// does): the rows stay keyed by the rowid, and this index, over
+	// columns made NOT NULL, is the key the catalogs show and a foreign
+	// key without columns references. A node that does not know the
+	// field keeps it as the unique index it also is.
+	Primary bool `json:"primary,omitempty"`
 	// Exprs, when set, is parallel to ColumnIDs: the SQL text of a key
 	// that is an expression over the row's columns (lower(email),
 	// b + 1), as parser.FormatExpr renders it, and "" for a key that is
@@ -1657,4 +1664,15 @@ func (a *Accessor) List(ctx context.Context, txn *kvclient.Txn) ([]*TableDescrip
 		out = append(out, &d)
 	}
 	return out, nil
+}
+
+// PrimaryKeyIndex is the table's Primary unique index (a PRIMARY KEY added
+// to a rowid-keyed table), or nil.
+func (d *TableDescriptor) PrimaryKeyIndex() *IndexDescriptor {
+	for i := range d.Indexes {
+		if d.Indexes[i].Primary {
+			return &d.Indexes[i]
+		}
+	}
+	return nil
 }

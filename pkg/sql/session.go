@@ -150,8 +150,11 @@ const (
 
 // Session executes statements for one client connection.
 type Session struct {
-	db  *kvclient.DB
-	cat *catalog.Accessor
+	// rowFuncIDs are the per-row closures this session registered for
+	// its current statement (registerRowFunc).
+	rowFuncIDs []int64
+	db         *kvclient.DB
+	cat        *catalog.Accessor
 	// scanned counts the KV rows this session's current statement has
 	// read, so the cost of a full scan is attributable to the statement
 	// shape that caused it rather than only to a cluster-wide counter
@@ -389,7 +392,13 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		if vt, ok := vtable.Lookup(name); ok {
 			return vt.Descriptor(), nil
 		}
-		return nil, &catalog.ErrTableNotFound{Name: name}
+		if db != vtable.PgCatalog || !catalog.IsSystemTable(bare) {
+			return nil, &catalog.ErrTableNotFound{Name: name}
+		}
+		// pg_catalog.datax_metrics: the cluster's own tables are listed
+		// in pg_catalog (pg_class), so they answer to that name too
+		// (pg_dump's GRANT ... ON TABLE pg_catalog.datax_metrics).
+		name = bare
 	}
 	// A descriptor this transaction's DDL wrote is read through the
 	// transaction and never cached: the cache is shared with other
@@ -691,6 +700,7 @@ func (s *Session) Close(ctx context.Context) {
 	}
 	s.discardNotify()
 	s.advisoryClose()
+	s.releaseRowFuncs()
 	s.state = StateIdle
 }
 
@@ -698,6 +708,7 @@ func (s *Session) Close(ctx context.Context) {
 // under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
 	params = s.zoneParams(params)
+	s.releaseRowFuncs()
 	s.stmtNow = 0
 	s.memUsed = 0
 	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
@@ -1633,7 +1644,7 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		if args[0].Null {
 			return types.DNull, nil
 		}
-		return types.NewString(`"` + strings.ReplaceAll(args[0].Text(), `"`, `""`) + `"`), nil
+		return types.NewString(quoteIdentifier(args[0].Text())), nil
 	case "pg_typeof":
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
 	case "to_regtype":
@@ -1677,6 +1688,8 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		"pg_get_function_result", "pg_get_function_arguments", "pg_get_function_identity_arguments",
 		"pg_get_functiondef", "pg_get_triggerdef", "pg_get_ruledef":
 		return types.DNull, nil
+	case rowSessionFunc:
+		return callRowFunc(args)
 	case unrecognizedSettingFunc:
 		// current_setting(name [, missing_ok]) per row, for a name that
 		// is none of the session's settings: NULL for a NULL name or
