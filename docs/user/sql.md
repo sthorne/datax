@@ -2394,8 +2394,68 @@ query. A replica with zeros in `garbage_versions`, `tombstones` and
 - It costs a compaction of the table on every replica. Use it for the
   account-deletion case, not after every `DELETE`.
 - Not inside `BEGIN`; needs table ownership and cluster version v21. A
-  key range rather than a table: `datax debug purge`
+  raw key range rather than a table: `datax debug purge`
   ([operations guide](operations.md#purging-deleted-data)).
+
+**Purging one key prefix: `PURGE WHERE`.** When one tenant's data must
+go, purging the whole table cuts off every tenant's older readers.
+`PURGE WHERE` purges only the rows a primary-key prefix or range names:
+
+```sql
+-- PRIMARY KEY (tenant, id)
+DELETE FROM documents WHERE tenant = 'acme';
+ALTER TABLE documents PURGE WHERE tenant = 'acme';
+
+-- PRIMARY KEY (a, b, c)
+ALTER TABLE t PURGE WHERE (a, b) = (1, 2);
+ALTER TABLE t PURGE WHERE a = 1 AND b BETWEEN 10 AND 20;
+ALTER TABLE t PURGE WHERE a = $1 AND b >= $2 AND b < $3;
+```
+
+The predicate is an equality on the leading primary-key columns
+(`a = 1 AND b = 2`, or `(a, b) = (1, 2)`), optionally followed by one
+range on the next column (`BETWEEN`, `<`, `<=`, `>`, `>=`, either way
+round), with constants or parameters as values. It is turned into key
+spans, never evaluated row by row. Anything else is refused, with a hint
+that names the table's primary key:
+
+| Predicate | SQLSTATE |
+|---|---|
+| a column outside the primary key, or a key column after one with no equality (`WHERE id = 1` on `(tenant, id)`) | `42P10` |
+| `OR`, `IN`, `<>`, `LIKE`, `IS NULL`, a function or expression on either side, a subquery | `0A000` |
+| a value the key column cannot hold exactly (`id = 1.5` on an integer), `NULL`, an empty range | `22023` (`22P02` for text that does not parse as the type) |
+| a column that does not exist | `42703` |
+
+What it covers:
+
+- **The rows**: only the named span of the primary index. Its ranges are
+  split at the span's ends, as for a whole-table purge, and only those
+  ranges' GC threshold rises. `AS OF SYSTEM TIME` before the purge, and
+  a transaction that began before it, are refused for the purged keys
+  (`72000`, `40001`); every other key of the table keeps its history.
+- **Secondary indexes** keep the same guarantee for the purged rows' old
+  versions, as narrowly as their keys allow. An index whose key begins
+  with the primary-key columns the predicate names (an index on
+  `(tenant, created_at)` for `WHERE tenant = 'acme'`) is purged over the
+  same prefix only. Any other index — keyed by other columns or by an
+  expression, inverted, vector — cannot be narrowed to those rows, so it
+  is purged **whole**, as `ALTER TABLE ... PURGE` purges it: the purged
+  rows' entries are gone, and older reads through that index are cut
+  off for every key. A `NOTICE` names each index purged wider than the
+  predicate. To keep a per-tenant purge narrow, lead secondary indexes
+  with the tenant column. The same holds for the table's other keys (a
+  vector index's centres, a layout an online re-shard or `ALTER` is
+  writing): they are purged whole.
+- **A sharded time-series table** is purged one span per shard bucket
+  (one, when the whole key is named).
+- **Split points stay.** The splits at the span's ends are ordinary,
+  not `SPLIT AT` boundaries: the merge queue folds the ranges back into
+  their neighbours once the neighbours' own window has passed the purge
+  (a merged range adopts the higher GC threshold, so it waits rather
+  than cut off history early). Nothing needs `UNSPLIT`.
+- The report and tag are a whole-table purge's, over all the spans; the
+  node's audit log and operations view record one `purge` per span. As
+  for `PURGE`: not inside `BEGIN`, table ownership, cluster version v21.
 
 ## Parameters
 

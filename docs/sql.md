@@ -16,7 +16,8 @@ CREATE TABLE t (col TYPE [NOT NULL], ..., PRIMARY KEY (col, ...))
 ALTER TABLE t SET (shards = M)          -- online re-shard of a sharded timeseries table
 ALTER TABLE [IF EXISTS] t SET (gc_ttl = ... | ttl_expiration = col | ttl_column = col | ttl = '...' | retention = '...')
 ALTER TABLE [IF EXISTS] t RESET (gc_ttl | ttl | ttl_column | ttl_expiration | retention [, ...])
-ALTER TABLE [IF EXISTS] t PURGE         -- collect the table's garbage now, compact it away, report per replica
+ALTER TABLE [IF EXISTS] t PURGE [WHERE pk-prefix [AND range on the next pk column]]
+                                        -- collect the table's (or one key prefix's) garbage now, compact it away, report per replica
 ALTER TABLE [IF EXISTS] t ADD | DROP COLUMN ... | RENAME TO t2 | RENAME [COLUMN] a TO b | RENAME CONSTRAINT a TO b
     | ALTER [COLUMN] c SET DEFAULT v | DROP DEFAULT | SET NOT NULL | DROP NOT NULL | ADD | DROP | VALIDATE CONSTRAINT ...
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] i ON t [USING btree] (cols)  /  DROP INDEX [IF EXISTS] i  /  ALTER INDEX i RENAME TO j
@@ -325,6 +326,31 @@ the job deletes it: there is no filter on reads.
 `compacted`, `status`. The tag is `PURGE <versions removed>` when every
 replica answered clean and `PURGE INCOMPLETE` otherwise — the statement
 succeeds either way, because the rows are the result.
+
+**`PURGE WHERE`** (issue #375; `pkg/sql/purge_where.go`) turns the
+predicate into key spans and purges each in turn through the same path,
+merging the reports. The parser keeps the predicate as conjuncts (a row
+equality `(a, b) = (1, 2)` lowered to `a = 1 AND b = 2`); the executor
+accepts an equality on each leading primary-key column (after the hidden
+`_shard` column of a sharded table) and at most one lower and one upper
+bound on the next, with literal or parameter values that the column's
+type holds exactly, and refuses anything else (`42P10` for a column that
+is not the next key column, `0A000` for an unsupported shape, `22023`
+for an inexact, NULL or empty bound) with a hint naming the key. The
+primary index contributes the prefix span (one per shard bucket unless
+the whole logical key is named, when the bucket is computed). A
+secondary index contributes its own prefix span when its leading key
+columns are those primary-key columns (ordinary or unique, partial
+allowed; not expression keys, inverted or vector indexes), using the
+equalities it matches and the range when it continues with the range
+column. The spans purged are the table's whole data span less, for the
+primary index and each narrowed index, the parts outside its prefix
+span: whatever cannot be narrowed — other indexes, the auxiliary index
+0, a re-shard's or online ALTER's other layout — is purged whole, so the
+purged rows' old versions are gone from every index. A NOTICE names
+each index purged wider than the predicate. The purge's own splits are
+not sticky; `Store.mergeWouldHideHistory` keeps them until the
+neighbours' window has passed the purge.
 
 `SET`, `RESET` and `PURGE` run outside a transaction block (`25001`
 inside one) and need table ownership.
