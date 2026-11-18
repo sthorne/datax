@@ -37,3 +37,27 @@ func TestResolveMaxStaleness(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveMinTimestamp (CR-AOST-001): with_min_timestamp reads at the
+// freshest locally servable timestamp, never older than its bound, and
+// refuses a bound in the future; follower_read_timestamp() is a fixed
+// lag behind now.
+func TestResolveMinTimestamp(t *testing.T) {
+	now := hlc.Timestamp{WallTime: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC).UnixNano()}
+	min := time.Date(2026, 11, 18, 11, 59, 50, 0, time.UTC)
+	fresh := now.AddNanos(-int64(time.Second))
+	if ts, err := resolveMinTimestamp(min.Format(time.RFC3339Nano), now, fresh); err != nil || ts != fresh {
+		t.Fatalf("fresh local: %v %v", ts, err)
+	}
+	if ts, err := resolveMinTimestamp("2026-11-18 11:59:50+00", now, hlc.Timestamp{}); err != nil || ts.WallTime != min.UnixNano() {
+		t.Fatalf("PostgreSQL timestamp text, no local: %v %v", ts, err)
+	}
+	for _, bad := range []string{"2026-11-18T13:00:00Z", "yesterday", ""} {
+		if _, err := resolveMinTimestamp(bad, now, fresh); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+	if ts, err := resolveAsOf("follower_read_timestamp()", now); err != nil || ts != now.AddNanos(-FollowerReadLag.Nanoseconds()) {
+		t.Fatalf("follower_read_timestamp(): %v %v", ts, err)
+	}
+}

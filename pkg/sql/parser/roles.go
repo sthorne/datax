@@ -1,6 +1,9 @@
 package parser
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // Roles, ownership and privilege scopes (issue #98).
 
@@ -119,10 +122,44 @@ func (p *parser) parseRoleStmt(alter bool) (Statement, error) {
 			set(&cr.BypassRLS, true)
 		case "nobypassrls":
 			set(&cr.BypassRLS, false)
-		case "nosuperuser", "nocreatedb", "nocreaterole", "noreplication":
-			// The defaults, which tools spell out; nothing to record.
-		case "superuser", "createdb", "createrole", "replication", "connection", "valid", "sysid", "role", "admin":
-			return nil, p.errf("role option %s is not supported (roles: LOGIN, NOLOGIN, PASSWORD, INHERIT, NOINHERIT, BYPASSRLS, NOBYPASSRLS, IN ROLE)", strings.ToUpper(word))
+		case "superuser":
+			set(&cr.Superuser, true)
+		case "nosuperuser":
+			set(&cr.Superuser, false)
+		case "createdb":
+			set(&cr.CreateDB, true)
+		case "nocreatedb":
+			set(&cr.CreateDB, false)
+		case "createrole":
+			set(&cr.CreateRole, true)
+		case "nocreaterole":
+			set(&cr.CreateRole, false)
+		case "replication":
+			set(&cr.Replication, true)
+		case "noreplication":
+			set(&cr.Replication, false)
+		case "connection":
+			if !p.consumeWord("limit") {
+				return nil, p.errf("expected LIMIT after CONNECTION")
+			}
+			n, err := p.parseSignedInt("CONNECTION LIMIT")
+			if err != nil {
+				return nil, err
+			}
+			cr.ConnLimit = &n
+		case "valid":
+			if !p.consumeIdentWord("until") {
+				return nil, p.errf("expected UNTIL after VALID")
+			}
+			vt := p.peek()
+			if vt.kind != tkString {
+				return nil, p.errf("VALID UNTIL takes a quoted timestamp, found %q", vt.text)
+			}
+			p.i++
+			v := vt.text
+			cr.ValidUntil = &v
+		case "sysid", "role", "admin":
+			return nil, p.errf("role option %s is not supported (use GRANT role TO role for membership)", strings.ToUpper(word))
 		default:
 			return nil, p.errf("unexpected %q in role options", t.text)
 		}
@@ -495,4 +532,23 @@ func (p *parser) parseAlterDefaultPrivileges() (Statement, error) {
 		p.consumeWord("restrict")
 	}
 	return adp, nil
+}
+
+// parseSignedInt parses an optionally negative integer literal (CONNECTION
+// LIMIT -1).
+func (p *parser) parseSignedInt(what string) (int64, error) {
+	neg := p.consumeOp("-")
+	t := p.peek()
+	if t.kind != tkNumber {
+		return 0, p.errf("%s takes an integer, found %q", what, t.text)
+	}
+	n, err := strconv.ParseInt(t.text, 10, 32)
+	if err != nil {
+		return 0, p.errf("%s takes an integer, found %q", what, t.text)
+	}
+	p.i++
+	if neg {
+		n = -n
+	}
+	return n, nil
 }

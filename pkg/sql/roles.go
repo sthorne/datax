@@ -7,12 +7,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/log"
 )
 
@@ -84,7 +86,10 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := reservedRoleName(name); err != nil {
 		return nil, err
 	}
-	selfPassword := t.Alter && name == s.user && t.Login == nil && t.Inherit == nil && t.BypassRLS == nil && len(t.InRoles) == 0 && t.Password != nil && *t.Password != ""
+	// A role may change its own password and nothing else: every
+	// attribute (SUPERUSER, CREATEDB, VALID UNTIL, ...) is an admin's to
+	// set, so the statement must carry the password alone.
+	selfPassword := t.Alter && name == s.user && t.Password != nil && *t.Password != "" && !roleAttributesSpelled(t)
 	if !selfPassword {
 		if err := s.checkAdmin(ctx, txn); err != nil {
 			return nil, err
@@ -131,6 +136,9 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 		d.BypassRLS = *t.BypassRLS
 	}
+	if err := applyRoleAttributes(d, t); err != nil {
+		return nil, err
+	}
 	if t.Password != nil {
 		if *t.Password == "" {
 			if name == catalog.RootRole {
@@ -159,15 +167,93 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 		return nil, err
 	}
 	s.invalidateRoles()
-	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "bypassrls", d.BypassRLS, "principal", s.sessionUser, "role", s.user)
+	superuser, _ := d.IsMemberOf(catalog.AdminRole)
+	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "bypassrls", d.BypassRLS, "superuser", superuser, "createdb", d.CreateDB,
+		"connlimit", d.ConnectionLimit(), "valid_until", d.ValidUntil, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: tag}, nil
+}
+
+// roleAttributesSpelled reports whether CREATE / ALTER ROLE names any
+// attribute besides the password.
+func roleAttributesSpelled(t *parser.CreateRole) bool {
+	return t.Login != nil || t.Inherit != nil || t.BypassRLS != nil || len(t.InRoles) > 0 ||
+		t.Superuser != nil || t.CreateDB != nil || t.CreateRole != nil || t.Replication != nil ||
+		t.ConnLimit != nil || t.ValidUntil != nil
+}
+
+// applyRoleAttributes sets SUPERUSER, CREATEDB, CREATEROLE, REPLICATION,
+// CONNECTION LIMIT and VALID UNTIL on d (PG-S-001). The caller is an
+// admin: only an admin reaches here with any of them spelled.
+//
+// SUPERUSER is datax's admin: the attribute is membership in the
+// built-in admin role, as GRANT admin TO r makes it, and NOSUPERUSER
+// takes that membership away. root stays a superuser whatever is said.
+func applyRoleAttributes(d *catalog.RoleDescriptor, t *parser.CreateRole) error {
+	if t.Superuser != nil {
+		if *t.Superuser {
+			d.AddMembership(catalog.AdminRole, false)
+		} else {
+			if d.Name == catalog.RootRole {
+				return newErrf(CodeFeatureNotSupported, "root is always a superuser")
+			}
+			d.RemoveMembership(catalog.AdminRole, false)
+		}
+	}
+	if t.CreateDB != nil {
+		d.CreateDB = *t.CreateDB
+	}
+	if t.CreateRole != nil {
+		d.CreateRole = *t.CreateRole
+	}
+	if t.Replication != nil {
+		d.Replication = *t.Replication
+	}
+	if t.ConnLimit != nil {
+		n := *t.ConnLimit
+		if n < -1 {
+			return newErrf(CodeInvalidParameterValue, "invalid connection limit: %d", n)
+		}
+		if n == -1 {
+			d.ConnLimit = nil
+		} else {
+			d.ConnLimit = &n
+		}
+	}
+	if t.ValidUntil != nil {
+		v, err := parseValidUntil(*t.ValidUntil)
+		if err != nil {
+			return err
+		}
+		if d.Name == catalog.RootRole && v != "infinity" {
+			// As with NOLOGIN and PASSWORD NULL: the bootstrap
+			// credential cannot be made to lapse.
+			return newErrf(CodeFeatureNotSupported, "root's password cannot expire (VALID UNTIL 'infinity' only)")
+		}
+		d.ValidUntil = v
+	}
+	return nil
+}
+
+// parseValidUntil reads a VALID UNTIL operand: a timestamp with time
+// zone (UTC when the text has none), infinity or -infinity.
+func parseValidUntil(text string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(text)); v {
+	case "infinity", "-infinity":
+		return v, nil
+	}
+	nanos, err := types.ParseTimestamp(strings.TrimSpace(text))
+	if err != nil {
+		return "", newErrf("22007", `invalid input syntax for type timestamp with time zone: "%s"`, text)
+	}
+	return time.Unix(0, nanos).UTC().Format(time.RFC3339Nano), nil
 }
 
 // execCreateRoleLegacy is the pre-v11 form: a login user with a
 // password, written to the old layout so every node can authenticate it.
 func (s *Session) execCreateRoleLegacy(ctx context.Context, txn *kvclient.Txn, t *parser.CreateRole, name, tag string) (*Result, error) {
-	if t.Login != nil && !*t.Login || t.Inherit != nil || t.BypassRLS != nil && *t.BypassRLS || len(t.InRoles) > 0 || !t.IsUser && t.Login == nil || t.Password != nil && *t.Password == "" {
-		return nil, s.requireV11("roles (NOLOGIN, INHERIT, IN ROLE, PASSWORD NULL)")
+	if t.Login != nil && !*t.Login || t.Inherit != nil || t.BypassRLS != nil && *t.BypassRLS || len(t.InRoles) > 0 || !t.IsUser && t.Login == nil || t.Password != nil && *t.Password == "" ||
+		t.Superuser != nil || t.CreateDB != nil || t.CreateRole != nil || t.Replication != nil || t.ConnLimit != nil || t.ValidUntil != nil {
+		return nil, s.requireV11("roles (NOLOGIN, INHERIT, IN ROLE, PASSWORD NULL, role attributes)")
 	}
 	key := keys.UserKey(name)
 	existing, err := txn.Get(ctx, key)

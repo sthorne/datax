@@ -103,6 +103,10 @@ CREATE ROLE etl WITH LOGIN PASSWORD '...' NOINHERIT;      -- privileges only via
 ALTER ROLE analyst PASSWORD 'rotated';                    -- a role may change its own password
 ALTER ROLE etl NOLOGIN;                                   -- lock out; LOGIN reopens
 ALTER ROLE auditor BYPASSRLS;                             -- exempt from row-level security; NOBYPASSRLS undoes it
+CREATE ROLE ops LOGIN SUPERUSER;                          -- = GRANT admin TO ops; NOSUPERUSER revokes it
+ALTER ROLE builder CREATEDB;                              -- may CREATE DATABASE without admin
+ALTER ROLE contractor VALID UNTIL '2027-01-01';           -- its password stops working then
+ALTER ROLE batch CONNECTION LIMIT 10;                     -- sessions per node; -1: no limit
 DROP ROLE analyst;                                        -- refused (2BP01) while it owns objects
 
 GRANT app_readers TO analyst;                             -- membership
@@ -144,7 +148,25 @@ take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
 the sequence — a `SERIAL` column's sequence follows `INSERT` on the
 table; `EXPLAIN` takes `SELECT` on every table the statement reads, as
 running it would, and `SHOW STATS FOR t` takes `SELECT` on `t`;
-`CREATE DATABASE`, role management and `ANALYZE` take the admin role.
+`CREATE DATABASE` takes the admin role or the `CREATEDB` attribute;
+role management and `ANALYZE` take the admin role.
+
+**Role attributes.** Only an admin sets one, on any role; a role may
+change its own password and nothing else (`ALTER ROLE me PASSWORD
+'...' SUPERUSER` is refused whole, `42501`). `SUPERUSER` is membership
+in `admin`, so it is everything `admin` is, and `NOSUPERUSER` revokes
+the membership (`root` keeps it). `CREATEDB` lets the role create
+databases, owned by itself or by a role it belongs to; like
+PostgreSQL's it is the role's own attribute, not inherited through
+membership. `CREATEROLE` and `REPLICATION` are recorded for the
+catalogs (`pg_roles`, `pg_authid`) and grant nothing. `VALID UNTIL`
+ends a role's password logins at that time — the attempt fails as a
+wrong password does — but not its certificate logins, as PostgreSQL
+applies it to passwords only; `root` cannot be given one.
+`CONNECTION LIMIT` caps the role's sessions on each node (`53300`),
+admins exempt. Attribute changes are audit-logged (`role-ddl`), and a
+node running an earlier release ignores the new attributes until it
+is upgraded.
 A view's query runs with its **owner's** privileges (PostgreSQL's
 rule): a reader needs `SELECT` on the view only. `DROP ROLE` refuses a
 role that owns objects or that a row-security policy names (`2BP01`);

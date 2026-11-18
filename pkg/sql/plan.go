@@ -362,7 +362,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.ShowStats:
 		return showStatsColumns(), nil
 
-	case *parser.Analyze, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot:
+	case *parser.Analyze, *parser.Vacuum, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot, *parser.SetTransactionAsOf:
 		return nil, nil
 	case *parser.Fetch:
 		if c, ok := s.cursors[t.Name]; ok && !t.Move {

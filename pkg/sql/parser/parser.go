@@ -689,13 +689,9 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			cd.Name = name
-			withKW := p.consumeIdentWord("with")
-			if withKW || (p.peek().kind == tkOp && p.peek().text == "(") {
-				opts, err := p.parsePlacementOptions()
-				if err != nil {
-					return nil, err
-				}
-				cd.Placement = opts
+			p.consumeIdentWord("with")
+			if err := p.parseCreateDatabaseOptions(cd); err != nil {
+				return nil, err
 			}
 			return cd, nil
 		}
@@ -981,15 +977,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			if p.consumeIdentWord("owner") {
 				return p.parseOwnerTo("database", name)
 			}
-			if p.consumeKeyword("SET") {
-				opts, err := p.parsePlacementOptions()
-				if err != nil {
-					return nil, err
-				}
-				return &AlterDatabase{Name: name, Placement: opts}, nil
-			}
 			if !p.consumeIdentWord("rename") {
-				return nil, p.errf("ALTER DATABASE supports RENAME TO, OWNER TO and SET (placement)")
+				return p.parseAlterDatabaseTail(name)
 			}
 			if err := p.expectKeyword("TO"); err != nil {
 				return nil, err
@@ -1013,11 +1002,11 @@ func (p *parser) parseStatement() (Statement, error) {
 		} else if !p.consumeKeyword("TRANSACTION") {
 			p.consumeIdentWord("work")
 		}
-		readOnly, isolation, _, err := p.parseTransactionModes(t.text)
+		readOnly, isolation, _, asOf, err := p.parseTransactionModesAsOf(t.text)
 		if err != nil {
 			return nil, err
 		}
-		b := &Begin{}
+		b := &Begin{AsOf: asOf}
 		if isolation != "" {
 			b.Modes = append(b.Modes, &SetVar{Name: "transaction_isolation", Value: isolation, Local: true})
 		}
@@ -1071,6 +1060,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parsePrepared(t.text)
 	case "declare", "fetch", "move", "close": // not reserved words; they lex as identifiers
 		return p.parseCursor(t.text)
+	case "vacuum": // not a reserved word; lexes as an identifier
+		return p.parseVacuum()
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -2065,19 +2056,29 @@ func exprContainsColumn(e Expr) bool {
 	return false
 }
 
-// parseTransactionModes parses the transaction modes of SET TRANSACTION,
+// parseTransactionModesAsOf parses the transaction modes of SET TRANSACTION,
 // SET SESSION CHARACTERISTICS AS TRANSACTION, BEGIN and START
 // TRANSACTION, up to the statement's end: ISOLATION LEVEL x, READ ONLY |
 // READ WRITE and [NOT] DEFERRABLE, separated by commas or whitespace.
 // readOnly is "on", "off" or "" (not given); isolation is the lower-cased
 // level or ""; deferrable is "on", "off" or "". what names the
 // statement in errors.
-func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferrable string, err error) {
+// It also takes CockroachDB's AS OF SYSTEM TIME mode (BEGIN AS OF
+// SYSTEM TIME '-5s', SET TRANSACTION AS OF SYSTEM TIME ...); asOf is
+// nil when not given.
+func (p *parser) parseTransactionModesAsOf(what string) (readOnly, isolation, deferrable string, asOf *AsOfClause, err error) {
 	for !p.atStatementEnd() {
 		switch {
+		case p.peek().kind == tkKeyword && p.peek().text == "AS" && p.peekWord(1, "of"):
+			p.i++
+			c, err := p.parseAsOfSystemTime()
+			if err != nil {
+				return "", "", "", nil, err
+			}
+			asOf = &c
 		case p.consumeIdentWord("isolation"):
 			if !p.consumeIdentWord("level") {
-				return "", "", "", p.errf("expected LEVEL after ISOLATION")
+				return "", "", "", nil, p.errf("expected LEVEL after ISOLATION")
 			}
 			var words []string
 			for !p.atStatementEnd() {
@@ -2095,7 +2096,7 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferr
 			switch isolation {
 			case "serializable", "repeatable read", "read committed", "read uncommitted":
 			default:
-				return "", "", "", p.errf("expected an isolation level, found %q", isolation)
+				return "", "", "", nil, p.errf("expected an isolation level, found %q", isolation)
 			}
 		case p.peekIdentSeq("read", "only"):
 			p.i += 2
@@ -2105,17 +2106,17 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferr
 			readOnly = "off"
 		case p.consumeKeyword("NOT"):
 			if !p.consumeIdentWord("deferrable") {
-				return "", "", "", p.errf("expected DEFERRABLE after NOT")
+				return "", "", "", nil, p.errf("expected DEFERRABLE after NOT")
 			}
 			deferrable = "off"
 		case p.consumeIdentWord("deferrable"):
 			deferrable = "on"
 		case p.consumeOp(","):
 		default:
-			return "", "", "", p.errf("unexpected %q in %s", p.peek().text, what)
+			return "", "", "", nil, p.errf("unexpected %q in %s", p.peek().text, what)
 		}
 	}
-	return readOnly, isolation, deferrable, nil
+	return readOnly, isolation, deferrable, asOf, nil
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
@@ -2152,9 +2153,18 @@ func (p *parser) parseSet() (Statement, error) {
 				return &SetTransactionSnapshot{ID: t.text}, nil
 			}
 		}
-		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
+		readOnly, isolation, deferrable, asOf, err := p.parseTransactionModesAsOf("SET TRANSACTION")
 		if err != nil {
 			return nil, err
+		}
+		if asOf != nil {
+			if characteristics {
+				return nil, p.errf("AS OF SYSTEM TIME is not a session characteristic")
+			}
+			if readOnly != "" || isolation != "" || deferrable != "" {
+				return nil, p.errf("SET TRANSACTION AS OF SYSTEM TIME takes no other mode (the transaction is read-only)")
+			}
+			return &SetTransactionAsOf{AsOf: *asOf}, nil
 		}
 		switch {
 		case readOnly != "" && characteristics:
@@ -3455,42 +3465,98 @@ func (p *parser) parseSelect() (Statement, error) {
 		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
 		// untouched; SYSTEM and TIME lex as identifiers).
 		if p.consumeKeyword("AS") {
-			for _, word := range []string{"of", "system", "time"} {
-				if t := p.peek(); t.isWord(word) {
-					p.i++
-				} else {
-					return nil, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
-				}
+			aost, err := p.parseAsOfSystemTime()
+			if err != nil {
+				return nil, err
 			}
-			// with_max_staleness('10s') asks for the freshest timestamp
-			// the local store can serve within the bound (bounded
-			// staleness); a bare literal pins an exact timestamp.
-			if p.consumeIdentWord("with_max_staleness") {
-				if err := p.expectOp("("); err != nil {
-					return nil, err
-				}
-				t := p.peek()
-				if t.kind != tkString {
-					return nil, p.errf("with_max_staleness expects a duration string, found %q", t.text)
-				}
-				sel.AsOfMaxStaleness = t.text
-				p.i++
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-			} else {
-				t := p.peek()
-				switch t.kind {
-				case tkString, tkNumber:
-					sel.AsOf = t.text
-					p.i++
-				default:
-					return nil, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
-				}
-			}
+			sel.AsOf, sel.AsOfMaxStaleness, sel.AsOfMinTimestamp, sel.AsOfNearestOnly = aost.Exact, aost.MaxStaleness, aost.MinTimestamp, aost.NearestOnly
 		}
 	}
 	return p.finishSelect(sel)
+}
+
+// FollowerReadTimestamp is the AS OF SYSTEM TIME operand
+// follower_read_timestamp() (CockroachDB's), as AsOfClause.Exact holds
+// it: a timestamp old enough for any replica to serve.
+const FollowerReadTimestamp = "follower_read_timestamp()"
+
+// parseAsOfOperand parses what follows AS OF SYSTEM TIME:
+//
+//	'-5s' | '2026-08-30T10:00:00Z' | 1756548000000000000
+//	follower_read_timestamp()
+//	with_max_staleness('10s' [, nearest_only])
+//	with_min_timestamp('2026-08-30T10:00:00Z' [, nearest_only])
+//
+// with_max_staleness and with_min_timestamp ask for the freshest
+// timestamp the local replicas can serve within the bound (bounded
+// staleness); the others pin an exact timestamp.
+func (p *parser) parseAsOfOperand() (AsOfClause, error) {
+	var c AsOfClause
+	t := p.peek()
+	switch {
+	case t.kind == tkString || t.kind == tkNumber:
+		c.Exact = t.text
+		p.i++
+		return c, nil
+	case t.isWord("follower_read_timestamp") || t.isWord("experimental_follower_read_timestamp"):
+		p.i++
+		if err := p.expectOp("("); err != nil {
+			return c, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return c, err
+		}
+		c.Exact = FollowerReadTimestamp
+		return c, nil
+	case t.isWord("with_max_staleness") || t.isWord("with_min_timestamp"):
+		p.i++
+		if err := p.expectOp("("); err != nil {
+			return c, err
+		}
+		arg := p.peek()
+		if arg.kind != tkString {
+			what := "a duration"
+			if t.text == "with_min_timestamp" {
+				what = "a timestamp"
+			}
+			return c, p.errf("%s expects %s string, found %q", t.text, what, arg.text)
+		}
+		p.i++
+		if t.text == "with_max_staleness" {
+			c.MaxStaleness = arg.text
+		} else {
+			c.MinTimestamp = arg.text
+		}
+		if p.consumeOp(",") {
+			b := p.peek()
+			switch {
+			case b.kind == tkKeyword && b.text == "TRUE":
+				c.NearestOnly = true
+			case b.kind == tkKeyword && b.text == "FALSE":
+			default:
+				return c, p.errf("%s's nearest_only argument must be TRUE or FALSE, found %q", t.text, b.text)
+			}
+			p.i++
+		}
+		if err := p.expectOp(")"); err != nil {
+			return c, err
+		}
+		return c, nil
+	}
+	return c, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
+}
+
+// parseAsOfSystemTime parses AS OF SYSTEM TIME operand, the AS already
+// consumed.
+func (p *parser) parseAsOfSystemTime() (AsOfClause, error) {
+	for _, word := range []string{"of", "system", "time"} {
+		if t := p.peek(); t.isWord(word) {
+			p.i++
+		} else {
+			return AsOfClause{}, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
+		}
+	}
+	return p.parseAsOfOperand()
 }
 
 // parseDerivedTable parses a FROM-list subquery member — (SELECT ...),

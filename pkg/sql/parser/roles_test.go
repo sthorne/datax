@@ -29,8 +29,20 @@ func TestParseRoles(t *testing.T) {
 	if !cr.Alter || !cr.IsUser || *cr.Password != "y" {
 		t.Fatalf("alter user: %+v", cr)
 	}
-	if _, err := Parse(`CREATE ROLE r SUPERUSER`); err == nil {
-		t.Fatal("SUPERUSER accepted")
+	// The role attributes (PG-S-001).
+	cr = parseOne(t, `CREATE ROLE r WITH SUPERUSER CREATEDB NOCREATEROLE REPLICATION CONNECTION LIMIT 5 VALID UNTIL '2030-01-01 00:00:00+00'`).(*CreateRole)
+	if cr.Superuser == nil || !*cr.Superuser || cr.CreateDB == nil || !*cr.CreateDB || cr.CreateRole == nil || *cr.CreateRole ||
+		cr.Replication == nil || !*cr.Replication || cr.ConnLimit == nil || *cr.ConnLimit != 5 || cr.ValidUntil == nil || *cr.ValidUntil != "2030-01-01 00:00:00+00" {
+		t.Fatalf("role attributes: %+v", cr)
+	}
+	cr = parseOne(t, `ALTER ROLE r NOSUPERUSER CONNECTION LIMIT -1`).(*CreateRole)
+	if cr.Superuser == nil || *cr.Superuser || cr.ConnLimit == nil || *cr.ConnLimit != -1 {
+		t.Fatalf("alter role attributes: %+v", cr)
+	}
+	for _, bad := range []string{`CREATE ROLE r SYSID 5`, `CREATE ROLE r CONNECTION 5`, `CREATE ROLE r VALID UNTIL now`} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("%s accepted", bad)
+		}
 	}
 	dr := parseOne(t, `DROP ROLE IF EXISTS a, b`).(*DropRole)
 	if !dr.IfExists || !reflect.DeepEqual(dr.Names, []string{"a", "b"}) {
