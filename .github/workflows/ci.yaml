@@ -71,10 +71,15 @@ jobs:
       # against; the runner image's default client is newer (18), whose
       # catalog queries datax does not answer yet (issue #370), so the
       # 16 client is installed beside it and DATAX_PG_DUMP names it.
+      # The runner has no PGDG apt source configured, so add it with
+      # postgresql-common's own script (it picks the release's codename)
+      # before installing the 16 client.
       - name: PostgreSQL 16 client tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client-16
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-16
           /usr/lib/postgresql/16/bin/pg_dump --version
       - name: test
         env:
