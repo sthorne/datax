@@ -1735,6 +1735,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Dropped tables are drained from every gateway** (#377). Once
+  `DROP TABLE`, `DROP VIEW`, `DROP OWNED` or `DROP DATABASE ... CASCADE`
+  returns, no gateway still serves the dropped table from its leased cache;
+  lookups fail with `42P01`. Before, other gateways could plan against it
+  until their next lease renewal, and a renewal racing the drop could
+  re-cache it on the dropping gateway. A statement planned against the
+  table before the drop can no longer commit after it, and the dropped-table
+  cleanup does not clear a table's rows while any gateway still holds a
+  lease on it. A drop now waits like `ALTER` does: a few seconds at the
+  default lease TTL when other gateways cache the table.
 - **Default privileges no longer reach the sealed system tables.** A rule
   for `root` (`ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO ...`) made
   before `datax_audit`, the large-object tables or `datax_keys` were created
