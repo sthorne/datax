@@ -21,6 +21,9 @@ func numeric(d types.Datum) (float64, error) {
 	case types.Float:
 		return d.F, nil
 	case types.Decimal:
+		if f, ok := types.DecimalSpecial(d); ok {
+			return f, nil
+		}
 		v, err := d.DecimalVal()
 		if err != nil {
 			return 0, errf(CodeInvalidText, "%v", err)
@@ -77,6 +80,10 @@ func init() {
 			case types.Float:
 				return f64(math.Abs(d.F)), nil
 			case types.Decimal:
+				if f, ok := types.DecimalSpecial(d); ok {
+					s, _ := types.DecimalFromSpecial(math.Abs(f))
+					return s, nil
+				}
 				v, err := d.DecimalVal()
 				if err != nil {
 					return types.Datum{}, errf(CodeInvalidText, "%v", err)
@@ -291,6 +298,9 @@ func roundTo(a []types.Datum, truncate bool) (types.Datum, error) {
 		}
 		return f64(v / p), nil
 	case types.Decimal:
+		if _, ok := types.DecimalSpecial(d); ok {
+			return d, nil // NaN and the infinities round to themselves
+		}
 		v, err := d.DecimalVal()
 		if err != nil {
 			return types.Datum{}, errf(CodeInvalidText, "%v", err)
@@ -322,6 +332,9 @@ func floorCeil(d types.Datum, fn func(float64) float64) (types.Datum, error) {
 	case types.Float:
 		return f64(fn(d.F)), nil
 	case types.Decimal:
+		if _, ok := types.DecimalSpecial(d); ok {
+			return d, nil
+		}
 		v, err := d.DecimalVal()
 		if err != nil {
 			return types.Datum{}, errf(CodeInvalidText, "%v", err)

@@ -1569,6 +1569,11 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			if handled {
 				base = d
 			}
+			if !handled {
+				// An untyped literal beside a bytea is a bytea
+				// ('\x01'::bytea || '\x02').
+				base, rhs = byteaConcatOperands(e, base, rhs)
+			}
 		}
 		if !handled {
 			if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
@@ -1626,10 +1631,21 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 			d, err := builtins.ConcatArrays(l, r)
 			return d, builtinErr(err)
 		}
+		if l.Fam == types.Bytes && r.Fam == types.Bytes {
+			// bytea || bytea is bytea (byteacat), not the hex texts
+			// joined.
+			return types.NewBytes([]byte(l.S + r.S)), nil
+		}
 		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
 		// bpchar-to-text cast strips the padding.
 		return types.NewString(concatTextIn(l, loc) + concatTextIn(r, loc)), nil
 	case "%":
+		if d, ok, err := types.DecimalSpecialArith(l, op, r); ok && r.Fam != types.Float && l.Fam != types.Float {
+			if err != nil {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "%v", err)
+			}
+			return d, nil
+		}
 		d, err := builtins.Mod(l, r)
 		return d, builtinErr(err)
 	case "^":
@@ -1675,6 +1691,12 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	if (l.Fam == types.Decimal || r.Fam == types.Decimal) &&
 		(l.Fam == types.Decimal || l.Fam == types.Int) &&
 		(r.Fam == types.Decimal || r.Fam == types.Int) {
+		if d, ok, err := types.DecimalSpecialArith(l, op, r); ok {
+			if err != nil {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "%v", err)
+			}
+			return d, nil
+		}
 		ld, err := l.Coerce(types.Decimal)
 		if err != nil {
 			return types.Datum{}, newErrf(CodeInternal, "%v", err)
@@ -2755,4 +2777,24 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 	s.createdTxn, s.createdTables = nil, nil
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
+}
+
+// byteaConcatOperands reads the untyped string literal on one side of
+// a || whose other side is a bytea as bytea input, as PostgreSQL
+// resolves an unknown literal to the other operand's type.
+func byteaConcatOperands(e parser.Expr, l, r types.Datum) (types.Datum, types.Datum) {
+	untyped := func(x *parser.Expr, d types.Datum) bool {
+		return x != nil && x.Lit != nil && x.Cast == "" && x.BinOp == "" && x.Func == "" && !d.Null && d.Fam == types.String
+	}
+	switch {
+	case l.Fam == types.Bytes && untyped(e.Right, r):
+		if b, err := r.Coerce(types.Bytes); err == nil {
+			r = b
+		}
+	case r.Fam == types.Bytes && untyped(e.Left, l):
+		if b, err := l.Coerce(types.Bytes); err == nil {
+			l = b
+		}
+	}
+	return l, r
 }

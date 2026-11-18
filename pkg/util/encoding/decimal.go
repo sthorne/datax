@@ -105,3 +105,58 @@ func DecodeDecimal(b []byte) (rest []byte, d decimal.Dec, err error) {
 	}
 	return b, d, nil
 }
+
+// numeric's special values in a key: -Infinity below every negative,
+// Infinity above every positive, and NaN above Infinity, as PostgreSQL
+// orders them. Each is its marker alone.
+const (
+	decMarkerNegInf byte = 0x13
+	decMarkerPosInf byte = 0x17
+	decMarkerNaN    byte = 0x18
+)
+
+// The canonical texts of numeric's special values (types.DecimalNaN,
+// ...), which this package cannot import.
+const (
+	textNaN    = "NaN"
+	textPosInf = "Infinity"
+	textNegInf = "-Infinity"
+)
+
+// EncodeDecimalText appends the order-preserving encoding of a
+// decimal's canonical text: NaN, Infinity and -Infinity included.
+func EncodeDecimalText(b []byte, s string) ([]byte, error) {
+	switch s {
+	case textNaN:
+		return append(b, decMarkerNaN), nil
+	case textPosInf:
+		return append(b, decMarkerPosInf), nil
+	case textNegInf:
+		return append(b, decMarkerNegInf), nil
+	}
+	d, err := decimal.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	return EncodeDecimal(b, d), nil
+}
+
+// DecodeDecimalText consumes one encoded decimal from b and returns
+// its canonical text (EncodeDecimalText's inverse).
+func DecodeDecimalText(b []byte) (rest []byte, s string, err error) {
+	if len(b) > 0 {
+		switch b[0] {
+		case decMarkerNaN:
+			return b[1:], textNaN, nil
+		case decMarkerPosInf:
+			return b[1:], textPosInf, nil
+		case decMarkerNegInf:
+			return b[1:], textNegInf, nil
+		}
+	}
+	rest, d, err := DecodeDecimal(b)
+	if err != nil {
+		return nil, "", err
+	}
+	return rest, d.String(), nil
+}

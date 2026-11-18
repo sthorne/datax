@@ -12,6 +12,8 @@ import (
 	"math"
 	"net"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -732,11 +734,18 @@ func (c *conn) handleStartup(ctx context.Context) error {
 			// parameters, as PostgreSQL applies them; the reported
 			// parameters below carry their values.
 			c.session.ApplyDatabaseDefaults(ctx, info.Settings)
+			// Then the settings the startup packet carries (TimeZone,
+			// DateStyle, ... and those of options' -c name=value), so
+			// ParameterStatus tells the client the session's own
+			// TimeZone, as PostgreSQL's does.
+			for _, kv := range startupSettings(m.Parameters) {
+				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: kv[0], Value: kv[1]}, nil)
+			}
 			if app := m.Parameters["application_name"]; app != "" {
 				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
 			}
-			// PostgreSQL 14's reported parameters, with the session's
-			// values (application_name as the startup packet set it).
+			// PostgreSQL 14's reported parameters, each once, with the
+			// session's values.
 			for _, kv := range c.session.StartupParams(ctx) {
 				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
@@ -976,6 +985,10 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil
 	}
+	if d.Reg != "" && col.Type != types.Int {
+		// A reg* value under a column described as its name.
+		return []byte(d.Reg)
+	}
 	if d.Fam.IsArray() {
 		if format == 0 {
 			return []byte(d.Text())
@@ -1014,7 +1027,9 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 		return []byte{0}
 	case types.Timestamp:
 		// Binary timestamptz: microseconds since 2000-01-01.
-		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000-pgEpochOffsetMicros))
+		// A value with nanoseconds (one written before input rounded to
+		// microseconds) rounds as its text form does.
+		return binary.BigEndian.AppendUint64(nil, uint64(types.RoundMicros(d.I)/1000-pgEpochOffsetMicros))
 	case types.Date:
 		// Binary date: days since 2000-01-01, int32.
 		return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I-pgEpochOffsetDays)))
@@ -1635,6 +1650,41 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 	finish()
 	st.Flushed()
 	return sent, true, nil
+}
+
+// startupSettings lists the settings a startup packet carries, in a
+// fixed order: every parameter but the connection's own (user,
+// database, replication, options), then each -c name=value (or
+// --name=value) of options.
+func startupSettings(params map[string]string) [][2]string {
+	var out [][2]string
+	for k, v := range params {
+		switch strings.ToLower(k) {
+		case "user", "database", "replication", "options":
+			continue
+		}
+		out = append(out, [2]string{k, v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0] < out[j][0] })
+	fields := strings.Fields(params["options"])
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		switch {
+		case f == "-c" && i+1 < len(fields):
+			i++
+			f = fields[i]
+		case strings.HasPrefix(f, "-c"):
+			f = f[2:]
+		case strings.HasPrefix(f, "--"):
+			f = f[2:]
+		default:
+			continue
+		}
+		if name, value, ok := strings.Cut(f, "="); ok {
+			out = append(out, [2]string{strings.ReplaceAll(name, "-", "_"), value})
+		}
+	}
+	return out
 }
 
 // checkConnectionLimits refuses a session past its role's or its

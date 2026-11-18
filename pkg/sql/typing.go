@@ -125,6 +125,9 @@ func arithFamily(op string, l, r types.Family) types.Family {
 		if r.IsArray() {
 			return r
 		}
+		if l == types.Bytes && r == types.Bytes {
+			return types.Bytes
+		}
 		return types.String
 	case "^":
 		if l == types.Int && r == types.Int {

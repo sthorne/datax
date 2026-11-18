@@ -219,9 +219,9 @@ syntax error or `0A000` feature not supported):
     `pg_extension` always lists it (see *Extensions* below);
     `vector_version()` does not exist. The
     type's OID is fixed (16000) rather than assigned at install time;
-    `to_regtype('vector')` returns the OID as a number, and
-    `'vector'::regtype` does not resolve — look the OID up with
-    `to_regtype('vector')::oid` or in `pg_type`, as `pgvector-go` does.
+    `to_regtype('vector')` returns the OID as a number;
+    `'vector'::regtype::oid`, `to_regtype('vector')::oid` and `pg_type`
+    all give it, as `pgvector-go` looks it up.
   - *No HNSW.* `USING hnsw` is refused (`0A000`) rather than built as
     something else; `hnsw.ef_search` is not a setting. A graph index
     suits a transactional, range-partitioned store poorly; `ivfflat` is
@@ -302,14 +302,20 @@ syntax error or `0A000` feature not supported):
   The catalog types tools cast to (`name`, `oid`, `regtype`, `xid`,
   `"char"`, ...) are accepted and behave as their text or number. A
   schema qualifier on a cast's type is ignored (`'1'::foo.int4` is an
-  `int4`). And `'t'::regclass` displays as the table's OID (a number,
-  where PostgreSQL displays `t`); `oid::regclass` gives the name back
-  (`conrelid::regclass`). The name is read as PostgreSQL reads one
-  (`'"Mixed"'::regclass`, `'public.t'::regclass`), and a system
-  catalog's OID is PostgreSQL's (`'pg_class'::regclass` is 1259). The
-  `to_regclass`, `to_regproc`, `to_regprocedure`, `to_regnamespace`
-  and `to_regrole` lookups return the OID the same way (`NULL` where
-  the cast would fail), not the name.
+  `int4`). A `regclass`, `regtype`, `regproc`, `regprocedure`,
+  `regnamespace` or `regrole` literal (`'t'::regclass`,
+  `'int4'::regtype`, `2200::regnamespace`) is the object's OID —
+  which comparisons use and `::oid` gives — and displays as its name,
+  as in PostgreSQL in text results; such a column describes as `int8`
+  rather than as the reg* type (so a binary result carries the OID),
+  and `pg_typeof` says `bigint`, not the reg* type. `oid::regclass` on a column gives the name too
+  (`conrelid::regclass`); the other reg* casts of a column pass the
+  number through. The name is read as PostgreSQL reads one
+  (`'"Mixed"'::regclass`, `'public.t'::regclass`, an index's name),
+  and a system catalog's OID is PostgreSQL's (`'pg_class'::regclass`
+  is 1259). The `to_regclass`, `to_regproc`, `to_regprocedure`,
+  `to_regnamespace` and `to_regrole` lookups return the OID (`NULL`
+  where the cast would fail), not the name.
 - **`COPY FROM STDIN` outside a transaction block is not atomic.** It
   commits in chunks (128 rows / 1 MiB) as the stream arrives, so a
   failure partway leaves the earlier chunks committed — the error names
@@ -401,13 +407,11 @@ syntax error or `0A000` feature not supported):
   (input without an offset, text output, `::text`, `::date`,
   `date_trunc`, `extract`, `to_char`, `current_date`, day and month
   arithmetic), and `AT TIME ZONE` / `timezone()` convert both ways; the
-  differences: abbreviations are a fixed list of the common ones, a
-  join's `ON` condition reads a literal without an offset in UTC (put
-  such a filter in `WHERE`), and `to_jsonb`, `array_to_string` and
-  `format` render a `TIMESTAMPTZ` in UTC. Microsecond precision on the binary wire, nanosecond internally — and
-  in text output, where computed values such as `now()` show nine
-  fractional digits (`13:18:04.787705724+00`) where PostgreSQL shows at
-  most six. `current_time` is a
+  differences: abbreviations are the fixed-offset ones of PostgreSQL's
+  default set (not configurable through `timezone_abbreviations`), and
+  `json_agg` / `jsonb_agg` render a `TIMESTAMPTZ` in UTC. Timestamps
+  keep microsecond precision, as PostgreSQL's do: input rounds to it
+  and text shows at most six fractional digits. `current_time` is a
   `time` (PostgreSQL's is `timetz`), and `localtimestamp` a
   `timestamptz` like `current_timestamp`.
 - **`EXPLAIN`** returns one plain-text line, not a plan tree (`EXPLAIN

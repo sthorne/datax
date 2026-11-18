@@ -134,8 +134,7 @@ func prettyDatum(b []byte, fam types.Family) ([]byte, string, error) {
 		rest, v, err := encoding.DecodeBool(b)
 		return rest, fmt.Sprintf("%t", v), err
 	case types.Decimal:
-		rest, d, err := encoding.DecodeDecimal(b)
-		return rest, d.String(), err
+		return encoding.DecodeDecimalText(b)
 	}
 	return nil, "", fmt.Errorf("unrenderable type %s", fam)
 }

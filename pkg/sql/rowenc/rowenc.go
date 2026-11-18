@@ -23,7 +23,6 @@ import (
 	"github.com/sthorne/datax/pkg/sql/inverted"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/sql/vector"
-	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/encoding"
 )
 
@@ -166,11 +165,11 @@ func appendDatum(k keys.Key, fam types.Family, d types.Datum) (keys.Key, error) 
 	case types.Bool:
 		return keys.Key(encoding.EncodeBool(k, d.B)), nil
 	case types.Decimal:
-		v, err := d.DecimalVal()
+		out, err := encoding.EncodeDecimalText(k, d.S)
 		if err != nil {
 			return nil, err
 		}
-		return keys.Key(encoding.EncodeDecimal(k, v)), nil
+		return keys.Key(out), nil
 	}
 	return nil, fmt.Errorf("unencodable type %s", fam)
 }
@@ -213,9 +212,9 @@ func decodeKeyDatum(rest []byte, fam types.Family) ([]byte, types.Datum, error) 
 		rest, v, err = encoding.DecodeBool(rest)
 		d = types.NewBool(v)
 	case types.Decimal:
-		var v decimal.Dec
-		rest, v, err = encoding.DecodeDecimal(rest)
-		d = types.NewDecimal(v.String())
+		var v string
+		rest, v, err = encoding.DecodeDecimalText(rest)
+		d = types.NewDecimal(v)
 	default:
 		err = fmt.Errorf("undecodable type %s", fam)
 	}
@@ -1008,7 +1007,7 @@ func skipDatum(b []byte, fam types.Family) ([]byte, error) {
 	case types.Bool:
 		b, _, err = encoding.DecodeBool(b)
 	case types.Decimal:
-		b, _, err = encoding.DecodeDecimal(b)
+		b, _, err = encoding.DecodeDecimalText(b)
 	default:
 		err = fmt.Errorf("unskippable type %s", fam)
 	}

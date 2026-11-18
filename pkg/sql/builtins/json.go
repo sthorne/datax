@@ -43,11 +43,17 @@ func jsonValue(d types.Datum) (any, error) {
 	case types.Jsonb:
 		return decodeJSON(d.S)
 	case types.Int, types.Decimal:
+		if _, ok := types.DecimalSpecial(d); ok {
+			return d.S, nil // NaN and Infinity as strings
+		}
 		return json.Number(d.Text()), nil
 	case types.Float:
 		return json.Number(strconv.FormatFloat(d.F, 'f', -1, 64)), nil
 	case types.Bool:
 		return d.B, nil
+	}
+	if t, ok := JSONTimeText(d, nil); ok {
+		return t, nil
 	}
 	return d.Text(), nil
 }

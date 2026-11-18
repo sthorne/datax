@@ -34,7 +34,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `length(text) → int8` (also `char_length`, `character_length`) — Number of characters in the string (of bytes in a bytea). *immutable*
 - `lower(text) → text` — The string in lower case. *immutable*
 - `lpad(text, int8, [text]) → text` — Pads the string on the left to the length with the fill (spaces by default), truncating when longer. *immutable*
-- `ltrim(text, [text]) → text` — Removes the given characters (spaces by default) from the start. *immutable*
+- `ltrim(text, [text]) → text` — Removes the given characters (spaces by default) from the start; over a bytea, the given bytes. *immutable*
 - `md5(text) → text` — The MD5 hash as 32 hex characters (of a bytea's bytes). *immutable*
 - `normalize(text, [text]) → text` — The string in a Unicode normal form: normalize(s [, NFC | NFD | NFKC | NFKD]), NFC by default. *immutable*
 - `octet_length(text) → int8` — Number of bytes in the string or bytea. *immutable*
@@ -54,10 +54,10 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `regexp_substr(text, text, [int8], [int8], [text], [int8]) → text` — The text of the n-th match (the first by default) of the POSIX pattern from the character start, or of its subexpr-th subexpression; NULL when there is none. *immutable*
 - `repeat(text, int8) → text` — The string repeated n times. *immutable*
 - `replace(text, text, text) → text` — Replaces every occurrence of the second argument with the third. *immutable*
-- `reverse(text) → text` — The characters in reverse order. *immutable*
+- `reverse(text) → text` — The characters in reverse order (a bytea's bytes). *immutable*
 - `right(text, int8) → text` — The last n characters (all but the first -n when negative). *immutable*
 - `rpad(text, int8, [text]) → text` — Pads the string on the right to the length with the fill (spaces by default), truncating when longer. *immutable*
-- `rtrim(text, [text]) → text` — Removes the given characters (spaces by default) from the end. *immutable*
+- `rtrim(text, [text]) → text` — Removes the given characters (spaces by default) from the end; over a bytea, the given bytes. *immutable*
 - `set_bit(any, int8, int8) → bytes` — The bytes with the bit at the 0-based offset set to 0 or 1. *immutable*
 - `set_byte(any, int8, int8) → bytes` — The bytes with the one at the 0-based offset set to the value (its low 8 bits). *immutable*
 - `sha224(any) → bytes` — The SHA-224 hash, as bytes. *immutable*
@@ -70,7 +70,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `to_ascii(text, [any]) → text` — Transliterates the value's bytes, read in the given encoding (LATIN1, LATIN2, LATIN9 or WIN1250; also by its number), to ASCII by dropping accents, as PostgreSQL does. Without an encoding it reads the database's, UTF8, which PostgreSQL does not convert (0A000). *immutable*
 - `to_hex(int8) → text` — The integer in hexadecimal. *immutable*
 - `translate(text, text, text) → text` — Replaces each character found in the second argument with the one at the same position in the third (dropped when the third is shorter). *immutable*
-- `trim(text, [text]) → text` (also `btrim`) — Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)). *immutable*
+- `trim(text, [text]) → text` (also `btrim`) — Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)); over a bytea, the given bytes. *immutable*
 - `unistr(text) → text` — The string with its Unicode escapes decoded: \XXXX, \+XXXXXX, \uXXXX, \UXXXXXXXX (hex code points; a UTF-16 surrogate pair combines) and \\ for a backslash. *immutable*
 - `upper(text) → text` — The string in upper case. *immutable*
 
@@ -168,6 +168,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 ## Set-returning functions
 
 - `generate_series(any, any, [any]) → setof the type of its bounds` — The values from start to stop (inclusive) by step (1 by default): integers, numerics, or timestamps stepped by an interval (generate_series(start, stop, interval '1 day')). A zero step is an error (22023). *immutable*
+- `generate_subscripts(any, int8, [bool]) → setof int8` — The subscripts of the array's given dimension (1 to its length for dimension 1; none for an empty array or another dimension), in reverse when the third argument is true. *immutable*
 
 ## Full-text search
 
@@ -273,14 +274,23 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 - `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*
 - `array_cat(any, any) → the type of argument 1` — The two arrays concatenated. *immutable, handles NULL arguments*
+- `array_dims(any) → text` — The text of an array's dimensions ([1:3] for three elements; NULL when empty). *immutable*
+- `array_fill(any, any, [any]) → the type of argument 1` — An array of the given length (ARRAY[n]; one dimension, lower bound 1) filled with the value. *immutable, handles NULL arguments*
 - `array_length(any, int8) → int8` — The number of elements of an array (dimension 1; NULL for an empty array or another dimension). *immutable*
 - `array_lower(any, int8) → int8` — The lower bound of an array's dimension (1; NULL when empty). *immutable*
 - `array_ndims(any) → int8` — The number of dimensions of an array (1; NULL when empty). *immutable*
 - `array_position(any, any) → int8` — The 1-based position of the first element equal to the value (NULL when absent). *immutable, handles NULL arguments*
+- `array_positions(any, any) → int8[]` — The 1-based positions of every element equal to the value (IS NOT DISTINCT FROM: NULL finds the NULLs); empty when there is none. *immutable, handles NULL arguments*
 - `array_prepend(any, any) → the type of argument 2` — The array with the value prepended. *immutable, handles NULL arguments*
 - `array_remove(any, any) → the type of argument 1` — The array without the elements equal to the value. *immutable, handles NULL arguments*
+- `array_replace(any, any, any) → the type of argument 1` — The array with each element equal to the second argument (IS NOT DISTINCT FROM) replaced by the third. *immutable, handles NULL arguments*
+- `array_reverse(any) → the type of argument 1` — The array's elements in reverse order. *immutable*
+- `array_sample(any, int8) → the type of argument 1` — n elements of the array chosen at random, in random order (22023 unless 0 ≤ n ≤ its length). *volatile*
+- `array_shuffle(any) → the type of argument 1` — The array's elements in random order. *volatile*
+- `array_sort(any, [bool], [bool]) → the type of argument 1` — The array's elements sorted: ascending with NULLs last by default; descending (second argument true) puts NULLs first unless the third argument (nulls_first) says otherwise. *immutable*
 - `array_to_string(any, text, [text]) → text` — The elements joined by the separator; NULL elements are skipped unless the third argument gives their text. *immutable, handles NULL arguments*
 - `array_upper(any, int8) → int8` — The upper bound of an array's dimension (its length; NULL when empty). *immutable*
 - `cardinality(any) → int8` — The number of elements of an array (0 for an empty one). *immutable*
 - `string_to_array(text, text, [text]) → text[]` — The text split on the separator into a text array (an empty separator yields one element; a NULL separator splits into characters); the third argument names the text that becomes NULL. *immutable, handles NULL arguments*
+- `trim_array(any, int8) → the type of argument 1` — The array without its last n elements (2202E unless 0 ≤ n ≤ its length). *immutable*
 

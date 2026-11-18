@@ -85,6 +85,22 @@ func (s *Session) resolveValueExprOpts(ctx context.Context, txn *kvclient.Txn, e
 // resolveValueNode is resolveValueExprOpts before the time-zone
 // annotation (zoneNode).
 func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e parser.Expr, params []types.Datum, keepVolatile bool) (parser.Expr, error) {
+	if constArgFuncs[e.Func] && argsNeedSplice(e.Args) {
+		// A session function that evaluates its arguments as constants
+		// here, given another session function or a subquery as one
+		// (pg_cancel_backend(pg_backend_pid()), set_config('a.b',
+		// current_user, false)): the arguments resolve first, innermost
+		// out, as PostgreSQL evaluates a nested call.
+		args := make([]parser.Expr, len(e.Args))
+		for i, a := range e.Args {
+			ra, err := s.resolveValueExprOpts(ctx, txn, a, params, keepVolatile)
+			if err != nil {
+				return e, err
+			}
+			args[i] = ra
+		}
+		e.Args = args
+	}
 	out := e
 	if e.Func != "" && volatileFuncs[e.Func] && !keepVolatile {
 		// nextval() and friends outside a write's per-row path (SELECT
@@ -601,15 +617,15 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			out.Func, out.Args, out.Lit = "", nil, &d
 		}
 	}
-	if out.Cast == "regclass" && out.Lit != nil && !out.Lit.Null && out.Lit.Fam == types.String {
-		// 'name'::regclass: the table's OID (a real table's, or a catalog
-		// view's), 42P01 when nothing is so named; '4'::regclass is the
-		// OID itself.
-		oid, err := s.regclassOID(ctx, txn, out.Lit.Text())
+	if kind := regKind(out.Cast); kind != "" && out.Lit != nil && !out.Lit.Null && (out.Lit.Fam == types.String || out.Lit.Fam == types.Int) && out.BinOp == "" {
+		// 'name'::regclass (a table's, an index's or a catalog view's
+		// OID, 42P01 when nothing is so named), 'lower'::regproc,
+		// 'int4'::regtype, ...: the OID, rendering as the name;
+		// '1259'::regclass is the OID itself.
+		d, err := s.resolveRegLiteral(ctx, txn, kind, *out.Lit)
 		if err != nil {
 			return e, err
 		}
-		d := types.NewInt(oid)
 		out.Lit, out.Cast = &d, ""
 	} else if out.Cast == "regclass" && out.Lit == nil {
 		// oid::regclass on a column or expression (conrelid::regclass in
@@ -680,7 +696,8 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 // above 6, microseconds, it changes nothing).
 func roundClock(nanos int64, args []parser.Expr) int64 {
 	if len(args) != 1 || args[0].Lit == nil || args[0].Lit.I >= 6 {
-		return nanos
+		// PostgreSQL's clock has microsecond precision.
+		return types.TruncMicros(nanos)
 	}
 	unit := int64(1000)
 	for p := args[0].Lit.I; p < 6; p++ {
@@ -997,12 +1014,13 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	}
 	// A join's ON conjuncts beyond its key equalities resolve as WHERE's
 	// do (pg_dump's d.classid = 'pg_class'::regclass in a LEFT JOIN),
-	// all but those holding a subquery, which the join evaluates per
-	// candidate row.
+	// OR groups included (so a literal in one reads in the session's
+	// TimeZone), all but those holding a subquery, which the join
+	// evaluates per candidate row.
 	for i, j := range t.Joins {
 		var f []parser.Comparison
 		for k, cmp := range j.Filter {
-			if cmp.Sub != nil || len(cmp.Or) > 0 || exprHasSubquery(cmp.Value) || cmp.Expr != nil && exprHasSubquery(*cmp.Expr) || !s.cmpNeedsResolve(cmp) {
+			if condHas(cmp, func(x parser.Expr) bool { return x.Sub != nil }) || !s.cmpNeedsResolve(cmp) {
 				continue
 			}
 			r, err := s.resolveWhereSubs(ctx, txn, []parser.Comparison{cmp}, params)
@@ -1834,6 +1852,17 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 	out := make([]oidName, 0, len(all))
 	for _, d := range all {
 		out = append(out, oidName{oid: vtable.TableOID(d), name: d.Name})
+		if d.IsView() || d.Virtual != "" {
+			continue
+		}
+		// Its indexes, as pg_class lists them and regclassOID resolves
+		// them (the primary key's as <table>_pkey when it is visible).
+		if oid, ok := vtable.IndexOIDByName(d, d.Name+"_pkey"); ok {
+			out = append(out, oidName{oid: oid, name: d.Name + "_pkey"})
+		}
+		for i := range d.Indexes {
+			out = append(out, oidName{oid: vtable.IndexOID(d, d.Indexes[i].ID), name: d.Indexes[i].Name})
+		}
 	}
 	vtable.EachClassOID(func(oid int64, name string) {
 		out = append(out, oidName{oid: oid, name: name})
@@ -1915,4 +1944,24 @@ func (s *Session) enumTypeByText(ctx context.Context, txn *kvclient.Txn, text st
 		return nil, false, nil
 	}
 	return td, true, nil
+}
+
+// constArgFuncs are the spliced functions whose splice evaluates their
+// arguments as constants (the others take their arguments as columns,
+// subqueries or sets themselves).
+var constArgFuncs = map[string]bool{
+	"pg_cancel_backend": true, "pg_terminate_backend": true, "pg_sleep": true, "pg_notify": true,
+	"set_config": true, "current_setting": true, "nextval": true, "currval": true, "setval": true,
+}
+
+// argsNeedSplice reports whether a call's arguments hold a spliced
+// call or a subquery, which must resolve before a spliced function
+// evaluates them.
+func argsNeedSplice(args []parser.Expr) bool {
+	for _, a := range args {
+		if exprHas(a, func(x parser.Expr) bool { return x.Sub != nil || (x.Func != "" && splicedFuncs[x.Func]) }) {
+			return true
+		}
+	}
+	return false
 }

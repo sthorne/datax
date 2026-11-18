@@ -71,7 +71,9 @@ func tsTime(d types.Datum) time.Time { return time.Unix(0, d.I).UTC() }
 func dateTime(d types.Datum) time.Time {
 	return time.Unix(d.I*86400, 0).UTC()
 }
-func tsDatum(t time.Time) types.Datum { return types.NewTimestamp(t.UTC().UnixNano()) }
+func tsDatum(t time.Time) types.Datum {
+	return types.NewTimestamp(types.RoundMicros(t.UTC().UnixNano()))
+}
 func dateDatum(t time.Time) types.Datum {
 	return types.NewDate(floorDiv(t.UTC().Unix(), 86400))
 }
@@ -269,7 +271,9 @@ func init() {
 		}})
 	register(&Builtin{Name: "clock_timestamp", Args: nil, Ret: types.Timestamp, Vol: Volatile, Category: catTime,
 		Doc: "The wall clock at the moment of the call (now() is the statement's start, the same for every row).",
-		Fn:  func([]types.Datum) (types.Datum, error) { return tsDatum(time.Now()), nil }})
+		Fn: func([]types.Datum) (types.Datum, error) {
+			return types.NewTimestamp(types.TruncMicros(time.Now().UnixNano())), nil
+		}})
 	register(&Builtin{Name: "justify_hours", Args: []types.Family{Any}, MinArgs: 1, Ret: types.IntervalFam, Category: catTime,
 		Doc: "Rewrites an interval's hours beyond 24 as days.",
 		Fn: func(a []types.Datum) (types.Datum, error) {

@@ -57,6 +57,8 @@ const (
 	CodeOutOfMemory           = "53200"
 	CodeInvalidRegexp         = "2201B"
 	CodeInvalidParameterValue = "22023"
+	// json_object_agg_unique: a key seen twice.
+	CodeDuplicateJSONKey = "22030"
 	// DECIMAL(p,s): integer digits exceed precision−scale.
 	CodeNumericValueOutOfRange = "22003"
 	// COPY FROM STDIN.

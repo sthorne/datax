@@ -86,7 +86,7 @@ func TestCastToUnknownType(t *testing.T) {
 		`SELECT '2024-01-02'::date, '10:00'::time, '10:00'::time without time zone, '1 day'::interval`:                                                                       "2024-01-02|10:00:00|10:00:00|1 day",
 		`SELECT 't'::bool, 'f'::boolean, '\x01'::bytea, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, '{"a":1}'::json, '{"a":1}'::jsonb`:                                     `t|f|\x01|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|{"a":1}|{"a":1}`,
 		`SELECT '{1,2}'::int[], '{1,2}'::_int4, '{a}'::text[], '{a}'::_text`:                                                                                                 "{1,2}|{1,2}|{a}|{a}",
-		`SELECT 'ct'::regclass = 'ct'::pg_catalog.regclass, 'int4'::regtype, 'pg_catalog'::pg_catalog.regnamespace, '5'::oid`:                                                "t|int4|pg_catalog|5",
+		`SELECT 'ct'::regclass = 'ct'::pg_catalog.regclass, 'int4'::regtype, 'pg_catalog'::pg_catalog.regnamespace, '5'::oid`:                                                "t|integer|pg_catalog|5",
 		`SELECT 'happy'::mood, CAST('sad' AS mood), m::text, t::mood FROM ct`:                                                                                                "happy|sad|happy|sad",
 		`SELECT count(*) FROM ct WHERE m = 'happy'::mood AND t::mood = 'sad'`:                                                                                                "1",
 		`SELECT NULL::mood IS NULL, '{happy}'::mood[], '{happy}'::_mood`:                                                                                                     "t|{happy}|{happy}",

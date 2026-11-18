@@ -40,6 +40,9 @@ func init() {
 			}
 			return i64(int64(utf8.RuneCountInString(a[0].S))), nil
 		}})
+	// char_length and character_length take text only (42883 for a
+	// bytea, as in PostgreSQL); length takes either.
+	registry["char_length"].Bytea, registry["character_length"].Bytea = false, false
 	register(&Builtin{Name: "octet_length", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.Int, Category: catString,
 		Doc: "Number of bytes in the string or bytea.", Bytea: true,
 		Fn: func(a []types.Datum) (types.Datum, error) { return i64(int64(len(a[0].S))), nil }})
@@ -156,14 +159,32 @@ func init() {
 			return str(strings.ReplaceAll(a[0].S, a[1].S, a[2].S)), nil
 		}})
 	register(&Builtin{Name: "trim", Args: []types.Family{types.String, types.String}, MinArgs: 1, Ret: types.String, Category: catString,
-		Doc: "Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)).", Aliases: []string{"btrim"},
-		Fn: func(a []types.Datum) (types.Datum, error) { return str(strings.Trim(a[0].S, cutset(a))), nil }})
+		Doc: "Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)); over a bytea, the given bytes.", Aliases: []string{"btrim"},
+		Bytea: true, RetOf: stringOrBytes,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if bytea(a) {
+				return trimBytea("btrim", a, true, true)
+			}
+			return str(strings.Trim(a[0].S, cutset(a))), nil
+		}})
 	register(&Builtin{Name: "ltrim", Args: []types.Family{types.String, types.String}, MinArgs: 1, Ret: types.String, Category: catString,
-		Doc: "Removes the given characters (spaces by default) from the start.",
-		Fn:  func(a []types.Datum) (types.Datum, error) { return str(strings.TrimLeft(a[0].S, cutset(a))), nil }})
+		Doc:   "Removes the given characters (spaces by default) from the start; over a bytea, the given bytes.",
+		Bytea: true, RetOf: stringOrBytes,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if bytea(a) {
+				return trimBytea("ltrim", a, true, false)
+			}
+			return str(strings.TrimLeft(a[0].S, cutset(a))), nil
+		}})
 	register(&Builtin{Name: "rtrim", Args: []types.Family{types.String, types.String}, MinArgs: 1, Ret: types.String, Category: catString,
-		Doc: "Removes the given characters (spaces by default) from the end.",
-		Fn:  func(a []types.Datum) (types.Datum, error) { return str(strings.TrimRight(a[0].S, cutset(a))), nil }})
+		Doc:   "Removes the given characters (spaces by default) from the end; over a bytea, the given bytes.",
+		Bytea: true, RetOf: stringOrBytes,
+		Fn: func(a []types.Datum) (types.Datum, error) {
+			if bytea(a) {
+				return trimBytea("rtrim", a, false, true)
+			}
+			return str(strings.TrimRight(a[0].S, cutset(a))), nil
+		}})
 	register(&Builtin{Name: "lpad", Args: []types.Family{types.String, types.Int, types.String}, MinArgs: 2, Ret: types.String, Category: catString,
 		Doc: "Pads the string on the left to the length with the fill (spaces by default), truncating when longer.",
 		Fn:  func(a []types.Datum) (types.Datum, error) { return str(pad(a, true)), nil }})
@@ -182,8 +203,16 @@ func init() {
 			return str(strings.Repeat(a[0].S, int(a[1].I))), nil
 		}})
 	register(&Builtin{Name: "reverse", Args: []types.Family{types.String}, MinArgs: 1, Ret: types.String, Category: catString,
-		Doc: "The characters in reverse order.",
+		Doc:   "The characters in reverse order (a bytea's bytes).",
+		Bytea: true, RetOf: stringOrBytes,
 		Fn: func(a []types.Datum) (types.Datum, error) {
+			if a[0].Fam == types.Bytes {
+				b := []byte(a[0].S)
+				for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+					b[i], b[j] = b[j], b[i]
+				}
+				return types.NewBytes(b), nil
+			}
 			r := []rune(a[0].S)
 			for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
 				r[i], r[j] = r[j], r[i]
@@ -270,7 +299,7 @@ func init() {
 					return r
 				}, a[0].S))
 			case "escape":
-				b, err = []byte(a[0].S), nil
+				b, err = types.ParseByteaEscape(a[0].S)
 			default:
 				return types.Datum{}, errf(CodeInvalidArgument, "unrecognized encoding: %q", a[1].S)
 			}

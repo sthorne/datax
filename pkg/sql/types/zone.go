@@ -28,6 +28,29 @@ var zoneAbbrevs = map[string]int{
 	"EET": 2 * 3600, "EEST": 3 * 3600, "MSK": 3 * 3600, "IST": 2 * 3600,
 	"JST": 9 * 3600, "KST": 9 * 3600, "HKT": 8 * 3600, "AWST": 8 * 3600,
 	"ACST": 9*3600 + 1800, "AEST": 10 * 3600, "AEDT": 11 * 3600, "NZST": 12 * 3600, "NZDT": 13 * 3600,
+	// The rest of PostgreSQL's Default set whose offset is fixed.
+	"UCT": 0, "ADT": -3 * 3600, "AST": -4 * 3600, "NST": -(3*3600 + 1800), "NDT": -(2*3600 + 1800),
+	"PMST": -3 * 3600, "PMDT": -2 * 3600, "WGT": -3 * 3600, "WGST": -2 * 3600, "EGT": -3600, "EGST": 0,
+	"AZOT": -3600, "AZOST": 0, "FNT": -2 * 3600, "FNST": -3600, "GFT": -3 * 3600, "ART": -3 * 3600,
+	"BRT": -3 * 3600, "BRST": -2 * 3600, "UYT": -3 * 3600, "UYST": -2 * 3600, "CLT": -4 * 3600, "CLST": -3 * 3600,
+	"PYT": -4 * 3600, "PYST": -3 * 3600, "BOT": -4 * 3600, "GYT": -4 * 3600, "VET": -4 * 3600,
+	"COT": -5 * 3600, "PET": -5 * 3600, "EAST": -6 * 3600, "EASST": -5 * 3600, "GALT": -6 * 3600,
+	"MART": -(9*3600 + 1800), "GAMT": -9 * 3600, "CKT": -10 * 3600, "TAHT": -10 * 3600, "NUT": -11 * 3600,
+	"WETDST": 3600, "MEZ": 3600, "MESZ": 2 * 3600, "METDST": 2 * 3600, "CETDST": 2 * 3600, "WAT": 3600,
+	"EETDST": 3 * 3600, "SAST": 2 * 3600, "IDT": 3 * 3600, "EAT": 3 * 3600, "MSD": 4 * 3600,
+	"IRT": 3*3600 + 1800, "GET": 4 * 3600, "AZT": 4 * 3600, "MUT": 4 * 3600, "RET": 4 * 3600, "SCT": 4 * 3600,
+	"AFT": 4*3600 + 1800, "PKT": 5 * 3600, "MVT": 5 * 3600, "TFT": 5 * 3600, "TJT": 5 * 3600, "TMT": 5 * 3600,
+	"UZT": 5 * 3600, "YEKT": 5 * 3600, "NPT": 5*3600 + 2700, "BDT": 6 * 3600, "BTT": 6 * 3600, "KGT": 6 * 3600,
+	"ALMT": 6 * 3600, "OMST": 6 * 3600, "XJT": 6 * 3600, "MMT": 6*3600 + 1800, "ICT": 7 * 3600, "CXT": 7 * 3600,
+	"DAVT": 7 * 3600, "KRAT": 7 * 3600, "NOVT": 7 * 3600, "CCT": 8 * 3600, "SGT": 8 * 3600, "MYT": 8 * 3600,
+	"PHT": 8 * 3600, "BNT": 8 * 3600, "IRKT": 8 * 3600, "ULAT": 8 * 3600, "ACWST": 8*3600 + 2700,
+	"AWSST": 9 * 3600, "JAYT": 9 * 3600, "PWT": 9 * 3600, "YAKT": 9 * 3600, "ACDT": 10*3600 + 1800,
+	"LHST": 10*3600 + 1800, "PGT": 10 * 3600, "CHUT": 10 * 3600, "TRUT": 10 * 3600, "DDUT": 10 * 3600,
+	"YAPT": 10 * 3600, "MPT": 10 * 3600, "LIGT": 10 * 3600, "VLAT": 10 * 3600, "AESST": 11 * 3600,
+	"LHDT": 11 * 3600, "KOST": 11 * 3600, "PONT": 11 * 3600, "VUT": 11 * 3600, "MAGT": 11 * 3600,
+	"NZT": 12 * 3600, "FJT": 12 * 3600, "MHT": 12 * 3600, "GILT": 12 * 3600, "TVT": 12 * 3600, "WAKT": 12 * 3600,
+	"WFT": 12 * 3600, "PETT": 12 * 3600, "CHAST": 12*3600 + 2700, "TOT": 13 * 3600, "PHOT": 13 * 3600,
+	"TKT": 13 * 3600, "CHADT": 13*3600 + 2700, "LINT": 14 * 3600,
 }
 
 // utcNames are the spellings of UTC itself.
@@ -205,9 +228,9 @@ func ParseTimestampIn(s string, loc *time.Location) (int64, error) {
 			return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
 		}
 		if strings.Contains(f, "Z07") || loc == time.UTC {
-			return t.UTC().UnixNano(), nil
+			return RoundMicros(t.UTC().UnixNano()), nil
 		}
-		return WallInZone(t.UnixNano(), loc), nil
+		return WallInZone(RoundMicros(t.UnixNano()), loc), nil
 	}
 	if i := strings.LastIndexByte(strings.TrimSpace(s), ' '); i > 0 {
 		head, name := strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:])
