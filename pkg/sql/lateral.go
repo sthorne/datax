@@ -166,9 +166,9 @@ func (s *Session) anyLateralSide(sides []joinSide) bool {
 // joinLateral runs join level k when side k is a lateral relation: for
 // every partial row, the lateral query with the row's values
 // substituted (memoized on them), its rows filtered by the level's ON
-// equalities and conditions; a partial row with no match NULL-extends
-// under LEFT JOIN and drops otherwise.
-func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []joinSide, k int, sub *parser.Select, on []onPair, filter []parser.Comparison, joined []joinedRow, params []types.Datum) ([]joinedRow, error) {
+// equalities and conditions (corrOn: its correlated ones); a partial
+// row with no match NULL-extends under LEFT JOIN and drops otherwise.
+func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []joinSide, k int, sub *parser.Select, on []onPair, filter []parser.Comparison, corrOn *onCorr, joined []joinedRow, params []types.Datum) ([]joinedRow, error) {
 	scope, rowOf := joinScope(sides[:k])
 	refs, node, err := s.analyzeSub(ctx, txn, sub, []scopeLevel{scope})
 	if err != nil {
@@ -227,6 +227,15 @@ func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []jo
 			ext := jr.extend(r)
 			if len(filter) > 0 {
 				ok, err := evalJoinWhere(sides[:k+1], filter, ext, params)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+			}
+			if corrOn != nil {
+				ok, err := s.onMatches(ctx, txn, corrOn, ext, params)
 				if err != nil {
 					return nil, err
 				}

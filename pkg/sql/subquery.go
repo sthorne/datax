@@ -1015,12 +1015,14 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 	// A join's ON conjuncts beyond its key equalities resolve as WHERE's
 	// do (pg_dump's d.classid = 'pg_class'::regclass in a LEFT JOIN),
 	// OR groups included (so a literal in one reads in the session's
-	// TimeZone), all but those holding a subquery, which the join
-	// evaluates per candidate row.
+	// TimeZone), and so do their uncorrelated subqueries: evaluated once,
+	// IN becomes a value list, EXISTS a constant, a scalar subquery a
+	// literal. The correlated ones were split off before
+	// (splitCorrelatedOn) for the join to evaluate per candidate row.
 	for i, j := range t.Joins {
 		var f []parser.Comparison
 		for k, cmp := range j.Filter {
-			if condHas(cmp, func(x parser.Expr) bool { return x.Sub != nil }) || !s.cmpNeedsResolve(cmp) {
+			if !s.cmpNeedsResolve(cmp) {
 				continue
 			}
 			r, err := s.resolveWhereSubs(ctx, txn, []parser.Comparison{cmp}, params)

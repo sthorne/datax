@@ -1191,7 +1191,10 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   from an earlier table are lookup keys; every other conjunct
   (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN (...)`) is a join
   condition, evaluated per candidate match — an outer join NULL-extends
-  when it fails, unlike a `WHERE` filter. An `ON` with no such equality
+  when it fails, unlike a `WHERE` filter. That includes subqueries
+  (`[NOT] IN (SELECT ...)`, `[NOT] EXISTS`, scalar): an uncorrelated
+  one is evaluated once, one reading the tables joined so far (`ON
+  EXISTS (SELECT 1 FROM c WHERE c.x = b.id)`) per candidate match. An `ON` with no such equality
   joins by nested loop: the joined table is read once and every row so
   far is tried against each of its rows (`EXPLAIN`: `fetched once,
   every row tried`; `+ join filter` marks a level with join

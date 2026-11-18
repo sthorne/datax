@@ -2378,8 +2378,18 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	var grouped *groupedCorr
 	var post *postSort
 	var jc *joinCorr
+	var onCorrs []*onCorr
 	if t.Table != "" && t.Derived == nil {
 		if outer, rowOf, ok := s.selectScope(ctx, txn, t); ok {
+			if len(t.Joins) > 0 {
+				// Correlated ON conjuncts leave the join filters the
+				// same way, for the join to evaluate per candidate row.
+				ons, c, oerr := s.splitCorrelatedOn(ctx, txn, t, outer.sides)
+				if oerr != nil {
+					return nil, oerr
+				}
+				t, onCorrs = c, ons
+			}
 			plannable, cc, serr := s.splitCorrelatedWhereScope(ctx, txn, t.Where, outer)
 			if serr != nil {
 				return nil, serr
@@ -2421,8 +2431,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				}
 				t, grouped = c, g
 			}
-			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0 || grouped != nil) {
-				jc = &joinCorr{conds: corr, projs: corrProjs, grouped: grouped, desc: outer.desc, rowOf: rowOf}
+			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0 || grouped != nil || onCorrs != nil) {
+				jc = &joinCorr{conds: corr, projs: corrProjs, grouped: grouped, on: onCorrs, desc: outer.desc, rowOf: rowOf}
 			}
 		}
 	}
@@ -3355,6 +3365,15 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	// Correlated conjuncts are stripped exactly as execution strips them,
 	// so the plan below describes the plannable remainder.
 	var corr []correlatedConjunct
+	if sel.Table != "" && len(sel.Joins) > 0 && sel.Derived == nil {
+		if outer, _, ok := s.selectScope(ctx, txn, sel); ok {
+			_, c, oerr := s.splitCorrelatedOn(ctx, txn, sel, outer.sides)
+			if oerr != nil {
+				return nil, oerr
+			}
+			sel = c
+		}
+	}
 	if sel.Table != "" && len(sel.Joins) == 0 && sel.Derived == nil {
 		if cdesc, derr := s.lookup(ctx, txn, sel.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Table, sel.Alias)
@@ -3740,6 +3759,7 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 		return scopeLevel{}, nil, false
 	}
 	level, rowOf := joinScope(sides)
+	level.sides = sides
 	return level, rowOf, true
 }
 

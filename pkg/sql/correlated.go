@@ -53,6 +53,9 @@ type scopeLevel struct {
 	// ambiguous are the bare names more than one side of a join level
 	// carries: an unqualified reference reaching this level is 42702.
 	ambiguous map[string]bool
+	// sides are the join's members, in syntactic order, when the level
+	// merges a join (selectScope).
+	sides []joinSide
 }
 
 // hiddenName is a table name an alias hides.
@@ -1427,9 +1430,77 @@ func (s *Session) evalCorrProj(ctx context.Context, txn *kvclient.Txn, cp *corrP
 type joinCorr struct {
 	conds   []correlatedConjunct
 	projs   []corrProj
+	on      []*onCorr                // per join clause: its correlated ON conjuncts
 	grouped *groupedCorr             // a grouped select's per-group subqueries
 	desc    *catalog.TableDescriptor // the merged descriptor
 	rowOf   func(jr joinedRow) map[catalog.ColumnID]types.Datum
+}
+
+// onCorr is one join level's correlated ON conjuncts, bound against the
+// scope of the members joined so far (an ON clause cannot see a later
+// one). They decide matching like the level's other ON conjuncts: a
+// candidate failing one is a miss, so an outer join NULL-extends.
+type onCorr struct {
+	conds []correlatedConjunct
+	desc  *catalog.TableDescriptor // the merged descriptor of sides 0..k
+	rowOf func(jr joinedRow) map[catalog.ColumnID]types.Datum
+	memo  corrMemo
+}
+
+// onMatches evaluates the level's correlated conjuncts against one
+// candidate row (the partial row extended by the joined side's).
+func (s *Session) onMatches(ctx context.Context, txn *kvclient.Txn, oc *onCorr, ext joinedRow, params []types.Datum) (bool, error) {
+	if oc == nil {
+		return true, nil
+	}
+	return s.evalCorrelated(ctx, txn, oc.conds, oc.desc, oc.rowOf(ext), params, oc.memo)
+}
+
+// splitCorrelatedOn strips the correlated conjuncts from every join
+// level's ON filter, before subquery resolution and planning see them,
+// as splitCorrelatedWhereScope does for WHERE: a subquery reading a
+// joined side is classified against the members joined so far (the
+// syntactic order), and evaluated per candidate row by the join. Each
+// stripped conjunct leaves a TRUE in the filter, so the level still has
+// one (it is not reordered or described as filterless). The uncorrelated
+// subqueries stay, for resolveSelectSubs to evaluate once. The result is
+// indexed by join clause (nil where a level has none); t is not changed.
+func (s *Session) splitCorrelatedOn(ctx context.Context, txn *kvclient.Txn, t *parser.Select, sides []joinSide) ([]*onCorr, *parser.Select, error) {
+	var ons []*onCorr
+	out := t
+	for i, jc := range t.Joins {
+		hasSub := false
+		for _, cmp := range jc.Filter {
+			if len(condSubqueries(cmp)) > 0 {
+				hasSub = true
+				break
+			}
+		}
+		if !hasSub {
+			continue
+		}
+		k := i + 1
+		// A member joined later is out of the clause's reach: a
+		// subquery naming it is 42P01, "missing FROM-clause entry", as
+		// in PostgreSQL.
+		level, rowOf := joinScope(sides[:k+1])
+		plannable, cc, err := s.splitCorrelatedWhereScope(ctx, txn, jc.Filter, level)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(cc) == 0 {
+			continue
+		}
+		if ons == nil {
+			ons = make([]*onCorr, len(t.Joins))
+			c := *t
+			c.Joins = append([]parser.JoinClause(nil), t.Joins...)
+			out = &c
+		}
+		out.Joins[i].Filter = append(plannable[:len(plannable):len(plannable)], parser.Comparison{Op: "TRUE"})
+		ons[i] = &onCorr{conds: cc, desc: level.desc, rowOf: rowOf, memo: corrMemo{}}
+	}
+	return ons, out, nil
 }
 
 // joinScope merges a join's sides into one scope level: every column
