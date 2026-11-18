@@ -782,7 +782,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 	done, resumed := false, false
 	err := s.db.RunTxn(ctx, "alter-table-publish", func(ctx context.Context, txn *kvclient.Txn) error {
 		plan, parents, notices, wipes, done, resumed = alterPlan{}, nil, nil, nil, false, false
-		shared, err := s.lookup(ctx, txn, at.Table)
+		shared, err := s.lookupForSchemaChange(ctx, txn, at.Table)
 		if err != nil {
 			return err
 		}
@@ -910,7 +910,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 	alreadyDone := false
 	err = s.db.RunTxn(ctx, "alter-table-flip", func(ctx context.Context, txn *kvclient.Txn) error {
 		flipParents, flipWipes, alreadyDone = nil, nil, false
-		shared, err := s.lookup(ctx, txn, at.Table)
+		shared, err := s.lookupForSchemaChange(ctx, txn, at.Table)
 		if err != nil {
 			return err
 		}
@@ -1300,7 +1300,7 @@ func (s *Session) abandonAlter(ctx context.Context, table, digest string) {
 	var parents []string
 	_ = s.db.RunTxn(ctx, "alter-table-abandon", func(ctx context.Context, txn *kvclient.Txn) error {
 		tableID, indexes, parents = 0, nil, nil
-		shared, err := s.lookup(ctx, txn, table)
+		shared, err := s.lookupForSchemaChange(ctx, txn, table)
 		if err != nil {
 			return err
 		}
