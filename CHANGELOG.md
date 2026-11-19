@@ -32,8 +32,8 @@ state or the internode protocol does, and an entry below says so.
   - Existing tables resolve exactly as before, and nothing on disk
     changes. `CREATE SCHEMA`, and restoring a backup that holds schemas,
     need cluster protocol version v22.
-  - Leftovers are PG-D-035 (sequences and enum types outside `public`)
-    and PG-D-036.
+  - Leftovers are PG-D-036; sequences and enum types outside `public`
+    (PG-D-035) are closed too, below.
 - **Temporary tables** (was PG-D-009):
   - `CREATE [GLOBAL | LOCAL] TEMP[ORARY] TABLE` with
     `ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP`,
@@ -50,6 +50,38 @@ state or the internode protocol does, and an entry below says so.
   `ALTER TABLE ... SET LOGGED | UNLOGGED` are accepted. Unlogged tables
   stay fully durable; only `pg_class.relpersistence` reports `u`.
   Temporary and unlogged tables need cluster protocol version v22.
+- **Sequences and enum types in any schema** (was PG-D-035; design in
+  docs/design/schemas.md, "Sequences and types"):
+  - `CREATE SEQUENCE s.x`, `CREATE TYPE s.x AS ENUM (...)`,
+    `nextval('s.x')`, `'a'::s.mood`, and unqualified names through
+    `search_path`. `SERIAL` and identity columns of a table in a schema
+    get their sequence in that schema.
+  - `ALTER SEQUENCE / TYPE ... SET SCHEMA`; `ALTER TABLE ... SET SCHEMA`
+    moves the table's own sequences with it. A move, or renaming the
+    schema, is refused (`2BP01`) while a view names the object, or a
+    default or CHECK casts to the type.
+  - A column default's `nextval('x')` is bound to the sequence `x` named
+    when the default was set, as PostgreSQL binds the `regclass`; a name
+    that names no sequence is refused (`42P01`). Neither a session's
+    `search_path` nor a sequence of that name created later can redirect
+    it. `DROP SEQUENCE` of a sequence a default is bound to (and
+    `DROP TABLE` of a table owning one), counting every session's
+    temporary tables, is `2BP01` unless `CASCADE`, which drops the
+    default.
+  - Using a sequence or type by name in a schema other than `public`
+    takes `USAGE` on the schema (also for `::regclass` / `::regtype`
+    input), and creating one takes `CREATE` on it.
+    `CREATE SEQUENCE ... OWNED BY` requires the table's owner (`55000`).
+    `DROP SCHEMA` counts the schema's sequences and types, and `CASCADE`
+    drops them.
+  - The catalogs name the schema of sequences and types (`pg_class`,
+    `pg_type`, `pg_sequences`, `information_schema.sequences`,
+    `information_schema.columns.udt_schema`, `pg_get_serial_sequence`).
+    `format_type`, `regtype` and `regclass` output qualify a name the
+    search path does not reach and quote it where needed; the visibility
+    functions follow the path, so psql's `\d`, `\ds` and `\dT` and
+    pg_dump work.
+  - Leftovers are PG-D-037.
 - **PostgreSQL compatibility: the small P2 gaps, and `information_schema`**
   (docs/compatibility-gaps.md; leftovers are new P3 rows there).
   - **Queries.**
@@ -1597,6 +1629,18 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **Sequences, types and relation names** (with PG-D-035 above):
+  - A `DEFAULT nextval('x')` written before `x` exists is `42P01`, as in
+    PostgreSQL; it used to be accepted and resolved when used.
+  - `regclass` output names sequences (it printed the number) and
+    quotes identifiers that need it (`"Big"."Q"`), for tables too.
+    An enum's `::regtype` is its OID, displayed by name.
+  - A table, view or rename can no longer take a sequence's name in the
+    same schema (`42P07`); a duplicate sequence is `42P07` and a
+    duplicate type `42710` (both were `XX000`); creating in a schema
+    that does not exist is `3F000`.
+  - `'a'::"public"."Role"` and `'a'::s.mood` keep their schema
+    qualifier instead of resolving the bare name through the path.
 - **Two-part names with schemas.** `x.t` now means table `t` in schema
   `x` of the current database when that schema exists. Only when it does
   not, and a database `x` exists, does it mean `x.public.t`, as before.

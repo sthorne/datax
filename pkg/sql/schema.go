@@ -271,15 +271,29 @@ func (s *Session) execDropSchema(ctx context.Context, txn *kvclient.Txn, t *pars
 		if err != nil {
 			return nil, err
 		}
-		if len(tables) > 0 && !t.Cascade {
-			kind := "table"
-			if tables[0].IsView() {
-				kind = "view"
+		seqs, typs, err := schemaSequencesAndTypes(ctx, txn, v.db.ID, v.sd.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !t.Cascade {
+			kind, name := "", ""
+			switch {
+			case len(tables) > 0:
+				kind, name = "table", tables[0].Name
+				if tables[0].IsView() {
+					kind = "view"
+				}
+			case len(seqs) > 0:
+				kind, name = "sequence", seqs[0].Name
+			case len(typs) > 0:
+				kind, name = "type", typs[0].Name
 			}
-			return nil, &Error{Code: CodeDependentObjectsExist,
-				Msg:    "cannot drop schema " + v.sd.Name + " because other objects depend on it",
-				Detail: kind + " " + v.sd.Name + "." + tables[0].Name + " depends on schema " + v.sd.Name,
-				Hint:   "Use DROP ... CASCADE to drop the dependent objects too."}
+			if kind != "" {
+				return nil, &Error{Code: CodeDependentObjectsExist,
+					Msg:    "cannot drop schema " + v.sd.Name + " because other objects depend on it",
+					Detail: kind + " " + v.sd.Name + "." + name + " depends on schema " + v.sd.Name,
+					Hint:   "Use DROP ... CASCADE to drop the dependent objects too."}
+			}
 		}
 		// Views first: a view of the schema may read its tables.
 		for _, views := range []bool{true, false} {
@@ -299,12 +313,57 @@ func (s *Session) execDropSchema(ctx context.Context, txn *kvclient.Txn, t *pars
 				dropped++
 			}
 		}
+		// Then its sequences (those its tables owned went with them;
+		// the defaults of other schemas' tables bound to one lose it,
+		// as CASCADE drops them in PostgreSQL), and its types (one a
+		// column of another schema's table still uses is refused).
+		for _, sq := range seqs {
+			if cur, err := catalog.ReadSequence(ctx, txn, sq.ID); err != nil || cur == nil {
+				continue
+			}
+			if _, err := s.execDropSequence(ctx, txn, &parser.DropSequence{Name: catalog.SequenceRelationName(sq), Cascade: true, IfExists: true}); err != nil {
+				return nil, err
+			}
+			dropped++
+		}
+		for _, td := range typs {
+			if _, err := s.execDropType(ctx, txn, &parser.DropType{Name: catalog.TypeRelationName(td), IfExists: true}); err != nil {
+				return nil, err
+			}
+			dropped++
+		}
 		if err := s.cat.DropSchema(ctx, txn, v.sd); err != nil {
 			return nil, err
 		}
 		log.Audit("schema-ddl", "stmt", tag, "target", v.sd.Name, "database", v.db.Name, "cascade", t.Cascade, "dropped", dropped, "principal", s.sessionUser, "role", s.user)
 	}
 	return &Result{Tag: tag, Notices: notices}, nil
+}
+
+// schemaSequencesAndTypes lists the sequences and types of schema
+// schemaID of database dbID.
+func schemaSequencesAndTypes(ctx context.Context, txn *kvclient.Txn, dbID, schemaID uint64) ([]*catalog.SequenceDescriptor, []*catalog.TypeDescriptor, error) {
+	allSeqs, err := catalog.ListSequences(ctx, txn, dbID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var seqs []*catalog.SequenceDescriptor
+	for _, sq := range allSeqs {
+		if sq.SchemaID == schemaID {
+			seqs = append(seqs, sq)
+		}
+	}
+	allTypes, err := catalog.ListTypes(ctx, txn, dbID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var typs []*catalog.TypeDescriptor
+	for _, td := range allTypes {
+		if td.SchemaID == schemaID {
+			typs = append(typs, td)
+		}
+	}
+	return seqs, typs, nil
 }
 
 // refuseIfSchemaViewed refuses a change to schema sd that would change
@@ -395,6 +454,42 @@ func (s *Session) execAlterSchemaRename(ctx context.Context, txn *kvclient.Txn, 
 	if err := s.refuseIfSchemaViewed(ctx, txn, db, sd, "rename schema "+sd.Name); err != nil {
 		return nil, err
 	}
+	// The column defaults bound to the schema's sequences keep drawing
+	// from them; their text is rewritten to the new name. A view naming
+	// one of its sequences or types by text, or a default or CHECK
+	// casting to one of its types by a qualified name, would break.
+	seqs, typs, err := schemaSequencesAndTypes(ctx, txn, db.ID, sd.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(seqs) > 0 || len(typs) > 0 {
+		inSchema := map[uint64]bool{}
+		for _, sq := range seqs {
+			inSchema[sq.ID] = true
+		}
+		for _, td := range typs {
+			inSchema[td.ID] = true
+		}
+		hit := func(id uint64) bool { return inSchema[id] }
+		if err := s.refuseIfObjectViewed(ctx, txn, db.ID, "rename schema "+sd.Name, hit, hit); err != nil {
+			return nil, err
+		}
+	}
+	if len(typs) > 0 {
+		if err := s.refuseIfTypeCastByText(ctx, txn, db.ID, nil, sd.Name, "rename schema "+sd.Name); err != nil {
+			return nil, err
+		}
+	}
+	var refs []seqDefaultRef
+	if len(seqs) > 0 {
+		ids := map[uint64]bool{}
+		for _, sq := range seqs {
+			ids[sq.ID] = true
+		}
+		if refs, err = s.seqDefaultRefs(ctx, txn, db.ID, func(id uint64) bool { return ids[id] }); err != nil {
+			return nil, err
+		}
+	}
 	sd = sd.Clone()
 	if err := s.cat.RenameSchema(ctx, txn, sd, t.NewName); err != nil {
 		var ex *catalog.ErrSchemaExists
@@ -402,6 +497,9 @@ func (s *Session) execAlterSchemaRename(ctx context.Context, txn *kvclient.Txn, 
 			return nil, newErrf(CodeDuplicateSchema, "schema %q already exists", t.NewName)
 		}
 		return nil, ToSQLError(err)
+	}
+	if err := s.rewriteSeqDefaults(ctx, txn, refs); err != nil {
+		return nil, err
 	}
 	log.Audit("schema-ddl", "stmt", "ALTER SCHEMA RENAME", "target", t.Name, "new_name", t.NewName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: tag}, nil
@@ -490,25 +588,36 @@ func (s *Session) createTarget(ctx context.Context, txn *kvclient.Txn, name stri
 	return t, nil
 }
 
+// objectTarget resolves where CREATE SEQUENCE / TYPE (or a SERIAL
+// column's sequence) puts name, as createTarget, and checks that the
+// actor may create there (CREATE on the schema; for public, as
+// before schemas). A schema other than public needs v22, as every
+// object filed under one does.
+func (s *Session) objectTarget(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.Target, error) {
+	t, err := s.createTarget(ctx, txn, name)
+	if err != nil {
+		return nil, err
+	}
+	if !t.Schema.IsPublic() {
+		if err := s.requireSchemas(); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.checkCreateInSchema(ctx, txn, t); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
 // execSetSchema is ALTER TABLE | VIEW | SEQUENCE [IF EXISTS] name SET
-// SCHEMA s.
+// SCHEMA s, and ALTER TYPE name SET SCHEMA s.
 func (s *Session) execSetSchema(ctx context.Context, txn *kvclient.Txn, t *parser.SetSchema) (*Result, error) {
 	tag := "ALTER " + strings.ToUpper(t.Kind)
-	if t.Kind == "sequence" {
-		sd, err := s.lookupSequence(ctx, txn, t.Name)
-		if err != nil {
-			if serr := ToSQLError(err); serr.Code == CodeUndefinedTable && t.IfExists {
-				return &Result{Tag: tag, Notices: []string{"relation \"" + t.Name + "\" does not exist, skipping"}}, nil
-			}
-			return nil, err
-		}
-		if t.Schema != catalog.PublicSchema {
-			return nil, newErrf(CodeFeatureNotSupported, "sequences in schemas other than public are not supported yet (schema %q)", t.Schema)
-		}
-		if err := s.checkOwner(ctx, txn, "sequence", sd.Name, sd.Owner); err != nil {
-			return nil, err
-		}
-		return &Result{Tag: tag}, nil // already there
+	switch t.Kind {
+	case "sequence":
+		return s.setSequenceSchema(ctx, txn, t, tag)
+	case "type":
+		return s.setTypeSchema(ctx, txn, t, tag)
 	}
 	shared, err := s.lookup(ctx, txn, t.Name)
 	if err != nil {
@@ -550,17 +659,31 @@ func (s *Session) execSetSchema(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err := s.checkCreateInSchema(ctx, txn, &catalog.Target{Database: db.Name, DBID: shared.DatabaseID, Schema: target, Name: shared.Name}); err != nil {
 		return nil, err
 	}
-	if !target.IsPublic() {
-		for _, c := range shared.Columns {
-			if c.SequenceID != 0 {
-				return nil, newErrf(CodeFeatureNotSupported, "table %q owns sequences, which cannot leave the public schema yet", shared.Name)
-			}
-		}
-	}
 	// A view stores its query as text, by name: moving a relation it
 	// reads would change what it reads.
 	if err := s.refuseIfViewed(ctx, txn, shared, "move "+shared.Name+" to schema "+target.Name); err != nil {
 		return nil, err
+	}
+	// The sequences the table owns (SERIAL, identity, OWNED BY) move
+	// with it, as in PostgreSQL; the defaults naming them are found
+	// now, while their names still resolve, and renamed after.
+	owned, err := s.ownedSequences(ctx, txn, shared)
+	if err != nil {
+		return nil, err
+	}
+	var refs []seqDefaultRef
+	if len(owned) > 0 {
+		ids := map[uint64]bool{}
+		for _, sq := range owned {
+			ids[sq.ID] = true
+		}
+		if err := s.refuseIfObjectViewed(ctx, txn, shared.DatabaseID, "move "+shared.Name+" to schema "+target.Name,
+			func(id uint64) bool { return ids[id] }, nil); err != nil {
+			return nil, err
+		}
+		if refs, err = s.seqDefaultRefs(ctx, txn, shared.DatabaseID, func(id uint64) bool { return ids[id] }); err != nil {
+			return nil, err
+		}
 	}
 	desc := shared.Clone()
 	if err := s.cat.SetTableSchema(ctx, txn, desc, target.ID); err != nil {
@@ -571,6 +694,153 @@ func (s *Session) execSetSchema(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, ToSQLError(err)
 	}
 	s.noteDDL(catalog.RelationName(desc))
+	for _, sq := range owned {
+		if err := catalog.SetSequenceSchema(ctx, txn, sq, target.ID); err != nil {
+			var ex *catalog.ErrSequenceExists
+			if asErr(err, &ex) {
+				return nil, newErrf(CodeDuplicateTable, "relation %q already exists in schema %q", sq.Name, target.Name)
+			}
+			return nil, ToSQLError(err)
+		}
+	}
+	if err := s.rewriteSeqDefaults(ctx, txn, refs); err != nil {
+		return nil, err
+	}
+	log.Audit("schema-ddl", "stmt", tag+" SET SCHEMA", "target", t.Name, "schema", target.Name, "principal", s.sessionUser, "role", s.user)
+	return &Result{Tag: tag}, nil
+}
+
+// ownedSequences lists the sequences table d owns: its SERIAL and
+// identity columns', and those made OWNED BY one of its columns.
+func (s *Session) ownedSequences(ctx context.Context, txn *kvclient.Txn, d *catalog.TableDescriptor) ([]*catalog.SequenceDescriptor, error) {
+	seqs, err := catalog.ListSequences(ctx, txn, d.DatabaseID)
+	if err != nil {
+		return nil, err
+	}
+	byCol := map[uint64]bool{}
+	for _, c := range d.Columns {
+		if c.SequenceID != 0 {
+			byCol[c.SequenceID] = true
+		}
+	}
+	var out []*catalog.SequenceDescriptor
+	for _, sq := range seqs {
+		if sq.OwnerTable == d.ID || byCol[sq.ID] {
+			out = append(out, sq)
+		}
+	}
+	return out, nil
+}
+
+// setSequenceSchema is ALTER SEQUENCE [IF EXISTS] name SET SCHEMA s:
+// the owner, holding CREATE on s. A sequence a column owns moves only
+// with its table (0A000, as in PostgreSQL). The column defaults bound
+// to the sequence keep drawing from it, and are rewritten to name it
+// where it now is.
+func (s *Session) setSequenceSchema(ctx context.Context, txn *kvclient.Txn, t *parser.SetSchema, tag string) (*Result, error) {
+	sd, err := s.lookupSequence(ctx, txn, t.Name)
+	if err != nil {
+		if serr := ToSQLError(err); serr.Code == CodeUndefinedTable && t.IfExists {
+			return &Result{Tag: tag, Notices: []string{"relation \"" + t.Name + "\" does not exist, skipping"}}, nil
+		}
+		return nil, err
+	}
+	if err := s.checkSequenceOwner(ctx, txn, sd); err != nil {
+		return nil, err
+	}
+	target, err := catalog.LookupSchema(ctx, txn, sd.DatabaseID, t.Schema)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	if target.ID == sd.SchemaID {
+		return &Result{Tag: tag}, nil
+	}
+	if sd.OwnerTable != 0 {
+		detail := ""
+		if owner, err := catalog.ReadTable(ctx, txn, sd.OwnerTable); err == nil && owner != nil {
+			detail = "Sequence \"" + sd.Name + "\" is linked to table \"" + owner.Name + "\"."
+		}
+		return nil, &Error{Code: CodeFeatureNotSupported, Msg: "cannot move an owned sequence into another schema", Detail: detail}
+	}
+	db, err := catalog.ReadDatabase(ctx, txn, sd.DatabaseID)
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		db = &catalog.DatabaseDescriptor{Name: s.database}
+	}
+	if err := s.checkCreateInSchema(ctx, txn, &catalog.Target{Database: db.Name, DBID: sd.DatabaseID, Schema: target, Name: sd.Name}); err != nil {
+		return nil, err
+	}
+	// A view names the sequence by text: moving it would break, or
+	// redirect, the view.
+	if err := s.refuseIfObjectViewed(ctx, txn, sd.DatabaseID, "move sequence "+sd.Name+" to schema "+target.Name,
+		func(id uint64) bool { return id == sd.ID }, nil); err != nil {
+		return nil, err
+	}
+	refs, err := s.seqDefaultRefs(ctx, txn, sd.DatabaseID, func(id uint64) bool { return id == sd.ID })
+	if err != nil {
+		return nil, err
+	}
+	if err := catalog.SetSequenceSchema(ctx, txn, sd, target.ID); err != nil {
+		var ex *catalog.ErrSequenceExists
+		if asErr(err, &ex) {
+			return nil, newErrf(CodeDuplicateTable, "relation %q already exists in schema %q", sd.Name, target.Name)
+		}
+		return nil, ToSQLError(err)
+	}
+	if err := s.rewriteSeqDefaults(ctx, txn, refs); err != nil {
+		return nil, err
+	}
+	log.Audit("schema-ddl", "stmt", tag+" SET SCHEMA", "target", t.Name, "schema", target.Name, "principal", s.sessionUser, "role", s.user)
+	return &Result{Tag: tag}, nil
+}
+
+// setTypeSchema is ALTER TYPE name SET SCHEMA s: the owner, holding
+// CREATE on s. The columns of the type hold its ID, so nothing else
+// changes.
+func (s *Session) setTypeSchema(ctx context.Context, txn *kvclient.Txn, t *parser.SetSchema, tag string) (*Result, error) {
+	td, err := s.lookupType(ctx, txn, t.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkOwner(ctx, txn, "type", td.Name, td.Owner); err != nil {
+		return nil, err
+	}
+	target, err := catalog.LookupSchema(ctx, txn, td.DatabaseID, t.Schema)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	if target.ID == td.SchemaID {
+		return &Result{Tag: tag}, nil
+	}
+	db, err := catalog.ReadDatabase(ctx, txn, td.DatabaseID)
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		db = &catalog.DatabaseDescriptor{Name: s.database}
+	}
+	if err := s.checkCreateInSchema(ctx, txn, &catalog.Target{Database: db.Name, DBID: td.DatabaseID, Schema: target, Name: td.Name}); err != nil {
+		return nil, err
+	}
+	// Views, column defaults and CHECK constraints name a type by text,
+	// resolved when they are evaluated: moving it would break, or
+	// redirect, them.
+	what := "move type " + td.Name + " to schema " + target.Name
+	if err := s.refuseIfObjectViewed(ctx, txn, td.DatabaseID, what, nil, func(id uint64) bool { return id == td.ID }); err != nil {
+		return nil, err
+	}
+	if err := s.refuseIfTypeCastByText(ctx, txn, td.DatabaseID, []string{td.Name}, "", what); err != nil {
+		return nil, err
+	}
+	if err := catalog.SetTypeSchema(ctx, txn, td, target.ID); err != nil {
+		var ex *catalog.ErrTypeExists
+		if asErr(err, &ex) {
+			return nil, newErrf(CodeDuplicateObject, "type %q already exists in schema %q", td.Name, target.Name)
+		}
+		return nil, ToSQLError(err)
+	}
 	log.Audit("schema-ddl", "stmt", tag+" SET SCHEMA", "target", t.Name, "schema", target.Name, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: tag}, nil
 }
@@ -616,44 +886,6 @@ func (s *Session) schemaByOID(ctx context.Context, txn *kvclient.Txn, oid int64)
 		return "", false, nil
 	}
 	return sd.Name, true, nil
-}
-
-// publicOnlyDatabase resolves the qualifier of a sequence or type name,
-// kinds that live in the public schema only for now: "" or public is
-// the current database; a schema of the current database is refused
-// (ok false: such an object does not exist there); any other qualifier
-// is a database (the datax extension), as before schemas.
-func (s *Session) publicOnlyDatabase(ctx context.Context, txn *kvclient.Txn, name string) (db, bare string, ok bool, err error) {
-	parts := catalog.SplitName(name)
-	bare = parts[len(parts)-1]
-	switch len(parts) {
-	case 1:
-		return s.database, bare, true, nil
-	case 2:
-		q := parts[0]
-		if q == catalog.PublicSchema {
-			return s.database, bare, true, nil
-		}
-		if !catalog.IsSystemSchemaName(q) {
-			dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
-			if err != nil {
-				return "", "", false, ToSQLError(err)
-			}
-			if _, err := catalog.LookupSchema(ctx, txn, dbID, q); err == nil {
-				return "", bare, false, nil
-			}
-		}
-		return q, bare, true, nil
-	case 3:
-		if parts[1] != catalog.PublicSchema {
-			if parts[0] != s.database {
-				return "", "", false, newErrf(CodeFeatureNotSupported, "cross-database references are not implemented: %q", name)
-			}
-			return "", bare, false, nil
-		}
-		return parts[0], bare, true, nil
-	}
-	return "", bare, false, nil
 }
 
 // viewResolutionPath is the search path a view's query resolves

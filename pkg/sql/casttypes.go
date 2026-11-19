@@ -2,10 +2,13 @@ package sql
 
 import (
 	"context"
+	"strings"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/builtins"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 )
 
 // castTypeNames lists, in order of appearance, the type names stmt's
@@ -61,6 +64,24 @@ func castTypeNames(stmt parser.Statement) []string {
 	return names
 }
 
+// castLookupName is the name a cast to a user-defined type looks the
+// type up by: without its typmod and array brackets, and with its
+// schema qualifier (s.mood is mood of schema s), but pg_catalog's.
+func castLookupName(typ string) string {
+	base := builtins.CastBaseType(typ)
+	name := strings.TrimSpace(typ)
+	if i := strings.IndexByte(name, '('); i >= 0 {
+		name = name[:i]
+	}
+	for strings.HasSuffix(name, "[]") {
+		name = strings.TrimSpace(strings.TrimSuffix(name, "[]"))
+	}
+	if q, _ := catalog.SplitTableName(name); q != "" && q != vtable.PgCatalog {
+		return q + "." + base
+	}
+	return base
+}
+
 // checkCastTypes refuses a statement that casts to a type that does not
 // exist, as PostgreSQL does when it analyzes the statement (42704 type
 // "t" does not exist), before any row is read: a cast to a type datax
@@ -75,11 +96,17 @@ func (s *Session) checkCastTypes(ctx context.Context, txn *kvclient.Txn, stmt pa
 	}
 	check := func(ctx context.Context, txn *kvclient.Txn) error {
 		for _, name := range names {
-			base := builtins.CastBaseType(name)
+			base := castLookupName(name)
 			_, err := s.lookupType(ctx, txn, base)
-			if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedObject && len(base) > 1 && base[0] == '_' {
+			if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedObject {
 				// _mood: the array type of the enum mood.
-				_, err = s.lookupType(ctx, txn, base[1:])
+				q, bare := catalog.SplitTableName(base)
+				if len(bare) > 1 && bare[0] == '_' {
+					if q != "" {
+						q += "."
+					}
+					_, err = s.lookupType(ctx, txn, q+bare[1:])
+				}
 			}
 			if err != nil {
 				if serr, ok := err.(*Error); ok && serr.Code == CodeUndefinedObject {

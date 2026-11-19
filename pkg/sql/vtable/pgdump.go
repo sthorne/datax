@@ -113,8 +113,12 @@ const OIDPgAttrdef = 2604
 // itself orders the same.
 func defaultAndViewDepends(env *Env) []Row {
 	seqByName := map[string]*catalog.SequenceDescriptor{}
+	seqByID := map[uint64]*catalog.SequenceDescriptor{}
 	for _, sq := range env.currentSequences() {
-		seqByName[sq.Name] = sq
+		if sq.SchemaID == 0 {
+			seqByName[sq.Name] = sq
+		}
+		seqByID[sq.ID] = sq
 	}
 	var rows []Row
 	for _, t := range env.currentTables() {
@@ -133,6 +137,22 @@ func defaultAndViewDepends(env *Env) []Row {
 			n++
 			def := ColumnDefault(c)
 			if def == "" || c.Identity != "" {
+				continue
+			}
+			if c.SeqBindings != nil {
+				// The sequences the default is bound to (gap PG-D-035).
+				seen := map[uint64]bool{}
+				ids := make([]uint64, 0, len(c.SeqBindings))
+				for _, id := range c.SeqBindings {
+					ids = append(ids, id)
+				}
+				sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+				for _, id := range ids {
+					if sq := seqByID[id]; sq != nil && !seen[id] {
+						seen[id] = true
+						rows = append(rows, Row{i64(OIDPgAttrdef), i64(AttrdefOID(t, n)), i64(0), i64(OIDPgClass), i64(int64(sq.ID)), i64(0), str("n")})
+					}
+				}
 				continue
 			}
 			for _, name := range nextvalSequences(def) {

@@ -2906,11 +2906,28 @@ not: without `USAGE` on it, a name there is `42501`). A view reads the
 relations its names meant when it was created, whatever the reader's
 path, and whatever was created under those names since.
 
-**Limits.** Sequences and enum types live in `public` only for now:
-`CREATE SEQUENCE s.x`, `CREATE TYPE s.x`, `SERIAL` / identity columns in
-a table of another schema, and `SET SCHEMA` of a sequence or of a table
-that owns one are `0A000` (use a sequence of `public`: `DEFAULT
-nextval('public.ids')`). `CREATE SCHEMA ... CREATE TABLE ...` (schema
+**Sequences and types.** Sequences and enum types live in any schema,
+as tables do: `CREATE SEQUENCE s.x`, `CREATE TYPE s.mood AS ENUM
+(...)`, `nextval('s.x')`, `'a'::s.mood`, and unqualified names through
+`search_path`. A `SERIAL` or identity column's sequence goes in its
+table's schema, and moves with the table (`ALTER TABLE ... SET
+SCHEMA`); `ALTER SEQUENCE ... SET SCHEMA` (a sequence a column owns
+moves only with its table, `0A000`) and `ALTER TYPE ... SET SCHEMA`
+move the others. A column default's `nextval('x')` is bound to the
+sequence `x` named when the default was set, as PostgreSQL binds the
+`regclass` (a name naming no sequence is `42P01`): an inserting
+session's path, a sequence of that name created later, a rename of the
+schema or a move of the sequence change nothing (the default's text is
+rewritten to the sequence's new name). Moving a sequence or type, or
+renaming its schema, is refused (`2BP01`) while a view names it, or a
+default or CHECK casts to the type, by text.
+`DROP SEQUENCE` of a sequence a default is bound to is `2BP01` unless
+`CASCADE`, which drops the default. Using a sequence or type of a schema
+takes `USAGE` on the schema; creating one takes `CREATE` on it.
+`DROP SCHEMA` counts the schema's sequences and types; `CASCADE` drops
+them (a type a column of another schema's table uses is `2BP01`).
+
+**Limits.** `CREATE SCHEMA ... CREATE TABLE ...` (schema
 elements), `COMMENT ON SCHEMA` and `ALTER DEFAULT PRIVILEGES IN SCHEMA`
 for a schema other than `public` are not supported. Renaming a schema,
 or moving a relation, that a view reads is refused (`2BP01`). A

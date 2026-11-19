@@ -35,29 +35,26 @@ func (s *Session) applyAddIdentity(ctx context.Context, txn *kvclient.Txn, desc 
 	if !col.NotNull {
 		return newErrf(CodeObjectNotInState, "column %q of relation %q must be declared NOT NULL before identity can be added", col.Name, desc.Name)
 	}
-	if desc.SchemaID != 0 {
-		return newErrf(CodeFeatureNotSupported, "identity columns in schemas other than public are not supported yet")
-	}
 	seqName := desc.Name + "_" + col.Name + "_seq"
 	if ai.Seq != nil && ai.Seq.SeqName != "" {
-		// [public.]name: the sequence lives with the table, in public.
-		db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, ai.Seq.SeqName)
-		if err != nil {
-			return err
+		// [schema.]name: the sequence lives with the table, in its
+		// schema (PostgreSQL refuses another).
+		seqName = catalog.BareName(ai.Seq.SeqName)
+		if len(catalog.SplitName(ai.Seq.SeqName)) > 1 {
+			target, err := s.createTarget(ctx, txn, ai.Seq.SeqName)
+			if err != nil {
+				return err
+			}
+			if target.DBID != desc.DatabaseID || target.Schema.ID != desc.SchemaID {
+				return newErrf(CodeFeatureNotSupported, "the sequence of an identity column must be in its table's schema (%q)", ai.Seq.SeqName)
+			}
 		}
-		if ok {
-			dbID, err := s.cat.DatabaseID(ctx, txn, db)
-			ok = err == nil && dbID == desc.DatabaseID
-		}
-		if !ok {
-			return newErrf(CodeFeatureNotSupported, "the sequence of an identity column must be in its table's schema (%q)", ai.Seq.SeqName)
-		}
-		seqName = bare
 	}
 	if eff.dry {
 		return nil
 	}
 	sd := catalog.NewSequenceDescriptor(seqName, desc.DatabaseID)
+	sd.SchemaID = desc.SchemaID
 	sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
 	sd.Owner = desc.Owner
 	if err := s.applyDefaultPrivileges(ctx, txn, desc.DatabaseID, sd.Owner, "SEQUENCES", &sd.Privileges, &sd.GrantOptions); err != nil {
@@ -71,11 +68,15 @@ func (s *Session) applyAddIdentity(ctx context.Context, txn *kvclient.Txn, desc 
 	if err := catalog.CreateSequence(ctx, txn, sd); err != nil {
 		return ToSQLError(err)
 	}
+	text, bindings, err := s.serialDefault(ctx, txn, sd)
+	if err != nil {
+		return err
+	}
 	for i := range desc.Columns {
 		if desc.Columns[i].ID == col.ID {
 			desc.Columns[i].Identity = ai.Identity
 			desc.Columns[i].SequenceID = sd.ID
-			desc.Columns[i].DefaultExpr = nextvalDefault(sd.Name)
+			desc.Columns[i].DefaultExpr, desc.Columns[i].SeqBindings = text, bindings
 		}
 	}
 	return nil

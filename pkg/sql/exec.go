@@ -258,13 +258,6 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if dbName == catalog.SystemDatabase && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "database %q is reserved for the cluster", dbName)
 	}
-	if !target.Schema.IsPublic() {
-		for _, cd := range t.Columns {
-			if cd.Serial || cd.Identity != "" {
-				return nil, newErrf(CodeFeatureNotSupported, "SERIAL and identity columns in schemas other than public are not supported yet (schema %q): use a sequence of the public schema and DEFAULT nextval('public.seq')", target.Schema.Name)
-			}
-		}
-	}
 	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Owner: s.user, Unlogged: t.Unlogged}
 	if id, ok := catalog.SystemTableID(bare); ok {
 		desc.ID = id
@@ -308,7 +301,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			if err != nil {
 				return nil, err
 			}
-			col.DefaultExpr = text
+			if err := s.setDefaultExpr(ctx, txn, &col, text); err != nil {
+				return nil, err
+			}
 		}
 		if cd.Serial || cd.Identity != "" {
 			if err := s.requireV7("SERIAL and identity columns"); err != nil {
@@ -418,6 +413,7 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		}
 		col := &desc.Columns[i]
 		sd := catalog.NewSequenceDescriptor(desc.Name+"_"+col.Name+"_seq", desc.DatabaseID)
+		sd.SchemaID = desc.SchemaID // the table's schema, as in PostgreSQL
 		sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
 		sd.Owner = desc.Owner
 		if err := s.applyDefaultPrivileges(ctx, txn, desc.DatabaseID, sd.Owner, "SEQUENCES", &sd.Privileges, &sd.GrantOptions); err != nil {
@@ -432,7 +428,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 			return nil, ToSQLError(err)
 		}
 		col.SequenceID = sd.ID
-		col.DefaultExpr = nextvalDefault(sd.Name)
+		if col.DefaultExpr, col.SeqBindings, err = s.serialDefault(ctx, txn, sd); err != nil {
+			return nil, err
+		}
 		owned = true
 	}
 	constrained, err := s.createTableConstraints(ctx, txn, desc, t)
@@ -1009,6 +1007,9 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 			return nil, err
 		}
 		if err := s.dropTableConstraints(ctx, txn, existing, t.Cascade); err != nil {
+			return nil, err
+		}
+		if err := s.dropOwnedSequenceDefaults(ctx, txn, existing, t.Cascade); err != nil {
 			return nil, err
 		}
 	}

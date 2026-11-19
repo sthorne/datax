@@ -82,49 +82,67 @@ func (s *Session) requireV7(what string) error {
 	return nil
 }
 
-// lookupSequence resolves a (possibly db-qualified) sequence name in the
-// session's database.
+// lookupSequence resolves a sequence name as written ("x", "s.x",
+// "db.s.x", "db.x"): an unqualified name through the session's search
+// path (a view's own inside a view), a qualified one where its
+// qualifiers say, by the rules tables follow (docs/design/schemas.md).
 func (s *Session) lookupSequence(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.SequenceDescriptor, error) {
-	db, bare := catalog.SplitTableName(name)
+	lookupName := name
 	if strings.Contains(name, `"`) {
 		// A name with quotes reads as SQL reads one ('"Ser_id_seq"',
 		// 'public."a""b_seq"'): what nextvalDefault writes.
 		parts, ok := parseQualifiedName(name)
-		if !ok || len(parts) > 2 {
-			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
-		}
-		db, bare = "", parts[len(parts)-1]
-		if len(parts) == 2 {
-			db = parts[0]
-		}
-	}
-	if db == "" || db == catalog.PublicSchema {
-		// public.s names the schema, as a table's name may
-		// (pg_dump's setval('public.s', ...)).
-		db = s.database
-	} else {
-		// Sequences live in public only (for now): a qualifier naming
-		// a schema of the current database finds none; any other names
-		// a database, as before schemas.
-		qdb, _, ok, err := s.publicOnlyDatabase(ctx, txn, db+"."+bare)
-		if err != nil {
-			return nil, err
-		}
 		if !ok {
 			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
 		}
-		db = qdb
+		if lookupName, ok = relationLookupName(parts); !ok {
+			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+		}
 	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, db)
-	if err != nil {
-		return nil, ToSQLError(err)
-	}
-	d, err := catalog.LookupSequence(ctx, txn, dbID, bare)
+	d, err := s.cat.LookupSequenceIn(s.rctx(ctx), txn, s.database, lookupName)
 	if err != nil {
 		var nf *catalog.ErrSequenceNotFound
 		if asErr(err, &nf) {
-			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", catalog.DisplayName(name))
 		}
+		return nil, ToSQLError(err)
+	}
+	return d, nil
+}
+
+// sequenceByOID resolves a sequence of the current database by its
+// OID (its ID): nextval('x'::regclass), and a default's bound sequence.
+func (s *Session) sequenceByOID(ctx context.Context, txn *kvclient.Txn, oid int64) (*catalog.SequenceDescriptor, error) {
+	if oid > 0 {
+		dbID, err := s.currentDatabaseID(ctx, txn)
+		if err != nil {
+			return nil, err
+		}
+		sd, err := catalog.ReadSequence(ctx, txn, uint64(oid))
+		if err == nil && sd != nil && sd.DatabaseID == dbID {
+			return sd, nil
+		}
+		var nf *catalog.ErrSequenceNotFound
+		if err != nil && !asErr(err, &nf) {
+			return nil, err
+		}
+	}
+	return nil, newErrf(CodeUndefinedTable, "could not open relation with OID %d", oid)
+}
+
+// sequenceArg resolves the sequence argument of nextval, currval and
+// setval: a regclass (an OID) or a name (which needs USAGE on the
+// sequence's schema).
+func (s *Session) sequenceArg(ctx context.Context, txn *kvclient.Txn, arg types.Datum) (*catalog.SequenceDescriptor, error) {
+	if arg.Fam == types.Int && !arg.Null {
+		return s.sequenceByOID(ctx, txn, arg.I)
+	}
+	d, err := s.lookupSequence(ctx, txn, arg.Text())
+	if err != nil {
+		return nil, err
+	}
+	// By name, the sequence's schema takes USAGE, as a table's does.
+	if err := s.checkObjectSchemaUsage(ctx, txn, d.SchemaID); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -174,21 +192,13 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 	if err := s.requireV7("CREATE SEQUENCE"); err != nil {
 		return nil, err
 	}
-	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
-		return nil, err
-	}
-	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, t.Name)
+	target, err := s.objectTarget(ctx, txn, t.Name)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
-		return nil, newErrf(CodeFeatureNotSupported, "sequences in schemas other than public are not supported yet (%q)", t.Name)
-	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, db)
-	if err != nil {
-		return nil, ToSQLError(err)
-	}
+	bare, dbID := target.Name, target.DBID
 	d := catalog.NewSequenceDescriptor(bare, dbID)
+	d.SchemaID = target.Schema.ID
 	d.Owner = s.user
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, d.Owner, "SEQUENCES", &d.Privileges, &d.GrantOptions); err != nil {
 		return nil, err
@@ -206,12 +216,27 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 		if !ok {
 			return nil, newErrf(CodeUndefinedColumn, "column %q of table %q does not exist", col, table)
 		}
+		if owner.IsView() || owner.Virtual != "" {
+			return nil, newErrf(CodeWrongObjectType, "sequence cannot be owned by relation %q", table)
+		}
+		// As ALTER SEQUENCE ... OWNED BY: a sequence another role could
+		// hang on a table would go, and move, with it.
+		if catalog.OwnerOf(owner.Owner) != catalog.OwnerOf(d.Owner) {
+			return nil, newErrf(CodeObjectNotInState, "sequence must have same owner as table it is linked to")
+		}
+		if owner.SchemaID != d.SchemaID {
+			return nil, newErrf(CodeObjectNotInState, "sequence must be in same schema as table it is linked to")
+		}
 		d.OwnerTable, d.OwnerColumn = owner.ID, c.ID
 	}
 	if err := catalog.CreateSequence(ctx, txn, d); err != nil {
 		var ex *catalog.ErrSequenceExists
-		if t.IfNotExists && asErr(err, &ex) {
-			return &Result{Tag: "CREATE SEQUENCE"}, nil
+		var tex *catalog.ErrTableExists
+		if asErr(err, &ex) || asErr(err, &tex) {
+			if t.IfNotExists {
+				return &Result{Tag: "CREATE SEQUENCE", Notices: []string{"relation \"" + bare + "\" already exists, skipping"}}, nil
+			}
+			return nil, newErrf(CodeDuplicateTable, "relation %q already exists", bare)
 		}
 		return nil, ToSQLError(err)
 	}
@@ -256,6 +281,9 @@ func (s *Session) execAlterSequence(ctx context.Context, txn *kvclient.Txn, t *p
 		if catalog.OwnerOf(owner.Owner) != catalog.OwnerOf(d.Owner) {
 			return nil, newErrf(CodeObjectNotInState, "sequence must have same owner as table it is linked to")
 		}
+		if owner.SchemaID != d.SchemaID {
+			return nil, newErrf(CodeObjectNotInState, "sequence must be in same schema as table it is linked to")
+		}
 		d.OwnerTable, d.OwnerColumn = owner.ID, c.ID
 	}
 	if err := catalog.UpdateSequence(ctx, txn, d); err != nil {
@@ -292,12 +320,65 @@ func (s *Session) execDropSequence(ctx context.Context, txn *kvclient.Txn, t *pa
 			}
 		}
 	}
+	// The column defaults bound to the sequence depend on it, as in
+	// PostgreSQL: RESTRICT refuses, CASCADE drops the defaults. (A
+	// default set before bindings existed names the sequence by text,
+	// and is left as before.)
+	refs, err := s.seqDefaultRefs(ctx, txn, d.DatabaseID, func(id uint64) bool { return id == d.ID })
+	if err != nil {
+		return nil, err
+	}
+	var notices []string
+	for _, r := range refs {
+		if r.legacy {
+			continue
+		}
+		col, _ := r.table.ColByID(r.col)
+		if !t.Cascade {
+			return nil, &Error{Code: CodeDependentObjectsExist,
+				Msg:    "cannot drop sequence " + d.Name + " because other objects depend on it",
+				Detail: "default value for column " + col.Name + " of table " + r.table.Name + " depends on sequence " + d.Name,
+				Hint:   "Use DROP ... CASCADE to drop the dependent objects too."}
+		}
+		if err := s.dropBoundDefault(ctx, txn, r.table.ID, r.col); err != nil {
+			return nil, err
+		}
+		notices = append(notices, "drop cascades to default value for column "+col.Name+" of table "+r.table.Name)
+	}
 	if err := catalog.DropSequence(ctx, txn, d); err != nil {
 		return nil, err
 	}
 	s.dropSeqBlock(d.ID)
 	log.Audit("sequence-ddl", "stmt", "DROP SEQUENCE", "target", d.Name, "principal", s.sessionUser, "role", s.user)
-	return &Result{Tag: "DROP SEQUENCE"}, nil
+	return &Result{Tag: "DROP SEQUENCE", Notices: notices}, nil
+}
+
+// dropBoundDefault drops the default of column col of table tableID
+// (DROP SEQUENCE ... CASCADE of the sequence it is bound to), as ALTER
+// COLUMN ... DROP DEFAULT does.
+func (s *Session) dropBoundDefault(ctx context.Context, txn *kvclient.Txn, tableID uint64, col catalog.ColumnID) error {
+	cur, err := catalog.ReadTable(ctx, txn, tableID)
+	if err != nil || cur == nil {
+		return err
+	}
+	desc := cur.Clone()
+	for i := range desc.Columns {
+		c := &desc.Columns[i]
+		if c.ID != col {
+			continue
+		}
+		if c.FillDefault {
+			c.DefaultExpr = "NULL"
+		} else {
+			c.Default, c.DefaultExpr = nil, ""
+		}
+		c.SeqBindings = nil
+	}
+	if err := s.cat.Update(ctx, txn, desc); err != nil {
+		return err
+	}
+	s.noteDDL(catalog.RelationName(desc))
+	return nil
 }
 
 // checkSequenceOwner: the sequence's owner (or an admin) may alter or
@@ -362,8 +443,8 @@ func (s *Session) sequenceValue(ctx context.Context, d *catalog.SequenceDescript
 // nextval hands out the sequence's next value: from the gateway-local
 // block when one remains, else after taking a fresh block with one
 // Increment outside the transaction.
-func (s *Session) nextval(ctx context.Context, txn *kvclient.Txn, name string) (int64, error) {
-	d, err := s.lookupSequence(ctx, txn, name)
+func (s *Session) nextval(ctx context.Context, txn *kvclient.Txn, arg types.Datum) (int64, error) {
+	d, err := s.sequenceArg(ctx, txn, arg)
 	if err != nil {
 		return 0, err
 	}
@@ -439,8 +520,8 @@ func (s *Session) takeSequenceBlock(ctx context.Context, d *catalog.SequenceDesc
 	return nil, newErrf(CodeSequenceLimit, "nextval: sequence %q exhausted", d.Name)
 }
 
-func (s *Session) currval(ctx context.Context, txn *kvclient.Txn, name string) (int64, error) {
-	d, err := s.lookupSequence(ctx, txn, name)
+func (s *Session) currval(ctx context.Context, txn *kvclient.Txn, arg types.Datum) (int64, error) {
+	d, err := s.sequenceArg(ctx, txn, arg)
 	if err != nil {
 		return 0, err
 	}
@@ -463,8 +544,8 @@ func (s *Session) lastvalFn() (int64, error) {
 
 // setval sets the counter: with is_called (the default) the next value
 // is v + increment; without, v itself.
-func (s *Session) setval(ctx context.Context, txn *kvclient.Txn, name string, v int64, isCalled bool) (int64, error) {
-	d, err := s.lookupSequence(ctx, txn, name)
+func (s *Session) setval(ctx context.Context, txn *kvclient.Txn, arg types.Datum, v int64, isCalled bool) (int64, error) {
+	d, err := s.sequenceArg(ctx, txn, arg)
 	if err != nil {
 		return 0, err
 	}
@@ -582,9 +663,9 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 			var v int64
 			var err error
 			if e.Func == "nextval" {
-				v, err = s.nextval(ctx, txn, args[0].Text())
+				v, err = s.nextval(ctx, txn, args[0])
 			} else {
-				v, err = s.currval(ctx, txn, args[0].Text())
+				v, err = s.currval(ctx, txn, args[0])
 			}
 			if err != nil {
 				return e, err
@@ -612,7 +693,7 @@ func (s *Session) spliceVolatile(ctx context.Context, txn *kvclient.Txn, e parse
 				}
 				called = b.B
 			}
-			v, err := s.setval(ctx, txn, args[0].Text(), n.I, called)
+			v, err := s.setval(ctx, txn, args[0], n.I, called)
 			if err != nil {
 				return e, err
 			}
@@ -679,7 +760,7 @@ type columnDefaults struct {
 // statement (nil when the table has none).
 func (s *Session) prepareDefaults(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, params []types.Datum) (*columnDefaults, error) {
 	var cd *columnDefaults
-	for _, c := range desc.Columns {
+	for i, c := range desc.Columns {
 		if c.DefaultExpr == "" {
 			continue
 		}
@@ -687,6 +768,9 @@ func (s *Session) prepareDefaults(ctx context.Context, txn *kvclient.Txn, desc *
 		if err != nil {
 			return nil, newErrf(CodeInternal, "column %q: default expression %q: %v", c.Name, c.DefaultExpr, err)
 		}
+		// Its sequence names draw from the sequences they were bound to
+		// when the default was set, whatever this session's path.
+		e = boundDefaultExpr(&desc.Columns[i], e)
 		if e, err = s.resolveValueExprOpts(ctx, txn, e, params, true); err != nil {
 			return nil, err
 		}

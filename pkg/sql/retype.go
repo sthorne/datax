@@ -423,7 +423,7 @@ func retypeSwapIDs(desc *catalog.TableDescriptor, oldID, shadowID catalog.Column
 		}
 		shadow.Default, shadow.FillDefault = &d, old.FillDefault
 	}
-	shadow.DefaultExpr = old.DefaultExpr
+	shadow.DefaultExpr, shadow.SeqBindings = old.DefaultExpr, old.SeqBindings
 	desc.Columns[oi] = shadow
 	desc.Columns = append(desc.Columns[:si], desc.Columns[si+1:]...)
 	return nil

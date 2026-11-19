@@ -216,6 +216,22 @@ func ToSQLError(err error) *Error {
 	if errors.As(err, &ex) {
 		return &Error{Code: CodeDuplicateTable, Msg: ex.Error()}
 	}
+	var seqEx *catalog.ErrSequenceExists
+	if errors.As(err, &seqEx) {
+		return &Error{Code: CodeDuplicateTable, Msg: fmt.Sprintf("relation %q already exists", seqEx.Name)}
+	}
+	var seqNF *catalog.ErrSequenceNotFound
+	if errors.As(err, &seqNF) {
+		return &Error{Code: CodeUndefinedTable, Msg: fmt.Sprintf("relation %q does not exist", seqNF.Name)}
+	}
+	var typEx *catalog.ErrTypeExists
+	if errors.As(err, &typEx) {
+		return &Error{Code: CodeDuplicateObject, Msg: typEx.Error()}
+	}
+	var typNF *catalog.ErrTypeNotFound
+	if errors.As(err, &typNF) {
+		return &Error{Code: CodeUndefinedObject, Msg: typNF.Error()}
+	}
 	return &Error{Code: CodeInternal, Msg: err.Error()}
 }
 

@@ -139,7 +139,9 @@ The built-in roles always exist and cannot be altered or dropped:
 | `metrics` | the HTTP `/metrics` endpoint, and nothing else — the Prometheus scrape account needs no table grants and cannot read data |
 
 What each statement needs: creating tables, views, sequences and types
-takes `CREATE` on the database (or on `public`), or the admin role;
+takes `CREATE` on the database (or on `public`), or the admin role — in
+another schema, `CREATE` on that schema, and using an object of one
+(a table, a sequence's `nextval`, a cast to a type) `USAGE` on it;
 `ALTER`, `DROP`, `COMMENT ON`, `CREATE INDEX` and `GRANT` on an object
 take its owner (or an admin); `TRUNCATE` takes the `TRUNCATE` privilege
 — `DELETE` does not cover it (finalizing the v11 upgrade gave every

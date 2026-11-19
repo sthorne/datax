@@ -299,6 +299,11 @@ func (s *Session) tablePrivAllowedSchema(ctx context.Context, txn *kvclient.Txn,
 		if err != nil || sd == nil || priv != "SELECT" {
 			return false, err
 		}
+		if schema && sd.SchemaID != 0 {
+			if err := s.checkObjectSchemaUsage(ctx, txn, sd.SchemaID); err != nil {
+				return false, nil
+			}
+		}
 		return s.sequencePrivAllowed(ctx, txn, sd, "SELECT")
 	}
 	if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
@@ -639,8 +644,46 @@ func (s *Session) sequencePrivAllowed(ctx context.Context, txn *kvclient.Txn, d 
 	return false, nil
 }
 
+// checkObjectSchemaUsage returns 42501 unless the actor holds USAGE on
+// schema schemaID, which reaching a sequence or a type of a schema
+// other than public takes, as reaching a table does. public's USAGE is
+// left to the object's own check, as before schemas.
+func (s *Session) checkObjectSchemaUsage(ctx context.Context, txn *kvclient.Txn, schemaID uint64) error {
+	if schemaID == 0 || s.system || s.actor() == catalog.RootRole {
+		return nil
+	}
+	if txn == nil {
+		var out error
+		if err := s.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
+			out = s.checkObjectSchemaUsage(ctx, txn, schemaID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return out
+	}
+	set, err := s.roleSet(ctx, txn)
+	if err != nil {
+		return err
+	}
+	sd, err := catalog.ReadSchema(ctx, txn, schemaID)
+	if err != nil || sd == nil {
+		return err
+	}
+	ok, err := s.schemaPrivOn(ctx, txn, nil, sd, set, catalog.PrivUsage)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return newErrf(CodeInsufficientPriv, "permission denied for schema %s", sd.Name)
+	}
+	return nil
+}
+
 // checkSequencePriv returns 42501 unless the actor holds priv on the
-// sequence.
+// sequence. (Reaching it by name takes USAGE on its schema too, which
+// sequenceArg checks; by OID — a regclass, a default's binding — it
+// does not, as in PostgreSQL.)
 func (s *Session) checkSequencePriv(ctx context.Context, txn *kvclient.Txn, d *catalog.SequenceDescriptor, priv string) error {
 	ok, err := s.sequencePrivAllowed(ctx, txn, d, priv)
 	if err != nil {
@@ -823,10 +866,13 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 			if err != nil {
 				return nil, ToSQLError(err)
 			}
-			if ids[0] {
-				// Sequences live in public only (for now).
-				if seqs, err = catalog.ListSequences(ctx, txn, dbID); err != nil {
-					return nil, err
+			all, err := catalog.ListSequences(ctx, txn, dbID)
+			if err != nil {
+				return nil, err
+			}
+			for _, sq := range all {
+				if ids[sq.SchemaID] {
+					seqs = append(seqs, sq)
 				}
 			}
 		} else {

@@ -522,6 +522,7 @@ func (s *Session) applyAddColumn(ctx context.Context, txn *kvclient.Txn, desc *c
 		col.DefaultExpr = nextvalDefault(seqName)
 		if !eff.dry {
 			sd := catalog.NewSequenceDescriptor(seqName, desc.DatabaseID)
+			sd.SchemaID = desc.SchemaID // the table's schema, as in PostgreSQL
 			sd.OwnerTable, sd.OwnerColumn = desc.ID, col.ID
 			sd.Owner = desc.Owner
 			if err := s.applyDefaultPrivileges(ctx, txn, desc.DatabaseID, sd.Owner, "SEQUENCES", &sd.Privileges, &sd.GrantOptions); err != nil {
@@ -536,6 +537,11 @@ func (s *Session) applyAddColumn(ctx context.Context, txn *kvclient.Txn, desc *c
 				return 0, ToSQLError(err)
 			}
 			col.SequenceID = sd.ID
+			text, bindings, err := s.serialDefault(ctx, txn, sd)
+			if err != nil {
+				return 0, err
+			}
+			col.DefaultExpr, col.SeqBindings = text, bindings
 		}
 	case def.Default != nil && !def.Default.Null:
 		d, cerr := coerceColumn(col, *def.Default)
@@ -555,7 +561,10 @@ func (s *Session) applyAddColumn(ctx context.Context, txn *kvclient.Txn, desc *c
 		if err != nil {
 			return 0, err
 		}
-		col.DefaultExpr, col.FillDefault = text, true
+		if err := s.setDefaultExpr(ctx, txn, &col, text); err != nil {
+			return 0, err
+		}
+		col.FillDefault = true
 		if exprIsVolatile(*def.DefaultExpr) {
 			// Each existing row gets a value of its own: the backfill.
 			col.Backfill = pending

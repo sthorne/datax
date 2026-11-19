@@ -265,7 +265,7 @@ func init() {
 			}
 		}
 		for _, sq := range env.currentSequences() {
-			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(sq.Owner))), i64(0), i64(int64(sq.ID)), i64(0),
+			rows = append(rows, Row{i64(int64(sq.ID)), str(sq.Name), i64(SchemaOID(sq.SchemaID)), i64(0), i64(RoleOID(catalog.OwnerOf(sq.Owner))), i64(0), i64(int64(sq.ID)), i64(0),
 				i64(1), types.NewFloat(1), i64(0), boolean(false), boolean(false), str("p"), str("S"), i64(3),
 				i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), ObjectACL(sq.Owner, "rwU", sq.Privileges, sq.GrantOptions), null(), null(), null(), null(), null()})
 		}
@@ -316,7 +316,7 @@ func init() {
 			return Row{i64(relid), str(c.Name), i64(ColumnTypeOID(c)), i64(-1),
 				i64(ColumnTypeLen(c)), i64(n), i64(ndims), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
 				boolean(ColumnDefault(c) != "" && c.Identity == ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
-				str(""), null(), null(), null(), str(FormatType(c)), indexdef, textOrNull(c.Comment)}
+				str(""), null(), null(), null(), str(env.formatType(c)), indexdef, textOrNull(c.Comment)}
 		}
 		for _, t := range env.currentTables() {
 			n := int64(0)
@@ -412,13 +412,13 @@ func init() {
 				boolean(true), str(","), i64(0), i64(0), i64(0), str(name + "in"), str(name + "out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
 				null(), str(FormatTypeOID(oid))})
 		}
-		// Enum types: typtype 'e', in the public schema; pg_enum carries
+		// Enum types: typtype 'e', in their schema; pg_enum carries
 		// their labels.
 		for _, t := range env.currentTypes() {
 			oid := catalog.EnumOID(t.ID)
-			rows = append(rows, Row{i64(oid), str(t.Name), i64(OIDPublic), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
+			rows = append(rows, Row{i64(oid), str(t.Name), i64(SchemaOID(t.SchemaID)), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
-				null(), str(QuoteIdent(t.Name))})
+				null(), str(env.typeName(t))})
 		}
 		// The array type of every element type: typelem points back,
 		// and the element row's typarray forward.
@@ -846,7 +846,7 @@ func init() {
 						last = i64(v)
 					}
 				}
-				rows = append(rows, Row{str(catalog.PublicSchema), str(sq.Name), str(catalog.OwnerOf(sq.Owner)), str("bigint"), i64(sq.Start), i64(sq.MinValue), i64(sq.MaxValue), i64(sq.Increment), boolean(sq.Cycle), i64(sq.Cache), last})
+				rows = append(rows, Row{str(env.schemaName(sq.SchemaID)), str(sq.Name), str(catalog.OwnerOf(sq.Owner)), str("bigint"), i64(sq.Start), i64(sq.MinValue), i64(sq.MaxValue), i64(sq.Increment), boolean(sq.Cycle), i64(sq.Cache), last})
 			}
 			return rows, nil
 		})

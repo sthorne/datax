@@ -284,7 +284,11 @@ func (s *Session) expandLike(ctx context.Context, txn *kvclient.Txn, t *parser.C
 					case c.DefaultExpr != "" && c.DefaultExpr != "NULL" && c.SequenceID == 0:
 						e, perr := parser.ParseExpr(c.DefaultExpr)
 						if perr == nil {
-							def.DefaultExpr = &e
+							pinned, err := s.pinnedDefaultExpr(ctx, txn, &c, e)
+							if err != nil {
+								return nil, nil, err
+							}
+							def.DefaultExpr = &pinned
 						}
 					case c.Default != nil && (c.DefaultExpr == "" || c.DefaultExpr == "NULL"):
 						d := *c.Default

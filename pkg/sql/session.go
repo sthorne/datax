@@ -607,6 +607,11 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		if env.Types, err = catalog.ListTypes(ctx, txn, cur.ID); err != nil {
 			return nil, err
 		}
+		if len(env.Types) > 0 {
+			if env.TypeNames, err = s.typeDisplayNames(ctx, txn); err != nil {
+				return nil, err
+			}
+		}
 		if env.Schemas, err = catalog.ListSchemas(ctx, txn, cur.ID); err != nil {
 			return nil, err
 		}

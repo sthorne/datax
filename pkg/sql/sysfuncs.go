@@ -481,7 +481,17 @@ func (s *Session) evalSerialSequence(ctx context.Context, txn *kvclient.Txn, c *
 	if sd == nil {
 		return types.DNull, nil
 	}
-	return types.NewString(catalog.PublicSchema + "." + quoteIdentifier(sd.Name)), nil
+	schema := catalog.PublicSchema
+	if sd.SchemaID != 0 {
+		sch, err := catalog.ReadSchema(ctx, txn, sd.SchemaID)
+		if err != nil {
+			return types.Datum{}, err
+		}
+		if sch != nil {
+			schema = sch.Name
+		}
+	}
+	return types.NewString(quoteIdentifier(schema) + "." + quoteIdentifier(sd.Name)), nil
 }
 
 // evalCurrentSchemas is current_schemas(include_implicit): the search
@@ -1229,15 +1239,11 @@ func (s *Session) evalPgHasRole(ctx context.Context, txn *kvclient.Txn, c *sysCa
 // one or one of the database's enums.
 func (s *Session) typeNameKnown(ctx context.Context, txn *kvclient.Txn, name string) (bool, error) {
 	n := strings.ToLower(strings.TrimSpace(name))
-	n = strings.TrimPrefix(strings.TrimPrefix(n, vtable.PgCatalog+"."), catalog.PublicSchema+".")
-	if builtins.KnownCastType(n) {
+	n = strings.TrimPrefix(n, vtable.PgCatalog+".")
+	if builtins.KnownCastType(strings.TrimPrefix(n, catalog.PublicSchema+".")) {
 		return true, nil
 	}
-	dbID, err := s.currentDatabaseID(ctx, txn)
-	if err != nil {
-		return false, err
-	}
-	td, err := catalog.LookupType(ctx, txn, dbID, n)
+	td, err := s.cat.LookupTypeIn(s.rctx(ctx), txn, s.database, n)
 	if err != nil {
 		return false, nil
 	}

@@ -83,6 +83,20 @@ type Column struct {
 	// per row at insert time when the column is omitted or given
 	// DEFAULT. Requires cluster version v7. Exclusive with Default.
 	DefaultExpr string `json:"default_expr,omitempty"`
+	// SeqBindings binds each sequence name DefaultExpr's nextval,
+	// currval and setval calls name, as written, to the sequence it
+	// resolved to when the default was set (gap PG-D-035), as
+	// PostgreSQL binds the regclass by OID: the default draws from that
+	// sequence whatever the inserting session's search path, and
+	// whatever is created under the name later. A name naming no
+	// sequence is refused when the default is set. 0 binds nothing
+	// (only a table restore leaves one, for a sequence it does not bring
+	// back): the name resolves as written, an unqualified one in
+	// public, never through a session's path. A default set before
+	// bindings existed has none and resolves its names through public
+	// alone, the only schema a sequence could be in then. Never modified
+	// in place.
+	SeqBindings map[string]uint64 `json:"seq_bindings,omitempty"`
 	// Identity marks GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY
 	// ("always" / "by default"): the column draws from its own sequence;
 	// ALWAYS refuses an explicit value unless OVERRIDING SYSTEM VALUE.
@@ -1646,6 +1660,9 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if existing != nil {
 		return &ErrTableExists{Name: d.Name}
 	}
+	if err := sequenceNameTaken(ctx, txn, d.DatabaseID, d.namespaceName(), d.Name); err != nil {
+		return err
+	}
 	if d.ID == 0 {
 		id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
 		if err != nil {
@@ -1772,6 +1789,9 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 	if existing != nil {
 		return &ErrTableExists{Name: newName}
 	}
+	if err := sequenceNameTaken(ctx, txn, d.DatabaseID, newEntry, newName); err != nil {
+		return err
+	}
 	oldName := d.Name
 	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, d.namespaceName())); err != nil {
 		return err
@@ -1860,6 +1880,23 @@ func (d *TableDescriptor) PrimaryKeyIndex() *IndexDescriptor {
 		if d.Indexes[i].Primary {
 			return &d.Indexes[i]
 		}
+	}
+	return nil
+}
+
+// sequenceNameTaken returns ErrTableExists when a sequence of database
+// dbID holds name entry entry: a table, a view and a sequence share a
+// schema's relation namespace.
+func sequenceNameTaken(ctx context.Context, txn *kvclient.Txn, dbID uint64, entry, name string) error {
+	if dbID == 0 {
+		return nil // the flat namespace predates sequences (v7)
+	}
+	raw, err := txn.Get(ctx, keys.SequenceNamespaceKey(dbID, entry))
+	if err != nil {
+		return err
+	}
+	if raw != nil {
+		return &ErrTableExists{Name: name}
 	}
 	return nil
 }

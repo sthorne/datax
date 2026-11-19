@@ -954,12 +954,6 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err != nil {
 		return nil, err
 	}
-	qualify := func(dbID uint64, n string) string {
-		if db := names[dbID]; db != "" {
-			return db + "." + n
-		}
-		return n
-	}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -1012,7 +1006,7 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 		if cur, err := catalog.ReadSequence(ctx, txn, d.ID); err != nil || cur == nil {
 			continue // dropped with its table
 		}
-		if _, err := s.execDropSequence(ctx, txn, &parser.DropSequence{Name: qualify(d.DatabaseID, d.Name), IfExists: true}); err != nil {
+		if _, err := s.execDropSequence(ctx, txn, &parser.DropSequence{Name: catalog.SequenceRelationName(d), IfExists: true, Cascade: t.Cascade}); err != nil {
 			return nil, err
 		}
 		dropped++
@@ -1025,7 +1019,7 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 		if !owned[catalog.OwnerOf(d.Owner)] {
 			continue
 		}
-		if _, err := s.execDropType(ctx, txn, &parser.DropType{Name: qualify(d.DatabaseID, d.Name), IfExists: true}); err != nil {
+		if _, err := s.execDropType(ctx, txn, &parser.DropType{Name: catalog.TypeRelationName(d), IfExists: true}); err != nil {
 			return nil, err
 		}
 		dropped++
