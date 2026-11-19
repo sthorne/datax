@@ -66,7 +66,7 @@ func TestParseCreateTableAsLikeCommentRetype(t *testing.T) {
 	if co := parseOne(t, `COMMENT ON VIEW v IS 'x'`).(*CommentOn); co.Kind != "table" || co.Name != "v" {
 		t.Fatalf("comment on view: %+v", co)
 	}
-	if co := parseOne(t, `COMMENT ON CONSTRAINT qty_pos ON public.orders IS 'positive'`).(*CommentOn); co.Kind != "constraint" || co.Name != "orders" || co.Column != "qty_pos" || *co.Text != "positive" {
+	if co := parseOne(t, `COMMENT ON CONSTRAINT qty_pos ON public.orders IS 'positive'`).(*CommentOn); co.Kind != "constraint" || co.Name != "public.orders" || co.Column != "qty_pos" || *co.Text != "positive" {
 		t.Fatalf("comment on constraint: %+v", co)
 	}
 	for _, bad := range []string{`COMMENT ON SEQUENCE s IS 'x'`, `COMMENT ON COLUMN qty IS 'x'`, `COMMENT ON TABLE t IS 1`,

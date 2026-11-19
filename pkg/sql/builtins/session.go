@@ -30,7 +30,7 @@ func init() {
 		{Name: "current_user", Ret: types.String, Vol: Stable, Doc: "The current role: the session user, or the role SET ROLE selected. Also written current_role and user; like session_user, all three are keywords written without parentheses."},
 		{Name: "session_user", Ret: types.String, Vol: Stable, Doc: "The authenticated session user (unchanged by SET ROLE)."},
 		{Name: "current_database", Ret: types.String, Vol: Stable, Doc: "The session's database (also the keyword current_catalog, without parentheses)."},
-		{Name: "current_schema", Ret: types.String, Vol: Stable, Doc: "public: the only schema."},
+		{Name: "current_schema", Ret: types.String, Vol: Stable, Doc: "The first schema of search_path that exists in the current database (\"$user\" naming the current role), or NULL when none does."},
 		{Name: "current_setting", Args: []types.Family{types.String, types.Bool}, MinArgs: 1, Ret: types.String, Vol: Stable, Doc: "The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Its arguments may name columns: the name is looked up per row."},
 		{Name: "set_config", Args: []types.Family{types.String, types.String, types.Bool}, MinArgs: 3, Ret: types.String, Vol: Volatile, Doc: "Sets a session setting, as SET does (SET LOCAL when is_local is true), and returns the value: SET with a value that can be a parameter. Evaluated once per statement: its arguments cannot name columns."},
 		{Name: "version", Ret: types.String, Vol: Stable, Doc: "The server version string (PostgreSQL 14.0 datax <release>)."},
@@ -50,7 +50,7 @@ func init() {
 	for _, f := range []*Builtin{
 		{Name: "pg_get_serial_sequence", Args: []types.Family{t, t}, MinArgs: 2, Ret: t, Doc: "The sequence a SERIAL, identity or OWNED BY column draws from, as public.name (quoted where needed), or NULL when it has none. The table name is read as SQL reads one ('\"Mixed\"', 'public.t'); the column name is taken as written. 42P01 for no such table, 42703 for no such column."},
 		{Name: "pg_is_in_recovery", Ret: types.Bool, Doc: "false: every node serves reads and writes; there is no standby mode."},
-		{Name: "current_schemas", Args: []types.Family{types.Bool}, MinArgs: 1, Ret: types.ArrayOf(t), Doc: "The schemas of the search path: {pg_catalog,public} when the argument (include implicit schemas) is true, {public} when false."},
+		{Name: "current_schemas", Args: []types.Family{types.Bool}, MinArgs: 1, Ret: types.ArrayOf(t), Doc: "The schemas of the search path that exist in the current database, in order, with pg_catalog first when the argument (include implicit schemas) is true."},
 		{Name: "to_regclass", Args: []types.Family{t}, MinArgs: 1, Ret: types.Int, Doc: "The OID of the table, view, sequence or catalog so named (read as SQL reads a name), or NULL when there is none — 'name'::regclass without the error."},
 		{Name: "to_regproc", Args: []types.Family{t}, MinArgs: 1, Ret: types.Int, Doc: "The pg_proc OID of the builtin function so named, or NULL."},
 		{Name: "to_regprocedure", Args: []types.Family{t}, MinArgs: 1, Ret: types.Int, Doc: "The pg_proc OID of the builtin function named with its argument list ('lower(text)'), or NULL when there is none or it takes another number of arguments."},

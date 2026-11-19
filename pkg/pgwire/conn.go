@@ -421,6 +421,7 @@ func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOpt
 		session.SetNotify(opts.Notify, c.listener)
 	}
 	session.SetKeyService(opts.KeyService)
+	session.SetTempRegistry(opts.TempTables)
 	if opts.Advisory != nil {
 		session.SetAdvisory(opts.Advisory.NewHolder(c.advisoryLost))
 	}

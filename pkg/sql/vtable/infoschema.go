@@ -280,12 +280,12 @@ func (env *Env) isGrantable(e aclEntry, owner string) string {
 
 // tableSchema is the schema a table is in: pg_catalog for the cluster's
 // own tables (datax_audit, datax_metrics, ...), as pg_class has them;
-// public for every other.
-func tableSchema(t *catalog.TableDescriptor) string {
+// its own schema for every other.
+func (env *Env) tableSchema(t *catalog.TableDescriptor) string {
 	if catalog.IsSystemTableID(t.ID) {
 		return PgCatalog
 	}
-	return catalog.PublicSchema
+	return env.schemaName(t.SchemaID)
 }
 
 // currentDatabase is the session's database descriptor (nil when it was
@@ -410,7 +410,7 @@ func tableConstraints(t *catalog.TableDescriptor) []isConstraint {
 // notNullName is the name PostgreSQL 14–17's information_schema gives a
 // NOT NULL column's constraint: namespace OID, table OID, attnum.
 func notNullName(t *catalog.TableDescriptor, attnum int) string {
-	return fmt.Sprintf("%d_%d_%d_not_null", OIDPublic, TableOID(t), attnum)
+	return fmt.Sprintf("%d_%d_%d_not_null", SchemaOID(t.SchemaID), TableOID(t), attnum)
 }
 
 // sequenceOf indexes the current database's sequences by ID.
@@ -577,6 +577,17 @@ func init() {
 		if usable || env.pgHasRole(owner) {
 			b.add("catalog_name", env.Database, "schema_name", catalog.PublicSchema, "schema_owner", owner)
 		}
+		// The database's own schemas: those the reader owns (directly
+		// or by membership) or holds a privilege on, as PostgreSQL lists
+		// them.
+		for _, sd := range env.Schemas {
+			sowner := catalog.OwnerOf(sd.Owner)
+			if env.RoleSet == nil || env.IsAdmin || env.pgHasRole(sowner) ||
+				catalog.HasPrivilege(sd.Privileges, env.RoleSet, catalog.PrivUsage) ||
+				catalog.HasPrivilege(sd.Privileges, env.RoleSet, catalog.PrivCreate) {
+				b.add("catalog_name", env.Database, "schema_name", sd.Name, "schema_owner", sowner)
+			}
+		}
 		return nil
 	})
 	isView("character_sets", func(_ context.Context, env *Env, b *isRows) error {
@@ -605,7 +616,10 @@ func init() {
 			if t.IsView() {
 				kind, insertable = "VIEW", "NO"
 			}
-			b.add("table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "table_type", kind,
+			if t.Temp != nil {
+				kind = "LOCAL TEMPORARY"
+			}
+			b.add("table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "table_type", kind,
 				"is_insertable_into", insertable, "is_typed", "NO")
 		}
 		// The catalogs themselves are views of pg_catalog and
@@ -626,7 +640,7 @@ func init() {
 			if env.ownsTable(t) {
 				def = str(ViewDef(t.ViewQuery))
 			}
-			b.add("table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "view_definition", def,
+			b.add("table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "view_definition", def,
 				"check_option", "NONE", "is_updatable", "NO", "is_insertable_into", "NO",
 				"is_trigger_updatable", "NO", "is_trigger_deletable", "NO", "is_trigger_insertable_into", "NO")
 		}
@@ -661,7 +675,7 @@ func init() {
 				if t.IsView() {
 					updatable = "NO"
 				}
-				b.add("table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "column_name", c.Name,
+				b.add("table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "column_name", c.Name,
 					"ordinal_position", nums[i], "column_default", def, "is_nullable", yesNo(!c.NotNull), "data_type", info.dataType,
 					"character_maximum_length", info.charMax, "character_octet_length", info.charOctet,
 					"numeric_precision", info.numPrec, "numeric_precision_radix", info.numRadix, "numeric_scale", info.scale,
@@ -695,7 +709,7 @@ func init() {
 				}
 				info := describeColumnType(c)
 				b.add("udt_catalog", env.Database, "udt_schema", info.udtSchema, "udt_name", info.udtName,
-					"table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "column_name", c.Name)
+					"table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "column_name", c.Name)
 			}
 		}
 		return nil
@@ -710,7 +724,7 @@ func init() {
 			}
 			_, nums := visibleColumns(t)
 			for _, n := range nums {
-				b.add("object_catalog", env.Database, "object_schema", tableSchema(t), "object_name", t.Name, "object_type", "TABLE",
+				b.add("object_catalog", env.Database, "object_schema", env.tableSchema(t), "object_name", t.Name, "object_type", "TABLE",
 					"dtd_identifier", strconv.Itoa(n))
 			}
 		}
@@ -731,7 +745,7 @@ func init() {
 				elem := *c
 				elem.Type = c.Type.Elem()
 				oid := ColumnTypeOID(&elem)
-				b.add("object_catalog", env.Database, "object_schema", tableSchema(t), "object_name", t.Name, "object_type", "TABLE",
+				b.add("object_catalog", env.Database, "object_schema", env.tableSchema(t), "object_name", t.Name, "object_type", "TABLE",
 					"collection_type_identifier", strconv.Itoa(nums[i]), "data_type", FormatTypeOID(oid),
 					"udt_catalog", env.Database, "udt_schema", PgCatalog, "udt_name", typeNameOID(oid), "dtd_identifier", "a"+strconv.Itoa(nums[i]))
 			}
@@ -751,15 +765,15 @@ func init() {
 				if c.contype == "u" {
 					nullsDistinct = str(yesNo(c.idx == nil || !c.idx.NullsNotDistinct))
 				}
-				b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name,
-					"table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "constraint_type", kinds[c.contype],
+				b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name,
+					"table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "constraint_type", kinds[c.contype],
 					"is_deferrable", "NO", "initially_deferred", "NO", "enforced", "YES", "nulls_distinct", nullsDistinct)
 			}
 			cols, nums := visibleColumns(t)
 			for i, c := range cols {
 				if c.NotNull {
-					b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", notNullName(t, nums[i]),
-						"table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "constraint_type", "CHECK",
+					b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", notNullName(t, nums[i]),
+						"table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "constraint_type", "CHECK",
 						"is_deferrable", "NO", "initially_deferred", "NO", "enforced", "YES")
 				}
 			}
@@ -775,14 +789,14 @@ func init() {
 			}
 			for _, c := range tableConstraints(t) {
 				if c.contype == "c" {
-					b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name,
+					b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name,
 						"check_clause", strings.TrimPrefix(ConstraintDef(t, c.con, nil), "CHECK "))
 				}
 			}
 			cols, nums := visibleColumns(t)
 			for i, c := range cols {
 				if c.NotNull {
-					b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", notNullName(t, nums[i]),
+					b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", notNullName(t, nums[i]),
 						"check_clause", c.Name+" IS NOT NULL")
 				}
 			}
@@ -814,10 +828,10 @@ func init() {
 				ucat, uschema, uname := null(), null(), null()
 				if ref != nil {
 					if n := uniqueConstraintNameFor(ref, c.con.RefColumns); n != "" {
-						ucat, uschema, uname = str(env.Database), str(tableSchema(ref)), str(n)
+						ucat, uschema, uname = str(env.Database), str(env.tableSchema(ref)), str(n)
 					}
 				}
-				b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name,
+				b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name,
 					"unique_constraint_catalog", ucat, "unique_constraint_schema", uschema, "unique_constraint_name", uname,
 					"match_option", "NONE", "update_rule", rule(c.con.OnUpdate), "delete_rule", rule(c.con.OnDelete))
 			}
@@ -852,8 +866,8 @@ func init() {
 							pos = i64(int64(p))
 						}
 					}
-					b.add("constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name,
-						"table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "column_name", columnName(t, id),
+					b.add("constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name,
+						"table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "column_name", columnName(t, id),
 						"ordinal_position", i+1, "position_in_unique_constraint", pos)
 				}
 			}
@@ -877,8 +891,8 @@ func init() {
 					continue
 				}
 				for _, id := range ids {
-					b.add("table_catalog", env.Database, "table_schema", tableSchema(holder), "table_name", holder.Name, "column_name", columnName(holder, id),
-						"constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name)
+					b.add("table_catalog", env.Database, "table_schema", env.tableSchema(holder), "table_name", holder.Name, "column_name", columnName(holder, id),
+						"constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name)
 				}
 			}
 		}
@@ -899,8 +913,8 @@ func init() {
 				if holder == nil || !env.ownsTable(holder) {
 					continue
 				}
-				b.add("table_catalog", env.Database, "table_schema", tableSchema(holder), "table_name", holder.Name,
-					"constraint_catalog", env.Database, "constraint_schema", tableSchema(t), "constraint_name", c.name)
+				b.add("table_catalog", env.Database, "table_schema", env.tableSchema(holder), "table_name", holder.Name,
+					"constraint_catalog", env.Database, "constraint_schema", env.tableSchema(t), "constraint_name", c.name)
 			}
 		}
 		return nil
@@ -910,8 +924,8 @@ func init() {
 	isView("view_table_usage", func(_ context.Context, env *Env, b *isRows) error {
 		for _, v := range env.currentTables() {
 			for _, ref := range viewRefs(env, v) {
-				b.add("view_catalog", env.Database, "view_schema", tableSchema(v), "view_name", v.Name,
-					"table_catalog", env.Database, "table_schema", tableSchema(ref), "table_name", ref.Name)
+				b.add("view_catalog", env.Database, "view_schema", env.tableSchema(v), "view_name", v.Name,
+					"table_catalog", env.Database, "table_schema", env.tableSchema(ref), "table_name", ref.Name)
 			}
 		}
 		return nil
@@ -920,8 +934,8 @@ func init() {
 		for _, v := range env.currentTables() {
 			for _, ref := range viewRefs(env, v) {
 				for _, name := range viewColumnsUsed(v.ViewQuery, ref) {
-					b.add("view_catalog", env.Database, "view_schema", tableSchema(v), "view_name", v.Name,
-						"table_catalog", env.Database, "table_schema", tableSchema(ref), "table_name", ref.Name, "column_name", name)
+					b.add("view_catalog", env.Database, "view_schema", env.tableSchema(v), "view_name", v.Name,
+						"table_catalog", env.Database, "table_schema", env.tableSchema(ref), "table_name", ref.Name, "column_name", name)
 				}
 			}
 		}
@@ -951,7 +965,7 @@ func init() {
 					if roleGrants && !env.grantListed(e) || !roleGrants && !env.privilegeListed(e) {
 						continue
 					}
-					b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "table_catalog", env.Database, "table_schema", tableSchema(t),
+					b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "table_catalog", env.Database, "table_schema", env.tableSchema(t),
 						"table_name", t.Name, "privilege_type", e.priv, "is_grantable", env.isGrantable(e, t.Owner), "with_hierarchy", yesNo(e.priv == "SELECT"))
 				}
 			}
@@ -974,7 +988,7 @@ func init() {
 						continue
 					}
 					for _, c := range cols {
-						b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "table_catalog", env.Database, "table_schema", tableSchema(t),
+						b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "table_catalog", env.Database, "table_schema", env.tableSchema(t),
 							"table_name", t.Name, "column_name", c.Name, "privilege_type", e.priv, "is_grantable", env.isGrantable(e, t.Owner))
 					}
 				}

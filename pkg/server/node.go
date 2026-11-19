@@ -246,6 +246,11 @@ type Config struct {
 	// the maximum clock offset, how long the advisory locks of a node
 	// that died stay held.
 	AdvisoryLockTTL time.Duration
+	// TempTableSweepInterval is how often the node drops the temporary
+	// tables of sessions that ended without dropping them, their node
+	// having stopped (0 = default 1m, negative = never;
+	// pkg/server/temp_sweep.go).
+	TempTableSweepInterval time.Duration
 	// ReshardRetireFor is how long a completed re-shard's superseded
 	// layout stays on disk serving AS OF SYSTEM TIME below the swap
 	// before the janitor reclaims it (0 = the GC TTL, matching the
@@ -1051,6 +1056,9 @@ func (n *Node) start() error {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.largeObjectSweepLoop); err != nil {
+		return err
+	}
+	if err := n.stopper.RunWorker(n.tempTableSweepLoop); err != nil {
 		return err
 	}
 	if err := n.stopper.RunWorker(n.restoreJanitorLoop); err != nil {

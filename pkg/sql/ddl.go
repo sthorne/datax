@@ -25,34 +25,74 @@ import (
 // database (or of the qualifier in name). The descriptor comes through
 // the leased lookup so the caller's write is version-safe.
 func (s *Session) findIndex(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, *catalog.IndexDescriptor, error) {
-	dbName, bare := catalog.SplitTableName(name)
-	if dbName == "" {
+	bare := catalog.BareName(name)
+	// The schemas to search, in order: the one the qualifier names, or
+	// those of the search path (an index lives in its table's schema).
+	var dbName string
+	var schemas []*catalog.SchemaDescriptor
+	if len(catalog.SplitName(name)) > 1 {
+		t, err := s.cat.ResolveTarget(s.rctx(ctx), txn, s.database, name)
+		if err != nil {
+			if serr := ToSQLError(err); serr.Code == CodeInvalidSchemaName {
+				return nil, nil, newErrf(CodeUndefinedObject, "index %q does not exist", name)
+			}
+			return nil, nil, ToSQLError(err)
+		}
+		dbName, schemas = t.Database, []*catalog.SchemaDescriptor{t.Schema}
+	} else {
 		dbName = s.database
+		var err error
+		if schemas, err = s.lookupPathSchemas(ctx, txn); err != nil {
+			return nil, nil, err
+		}
 	}
 	db, err := s.cat.Database(ctx, txn, dbName)
 	if err != nil {
 		return nil, nil, ToSQLError(err)
 	}
-	all, err := s.cat.ListIn(ctx, txn, db)
+	all, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, d := range all {
-		if _, ok := d.Index(bare); !ok {
-			continue
+	// A temporary table's index, by an unqualified name: pg_temp leads
+	// the search path.
+	if len(catalog.SplitName(name)) == 1 {
+		for _, d := range all {
+			if !d.TempOf(s.temp.sid) {
+				continue
+			}
+			if _, ok := d.Index(bare); !ok {
+				continue
+			}
+			shared, err := s.lookup(ctx, txn, catalog.RelationName(d))
+			if err != nil {
+				return nil, nil, err
+			}
+			desc := shared.Clone()
+			for i := range desc.Indexes {
+				if desc.Indexes[i].Name == bare {
+					return desc, &desc.Indexes[i], nil
+				}
+			}
 		}
-		tname := d.Name
-		if dbName != s.database {
-			tname = dbName + "." + d.Name
-		}
-		shared, err := s.lookup(ctx, txn, tname)
-		if err != nil {
-			return nil, nil, err
-		}
-		desc := shared.Clone()
-		for i := range desc.Indexes {
-			if desc.Indexes[i].Name == bare {
-				return desc, &desc.Indexes[i], nil
+	}
+	for _, sd := range schemas {
+		for _, d := range all {
+			if d.Temp != nil || d.SchemaID != sd.ID {
+				continue
+			}
+			if _, ok := d.Index(bare); !ok {
+				continue
+			}
+			shared, err := s.lookup(ctx, txn, catalog.RelationName(d))
+			if err != nil {
+				return nil, nil, err
+			}
+			desc := shared.Clone()
+			for i := range desc.Indexes {
+				if desc.Indexes[i].Name == bare {
+					return desc, &desc.Indexes[i], nil
+				}
 			}
 		}
 	}
@@ -116,7 +156,7 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	s.pendingWipes = append(s.pendingWipes, wipe)
 	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP INDEX"}, nil
@@ -155,7 +195,7 @@ func (s *Session) execAlterIndex(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	log.Audit("index-ddl", "stmt", "ALTER INDEX RENAME", "target", desc.Name+"."+old, "to", t.NewName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER INDEX"}, nil
 }
@@ -190,6 +230,7 @@ func (s *Session) execRenameTable(ctx context.Context, txn *kvclient.Txn, desc *
 	if err := s.cat.RenameTable(ctx, txn, desc, t.RenameTo); err != nil {
 		return nil, err
 	}
+	s.noteTempRenamed(desc)
 	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME", "target", old, "to", t.RenameTo, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }
@@ -449,13 +490,9 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 			if !t.Cascade {
 				return nil, newErrf(CodeFeatureNotSupported, "cannot truncate table %q because table %q references it through foreign key %q (use TRUNCATE ... CASCADE, or truncate both)", desc.Name, child.Name, c.Name)
 			}
-			// Foreign keys never cross databases, so the child resolves
-			// in the parent's.
-			cname := child.Name
-			if q, _ := catalog.SplitTableName(desc.Name); q != "" {
-				cname = q + "." + child.Name
-			}
-			if _, err := add(cname); err != nil {
+			// The child by a name that resolves to it alone, whatever
+			// its schema and the search path.
+			if _, err := add(catalog.RelationName(child)); err != nil {
 				return nil, err
 			}
 		}
@@ -479,7 +516,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 				return nil, err
 			}
 		}
-		s.noteDDL(desc.Name)
+		s.noteDDL(catalog.RelationName(desc))
 		names = append(names, desc.Name)
 	}
 	log.Audit("table-ddl", "stmt", "TRUNCATE", "target", strings.Join(names, ","), "principal", s.sessionUser, "role", s.user)

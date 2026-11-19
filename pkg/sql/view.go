@@ -91,11 +91,11 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		shadowed[strings.ToLower(cte.Name)] = true
 	}
 	var members []parser.CTE
-	seen := map[string]bool{}
+	seen := map[string]uint64{}
 	for _, name := range stmtTables(stmt) {
 		lname := strings.ToLower(name)
 		db, bare := catalog.SplitTableName(lname)
-		if seen[bare] || shadowed[bare] {
+		if shadowed[bare] {
 			continue
 		}
 		if r, bound := s.rels[bare]; bound && (db == "" || r.alias == lname) {
@@ -104,6 +104,14 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		d, err := resolve(name)
 		if err != nil || d == nil || d.Virtual != "" || !d.IsView() {
 			continue // the statement reports a missing table itself
+		}
+		if id, dup := seen[bare]; dup {
+			if id != d.ID {
+				// A view binds by its own name: two of one name, from two
+				// schemas, cannot both be bound in one statement.
+				return nil, newErrf(CodeFeatureNotSupported, "a statement cannot read two views named %q from different schemas", bare)
+			}
+			continue
 		}
 		if txn != nil {
 			if err := s.checkTablePriv(ctx, txn, d, "SELECT"); err != nil {
@@ -122,12 +130,12 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		for _, c := range d.Columns {
 			cols = append(cols, c.Name)
 		}
-		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner)}
+		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner), SearchPath: viewResolutionPath(d.ViewSearchPath), Bindings: d.ViewBindings}
 		if db != "" {
 			m.Qualified = lname
 		}
 		members = append(members, m)
-		seen[bare] = true
+		seen[bare] = d.ID
 	}
 	if len(members) == 0 {
 		return stmt, nil
@@ -312,12 +320,13 @@ func stmtTables(stmt parser.Statement) []string {
 
 // viewDependencies resolves the tables and views a view's query reads
 // (every one must exist now; the catalogs count for nothing).
-func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *parser.Select) ([]uint64, error) {
+func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *parser.Select) ([]uint64, map[string]uint64, error) {
 	shadowed := map[string]bool{}
 	for _, cte := range q.With {
 		shadowed[strings.ToLower(cte.Name)] = true
 	}
 	var deps []uint64
+	bindings := map[string]uint64{}
 	seen := map[uint64]bool{}
 	for _, name := range stmtTables(q) {
 		if _, bare := catalog.SplitTableName(strings.ToLower(name)); shadowed[bare] {
@@ -327,17 +336,24 @@ func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *pa
 		if err != nil {
 			var nf *catalog.ErrTableNotFound
 			if asErr(err, &nf) {
-				return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+				return nil, nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
 			}
-			return nil, err
+			return nil, nil, err
 		}
-		if d.Virtual != "" || seen[d.ID] {
+		if d.Virtual != "" {
+			continue
+		}
+		bindings[name] = d.ID
+		if seen[d.ID] {
 			continue
 		}
 		seen[d.ID] = true
 		deps = append(deps, d.ID)
 	}
-	return deps, nil
+	if len(bindings) == 0 {
+		bindings = nil
+	}
+	return deps, bindings, nil
 }
 
 // execCreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
@@ -345,10 +361,11 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.requireV9("views"); err != nil {
 		return nil, err
 	}
-	dbName, bare := catalog.SplitTableName(t.Name)
-	if dbName == "" {
-		dbName = s.database
+	target, err := s.createTarget(ctx, txn, t.Name)
+	if err != nil {
+		return nil, err
 	}
+	dbName, bare := target.Database, target.Name
 	if catalog.IsSystemTable(bare) || vtableName(bare) {
 		return nil, newErrf(CodeInsufficientPriv, "relation name %q is reserved", bare)
 	}
@@ -361,7 +378,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	if t.Query.AsOf != "" || t.Query.AsOfMaxStaleness != "" || t.Query.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "a view's query cannot use AS OF SYSTEM TIME or FOR UPDATE")
 	}
-	deps, err := s.viewDependencies(ctx, txn, t.Query)
+	deps, bindings, err := s.viewDependencies(ctx, txn, t.Query)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +389,11 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 		d, err := catalog.ReadTable(ctx, txn, id)
 		if err != nil || d == nil || d.IsView() {
 			continue
+		}
+		if d.Temp != nil {
+			// PostgreSQL makes such a view temporary itself; datax has no
+			// temporary views.
+			return nil, newErrf(CodeFeatureNotSupported, "view %q cannot read temporary table %q: temporary views are not supported", bare, d.Name)
 		}
 		if err := s.checkTablePriv(ctx, txn, d, "SELECT"); err != nil {
 			return nil, err
@@ -412,8 +434,21 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
+	// The query resolves its names through the creator's search path,
+	// now and whenever the view is read (viewResolutionPath).
+	var viewPath []string
+	if schemas, err := s.pathSchemas(ctx, txn); err != nil {
+		return nil, err
+	} else if len(schemas) != 1 || !schemas[0].IsPublic() {
+		for _, sd := range schemas {
+			viewPath = append(viewPath, sd.Name)
+		}
+		if len(viewPath) == 0 {
+			viewPath = []string{catalog.PublicSchema}
+		}
+	}
 	if t.OrReplace {
-		existing, err := s.cat.LookupIn(ctx, txn, dbName, bare)
+		existing, err := s.cat.LookupIn(ctx, txn, dbName, catalog.RelationName(&catalog.TableDescriptor{Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID}))
 		var nf *catalog.ErrTableNotFound
 		if err != nil && !asErr(err, &nf) {
 			return nil, err
@@ -432,7 +467,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			}
 			nd := existing.Clone()
 			nd.Columns, nd.NextColumnID = columns, catalog.ColumnID(len(columns)+1)
-			nd.ViewQuery, nd.ViewDepends = t.Text, deps
+			nd.ViewQuery, nd.ViewDepends, nd.ViewSearchPath, nd.ViewBindings = t.Text, deps, viewPath, bindings
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
@@ -447,8 +482,8 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 		}
 	}
 	desc := &catalog.TableDescriptor{
-		Name: bare, DatabaseID: dbID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
-		ViewQuery: t.Text, ViewDepends: deps, Owner: s.user,
+		Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
+		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, Owner: s.user,
 	}
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err
@@ -577,13 +612,13 @@ func (s *Session) dropDependentViews(ctx context.Context, txn *kvclient.Txn, id 
 			return err
 		}
 		deps = append(deps, more...)
-		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name)
+		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], catalog.RelationName(v))
 		if err != nil {
 			return err
 		}
 		dropped[v.ID] = true
 		s.noteDrop(gone)
-		s.noteDDL(v.Name)
+		s.noteDDL(catalog.RelationName(v))
 		log.Audit("view-ddl", "stmt", "DROP VIEW (cascade)", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}
 	return nil
@@ -646,7 +681,7 @@ func (s *Session) execDropView(ctx context.Context, txn *kvclient.Txn, t *parser
 		if err := s.dropDependentViews(ctx, txn, v.ID, "view "+v.Name, true, "DROP VIEW ..."); err != nil {
 			return nil, err
 		}
-		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], v.Name)
+		gone, err := s.cat.DropIn(ctx, txn, dbs[v.DatabaseID], catalog.RelationName(v))
 		if err != nil {
 			var nf *catalog.ErrTableNotFound
 			if asErr(err, &nf) {
@@ -655,7 +690,7 @@ func (s *Session) execDropView(ctx context.Context, txn *kvclient.Txn, t *parser
 			return nil, err
 		}
 		s.noteDrop(gone)
-		s.noteDDL(v.Name)
+		s.noteDDL(catalog.RelationName(v))
 		log.Audit("view-ddl", "stmt", "DROP VIEW", "target", v.Name, "principal", s.sessionUser, "role", s.user)
 	}
 	return &Result{Tag: "DROP VIEW"}, nil

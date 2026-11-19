@@ -102,6 +102,18 @@ func (s *Session) lookupSequence(ctx context.Context, txn *kvclient.Txn, name st
 		// public.s names the schema, as a table's name may
 		// (pg_dump's setval('public.s', ...)).
 		db = s.database
+	} else {
+		// Sequences live in public only (for now): a qualifier naming
+		// a schema of the current database finds none; any other names
+		// a database, as before schemas.
+		qdb, _, ok, err := s.publicOnlyDatabase(ctx, txn, db+"."+bare)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+		}
+		db = qdb
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {
@@ -165,9 +177,12 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
 		return nil, err
 	}
-	db, bare := catalog.SplitTableName(t.Name)
-	if db == "" {
-		db = s.database
+	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, t.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newErrf(CodeFeatureNotSupported, "sequences in schemas other than public are not supported yet (%q)", t.Name)
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {
@@ -182,7 +197,7 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 		return nil, err
 	}
 	if t.Options.OwnedBy != "" && t.Options.OwnedBy != "none" {
-		table, col, _ := strings.Cut(t.Options.OwnedBy, ".")
+		table, col := splitOwnedBy(t.Options.OwnedBy)
 		owner, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return nil, err
@@ -226,7 +241,7 @@ func (s *Session) execAlterSequence(ctx context.Context, txn *kvclient.Txn, t *p
 		// OWNED BY t.c (pg_dump's, after the table and the sequence
 		// exist): the sequence goes with the column. As in PostgreSQL the
 		// table must have the sequence's owner.
-		table, col, _ := strings.Cut(t.Options.OwnedBy, ".")
+		table, col := splitOwnedBy(t.Options.OwnedBy)
 		owner, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return nil, err
@@ -741,4 +756,14 @@ func (s *Session) expandDefaults(ctx context.Context, txn *kvclient.Txn, desc *c
 		outV = append(outV, d)
 	}
 	return outT, outV, nil
+}
+
+// splitOwnedBy splits OWNED BY's [schema.]table.column into the table
+// (qualified as written) and the column.
+func splitOwnedBy(ref string) (table, col string) {
+	i := strings.LastIndexByte(ref, '.')
+	if i < 0 {
+		return ref, ""
+	}
+	return ref[:i], ref[i+1:]
 }

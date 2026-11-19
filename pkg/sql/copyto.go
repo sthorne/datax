@@ -143,10 +143,11 @@ func (s *Session) planCopyTo(ctx context.Context, ct *parser.CopyTo) (parser.Sta
 		b.WriteString("*")
 	}
 	b.WriteString(" FROM ")
-	if db, rel := catalog.SplitTableName(ct.Table); db != "" {
-		b.WriteString(copyQuoteIdent(db) + "." + copyQuoteIdent(rel))
-	} else {
-		b.WriteString(copyQuoteIdent(rel))
+	for i, part := range catalog.SplitName(ct.Table) {
+		if i > 0 {
+			b.WriteString(".")
+		}
+		b.WriteString(copyQuoteIdent(part))
 	}
 	stmts, err := parser.Parse(b.String())
 	if err != nil {

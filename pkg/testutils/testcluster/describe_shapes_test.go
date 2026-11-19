@@ -41,7 +41,10 @@ var describeSamples = []struct {
 }{
 	{"CreateDatabase", []describeSample{{sql: `CREATE DATABASE shapes_other`}}},
 	{"AlterDatabase", []describeSample{{sql: `ALTER DATABASE shapes_other RENAME TO shapes_other2`}}},
-	{"CreateTable", []describeSample{{sql: `CREATE TABLE shapes (id INT8 PRIMARY KEY, v TEXT)`}}},
+	{"CreateSchema", []describeSample{{sql: `CREATE SCHEMA shapes_s`}}},
+	{"AlterSchemaRename", []describeSample{{sql: `ALTER SCHEMA shapes_s RENAME TO shapes_s2`}}},
+	{"CreateTable", []describeSample{{sql: `CREATE TABLE shapes (id INT8 PRIMARY KEY, v TEXT)`}, {sql: `CREATE TABLE shapes_s2.moved (a INT8)`}}},
+	{"SetSchema", []describeSample{{sql: `ALTER TABLE shapes_s2.moved SET SCHEMA public`}}},
 	{"Insert", []describeSample{
 		{sql: `INSERT INTO shapes VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')`},
 		{sql: `INSERT INTO shapes VALUES (5, 'e') RETURNING id, v`, rows: true},
@@ -175,6 +178,7 @@ var describeSamples = []struct {
 	{"DropTable", []describeSample{{sql: `DROP TABLE shapes`}}},
 	{"DropType", []describeSample{{sql: `DROP TYPE shapes_mood`}}},
 	{"DropDatabase", []describeSample{{sql: `DROP DATABASE shapes_other2`}}},
+	{"DropSchema", []describeSample{{sql: `DROP SCHEMA shapes_s2 CASCADE`}}},
 	{"Use", []describeSample{{sql: `USE datax`}}},
 }
 

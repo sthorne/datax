@@ -677,6 +677,9 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		if (d.Name == catalog.MetricsTableName || d.Name == catalog.ShapesMetricsTableName || d.Name == catalog.StatementShapesTableName) && !includeMetrics {
 			return nil // the cluster's own metrics: bulky, regenerable, opt-in
 		}
+		if d.Temp != nil {
+			return nil // a session's temporary table ends with the session
+		}
 		// Every other system table is backed up unconditionally. The
 		// console's preferences (datax_ui_prefs) are small and are not
 		// regenerable from anything — losing them across a restore
@@ -1048,7 +1051,9 @@ var manifestKeyGroups = []manifestKeyGroup{
 		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.RoleSpan())} }},
 	{"databases", func(m *backupManifest) *[]backupKV { return &m.Databases },
 		func() [][2]keys.Key {
-			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}
+			// The schemas (gap PG-D-001) travel with their databases.
+			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan()),
+				spanOf(keys.SchemaDescSpan()), spanOf(keys.AllSchemaNamespaceSpan())}
 		}},
 	{"sequences", func(m *backupManifest) *[]backupKV { return &m.Sequences },
 		func() [][2]keys.Key {
@@ -1342,6 +1347,16 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 	if err := n.checkRestoreClusterKeys(ctx, chain); err != nil {
 		return nil, err
 	}
+	// Schemas (gap PG-D-001) are written only once the cluster has
+	// finalized v22: a v21 node would list a schema's tables as public
+	// ones, and rewrite their descriptors without their schema.
+	if n.ClusterVersion() < version.V22 {
+		for _, kv := range final.Databases {
+			if _, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok {
+				return nil, fmt.Errorf("the backup holds schemas, which need cluster version %s: finalize the upgrade with `datax debug upgrade` first", version.V22)
+			}
+		}
+	}
 	// The target must hold no user tables: restored data keys bake in the
 	// backed-up table IDs, which an existing catalog could collide with.
 	// The cluster's own metrics table does not count: it lives at a
@@ -1411,6 +1426,10 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		var wb kvclient.WriteBatch
 		for _, kv := range final.Databases {
 			wb.Put(keys.Key(kv.Key), kv.Value)
+			// Schemas keep their ids, which the restored tables name.
+			if id, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
+				maxID = id
+			}
 		}
 		for _, kv := range final.Sequences {
 			wb.Put(keys.Key(kv.Key), kv.Value)
@@ -1442,7 +1461,9 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 				}
 			}
 			if json.Unmarshal(t.Descriptor, &d) == nil && d.DatabaseID != 0 {
-				wb.Put(keys.TableNamespaceKey(d.DatabaseID, t.Name), []byte(fmt.Sprintf("%d", t.ID)))
+				// Under its schema's entry when it has one (the name itself
+				// in public).
+				wb.Put(keys.TableNamespaceKey(d.DatabaseID, catalog.SchemaNamespaceName(d.SchemaID, t.Name)), []byte(fmt.Sprintf("%d", t.ID)))
 			} else {
 				wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
 			}

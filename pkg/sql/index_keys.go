@@ -424,6 +424,6 @@ func (s *Session) execCreateIndexInTxn(ctx context.Context, txn *kvclient.Txn, t
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	return &Result{Tag: "CREATE INDEX", Notices: notices}, nil
 }

@@ -23,9 +23,12 @@ import (
 // lookupType resolves a type name (optionally database-qualified) in
 // the session's database.
 func (s *Session) lookupType(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TypeDescriptor, error) {
-	db, bare := catalog.SplitTableName(name)
-	if db == "" {
-		db = s.database
+	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newErrf(CodeUndefinedObject, "type %q does not exist", name)
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {
@@ -106,9 +109,12 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
 		return nil, err
 	}
-	db, bare := catalog.SplitTableName(t.Name)
-	if db == "" {
-		db = s.database
+	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, t.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newErrf(CodeFeatureNotSupported, "types in schemas other than public are not supported yet (%q)", t.Name)
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {
@@ -177,25 +183,10 @@ func (s *Session) execAlterType(ctx context.Context, txn *kvclient.Txn, t *parse
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, ToSQLError(err)
 		}
-		s.noteDDL(s.qualifiedTableName(ctx, txn, desc))
+		s.noteDDL(catalog.RelationName(desc))
 	}
 	log.Audit("type-ddl", "stmt", "ALTER TYPE", "target", d.Name, "label", t.AddValue, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TYPE"}, nil
-}
-
-// qualifiedTableName names a table for the post-commit drain: bare in
-// the session's database, db.name elsewhere.
-func (s *Session) qualifiedTableName(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor) string {
-	dbs, err := catalog.ListDatabases(ctx, txn)
-	if err != nil {
-		return desc.Name
-	}
-	for _, db := range dbs {
-		if db.ID == desc.DatabaseID && db.Name != s.database {
-			return db.Name + "." + desc.Name
-		}
-	}
-	return desc.Name
 }
 
 func (s *Session) execDropType(ctx context.Context, txn *kvclient.Txn, t *parser.DropType) (*Result, error) {

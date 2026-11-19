@@ -327,8 +327,9 @@ func (s *Session) tablePrivAllowedSchema(ctx context.Context, txn *kvclient.Txn,
 	if !allowed || !schema {
 		return allowed, nil
 	}
-	// The schema: USAGE on public is everyone's unless revoked from PUBLIC.
-	usage, err := s.schemaUsageAllowed(ctx, txn, desc.DatabaseID, set)
+	// The schema: USAGE on public is everyone's unless revoked from
+	// PUBLIC; on another schema, its owner's and its grantees'.
+	usage, err := s.tableSchemaUsageAllowed(ctx, txn, desc, set)
 	if err != nil {
 		return false, err
 	}
@@ -446,7 +447,7 @@ func (s *Session) descriptorForChange(ctx context.Context, txn *kvclient.Txn, d 
 // name (no KV round trip, and as current as any statement here may
 // use), else the descriptor read by ID. nil when it has been dropped.
 func (s *Session) freshTable(ctx context.Context, cur *kvclient.Txn, hdesc *catalog.TableDescriptor) (*catalog.TableDescriptor, error) {
-	if d := s.cat.Leased(hdesc.DatabaseID, hdesc.Name, hdesc.ID); d != nil {
+	if d := s.cat.Leased(hdesc.DatabaseID, hdesc.NamespaceName(), hdesc.ID); d != nil {
 		return d, nil
 	}
 	return catalog.ReadTable(ctx, cur, hdesc.ID)
@@ -485,6 +486,22 @@ func (s *Session) schemaUsageAllowed(ctx context.Context, txn *kvclient.Txn, dbI
 	return catalog.HasPrivilege(db.SchemaPrivileges, set, catalog.PrivUsage), nil
 }
 
+// tableSchemaUsageAllowed reports whether set holds USAGE on the
+// schema of table desc.
+func (s *Session) tableSchemaUsageAllowed(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, set catalog.RoleSet) (bool, error) {
+	if desc.SchemaID == 0 {
+		return s.schemaUsageAllowed(ctx, txn, desc.DatabaseID, set)
+	}
+	if set.IsAdmin() {
+		return true, nil
+	}
+	sd, err := catalog.ReadSchema(ctx, txn, desc.SchemaID)
+	if err != nil || sd == nil {
+		return false, err
+	}
+	return s.schemaPrivOn(ctx, txn, nil, sd, set, catalog.PrivUsage)
+}
+
 // checkTablePriv returns 42501 unless the actor holds priv on the table.
 func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, priv string) error {
 	ok, err := s.tablePrivAllowed(ctx, txn, desc, priv)
@@ -497,6 +514,15 @@ func (s *Session) checkTablePriv(ctx context.Context, txn *kvclient.Txn, desc *c
 		}
 		if catalog.IsSystemTable(desc.Name) && priv != "SELECT" {
 			return newErrf(CodeInsufficientPriv, "permission denied for table %q: only admins may %s it", desc.Name, priv)
+		}
+		if desc.SchemaID != 0 && desc.Virtual == "" {
+			// The table's own grants would do: it is the schema's USAGE
+			// that is missing, which PostgreSQL reports so.
+			if own, err := s.tablePrivAllowedSchema(ctx, txn, desc, priv, false); err == nil && own {
+				if sd, err := catalog.ReadSchema(ctx, txn, desc.SchemaID); err == nil && sd != nil {
+					return newErrf(CodeInsufficientPriv, "permission denied for schema %s", sd.Name)
+				}
+			}
 		}
 		kind := "table"
 		if desc.IsView() {
@@ -552,7 +578,7 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 				continue
 			}
 			if q, ok := stmts[0].(*parser.Select); ok {
-				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), q, seen); err != nil {
+				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), desc.ViewSearchPath, desc.ViewBindings, q, seen); err != nil {
 					return err
 				}
 			}
@@ -560,7 +586,7 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 	}
 	for _, cte := range definers {
 		if q, ok := cte.Query.(*parser.Select); ok {
-			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, q, seen); err != nil {
+			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, cte.SearchPath, cte.Bindings, q, seen); err != nil {
 				return err
 			}
 		}
@@ -570,10 +596,10 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 
 // checkSelectReadsAs is checkSelectReads as another role: a view's
 // owner, for the tables the view reads.
-func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, sel *parser.Select, seen map[uint64]bool) error {
-	saved := s.privAs
-	s.privAs = role
-	defer func() { s.privAs = saved }()
+func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, path []string, bindings map[string]uint64, sel *parser.Select, seen map[uint64]bool) error {
+	saved, savedPath, savedBindings := s.privAs, s.viewPath, s.viewBindings
+	s.privAs, s.viewPath, s.viewBindings = role, viewResolutionPath(path), bindings
+	defer func() { s.privAs, s.viewPath, s.viewBindings = saved, savedPath, savedBindings }()
 	return s.checkSelectReads(ctx, txn, sel, seen)
 }
 
@@ -658,22 +684,11 @@ func (s *Session) checkCreateInDatabase(ctx context.Context, txn *kvclient.Txn, 
 	if s.actor() == catalog.RootRole {
 		return nil
 	}
-	dbName, _ := catalog.SplitTableName(table)
-	if dbName == "" {
-		dbName = s.database
-	}
-	db, err := s.cat.Database(ctx, txn, dbName)
-	if err != nil {
-		return ToSQLError(err)
-	}
-	ok, err := s.databasePrivAllowed(ctx, txn, db, catalog.PrivCreate)
+	t, err := s.createTarget(ctx, txn, table)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return newErrf(CodeInsufficientPriv, "permission denied: %q needs the admin role or CREATE on database %q", s.actor(), dbName)
-	}
-	return nil
+	return s.checkCreateInSchema(ctx, txn, t)
 }
 
 // canGrantOn reports whether the actor may grant privs on an object:
@@ -784,19 +799,35 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 			targets = append(targets, name)
 		}
 	case "schema":
-		if err := s.grantOnSchema(ctx, txn, privs, grantees, t); err != nil {
-			return nil, err
+		for _, name := range t.Objects {
+			if name != catalog.PublicSchema {
+				if err := s.grantOnUserSchema(ctx, txn, name, privs, grantees, t); err != nil {
+					return nil, err
+				}
+				targets = append(targets, s.database+"."+name)
+				continue
+			}
+			if err := s.grantOnSchema(ctx, txn, privs, grantees, t); err != nil {
+				return nil, err
+			}
+			targets = append(targets, s.database+".public")
 		}
-		targets = append(targets, s.database+".public")
 	case "sequence":
 		var seqs []*catalog.SequenceDescriptor
 		if t.AllInSchema {
+			ids, err := s.grantSchemaIDs(ctx, txn, t.Schemas)
+			if err != nil {
+				return nil, err
+			}
 			dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
 			if err != nil {
 				return nil, ToSQLError(err)
 			}
-			if seqs, err = catalog.ListSequences(ctx, txn, dbID); err != nil {
-				return nil, err
+			if ids[0] {
+				// Sequences live in public only (for now).
+				if seqs, err = catalog.ListSequences(ctx, txn, dbID); err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			for _, name := range t.Objects {
@@ -832,6 +863,10 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 		var descs []*catalog.TableDescriptor
 		var given []string // the names as the statement spelled them, for the lease drain
 		if t.AllInSchema {
+			ids, err := s.grantSchemaIDs(ctx, txn, t.Schemas)
+			if err != nil {
+				return nil, err
+			}
 			db, err := s.cat.Database(ctx, txn, s.database)
 			if err != nil {
 				return nil, ToSQLError(err)
@@ -841,9 +876,10 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 				return nil, err
 			}
 			for _, d := range all {
-				if !catalog.IsSystemTable(d.Name) {
+				// A temporary table is in no schema a GRANT can name.
+				if !catalog.IsSystemTable(d.Name) && d.Temp == nil && ids[d.SchemaID] {
 					descs = append(descs, d)
-					given = append(given, d.Name)
+					given = append(given, catalog.RelationName(d))
 				}
 			}
 		} else {
@@ -958,6 +994,57 @@ func (s *Session) grantOnDatabase(ctx context.Context, txn *kvclient.Txn, name s
 		return s.cat.UpdateDatabase(ctx, txn, db)
 	}
 	return nil
+}
+
+// grantSchemaIDs resolves the schemas of ALL TABLES / SEQUENCES IN
+// SCHEMA s [, ...] in the current database to their IDs (3F000 for one
+// that does not exist).
+func (s *Session) grantSchemaIDs(ctx context.Context, txn *kvclient.Txn, names []string) (map[uint64]bool, error) {
+	if len(names) == 0 {
+		names = []string{catalog.PublicSchema}
+	}
+	dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
+	if err != nil {
+		return nil, ToSQLError(err)
+	}
+	ids := map[uint64]bool{}
+	for _, n := range names {
+		sd, err := catalog.LookupSchema(ctx, txn, dbID, n)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		ids[sd.ID] = true
+	}
+	return ids, nil
+}
+
+// grantOnUserSchema applies a grant on a schema of the current
+// database other than public: its owner (or a holder of the grant
+// option) grants USAGE and CREATE to roles or PUBLIC, which holds none
+// until granted, as in PostgreSQL.
+func (s *Session) grantOnUserSchema(ctx context.Context, txn *kvclient.Txn, name string, privs, grantees []string, t *parser.GrantRevoke) error {
+	_, sd, err := s.lookupSchemaOrErr(ctx, txn, name)
+	if err != nil {
+		return err
+	}
+	ok, err := s.canGrantOn(ctx, txn, sd.Owner, sd.GrantOptions, privs)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return newErrf(CodeInsufficientPriv, "permission denied for schema %s (%q is not its owner and holds no grant option)", name, s.actor())
+	}
+	sd = sd.Clone()
+	changed := false
+	for _, g := range grantees {
+		if applyGrant(&sd.Privileges, &sd.GrantOptions, g, privs, schemaPrivOrder, t.Revoke, t.GrantOption && t.Revoke, t.GrantOption) {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.cat.UpdateSchema(ctx, txn, sd)
 }
 
 // grantOnSchema applies a grant on the public schema of the current
@@ -1212,7 +1299,7 @@ func (s *Session) grantRows(ctx context.Context, txn *kvclient.Txn, t *parser.Sh
 	if err != nil {
 		return nil, err
 	}
-	tables, err := s.cat.ListIn(ctx, txn, db)
+	tables, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}

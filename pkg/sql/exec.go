@@ -54,8 +54,12 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 	}
 	if ct, ok := stmt.(*parser.CreateTable); ok {
 		// CREATE TABLE: admins, or a user granted CREATE on the database.
-		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
-			return nil, err
+		// A temporary table takes the TEMPORARY privilege, which here
+		// follows CONNECT: the session has it.
+		if db, _ := catalog.SplitTableName(ct.Name); !ct.Temp && db != catalog.TempSchema {
+			if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
+				return nil, err
+			}
 		}
 	} else if cv, ok := stmt.(*parser.CreateView); ok {
 		if err := s.checkCreateInDatabase(ctx, txn, cv.Name); err != nil {
@@ -79,6 +83,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execGrantRevoke(ctx, txn, t)
 	case *parser.CreateDatabase:
 		return s.execCreateDatabase(ctx, txn, t)
+	case *parser.CreateSchema:
+		return s.execCreateSchema(ctx, txn, t)
+	case *parser.DropSchema:
+		return s.execDropSchema(ctx, txn, t)
+	case *parser.AlterSchemaRename:
+		return s.execAlterSchemaRename(ctx, txn, t)
+	case *parser.SetSchema:
+		return s.execSetSchema(ctx, txn, t)
 	case *parser.DropDatabase:
 		return s.execDropDatabase(ctx, txn, t)
 	case *parser.AlterDatabase:
@@ -206,6 +218,10 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if t.As != nil {
 		return nil, newErrf(CodeActiveTransaction, "CREATE TABLE ... AS cannot run inside a transaction block")
 	}
+	t, err := prepareTempCreate(t)
+	if err != nil {
+		return nil, err
+	}
 	t, likeIndexes, err := s.expandLike(ctx, txn, t)
 	if err != nil {
 		return nil, err
@@ -213,23 +229,48 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if t, err = withRowidKey(t); err != nil {
 		return nil, err
 	}
-	dbName, bare := catalog.SplitTableName(t.Name)
-	if dbName == "" {
-		dbName = s.database
+	// Where the table goes: the schema its qualifier names, or the first
+	// schema of the search path that exists (a temporary table: the
+	// session's own, in the current database).
+	if t.Temp || t.Unlogged {
+		// A temporary table's descriptor field, and its name entry, and
+		// UNLOGGED's, are written only once the cluster has finalized
+		// v22: a v21 node would list the temporary table as an ordinary
+		// one, and drop either field when it rewrites the descriptor.
+		if err := s.requireV22For("temporary and unlogged tables"); err != nil {
+			return nil, err
+		}
 	}
+	var target *catalog.Target
+	if t.Temp {
+		dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		target = &catalog.Target{Database: s.database, DBID: dbID, Schema: &catalog.SchemaDescriptor{Name: catalog.PublicSchema, DatabaseID: dbID}, Name: catalog.BareName(t.Name)}
+	} else if target, err = s.createTarget(ctx, txn, t.Name); err != nil {
+		return nil, err
+	}
+	dbName, bare, dbID := target.Database, target.Name, target.DBID
 	if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved for the cluster's own use", bare)
 	}
 	if dbName == catalog.SystemDatabase && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "database %q is reserved for the cluster", dbName)
 	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, dbName)
-	if err != nil {
-		return nil, ToSQLError(err)
+	if !target.Schema.IsPublic() {
+		for _, cd := range t.Columns {
+			if cd.Serial || cd.Identity != "" {
+				return nil, newErrf(CodeFeatureNotSupported, "SERIAL and identity columns in schemas other than public are not supported yet (schema %q): use a sequence of the public schema and DEFAULT nextval('public.seq')", target.Schema.Name)
+			}
+		}
 	}
-	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, Owner: s.user}
+	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Owner: s.user, Unlogged: t.Unlogged}
 	if id, ok := catalog.SystemTableID(bare); ok {
 		desc.ID = id
+	}
+	if t.Temp {
+		desc.Temp = &catalog.TempTable{Session: s.tempSession(), OnCommit: tempOnCommit(t)}
 	}
 	seen := map[string]bool{}
 	var colPK []string
@@ -364,6 +405,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 		return nil, err
 	}
 	s.noteCreatedTable(txn, desc.ID)
+	if desc.Temp != nil {
+		s.noteTempCreated(desc)
+	}
 	// SERIAL and identity columns own a sequence named <table>_<col>_seq,
 	// created now that the table has its ID; the column defaults to
 	// nextval of it.
@@ -420,7 +464,9 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if desc.GCTTLSeconds > 0 {
 		s.splitAtTableEdges(ctx, desc)
 	}
-	s.presplitPlacement(ctx, txn, dbName, desc)
+	if desc.Temp == nil {
+		s.presplitPlacement(ctx, txn, dbName, desc)
+	}
 	res := &Result{Tag: "CREATE TABLE"}
 	if sealed {
 		res.Notices = append(res.Notices, sealedTableNotice(desc))
@@ -922,7 +968,37 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 	} else if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
 	}
-	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
+	if gone, err := s.forgetVanishedTemp(ctx, txn, t.Name); err != nil {
+		return nil, err
+	} else if gone {
+		return &Result{Tag: "DROP TABLE"}, nil
+	}
+	if td, ok, err := s.lookupTemp(ctx, txn, t.Name); ok {
+		// One of the session's temporary tables: it shadows an ordinary
+		// table of its name.
+		var nf *catalog.ErrTableNotFound
+		if err != nil {
+			if t.IfExists && asErr(err, &nf) {
+				return &Result{Tag: "DROP TABLE"}, nil
+			}
+			return nil, err
+		}
+		if !t.Cascade {
+			// Refused while another of its temporary tables references it.
+			if err := s.dropTableConstraints(ctx, txn, td, false); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.dropTempTable(ctx, txn, td); err != nil {
+			return nil, err
+		}
+		return &Result{Tag: "DROP TABLE"}, nil
+	}
+	// Read in the transaction, never from the gateway's cache: a DROP
+	// SCHEMA ... CASCADE or DROP OWNED dropping several tables has just
+	// written the descriptors of those that referenced each other, and a
+	// lease on one of them would wait for this very transaction.
+	if existing, err := s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, t.Name); err == nil && existing != nil {
 		if existing.IsView() {
 			return nil, newErrf(CodeWrongObjectType, "%q is a view (use DROP VIEW)", t.Name)
 		}
@@ -936,7 +1012,7 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 			return nil, err
 		}
 	}
-	desc, err := s.cat.DropIn(ctx, txn, s.database, t.Name)
+	desc, err := s.cat.DropIn(s.rctx(ctx), txn, s.database, t.Name)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {
@@ -944,31 +1020,39 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		}
 		return nil, err
 	}
-	// Statistics die with the table (same DDL txn; the background
-	// sampler's orphan sweep is the backstop for anything missed), and so
-	// do the sequences its columns own.
 	if desc != nil {
-		s.noteDrop(desc)
-		if err := s.queueKeyDestroy(ctx, txn, desc); err != nil {
+		if err := s.finishTableDrop(ctx, txn, desc); err != nil {
 			return nil, err
-		}
-		s.releaseManualSplits(ctx, desc.ID)
-		if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
-			return nil, err
-		}
-		seqs, err := catalog.ListSequences(ctx, txn, desc.DatabaseID)
-		if err != nil {
-			return nil, err
-		}
-		for _, sd := range seqs {
-			if sd.OwnerTable == desc.ID {
-				if err := catalog.DropSequence(ctx, txn, sd); err != nil {
-					return nil, err
-				}
-			}
 		}
 	}
 	return &Result{Tag: "DROP TABLE"}, nil
+}
+
+// finishTableDrop is what follows the removal of a table's descriptor
+// in the dropping transaction. Statistics die with the table (same DDL
+// txn; the background sampler's orphan sweep is the backstop for
+// anything missed), and so do the sequences its columns own.
+func (s *Session) finishTableDrop(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor) error {
+	s.noteDrop(desc)
+	if err := s.queueKeyDestroy(ctx, txn, desc); err != nil {
+		return err
+	}
+	s.releaseManualSplits(ctx, desc.ID)
+	if err := txn.Delete(ctx, keys.TableStatsKey(desc.ID)); err != nil {
+		return err
+	}
+	seqs, err := catalog.ListSequences(ctx, txn, desc.DatabaseID)
+	if err != nil {
+		return err
+	}
+	for _, sd := range seqs {
+		if sd.OwnerTable == desc.ID {
+			if err := catalog.DropSequence(ctx, txn, sd); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.Insert, params []types.Datum) (*Result, error) {
@@ -3537,7 +3621,7 @@ func (s *Session) execShowTables(ctx context.Context, txn *kvclient.Txn, dbName 
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	descs, err := s.cat.ListIn(ctx, txn, db)
+	descs, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}
@@ -3827,7 +3911,7 @@ func (s *Session) execShow(ctx context.Context, txn *kvclient.Txn, t *parser.Sho
 		if err != nil {
 			return nil, ToSQLError(err)
 		}
-		descs, err := s.cat.ListIn(ctx, txn, db)
+		descs, err := s.listIn(ctx, txn, db)
 		if err != nil {
 			return nil, err
 		}

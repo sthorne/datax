@@ -246,7 +246,9 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 		// gateway's lease acquisition (its own transaction) would wait on
 		// for as long as this one runs.
 		shared := desc
-		if q, bare := catalog.SplitTableName(cd.RefTable); bare != desc.Name || (q != "" && q != s.database) {
+		if self, err := s.refersToItself(ctx, txn, desc, cd.RefTable); err != nil {
+			return nil, nil, err
+		} else if !self {
 			if shared, err = s.lookup(ctx, txn, cd.RefTable); err != nil {
 				return nil, nil, err
 			}
@@ -258,6 +260,11 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 			// A reference would write the audit table's descriptor, and
 			// then stand in the way of its records ageing out.
 			return nil, nil, sealedTableError(shared.Name)
+		}
+		if shared.Temp == nil && desc.Temp != nil {
+			return nil, nil, newErrf(CodeInvalidTableDefinition, "constraints on temporary tables may reference only temporary tables")
+		} else if shared.Temp != nil && desc.Temp == nil {
+			return nil, nil, newErrf(CodeInvalidTableDefinition, "constraints on permanent tables may reference only permanent tables")
 		}
 		ref := desc // self-reference: one descriptor, written once
 		if shared.ID != desc.ID {
@@ -1032,7 +1039,7 @@ func (s *Session) createTableConstraints(ctx context.Context, txn *kvclient.Txn,
 		if err := s.cat.Update(ctx, txn, p); err != nil {
 			return false, err
 		}
-		s.noteDDL(p.Name)
+		s.noteDDL(catalog.RelationName(p))
 	}
 	return true, nil
 }
@@ -1075,7 +1082,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 			indexID = 0
 		}
 		if parent != nil {
-			parentName = parent.Name
+			parentName = catalog.RelationName(parent)
 			if err := s.cat.Update(ctx, txn, parent); err != nil {
 				return err
 			}
@@ -1088,11 +1095,11 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	if exists {
 		return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("constraint %q for relation %q already exists, skipping", cd.Name, t.Table)}}, nil
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if parentName != "" {
-		if err := s.cat.FinishDDLIn(ctx, s.database, parentName); err != nil {
+		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(parentName)); err != nil {
 			return nil, ToSQLError(err)
 		}
 	}
@@ -1115,7 +1122,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 		s.abandonConstraint(ctx, t.Table, cID)
 		return nil, ToSQLError(ferr)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.sessionUser, "role", s.user)
@@ -1177,16 +1184,16 @@ func (s *Session) abandonConstraint(ctx context.Context, table string, cID uint6
 		}
 		indexID = c.IndexID
 		if parent != nil {
-			parentName = parent.Name
+			parentName = catalog.RelationName(parent)
 			if err := s.cat.Update(ctx, txn, parent); err != nil {
 				return err
 			}
 		}
 		return s.cat.Update(ctx, txn, desc)
 	})
-	_ = s.cat.FinishDDLIn(ctx, s.database, table)
+	_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(table))
 	if parentName != "" {
-		_ = s.cat.FinishDDLIn(ctx, s.database, parentName)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(parentName))
 	}
 	if tableID != 0 && indexID != 0 {
 		s.wipeIndexEntries(ctx, tableID, indexID)
@@ -1363,7 +1370,7 @@ func (s *Session) execValidateConstraintOnline(ctx context.Context, t *parser.Al
 	if err := s.setConstraintValidated(ctx, t.Table, cID); err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "ALTER TABLE"}, nil
@@ -1466,7 +1473,7 @@ func (s *Session) execSetNotNullOnline(ctx context.Context, t *parser.AlterTable
 	if err := flip(true); err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if err := s.sweepRows(ctx, t.Table, func(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) error {
@@ -1476,7 +1483,7 @@ func (s *Session) execSetNotNullOnline(ctx context.Context, t *parser.AlterTable
 		return nil
 	}); err != nil {
 		_ = flip(false)
-		_ = s.cat.FinishDDLIn(ctx, s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table))
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "ALTER TABLE"}, nil
@@ -1603,7 +1610,7 @@ func (s *Session) dropTableConstraints(ctx context.Context, txn *kvclient.Txn, d
 		if err := s.cat.Update(ctx, txn, cd); err != nil {
 			return err
 		}
-		s.noteDDL(cd.Name)
+		s.noteDDL(catalog.RelationName(cd))
 		if indexID != 0 {
 			s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: cd.ID, indexID: indexID})
 		}
@@ -1638,7 +1645,7 @@ func (s *Session) dropTableConstraints(ctx context.Context, txn *kvclient.Txn, d
 		if err := s.cat.Update(ctx, txn, p); err != nil {
 			return err
 		}
-		s.noteDDL(p.Name)
+		s.noteDDL(catalog.RelationName(p))
 	}
 	return nil
 }
@@ -1655,4 +1662,36 @@ func refuseAddPrimaryKey(desc *catalog.TableDescriptor) error {
 		}
 	}
 	return newErrf(CodeFeatureNotSupported, "ALTER TABLE ... ADD PRIMARY KEY is not supported: table %q has no declared primary key and is keyed by a hidden rowid; create a new table with the PRIMARY KEY and copy the rows (INSERT INTO new SELECT * FROM %s)", desc.Name, desc.Name)
+}
+
+// refersToItself reports whether a foreign key of table desc that
+// references ref names desc itself: a qualified name that resolves to
+// desc's schema, or an unqualified one whose search path reaches desc's
+// schema before any other table of the name.
+func (s *Session) refersToItself(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, ref string) (bool, error) {
+	parts := catalog.SplitName(ref)
+	if parts[len(parts)-1] != desc.Name || desc.Temp != nil {
+		return parts[len(parts)-1] == desc.Name && len(parts) == 1, nil
+	}
+	if len(parts) > 1 {
+		t, err := s.cat.ResolveTarget(s.rctx(ctx), txn, s.database, ref)
+		if err != nil {
+			return false, nil // the lookup reports it
+		}
+		return t.DBID == desc.DatabaseID && t.Schema.ID == desc.SchemaID, nil
+	}
+	schemas, err := s.lookupPathSchemas(ctx, txn)
+	if err != nil {
+		return false, err
+	}
+	for _, sd := range schemas {
+		if sd.ID == desc.SchemaID {
+			return true, nil
+		}
+		other := catalog.RelationName(&catalog.TableDescriptor{Name: desc.Name, DatabaseID: desc.DatabaseID, SchemaID: sd.ID})
+		if d, err := s.cat.LookupFreshIn(ctx, txn, s.database, other); err == nil && d != nil {
+			return false, nil
+		}
+	}
+	return false, nil
 }

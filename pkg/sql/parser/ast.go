@@ -222,6 +222,13 @@ type CreateTable struct {
 	// names mapping to raw literal text (e.g. timeseries=true,
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
+	// Temp is CREATE [GLOBAL | LOCAL] TEMP[ORARY] TABLE; Unlogged is
+	// CREATE UNLOGGED TABLE.
+	Temp     bool
+	Unlogged bool
+	// OnCommit is the ON COMMIT clause: "preserve" (PRESERVE ROWS),
+	// "delete" (DELETE ROWS) or "drop"; "" when none was given.
+	OnCommit string
 }
 
 // LikeClause is LIKE source [INCLUDING | EXCLUDING option ...] inside a
@@ -730,6 +737,13 @@ type CTE struct {
 	// Definer, when set, is the role whose privileges the member's query
 	// runs with: a view's owner (pkg/sql/view.go).
 	Definer string
+	// SearchPath, on a view's member, is the search path the view's
+	// query resolves its names through (the view's own, never the
+	// reader's).
+	SearchPath []string
+	// Bindings, on a view's member, are the relations the view's names
+	// were bound to at its creation (catalog.TableDescriptor.ViewBindings).
+	Bindings map[string]uint64
 }
 
 type Select struct {
@@ -934,6 +948,8 @@ type AlterTable struct {
 	// RowSecurity is ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL
 	// SECURITY: "enable", "disable", "force" or "no force".
 	RowSecurity string
+	// SetLogged is SET LOGGED ("logged") or SET UNLOGGED ("unlogged").
+	SetLogged string
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
@@ -1035,6 +1051,8 @@ type GrantRevoke struct {
 	ObjectKind  string
 	Objects     []string
 	AllInSchema bool
+	// Schemas are the schemas of ALL TABLES / SEQUENCES IN SCHEMA.
+	Schemas []string
 	// Grantees are role names, lower-cased; "public" is the pseudo-role.
 	Grantees []string
 	// GrantOption is WITH GRANT OPTION (GRANT) or GRANT OPTION FOR
@@ -1238,6 +1256,37 @@ type PlacementOptions struct {
 	SetConstraints bool
 }
 
+// CreateSchema is CREATE SCHEMA [IF NOT EXISTS] [name] [AUTHORIZATION
+// role] (gap PG-D-001); without a name the schema is named after the
+// role.
+type CreateSchema struct {
+	Name          string
+	IfNotExists   bool
+	Authorization string
+}
+
+// DropSchema is DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE |
+// RESTRICT].
+type DropSchema struct {
+	Names    []string
+	IfExists bool
+	Cascade  bool
+}
+
+// AlterSchemaRename is ALTER SCHEMA name RENAME TO new_name.
+type AlterSchemaRename struct {
+	Name, NewName string
+}
+
+// SetSchema is ALTER TABLE | VIEW | SEQUENCE [IF EXISTS] name SET
+// SCHEMA schema: Kind is "table", "view" or "sequence".
+type SetSchema struct {
+	Kind     string
+	Name     string
+	Schema   string
+	IfExists bool
+}
+
 // CreateDatabase is
 // CREATE DATABASE [IF NOT EXISTS] name [WITH] (placement options).
 type CreateDatabase struct {
@@ -1358,6 +1407,10 @@ func (*Vacuum) stmt()                 {}
 func (*ShowStats) stmt()              {}
 func (*SetVar) stmt()                 {}
 func (*CreateDatabase) stmt()         {}
+func (*CreateSchema) stmt()           {}
+func (*DropSchema) stmt()             {}
+func (*AlterSchemaRename) stmt()      {}
+func (*SetSchema) stmt()              {}
 func (*ShowPlacement) stmt()          {}
 func (*DropDatabase) stmt()           {}
 func (*AlterDatabase) stmt()          {}

@@ -52,6 +52,41 @@ const (
 	OIDInformationSchema = 12
 )
 
+// schemaOIDBase is where the OIDs of user schemas start: a schema's
+// pg_namespace OID is the base plus its ID (IDs come from the shared
+// descriptor counter, so no two schemas share one).
+const schemaOIDBase = 16384
+
+// SchemaOID is the pg_namespace OID of user schema id (0 = public).
+func SchemaOID(id uint64) int64 {
+	if id == 0 {
+		return OIDPublic
+	}
+	return schemaOIDBase + int64(id)
+}
+
+// SchemaIDOfOID inverts SchemaOID for a user schema.
+func SchemaIDOfOID(oid int64) (uint64, bool) {
+	if oid <= schemaOIDBase {
+		return 0, false
+	}
+	return uint64(oid - schemaOIDBase), true
+}
+
+// schemaName is the name of schema id of the current database (public
+// for 0).
+func (env *Env) schemaName(id uint64) string {
+	if id == 0 {
+		return catalog.PublicSchema
+	}
+	for _, sd := range env.Schemas {
+		if sd.ID == id {
+			return sd.Name
+		}
+	}
+	return fmt.Sprintf("pg_schema_%d", id)
+}
+
 // Env is what a generator may consult: the catalog as of the statement,
 // and the session's identity.
 type Env struct {
@@ -73,6 +108,9 @@ type Env struct {
 	// currentSequences and currentTypes).
 	Sequences []*catalog.SequenceDescriptor
 	Types     []*catalog.TypeDescriptor
+	// Schemas are the current database's schemas other than public
+	// (gap PG-D-001), by name.
+	Schemas []*catalog.SchemaDescriptor
 	// SequenceValue reads a sequence's last value (called reports whether
 	// nextval has run); nil when the caller cannot read counters.
 	SequenceValue func(*catalog.SequenceDescriptor) (value int64, called bool, err error)

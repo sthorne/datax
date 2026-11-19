@@ -55,7 +55,7 @@ func TestSessionVariables(t *testing.T) {
 		{`SET application_name = 'app1'`, "application_name", "app1"},
 		{`SET application_name TO app2`, "application_name", "app2"},
 		{`SET search_path = public, other`, "search_path", "public, other"},
-		{`SET search_path TO "$user", public`, "search_path", "$user, public"},
+		{`SET search_path TO "$user", public`, "search_path", `"$user", public`},
 		{`SET TIME ZONE 'America/New_York'`, "TimeZone", "America/New_York"},
 		{`SET TimeZone = '+05:30'`, "timezone", "+05:30"},
 		{`SET TIME ZONE 'UTC'`, "TIME ZONE", "UTC"},
@@ -103,7 +103,7 @@ func TestSessionVariables(t *testing.T) {
 		t.Fatal("SET ... DEFAULT")
 	}
 	execSQL(t, ctx, s, `RESET ALL`)
-	if show("lock_timeout") != "0" || show("search_path") != "public" || show("foreign_key_cascade_limit") == "5" {
+	if show("lock_timeout") != "0" || show("search_path") != `"$user", public` || show("foreign_key_cascade_limit") == "5" {
 		t.Fatal("RESET ALL")
 	}
 	all := execSQL(t, ctx, s, `SHOW ALL`)
@@ -116,7 +116,7 @@ func TestSessionVariables(t *testing.T) {
 			t.Fatalf("pg_settings statement_timeout: %v", r)
 		}
 	}
-	if r := execSQL(t, ctx, s, `SELECT current_setting('search_path'), current_setting('TimeZone')`); r.Rows[0][0].S != "public" || r.Rows[0][1].S != "UTC" {
+	if r := execSQL(t, ctx, s, `SELECT current_setting('search_path'), current_setting('TimeZone')`); r.Rows[0][0].S != `"$user", public` || r.Rows[0][1].S != "UTC" {
 		t.Fatalf("current_setting: %v", r.Rows)
 	}
 
@@ -309,11 +309,11 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 	t.Run("per-row", func(t *testing.T) {
 		h := setup(t)
 		execSQL(t, ctx, h.s, `INSERT INTO names VALUES (1, 'search_path', false), (2, 'TIMEZONE', false), (3, 'nosuch', true), (4, 'app.never_set', true), (5, NULL, false)`)
-		h.want(`SELECT current_setting(n) FROM names WHERE id <= 2 ORDER BY id`, "public", "UTC")
+		h.want(`SELECT current_setting(n) FROM names WHERE id <= 2 ORDER BY id`, `"$user", public`, "UTC")
 		h.refused(`SELECT current_setting(n) FROM names ORDER BY id`, sql.CodeUndefinedObject, `unrecognized configuration parameter "nosuch"`)
 		h.refused(`SELECT current_setting(n, false) FROM names WHERE id = 4`, sql.CodeUndefinedObject, `unrecognized configuration parameter "app.never_set"`)
-		h.want(`SELECT current_setting(n, true) FROM names ORDER BY id`, "public", "UTC", "NULL", "NULL", "NULL")
-		h.want(`SELECT current_setting(n, ok) FROM names WHERE id <> 5 ORDER BY id`, "public", "UTC", "NULL", "NULL")
+		h.want(`SELECT current_setting(n, true) FROM names ORDER BY id`, `"$user", public`, "UTC", "NULL", "NULL", "NULL")
+		h.want(`SELECT current_setting(n, ok) FROM names WHERE id <> 5 ORDER BY id`, `"$user", public`, "UTC", "NULL", "NULL")
 		h.want(`SELECT current_setting(n) FROM names WHERE id = 5`, "NULL") // strict: a NULL name is NULL
 		// A custom setting once SET is known.
 		execSQL(t, ctx, h.s, `SET app.never_set = 'now set'`)

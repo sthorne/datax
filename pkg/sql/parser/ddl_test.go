@@ -274,7 +274,7 @@ func TestParseAlterTableActionList(t *testing.T) {
 	at := parseOne(t, `ALTER TABLE IF EXISTS ONLY public.t ADD COLUMN a INT8, ADD "b" character varying DEFAULT 'x' NOT NULL,
 		DROP COLUMN c, ALTER COLUMN d SET DEFAULT 1, ALTER d DROP NOT NULL, ADD CONSTRAINT k CHECK (a > 0),
 		ALTER COLUMN e TYPE TEXT, DROP CONSTRAINT IF EXISTS old, ENABLE ROW LEVEL SECURITY, VALIDATE CONSTRAINT v`).(*AlterTable)
-	if at.Table != "t" || !at.IfExists || !at.Only || len(at.Cmds) != 10 || at.AddCol != nil {
+	if at.Table != "public.t" || !at.IfExists || !at.Only || len(at.Cmds) != 10 || at.AddCol != nil {
 		t.Fatalf("action list: %+v", at)
 	}
 	c := at.Cmds
@@ -292,7 +292,7 @@ func TestParseAlterTableActionList(t *testing.T) {
 		t.Fatalf("actions: %+v %+v %+v %+v %+v %+v %+v %+v %+v %+v", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9])
 	}
 	for _, cmd := range c {
-		if cmd.Table != "t" || !cmd.IfExists || !cmd.Only || cmd.Cmds != nil {
+		if cmd.Table != "public.t" || !cmd.IfExists || !cmd.Only || cmd.Cmds != nil {
 			t.Fatalf("action carries the statement's table and flags: %+v", cmd)
 		}
 	}

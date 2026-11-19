@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"context"
 	"errors"
 
 	"github.com/sthorne/datax/pkg/sql/advisory"
@@ -9,8 +10,8 @@ import (
 
 // DISCARD (what connection poolers run to hand a connection on clean):
 // DISCARD PLANS drops the session's cached plans, DISCARD SEQUENCES its
-// currval / lastval state, DISCARD TEMP its temporary tables (datax has
-// none), and DISCARD ALL all of that and the rest of the session's state,
+// currval / lastval state, DISCARD TEMP the session's temporary tables
+// (in the open transaction block, if any), and DISCARD ALL all of that and the rest of the session's state,
 // as PostgreSQL's does: it closes every cursor, resets every setting to
 // its default (the role included, which is SET SESSION AUTHORIZATION
 // DEFAULT), deallocates every prepared statement, stops listening on
@@ -18,7 +19,7 @@ import (
 // layer drops its named protocol-level statements with it. DISCARD ALL
 // is refused inside a transaction block (25001), as in PostgreSQL.
 
-func (s *Session) execDiscard(t *parser.Discard) (*Result, *Error) {
+func (s *Session) execDiscard(ctx context.Context, t *parser.Discard) (*Result, *Error) {
 	switch t.Kind {
 	case "plans":
 		s.plans = nil
@@ -27,10 +28,19 @@ func (s *Session) execDiscard(t *parser.Discard) (*Result, *Error) {
 		s.seqs = nil
 		return &Result{Tag: "DISCARD SEQUENCES"}, nil
 	case "temp":
+		if err := s.dropTempTables(ctx); err != nil {
+			if s.state == StateOpen {
+				s.state = StateFailed
+			}
+			return nil, ToSQLError(err)
+		}
 		return &Result{Tag: "DISCARD TEMP"}, nil
 	}
 	if s.state == StateOpen {
 		return nil, newErrf(CodeActiveTransaction, "DISCARD ALL cannot run inside a transaction block")
+	}
+	if err := s.dropTempTables(ctx); err != nil {
+		return nil, ToSQLError(err)
 	}
 	s.cursors = nil
 	s.vars = defaultVars()

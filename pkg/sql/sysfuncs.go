@@ -269,24 +269,20 @@ func isNameSpace(c byte) bool {
 }
 
 // relationLookupName maps a parsed relation name to the form the
-// session resolves: t; public.t is t; pg_catalog.t and
-// information_schema.t stay qualified; db.t and db.public.t name another
-// database's table. ok is false for a name no relation can have.
+// session resolves: the parts as written ("t", "s.t", "db.s.t"), which
+// the catalog resolves by the search path and the qualifiers
+// (docs/design/schemas.md). ok is false for a name no relation can
+// have.
 func relationLookupName(parts []string) (string, bool) {
-	switch len(parts) {
-	case 1:
-		return parts[0], true
-	case 2:
-		if parts[0] == catalog.PublicSchema {
-			return parts[1], true
-		}
-		return parts[0] + "." + parts[1], true
-	case 3:
-		if parts[1] == catalog.PublicSchema {
-			return parts[0] + "." + parts[2], true
+	if len(parts) == 0 || len(parts) > 3 {
+		return "", false
+	}
+	for _, p := range parts {
+		if p == "" || strings.Contains(p, ".") {
+			return "", false
 		}
 	}
-	return "", false
+	return strings.Join(parts, "."), true
 }
 
 // relRef is what a relation argument resolved to: a table or view
@@ -369,7 +365,7 @@ func (s *Session) relationByOID(ctx context.Context, txn *kvclient.Txn, oid int6
 	if err != nil {
 		return nil, err
 	}
-	if desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); err == nil && desc != nil && desc.DatabaseID == dbID {
+	if desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); err == nil && desc != nil && desc.DatabaseID == dbID && s.tempVisible(desc) {
 		return &relRef{desc: desc, oid: oid}, nil
 	}
 	if sd, err := catalog.ReadSequence(ctx, txn, uint64(oid)); err == nil && sd != nil && sd.DatabaseID == dbID {
@@ -401,7 +397,7 @@ func (s *Session) relationDomain(ctx context.Context, txn *kvclient.Txn) ([]doma
 	if err != nil {
 		return nil, err
 	}
-	all, err := s.cat.List(ctx, txn)
+	all, err := s.listAll(ctx, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -490,12 +486,19 @@ func (s *Session) evalSerialSequence(ctx context.Context, txn *kvclient.Txn, c *
 
 // evalCurrentSchemas is current_schemas(include_implicit): the search
 // path's schemas, pg_catalog first when the implicit ones are asked for.
-func (s *Session) evalCurrentSchemas(_ context.Context, _ *kvclient.Txn, c *sysCall) (types.Datum, error) {
+func (s *Session) evalCurrentSchemas(ctx context.Context, txn *kvclient.Txn, c *sysCall) (types.Datum, error) {
 	implicit, err := c.args[0].Coerce(types.Bool)
 	if err != nil {
 		return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "current_schemas: %v", err)
 	}
-	elems := []types.Datum{types.NewString(catalog.PublicSchema)}
+	schemas, err := s.pathSchemasAnyTxn(ctx, txn)
+	if err != nil {
+		return types.Datum{}, err
+	}
+	elems := make([]types.Datum, 0, len(schemas)+1)
+	for _, sd := range schemas {
+		elems = append(elems, types.NewString(sd.Name))
+	}
 	if implicit.B {
 		elems = append([]types.Datum{types.NewString(vtable.PgCatalog)}, elems...)
 	}
@@ -565,15 +568,16 @@ var schemaOIDs = map[string]int64{vtable.PgCatalog: vtable.OIDPgCatalog, catalog
 
 // evalToRegnamespace is to_regnamespace(name): the schema's OID, NULL
 // when there is none.
-func (s *Session) evalToRegnamespace(_ context.Context, _ *kvclient.Txn, c *sysCall) (types.Datum, error) {
+func (s *Session) evalToRegnamespace(ctx context.Context, txn *kvclient.Txn, c *sysCall) (types.Datum, error) {
 	parts, ok := parseQualifiedName(c.args[0].Text())
 	if !ok || len(parts) != 1 {
 		return types.DNull, nil
 	}
-	if oid, ok := schemaOIDs[parts[0]]; ok {
-		return types.NewInt(oid), nil
+	oid, ok, err := s.schemaOID(ctx, txn, parts[0])
+	if err != nil || !ok {
+		return types.DNull, err
 	}
-	return types.DNull, nil
+	return types.NewInt(oid), nil
 }
 
 // evalToRegrole is to_regrole(name): the role's OID, NULL when there is
@@ -777,15 +781,16 @@ var privKinds = map[string]*privKind{
 		privs: []string{"CREATE", "USAGE"},
 		resolve: func(s *Session, ctx context.Context, txn *kvclient.Txn, c *sysCall, i int) (any, error) {
 			if oid, ok := c.argIsOID(i); ok {
-				for name, o := range schemaOIDs {
-					if o == oid {
-						return name, nil
-					}
+				name, found, err := s.schemaByOID(ctx, txn, oid)
+				if err != nil || !found {
+					return nil, err
 				}
-				return nil, nil
+				return name, nil
 			}
 			name := c.args[i].Text()
-			if _, ok := schemaOIDs[name]; !ok {
+			if _, ok, err := s.schemaOID(ctx, txn, name); err != nil {
+				return nil, err
+			} else if !ok {
 				return nil, newErrf(CodeInvalidSchemaName, "schema %q does not exist", name)
 			}
 			return name, nil
@@ -1113,6 +1118,24 @@ func (s *Session) relationPrivAllowed(ctx context.Context, txn *kvclient.Txn, ob
 // is what creating a table in the database takes. The catalog schemas
 // are everyone's to use and admins' alone to create in.
 func (s *Session) schemaPrivAllowed(ctx context.Context, txn *kvclient.Txn, obj any, p privSpec) (bool, error) {
+	if name := obj.(string); name != catalog.PublicSchema && !catalog.IsSystemSchemaName(name) {
+		// A schema of the current database.
+		db, sd, err := s.lookupSchemaOrErr(ctx, txn, name)
+		if err != nil {
+			return false, err
+		}
+		if p.option {
+			return s.holdsGrantOption(ctx, txn, sd.Owner, sd.GrantOptions, p.priv)
+		}
+		if s.actor() == catalog.RootRole {
+			return true, nil
+		}
+		set, err := s.roleSet(ctx, txn)
+		if err != nil {
+			return false, err
+		}
+		return s.schemaPrivOn(ctx, txn, db, sd, set, p.priv)
+	}
 	if obj.(string) != catalog.PublicSchema {
 		if p.priv == catalog.PrivUsage && !p.option {
 			return true, nil

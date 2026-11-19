@@ -249,7 +249,7 @@ func (s *Session) execAnalyze(ctx context.Context, an *parser.Analyze) (*Result,
 		if derr != nil {
 			return derr
 		}
-		all, lerr := s.cat.ListIn(ctx, txn, db)
+		all, lerr := s.listIn(ctx, txn, db)
 		if lerr != nil {
 			return lerr
 		}

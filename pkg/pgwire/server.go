@@ -126,6 +126,10 @@ type ServerOptions struct {
 	// (issue #353; nil: a manager of this server's own, with the default
 	// lease).
 	Advisory *advisory.Manager
+	// TempTables is the node's registry of the sessions that may own
+	// temporary tables (gap PG-D-009), the orphan sweep's view of which
+	// are live (nil: a registry of this server's own).
+	TempTables *sql.TempRegistry
 }
 
 // Server accepts SQL client connections.
@@ -153,6 +157,10 @@ type Server struct {
 // Activity exposes the server's client accounting.
 func (s *Server) Activity() *Activity { return s.act }
 
+// TempTables is the server's registry of the sessions that may own
+// temporary tables.
+func (s *Server) TempTables() *sql.TempRegistry { return s.opts.TempTables }
+
 // Serve starts accepting connections on lis (returns immediately).
 func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *stop.Stopper, opts ServerOptions) *Server {
 	if opts.Notify == nil {
@@ -160,6 +168,9 @@ func Serve(lis net.Listener, db *kvclient.DB, cat *catalog.Accessor, stopper *st
 	}
 	if opts.Advisory == nil && db != nil {
 		opts.Advisory = advisory.NewManager(stopper.Ctx(), advisory.Config{DB: db, NodeID: opts.NodeID})
+	}
+	if opts.TempTables == nil {
+		opts.TempTables = sql.NewTempRegistry(opts.NodeID)
 	}
 	s := &Server{db: db, cat: cat, stopper: stopper, lis: lis, opts: opts, conns: make(map[net.Conn]*conn), act: newActivity(opts.SlowStatementThreshold), cancel: newCancelRegistry()}
 	stopper.AddCloser(func() { _ = lis.Close() })
