@@ -578,7 +578,7 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 				continue
 			}
 			if q, ok := stmts[0].(*parser.Select); ok {
-				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), desc.ViewSearchPath, q, seen); err != nil {
+				if err := s.checkSelectReadsAs(ctx, txn, catalog.OwnerOf(desc.Owner), desc.ViewSearchPath, desc.ViewBindings, q, seen); err != nil {
 					return err
 				}
 			}
@@ -586,7 +586,7 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 	}
 	for _, cte := range definers {
 		if q, ok := cte.Query.(*parser.Select); ok {
-			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, cte.SearchPath, q, seen); err != nil {
+			if err := s.checkSelectReadsAs(ctx, txn, cte.Definer, cte.SearchPath, cte.Bindings, q, seen); err != nil {
 				return err
 			}
 		}
@@ -596,10 +596,10 @@ func (s *Session) checkSelectReads(ctx context.Context, txn *kvclient.Txn, sel *
 
 // checkSelectReadsAs is checkSelectReads as another role: a view's
 // owner, for the tables the view reads.
-func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, path []string, sel *parser.Select, seen map[uint64]bool) error {
-	saved, savedPath := s.privAs, s.viewPath
-	s.privAs, s.viewPath = role, viewResolutionPath(path)
-	defer func() { s.privAs, s.viewPath = saved, savedPath }()
+func (s *Session) checkSelectReadsAs(ctx context.Context, txn *kvclient.Txn, role string, path []string, bindings map[string]uint64, sel *parser.Select, seen map[uint64]bool) error {
+	saved, savedPath, savedBindings := s.privAs, s.viewPath, s.viewBindings
+	s.privAs, s.viewPath, s.viewBindings = role, viewResolutionPath(path), bindings
+	defer func() { s.privAs, s.viewPath, s.viewBindings = saved, savedPath, savedBindings }()
 	return s.checkSelectReads(ctx, txn, sel, seen)
 }
 

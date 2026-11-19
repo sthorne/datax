@@ -232,6 +232,15 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	// Where the table goes: the schema its qualifier names, or the first
 	// schema of the search path that exists (a temporary table: the
 	// session's own, in the current database).
+	if t.Temp || t.Unlogged {
+		// A temporary table's descriptor field, and its name entry, and
+		// UNLOGGED's, are written only once the cluster has finalized
+		// v22: a v21 node would list the temporary table as an ordinary
+		// one, and drop either field when it rewrites the descriptor.
+		if err := s.requireV22For("temporary and unlogged tables"); err != nil {
+			return nil, err
+		}
+	}
 	var target *catalog.Target
 	if t.Temp {
 		dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
@@ -958,6 +967,11 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		return nil, sealedTableError(bare)
 	} else if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table %q belongs to the cluster and cannot be dropped (DELETE FROM it, or ALTER TABLE ... SET (retention = ...))", bare)
+	}
+	if gone, err := s.forgetVanishedTemp(ctx, txn, t.Name); err != nil {
+		return nil, err
+	} else if gone {
+		return &Result{Tag: "DROP TABLE"}, nil
 	}
 	if td, ok, err := s.lookupTemp(ctx, txn, t.Name); ok {
 		// One of the session's temporary tables: it shadows an ordinary

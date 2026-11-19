@@ -699,6 +699,14 @@ durable as an ordinary one (and not faster). `pg_class.relpersistence`
 reports it as `u`; `ALTER TABLE ... SET LOGGED` and `SET UNLOGGED` are
 accepted and change only that (`42P16` on a temporary table).
 
+Temporary and unlogged tables need **cluster version v22** (`0A000`
+until `datax debug upgrade` finalizes it). If the session's temporary
+table is dropped from under it (a node whose liveness lapsed has its
+sessions' tables swept), the session's unqualified uses of the name are
+refused (`42P01`) until it drops the name (`DROP TABLE`, which then
+succeeds) or runs `DISCARD TEMP`: they never reach an ordinary table of
+the name.
+
 ### Tables without a primary key
 
 A table created without a `PRIMARY KEY` — a join table, an imported
@@ -2892,8 +2900,11 @@ objects needs `USAGE` on it (`42501 permission denied for schema s`) on
 top of the objects' own grants, and creating in it needs `CREATE`.
 `CREATE SCHEMA` needs `CREATE` on the database. `public` keeps its
 rules: `USAGE` for PUBLIC (revocable), `CREATE` for the database's owner
-and its grantees (PostgreSQL 15's default). A view's query resolves its
-names through the search path its creator had, whatever the reader's.
+and its grantees (PostgreSQL 15's default). A schema of the search path
+the role holds no `USAGE` on is skipped, as in PostgreSQL (`public` is
+not: without `USAGE` on it, a name there is `42501`). A view reads the
+relations its names meant when it was created, whatever the reader's
+path, and whatever was created under those names since.
 
 **Limits.** Sequences and enum types live in `public` only for now:
 `CREATE SEQUENCE s.x`, `CREATE TYPE s.x`, `SERIAL` / identity columns in

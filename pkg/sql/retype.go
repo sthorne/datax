@@ -107,6 +107,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 		if err := mustBeReal(shared); err != nil {
 			return err
 		}
+		s.pinTable(t.Table, shared)
 		desc := shared.Clone()
 		col, target, how, err := s.retypePlan(ctx, txn, desc, st)
 		if err != nil {
@@ -137,7 +138,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 	if !changed && !widened {
 		return &Result{Tag: "ALTER TABLE"}, nil
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if widened {
@@ -162,7 +163,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 			desc.Columns = kept
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, s.pinName(t.Table))
 		return nil, ToSQLError(cause)
 	}
 
@@ -186,7 +187,7 @@ func (s *Session) execRetypeOnline(ctx context.Context, t *parser.AlterTable) (*
 	if err != nil {
 		return abandon(err)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	log.Audit("table-ddl", "stmt", "ALTER COLUMN TYPE", "target", t.Table+"."+st.Column, "type", st.Type.String(), "principal", s.sessionUser, "role", s.user)

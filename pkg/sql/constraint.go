@@ -1039,7 +1039,7 @@ func (s *Session) createTableConstraints(ctx context.Context, txn *kvclient.Txn,
 		if err := s.cat.Update(ctx, txn, p); err != nil {
 			return false, err
 		}
-		s.noteDDL(p.Name)
+		s.noteDDL(catalog.RelationName(p))
 	}
 	return true, nil
 }
@@ -1082,7 +1082,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 			indexID = 0
 		}
 		if parent != nil {
-			parentName = parent.Name
+			parentName = catalog.RelationName(parent)
 			if err := s.cat.Update(ctx, txn, parent); err != nil {
 				return err
 			}
@@ -1095,11 +1095,11 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 	if exists {
 		return &Result{Tag: "ALTER TABLE", Notices: []string{fmt.Sprintf("constraint %q for relation %q already exists, skipping", cd.Name, t.Table)}}, nil
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if parentName != "" {
-		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, parentName); err != nil {
+		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(parentName)); err != nil {
 			return nil, ToSQLError(err)
 		}
 	}
@@ -1122,7 +1122,7 @@ func (s *Session) execAddConstraintOnline(ctx context.Context, t *parser.AlterTa
 		s.abandonConstraint(ctx, t.Table, cID)
 		return nil, ToSQLError(ferr)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	log.Audit("constraint-ddl", "stmt", "ADD CONSTRAINT", "target", t.Table, "principal", s.sessionUser, "role", s.user)
@@ -1184,16 +1184,16 @@ func (s *Session) abandonConstraint(ctx context.Context, table string, cID uint6
 		}
 		indexID = c.IndexID
 		if parent != nil {
-			parentName = parent.Name
+			parentName = catalog.RelationName(parent)
 			if err := s.cat.Update(ctx, txn, parent); err != nil {
 				return err
 			}
 		}
 		return s.cat.Update(ctx, txn, desc)
 	})
-	_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, table)
+	_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(table))
 	if parentName != "" {
-		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, parentName)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(parentName))
 	}
 	if tableID != 0 && indexID != 0 {
 		s.wipeIndexEntries(ctx, tableID, indexID)
@@ -1370,7 +1370,7 @@ func (s *Session) execValidateConstraintOnline(ctx context.Context, t *parser.Al
 	if err := s.setConstraintValidated(ctx, t.Table, cID); err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "ALTER TABLE"}, nil
@@ -1473,7 +1473,7 @@ func (s *Session) execSetNotNullOnline(ctx context.Context, t *parser.AlterTable
 	if err := flip(true); err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if err := s.sweepRows(ctx, t.Table, func(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) error {
@@ -1483,7 +1483,7 @@ func (s *Session) execSetNotNullOnline(ctx context.Context, t *parser.AlterTable
 		return nil
 	}); err != nil {
 		_ = flip(false)
-		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table))
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "ALTER TABLE"}, nil
@@ -1610,7 +1610,7 @@ func (s *Session) dropTableConstraints(ctx context.Context, txn *kvclient.Txn, d
 		if err := s.cat.Update(ctx, txn, cd); err != nil {
 			return err
 		}
-		s.noteDDL(cd.Name)
+		s.noteDDL(catalog.RelationName(cd))
 		if indexID != 0 {
 			s.pendingWipes = append(s.pendingWipes, indexWipe{tableID: cd.ID, indexID: indexID})
 		}
@@ -1645,7 +1645,7 @@ func (s *Session) dropTableConstraints(ctx context.Context, txn *kvclient.Txn, d
 		if err := s.cat.Update(ctx, txn, p); err != nil {
 			return err
 		}
-		s.noteDDL(p.Name)
+		s.noteDDL(catalog.RelationName(p))
 	}
 	return nil
 }

@@ -161,7 +161,34 @@ func (s *Session) lookupForSchemaChange(ctx context.Context, txn *kvclient.Txn, 
 	if d.Temp != nil {
 		return d, nil // read in txn: temporary tables are never cached
 	}
-	return s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, name)
+	// Every later phase, and the drain, act on this very table: a table
+	// created under the name meanwhile (in a schema earlier on the
+	// search path) is not it.
+	s.pinTable(name, d)
+	return s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, s.pinName(name))
+}
+
+// pinTable pins name to table d for the rest of the statement (the
+// first pin of a name holds).
+func (s *Session) pinTable(name string, d *catalog.TableDescriptor) {
+	if d == nil || d.Temp != nil || d.Virtual != "" {
+		return
+	}
+	if _, pinned := s.ddlPins[name]; !pinned {
+		if s.ddlPins == nil {
+			s.ddlPins = map[string]string{}
+		}
+		s.ddlPins[name] = catalog.RelationName(d)
+	}
+}
+
+// pinName is the exact name a multi-phase schema change pinned name to
+// (ddlPins), or name itself.
+func (s *Session) pinName(name string) string {
+	if p, ok := s.ddlPins[name]; ok {
+		return p
+	}
+	return name
 }
 
 // TestingCreateIndexHook, when set, is called by an online CREATE INDEX
@@ -301,7 +328,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	if TestingCreateIndexHook != nil {
 		TestingCreateIndexHook(CreateIndexPublished, t.Name)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if TestingCreateIndexHook != nil {
@@ -352,7 +379,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			desc.Indexes = kept
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table))
 		if tableID != 0 {
 			s.wipeIndexEntries(ctx, tableID, indexID)
 			if vec != nil {
@@ -363,7 +390,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	}
 
 	// Step 3: drain adoption of the public index.
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(t.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "CREATE INDEX", Notices: notices}, nil

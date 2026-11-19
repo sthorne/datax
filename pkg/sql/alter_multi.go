@@ -125,7 +125,7 @@ func (s *Session) commitAlterEffects(ctx context.Context, txn *kvclient.Txn, des
 	}
 	for _, p := range eff.parents {
 		if p.ID != desc.ID {
-			s.noteDDL(p.Name)
+			s.noteDDL(catalog.RelationName(p))
 		}
 	}
 	s.pendingWipes = append(s.pendingWipes, eff.wipes...)
@@ -342,6 +342,11 @@ func (s *Session) applyAlterAction(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	switch {
 	case t.SetLogged != "":
+		if t.SetLogged == "unlogged" {
+			if err := s.requireV22For("temporary and unlogged tables"); err != nil {
+				return err
+			}
+		}
 		// SET LOGGED / UNLOGGED: every table is durable; only
 		// relpersistence follows (catalog.TableDescriptor.Unlogged).
 		if desc.Temp != nil {
@@ -859,7 +864,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 			notices, wipes, done = eff.notices, eff.wipes, true
 			for _, p := range eff.parents {
 				if p.ID != desc.ID {
-					parents = append(parents, p.Name)
+					parents = append(parents, catalog.RelationName(p))
 				}
 			}
 			return s.writeAlterEffects(ctx, txn, desc, eff)
@@ -889,7 +894,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 		desc.Alter = &catalog.PendingAlter{Statement: digest, Plan: raw}
 		for _, p := range eff.parents {
 			if p.ID != desc.ID {
-				parents = append(parents, p.Name)
+				parents = append(parents, catalog.RelationName(p))
 			}
 		}
 		eff.audits = nil // logged once the statement is done
@@ -980,7 +985,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 // drainAlter waits until no gateway can still use the descriptors of
 // the table and the tables named before their last change.
 func (s *Session) drainAlter(ctx context.Context, table string, others []string) error {
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(table)); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -989,7 +994,7 @@ func (s *Session) drainAlter(ctx context.Context, table string, others []string)
 			continue
 		}
 		seen[name] = true
-		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); err != nil {
+		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); err != nil {
 			return err
 		}
 	}
@@ -1003,7 +1008,7 @@ func (s *Session) tableNameByID(ctx context.Context, id uint64) (string, bool) {
 	_ = s.db.RunTxn(ctx, "table-name", func(ctx context.Context, txn *kvclient.Txn) error {
 		d, err := catalog.ReadTable(ctx, txn, id)
 		if err == nil && d != nil {
-			name = d.Name
+			name = catalog.RelationName(d) // exact, whatever the search path
 		}
 		return nil
 	})
@@ -1369,7 +1374,7 @@ func (s *Session) abandonAlter(ctx context.Context, table, digest string) {
 		desc.Alter = nil
 		for _, p := range eff.parents {
 			if p.ID != desc.ID {
-				parents = append(parents, p.Name)
+				parents = append(parents, catalog.RelationName(p))
 			}
 		}
 		return s.writeAlterEffects(ctx, txn, desc, eff)

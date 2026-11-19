@@ -365,7 +365,7 @@ func (s *Session) relationByOID(ctx context.Context, txn *kvclient.Txn, oid int6
 	if err != nil {
 		return nil, err
 	}
-	if desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); err == nil && desc != nil && desc.DatabaseID == dbID {
+	if desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); err == nil && desc != nil && desc.DatabaseID == dbID && s.tempVisible(desc) {
 		return &relRef{desc: desc, oid: oid}, nil
 	}
 	if sd, err := catalog.ReadSequence(ctx, txn, uint64(oid)); err == nil && sd != nil && sd.DatabaseID == dbID {

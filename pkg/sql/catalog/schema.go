@@ -390,6 +390,11 @@ func (a *Accessor) SetTableSchema(ctx context.Context, txn *kvclient.Txn, d *Tab
 type Resolution struct {
 	Path []string
 	User string
+	// CanUse reports whether the role may use a schema of the path
+	// other than public (USAGE): one it may not is skipped, as
+	// PostgreSQL skips it, for resolution and as the creation target.
+	// nil: every schema is usable.
+	CanUse func(ctx context.Context, txn *kvclient.Txn, sd *SchemaDescriptor) (bool, error)
 }
 
 type resolutionKey struct{}
@@ -456,8 +461,9 @@ const UserPathEntry = "$user"
 func PathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolution) ([]*SchemaDescriptor, error) {
 	path := []string{PublicSchema}
 	user := ""
+	var canUse func(context.Context, *kvclient.Txn, *SchemaDescriptor) (bool, error)
 	if r != nil {
-		path, user = r.Path, r.User
+		path, user, canUse = r.Path, r.User, r.CanUse
 	}
 	var out []*SchemaDescriptor
 	seen := map[string]bool{}
@@ -476,6 +482,15 @@ func PathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolut
 				continue
 			}
 			return nil, err
+		}
+		if !sd.IsPublic() && canUse != nil {
+			ok, err := canUse(ctx, txn, sd)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
 		}
 		out = append(out, sd)
 	}

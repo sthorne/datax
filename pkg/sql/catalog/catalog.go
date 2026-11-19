@@ -795,6 +795,13 @@ type TableDescriptor struct {
 	// the view was created. Empty means public alone, which is how
 	// every view made before schemas resolved.
 	ViewSearchPath []string `json:"view_search_path,omitempty"`
+	// ViewBindings maps each relation name a view's query writes, as
+	// written, to the table or view it resolved to when the view was
+	// created: reading the view binds the name to that relation again,
+	// whatever else the name would resolve to now (PostgreSQL binds a
+	// view's relations at creation). Empty for a view made before
+	// schemas, whose names resolve through public.
+	ViewBindings map[string]uint64 `json:"view_bindings,omitempty"`
 }
 
 // RestoredRowsBand is one band of RestoredRows.

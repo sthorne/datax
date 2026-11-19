@@ -741,6 +741,9 @@ type CTE struct {
 	// query resolves its names through (the view's own, never the
 	// reader's).
 	SearchPath []string
+	// Bindings, on a view's member, are the relations the view's names
+	// were bound to at its creation (catalog.TableDescriptor.ViewBindings).
+	Bindings map[string]uint64
 }
 
 type Select struct {

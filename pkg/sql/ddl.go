@@ -156,7 +156,7 @@ func (s *Session) execDropIndex(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	s.pendingWipes = append(s.pendingWipes, wipe)
 	log.Audit("index-ddl", "stmt", "DROP INDEX", "target", desc.Name+"."+indexName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "DROP INDEX"}, nil
@@ -195,7 +195,7 @@ func (s *Session) execAlterIndex(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	log.Audit("index-ddl", "stmt", "ALTER INDEX RENAME", "target", desc.Name+"."+old, "to", t.NewName, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER INDEX"}, nil
 }
@@ -516,7 +516,7 @@ func (s *Session) execTruncate(ctx context.Context, txn *kvclient.Txn, t *parser
 				return nil, err
 			}
 		}
-		s.noteDDL(desc.Name)
+		s.noteDDL(catalog.RelationName(desc))
 		names = append(names, desc.Name)
 	}
 	log.Audit("table-ddl", "stmt", "TRUNCATE", "target", strings.Join(names, ","), "principal", s.sessionUser, "role", s.user)

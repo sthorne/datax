@@ -130,7 +130,7 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		for _, c := range d.Columns {
 			cols = append(cols, c.Name)
 		}
-		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner), SearchPath: viewResolutionPath(d.ViewSearchPath)}
+		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner), SearchPath: viewResolutionPath(d.ViewSearchPath), Bindings: d.ViewBindings}
 		if db != "" {
 			m.Qualified = lname
 		}
@@ -320,12 +320,13 @@ func stmtTables(stmt parser.Statement) []string {
 
 // viewDependencies resolves the tables and views a view's query reads
 // (every one must exist now; the catalogs count for nothing).
-func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *parser.Select) ([]uint64, error) {
+func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *parser.Select) ([]uint64, map[string]uint64, error) {
 	shadowed := map[string]bool{}
 	for _, cte := range q.With {
 		shadowed[strings.ToLower(cte.Name)] = true
 	}
 	var deps []uint64
+	bindings := map[string]uint64{}
 	seen := map[uint64]bool{}
 	for _, name := range stmtTables(q) {
 		if _, bare := catalog.SplitTableName(strings.ToLower(name)); shadowed[bare] {
@@ -335,17 +336,24 @@ func (s *Session) viewDependencies(ctx context.Context, txn *kvclient.Txn, q *pa
 		if err != nil {
 			var nf *catalog.ErrTableNotFound
 			if asErr(err, &nf) {
-				return nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
+				return nil, nil, newErrf(CodeUndefinedTable, "relation %q does not exist", name)
 			}
-			return nil, err
+			return nil, nil, err
 		}
-		if d.Virtual != "" || seen[d.ID] {
+		if d.Virtual != "" {
+			continue
+		}
+		bindings[name] = d.ID
+		if seen[d.ID] {
 			continue
 		}
 		seen[d.ID] = true
 		deps = append(deps, d.ID)
 	}
-	return deps, nil
+	if len(bindings) == 0 {
+		bindings = nil
+	}
+	return deps, bindings, nil
 }
 
 // execCreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.
@@ -370,7 +378,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	if t.Query.AsOf != "" || t.Query.AsOfMaxStaleness != "" || t.Query.ForUpdate {
 		return nil, newErrf(CodeFeatureNotSupported, "a view's query cannot use AS OF SYSTEM TIME or FOR UPDATE")
 	}
-	deps, err := s.viewDependencies(ctx, txn, t.Query)
+	deps, bindings, err := s.viewDependencies(ctx, txn, t.Query)
 	if err != nil {
 		return nil, err
 	}
@@ -459,7 +467,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			}
 			nd := existing.Clone()
 			nd.Columns, nd.NextColumnID = columns, catalog.ColumnID(len(columns)+1)
-			nd.ViewQuery, nd.ViewDepends, nd.ViewSearchPath = t.Text, deps, viewPath
+			nd.ViewQuery, nd.ViewDepends, nd.ViewSearchPath, nd.ViewBindings = t.Text, deps, viewPath, bindings
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
@@ -475,7 +483,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	desc := &catalog.TableDescriptor{
 		Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
-		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, Owner: s.user,
+		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, Owner: s.user,
 	}
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err

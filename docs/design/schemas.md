@@ -83,6 +83,12 @@ now (see Deferred).
 
 ### Version gate
 
+The temporary and unlogged tables (gap PG-D-009) are gated on v22 too
+(`CREATE TEMP / UNLOGGED TABLE`, `ALTER TABLE ... SET UNLOGGED`): a v21
+node would list a temporary table as an ordinary one and drop either
+descriptor field when it rewrote the descriptor. A restore of a backup
+holding schemas is refused below v22.
+
 `CREATE SCHEMA` (the only way to create the new descriptors and
 entries) is refused with `0A000` until the cluster has finalized
 **v22**, the cluster version this tree is developing ("V22 also
@@ -195,10 +201,21 @@ every older view resolved), and the view's query always resolves
 through it: the expanded member carries the path (`parser.CTE.SearchPath`)
 and the session switches to it while the member runs or is checked
 (`Session.viewPath`), skipping the reader's temporary tables and the
-statement's lookup memo. Renaming a schema a view reads or resolves
-through, or moving a relation a view reads, is refused (`2BP01`), as
-renaming a table a view reads already was. Storing resolved OIDs
-(PostgreSQL) is deferred.
+statement's lookup memo.
+
+The path alone is not enough: a table created later in a schema
+earlier on the path would take a name the view meant for another
+relation, and the view would read it with its owner's privileges. So
+`CREATE VIEW` also records, for each relation name its query writes,
+the relation it resolved to (`view_bindings`, name as written → table
+or view ID), and reading the view binds each such name to exactly that
+relation again (`Session.viewBindings`), as PostgreSQL binds a view's
+relations at creation; only names that are not relations (the catalog
+views) go through the stored path. A view made before schemas has
+neither and resolves through `public`, as it always did. Renaming a
+schema a view reads or resolves through, dropping a schema in another
+schema's view's path, or moving a relation a view reads, is refused
+(`2BP01`), as renaming a table a view reads already was.
 
 ## Statements
 
@@ -245,9 +262,15 @@ renaming a table a view reads already was. Storing resolved OIDs
 * Reaching any object of a schema needs `USAGE` on it (`42501
   permission denied for schema s`), checked with the table privilege,
   as `public`'s already was. Creating in a schema needs `CREATE` on
-  it. Difference kept: PostgreSQL skips a path schema without USAGE
-  when resolving an unqualified name; datax resolves to it and refuses
-  (`42501`): never a different table, never a leak.
+  it.
+* A schema of the search path the acting role holds no `USAGE` on is
+  skipped, for resolution, as the creation target and in
+  `current_schema()`, as in PostgreSQL (`catalog.Resolution.CanUse`):
+  otherwise a role with CREATE on the database could create a schema
+  named after another role and capture that role's unqualified names
+  through `"$user"`. `public` is never skipped (a role whose USAGE on it
+  was revoked gets `42501`, as before schemas); explicit qualification
+  of a schema without USAGE is `42501`.
 
 ## Catalogs and functions
 
@@ -326,6 +349,6 @@ dropping its schemas; backup and restore of schemas.
   are not verified.
 * `RESTORE TABLE` / `RESTORE DATABASE` of a table outside `public` is
   refused (a cluster restore carries schemas).
-* A path schema without `USAGE` is refused (`42501`) rather than skipped
-  as PostgreSQL does.
+* `public` without `USAGE` is refused (`42501`) rather than skipped
+  from the path as PostgreSQL does (kept from before schemas).
 * Removing the two-part database fallback (a future major release).

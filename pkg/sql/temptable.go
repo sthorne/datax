@@ -132,6 +132,36 @@ type tempState struct {
 	// dropAtCommit those it created ON COMMIT DROP.
 	touched      map[uint64]bool
 	dropAtCommit map[uint64]bool
+	// live maps the name of each temporary table the session created
+	// (and has not dropped itself) to its ID; created are the IDs the
+	// current transaction created, forgotten from live if it does not
+	// commit. A name in live whose table is gone was dropped from under
+	// the session (the orphan sweep, after a lapse of the node's
+	// liveness): its lookup is refused rather than falling through to an
+	// ordinary table of the name.
+	live    map[string]uint64
+	created map[uint64]bool
+}
+
+// tempTxnDone settles the transaction's temporary-table bookkeeping:
+// the tables it created stay live if it committed, and are forgotten
+// if it did not.
+func (s *Session) tempTxnDone(committed bool) {
+	if !committed {
+		for id := range s.temp.created {
+			s.forgetTempLive(id)
+		}
+	}
+	s.temp.created = nil
+}
+
+// forgetTempLive removes temporary table id from the live names.
+func (s *Session) forgetTempLive(id uint64) {
+	for n, lid := range s.temp.live {
+		if lid == id {
+			delete(s.temp.live, n)
+		}
+	}
 }
 
 // SetTempRegistry gives the session its node's registry of session ids.
@@ -204,6 +234,12 @@ func (s *Session) lookupTemp(ctx context.Context, txn *kvclient.Txn, name string
 			if must {
 				return nil, true, &catalog.ErrTableNotFound{Name: name}
 			}
+			if gone, gerr := s.tempTableVanished(ctx, txn, bare); gerr != nil {
+				return nil, true, gerr
+			} else if gone {
+				return nil, true, &Error{Code: CodeUndefinedTable, Msg: fmt.Sprintf("relation %q does not exist", bare),
+					Detail: fmt.Sprintf("this session's temporary table %q was dropped from under it (taken for an orphan by the cleanup of ended sessions)", bare)}
+			}
 			return nil, false, nil
 		}
 		return nil, true, err
@@ -213,6 +249,52 @@ func (s *Session) lookupTemp(ctx context.Context, txn *kvclient.Txn, name string
 	}
 	s.temp.touched[d.ID] = true
 	return d, true, nil
+}
+
+// tempTableVanished reports whether the session's live temporary table
+// name is gone though the session did not drop it. The name stays
+// refused until the session drops it (DROP TABLE, which then succeeds)
+// or discards its temporary tables: a statement resolves a name more
+// than once (Describe, then Execute), and none of them may fall
+// through to an ordinary table of the name.
+func (s *Session) tempTableVanished(ctx context.Context, txn *kvclient.Txn, name string) (bool, error) {
+	id, ok := s.temp.live[name]
+	if !ok || s.temp.created[id] {
+		return false, nil // not one it made, or made in this transaction (a savepoint rolled back)
+	}
+	d, err := catalog.ReadTable(ctx, txn, id)
+	if err != nil {
+		return false, err
+	}
+	if d.TempOf(s.temp.sid) {
+		// It still exists under another name (a rename rolled back).
+		delete(s.temp.live, name)
+		s.temp.live[d.Name] = id
+		return false, nil
+	}
+	return true, nil
+}
+
+// forgetVanishedTemp is DROP TABLE of a temporary table dropped from
+// under the session (tempTableVanished): the name is forgotten, and the
+// drop has nothing left to do.
+func (s *Session) forgetVanishedTemp(ctx context.Context, txn *kvclient.Txn, name string) (bool, error) {
+	db, bare := catalog.SplitTableName(name)
+	if (db != "" && db != catalog.TempSchema) || s.temp.sid == "" {
+		return false, nil
+	}
+	if _, ok := s.temp.live[bare]; !ok {
+		return false, nil
+	}
+	if _, err := s.cat.LookupTemp(ctx, txn, s.database, s.temp.sid, bare); err == nil {
+		return false, nil
+	}
+	gone, err := s.tempTableVanished(ctx, txn, bare)
+	if err != nil || !gone {
+		return false, err
+	}
+	delete(s.temp.live, bare)
+	return true, nil
 }
 
 // namesTempTable reports whether name resolves to one of the session's
@@ -283,6 +365,14 @@ func (s *Session) noteTempCreated(d *catalog.TableDescriptor) {
 	}
 	s.temp.names[d.Name] = true
 	s.temp.ids[d.ID] = true
+	if s.temp.live == nil {
+		s.temp.live = map[string]uint64{}
+	}
+	if s.temp.created == nil {
+		s.temp.created = map[uint64]bool{}
+	}
+	s.temp.live[d.Name] = d.ID
+	s.temp.created[d.ID] = true
 	if d.Temp.OnCommit == catalog.OnCommitDrop {
 		if s.temp.dropAtCommit == nil {
 			s.temp.dropAtCommit = map[uint64]bool{}
@@ -295,6 +385,15 @@ func (s *Session) noteTempCreated(d *catalog.TableDescriptor) {
 func (s *Session) noteTempRenamed(d *catalog.TableDescriptor) {
 	if d.Temp != nil && s.temp.names != nil {
 		s.temp.names[d.Name] = true
+		if _, ok := s.temp.live[d.Name]; !ok {
+			for n, id := range s.temp.live {
+				if id == d.ID {
+					delete(s.temp.live, n)
+					s.temp.live[d.Name] = id
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -367,6 +466,7 @@ func (s *Session) dropTempTable(ctx context.Context, txn *kvclient.Txn, d *catal
 	if err := txn.RunBatch(ctx, &wb); err != nil {
 		return err
 	}
+	s.forgetTempLive(d.ID)
 	return s.finishTableDrop(ctx, txn, d)
 }
 
@@ -393,6 +493,7 @@ func (s *Session) dropTempTables(ctx context.Context) error {
 		return nil
 	}
 	if s.state == StateOpen {
+		s.temp.live = nil
 		return drop(ctx, s.txn)
 	}
 	saved := s.extraDrops
@@ -404,7 +505,7 @@ func (s *Session) dropTempTables(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.temp.ids = nil
+	s.temp.ids, s.temp.live = nil, nil
 	return nil
 }
 

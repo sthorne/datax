@@ -1347,6 +1347,16 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 	if err := n.checkRestoreClusterKeys(ctx, chain); err != nil {
 		return nil, err
 	}
+	// Schemas (gap PG-D-001) are written only once the cluster has
+	// finalized v22: a v21 node would list a schema's tables as public
+	// ones, and rewrite their descriptors without their schema.
+	if n.ClusterVersion() < version.V22 {
+		for _, kv := range final.Databases {
+			if _, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok {
+				return nil, fmt.Errorf("the backup holds schemas, which need cluster version %s: finalize the upgrade with `datax debug upgrade` first", version.V22)
+			}
+		}
+	}
 	// The target must hold no user tables: restored data keys bake in the
 	// backed-up table IDs, which an existing catalog could collide with.
 	// The cluster's own metrics table does not count: it lives at a

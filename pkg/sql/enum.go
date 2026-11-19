@@ -183,25 +183,10 @@ func (s *Session) execAlterType(ctx context.Context, txn *kvclient.Txn, t *parse
 		if err := s.cat.Update(ctx, txn, desc); err != nil {
 			return nil, ToSQLError(err)
 		}
-		s.noteDDL(s.qualifiedTableName(ctx, txn, desc))
+		s.noteDDL(catalog.RelationName(desc))
 	}
 	log.Audit("type-ddl", "stmt", "ALTER TYPE", "target", d.Name, "label", t.AddValue, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TYPE"}, nil
-}
-
-// qualifiedTableName names a table for the post-commit drain: bare in
-// the session's database, db.name elsewhere.
-func (s *Session) qualifiedTableName(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor) string {
-	dbs, err := catalog.ListDatabases(ctx, txn)
-	if err != nil {
-		return desc.Name
-	}
-	for _, db := range dbs {
-		if db.ID == desc.DatabaseID && db.Name != s.database {
-			return db.Name + "." + desc.Name
-		}
-	}
-	return desc.Name
 }
 
 func (s *Session) execDropType(ctx context.Context, txn *kvclient.Txn, t *parser.DropType) (*Result, error) {

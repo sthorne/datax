@@ -195,7 +195,7 @@ func (s *Session) execAlterSeal(ctx context.Context, at *parser.AlterTable) (*Re
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, at.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(at.Table)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	res := &Result{Tag: "ALTER TABLE"}

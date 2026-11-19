@@ -459,7 +459,7 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 			d := types.DNull
 			switch e.Func {
 			case "pg_get_viewdef":
-				if desc, rerr := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); rerr == nil && desc != nil && desc.IsView() {
+				if desc, rerr := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid)); rerr == nil && desc != nil && desc.IsView() && s.tempVisible(desc) {
 					d = types.NewString(vtable.ViewDef(desc.ViewQuery))
 				}
 			case "pg_get_indexdef", "pg_get_constraintdef":
@@ -1776,12 +1776,12 @@ func (s *Session) indexOrConstraintDef(ctx context.Context, txn *kvclient.Txn, e
 		return "", false
 	}
 	desc, err := catalog.ReadTable(ctx, txn, vtable.TableIDOfOID(oid>>16))
-	if err != nil || desc == nil {
+	if err != nil || desc == nil || !s.tempVisible(desc) {
 		return "", false
 	}
 	byID := func(id uint64) *catalog.TableDescriptor {
 		d, err := catalog.ReadTable(ctx, txn, id)
-		if err != nil {
+		if err != nil || d == nil || !s.tempVisible(d) {
 			return nil
 		}
 		return d
@@ -1805,7 +1805,7 @@ func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int6
 		tableID, indexID = vtable.TableIDOfOID(oid>>16), uint64(oid&0xffff)
 	}
 	desc, err := catalog.ReadTable(ctx, txn, tableID)
-	if err != nil || desc == nil {
+	if err != nil || desc == nil || !s.tempVisible(desc) {
 		return ""
 	}
 	if e.Func == "obj_description" && len(e.Args) > 1 && e.Args[1].Lit != nil && e.Args[1].Lit.Text() == "pg_constraint" {

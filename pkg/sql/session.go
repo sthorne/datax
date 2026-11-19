@@ -231,7 +231,15 @@ type Session struct {
 		raw    string
 		parsed []string
 	}
-	viewPath           []string
+	viewPath []string
+	// viewBindings, while a view's query runs, are the relations its
+	// names were bound to at creation (catalog ViewBindings).
+	viewBindings map[string]uint64
+	// ddlPins maps the name a multi-phase schema change named its table
+	// by to that table's exact name (catalog.RelationName), taken in its
+	// first phase: the later phases, and the drain, change the same
+	// table whatever was created under the name since. Per statement.
+	ddlPins            map[string]string
 	localVars          *sessionVars
 	txnStartedReadOnly bool
 	// BackendPID is the wire's process ID for this session (0 for an
@@ -400,6 +408,32 @@ func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version,
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
 	if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
 		name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+	}
+	name = s.pinName(name)
+	if s.viewBindings != nil {
+		// A view's name binds to the relation it named at the view's
+		// creation, whatever the name would resolve to now.
+		if id, ok := s.viewBindings[name]; ok {
+			d, err := catalog.ReadTable(ctx, txn, id)
+			if err != nil {
+				return nil, err
+			}
+			if d == nil {
+				return nil, &catalog.ErrTableNotFound{Name: name}
+			}
+			if d.IsView() {
+				// A view the query reads is bound, by expandViews, as a
+				// WITH member of its name: that member is what is read.
+				if r, ok := s.rels[strings.ToLower(catalog.BareName(name))]; ok {
+					return r.desc, nil
+				}
+				return d, nil
+			}
+			if verr := s.loadVectorCentroids(ctx, d); verr != nil {
+				return nil, verr
+			}
+			return d, nil
+		}
 	}
 	db, bare := catalog.SplitTableName(name)
 	if len(s.rels) > 0 {
@@ -765,6 +799,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	s.stmtNow = 0
 	s.memUsed = 0
 	s.policyMemo, s.historicalMemo, s.historicalPrivs = nil, nil, nil
+	s.ddlPins = nil
 	s.invalidateRoles()
 	s.advisoryStatement()
 	s.warnings = nil
@@ -919,6 +954,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.extraDDL, s.extraDrops = nil, nil
 		s.tempEndTxn()
 		err := s.txn.Commit(ctx)
+		s.tempTxnDone(err == nil)
 		s.loEndTxn(ctx, err == nil)
 		s.txn = nil
 		s.state = StateIdle
@@ -941,7 +977,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
-			if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); derr != nil {
+			if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {
 				return nil, ToSQLError(derr)
 			}
 		}
@@ -1362,6 +1398,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		s.discardNotify() // a retry starts the statement over
 		s.advisoryRestart()
 		s.tempEndTxn()
+		s.tempTxnDone(false) // an earlier attempt's creations did not commit
 		res, err = s.execStmt(ctx, txn, stmt, params)
 		if err == nil {
 			err = s.tempPreCommit(ctx, txn)
@@ -1372,6 +1409,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return err
 	})
 	s.tempEndTxn()
+	s.tempTxnDone(err == nil)
 	if err != nil {
 		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		return nil, ToSQLError(err)
@@ -1382,7 +1420,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		names = append([]string{name}, names...)
 	}
 	for _, name := range names {
-		if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); derr != nil {
+		if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {
 			return nil, ToSQLError(derr)
 		}
 	}
@@ -1483,6 +1521,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.discardNotify()
 	s.advisoryEndTxn()
 	s.tempEndTxn()
+	s.tempTxnDone(false)
 	s.state = StateIdle
 }
 

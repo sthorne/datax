@@ -58,10 +58,12 @@ syntax error or `0A000` feature not supported):
 - **Schemas** resolve as in PostgreSQL ([details](sql.md#schemas)), with
   these differences: a real table shadows a `pg_catalog` view of its
   name (PostgreSQL searches `pg_catalog` first unless the path lists
-  it); a schema of the path the role holds no `USAGE` on is not skipped
-  but refused (`42501`); a view keeps its query as text and resolves it
-  through its creator's path, so renaming a schema or moving a relation
-  that a view reads is refused (`2BP01`) rather than followed; a
+  it); `public` stays on the path when the role's `USAGE` on it is
+  revoked (`42501`; other schemas without `USAGE` are skipped, as in
+  PostgreSQL); a view keeps its query as text, with the relations its
+  names were bound to at creation, so renaming a schema or moving a
+  relation that a view reads, or dropping a schema a view's path
+  names, is refused (`2BP01`) rather than followed; a
   two-part name may also name a database when no schema has that name
   (deprecated); a search path naming no schema (`''`, as pg_dump sets
   it) still resolves existing names through `public`.

@@ -43,7 +43,20 @@ func (s *Session) resolution() *catalog.Resolution {
 	if path == nil {
 		path = s.pathOf(s.vars.searchPath)
 	}
-	return &catalog.Resolution{Path: path, User: s.user}
+	return &catalog.Resolution{Path: path, User: s.user, CanUse: s.pathSchemaUsable}
+}
+
+// pathSchemaUsable reports whether the acting role holds USAGE on a
+// schema of its search path (catalog.Resolution.CanUse).
+func (s *Session) pathSchemaUsable(ctx context.Context, txn *kvclient.Txn, sd *catalog.SchemaDescriptor) (bool, error) {
+	if s.actor() == catalog.RootRole || s.system {
+		return true, nil
+	}
+	set, err := s.roleSet(ctx, txn)
+	if err != nil {
+		return false, err
+	}
+	return s.schemaPrivOn(ctx, txn, nil, sd, set, catalog.PrivUsage)
 }
 
 // rctx attaches the session's resolution context to ctx, for a by-name
@@ -91,9 +104,13 @@ func (s *Session) lookupPathSchemas(ctx context.Context, txn *kvclient.Txn) ([]*
 // requireSchemas gates the statements that create schemas on cluster
 // version v22: before it, no node may write a schema descriptor or a
 // table filed under one.
-func (s *Session) requireSchemas() error {
+func (s *Session) requireSchemas() error { return s.requireV22For("schemas") }
+
+// requireV22For refuses what writes v22 catalog state (schemas,
+// temporary and unlogged tables) before the cluster has finalized v22.
+func (s *Session) requireV22For(what string) error {
 	if s.db.ClusterVersion() < version.V22 {
-		return newErrf(CodeFeatureNotSupported, "schemas need cluster version %s: finalize the upgrade with `datax debug upgrade` first", version.V22)
+		return newErrf(CodeFeatureNotSupported, "%s need cluster version %s: finalize the upgrade with `datax debug upgrade` first", what, version.V22)
 	}
 	return nil
 }
@@ -240,6 +257,12 @@ func (s *Session) execDropSchema(ctx context.Context, txn *kvclient.Txn, t *pars
 		if err := s.checkOwner(ctx, txn, "schema", name, sd.Owner); err != nil {
 			return nil, err
 		}
+		// A view of another schema that resolves its names through this
+		// one would resolve them through whatever schema took the name
+		// next.
+		if err := s.refuseIfSchemaInViewPath(ctx, txn, db, sd, "drop schema "+name); err != nil {
+			return nil, err
+		}
 		victims = append(victims, victim{db, sd})
 	}
 	dropped := 0
@@ -313,6 +336,26 @@ func (s *Session) refuseIfSchemaViewed(ctx context.Context, txn *kvclient.Txn, d
 			}
 			if inSchema[dep] && inSchema[v.ID] {
 				return newErrf(CodeDependentObjectsExist, "cannot %s: view %q names a relation of schema %s in its query (drop or replace the view first)", what, v.Name, sd.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// refuseIfSchemaInViewPath refuses a change to schema sd while a view
+// outside it resolves its names through it (its stored search path).
+func (s *Session) refuseIfSchemaInViewPath(ctx context.Context, txn *kvclient.Txn, db *catalog.DatabaseDescriptor, sd *catalog.SchemaDescriptor, what string) error {
+	all, err := s.cat.ListIn(ctx, txn, db)
+	if err != nil {
+		return err
+	}
+	for _, v := range all {
+		if !v.IsView() || v.SchemaID == sd.ID {
+			continue
+		}
+		for _, p := range v.ViewSearchPath {
+			if p == sd.Name {
+				return newErrf(CodeDependentObjectsExist, "cannot %s: view %q resolves its names through schema %s (drop or replace the view first)", what, v.Name, sd.Name)
 			}
 		}
 	}

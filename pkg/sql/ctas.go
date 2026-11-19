@@ -137,9 +137,11 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 		created = res != nil
 		return nil
 	}); err != nil {
+		s.tempTxnDone(false)
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, ct.Name); err != nil {
+	s.tempTxnDone(true)
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(ct.Name)); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if t.NoData {
@@ -165,7 +167,7 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 				_ = s.finishDrops(cctx, s.extraDrops)
 			}
 			s.extraDrops = nil
-			_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, ct.Name)
+			_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, s.pinName(ct.Name))
 		}
 		return nil, ToSQLError(cause)
 	}
@@ -478,7 +480,7 @@ func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parse
 	if err := s.cat.Update(ctx, txn, desc); err != nil {
 		return nil, err
 	}
-	s.noteDDL(desc.Name)
+	s.noteDDL(catalog.RelationName(desc))
 	return &Result{Tag: "COMMENT"}, nil
 }
 
