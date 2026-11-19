@@ -140,7 +140,11 @@ var (
 		"encryption_key")
 	restoreColumnFields = fieldSet("id", "name", "type", "precision", "scale", "width", "max_len", "char", "no_tz",
 		"enum_type", "enum_name", "enum_labels", "time_precision", "not_null", "default", "default_expr", "identity",
-		"sequence_id", "fill_default", "hidden", "comment", "retype_from")
+		"sequence_id", "fill_default", "hidden", "comment", "retype_from",
+		// The sequences a default is bound to: remapped to the restored
+		// sequences a column owns, the others left to resolve by name
+		// (restoredDescriptor).
+		"seq_bindings")
 	// An inverted index's entries are keyed under the table prefix like
 	// any index's, so they are re-keyed with the rest.
 	// So are a vector index's, and so are its centres, which sit under
@@ -521,16 +525,34 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 	d.InboundFKs = inbound
 	for i := range d.Columns {
 		c := &d.Columns[i]
-		if c.SequenceID == 0 {
-			continue
-		}
-		old := c.SequenceID
-		c.SequenceID = seqIDs[old]
-		for _, s := range p.seqs {
-			if s.desc.ID == old && c.DefaultExpr == fmt.Sprintf("nextval('%s')", s.desc.Name) {
-				c.DefaultExpr = fmt.Sprintf("nextval('%s')", seqNames[old])
+		// A default bound to a sequence the restore brings back is bound
+		// to the restored copy; to any other, it resolves by its name
+		// when used (gap PG-D-035), as defaults did before bindings.
+		var bindings map[string]uint64
+		if c.SeqBindings != nil {
+			bindings = make(map[string]uint64, len(c.SeqBindings))
+			for name, id := range c.SeqBindings {
+				if to, ok := seqIDs[id]; ok && id != 0 {
+					bindings[name] = to
+				} else {
+					bindings[name] = 0
+				}
 			}
 		}
+		if c.SequenceID != 0 {
+			old := c.SequenceID
+			c.SequenceID = seqIDs[old]
+			for _, s := range p.seqs {
+				if s.desc.ID == old && c.DefaultExpr == fmt.Sprintf("nextval('%s')", s.desc.Name) {
+					c.DefaultExpr = fmt.Sprintf("nextval('%s')", seqNames[old])
+					if bindings != nil {
+						delete(bindings, s.desc.Name)
+						bindings[seqNames[old]] = c.SequenceID
+					}
+				}
+			}
+		}
+		c.SeqBindings = bindings
 	}
 	// Grants come back for the roles this cluster has. A grant to a role
 	// it lacks would be a grant to whoever is given that name next.
@@ -1216,6 +1238,7 @@ func (n *Node) loadAndPublishTables(ctx context.Context, opID string, opts Resto
 				sd := s.desc
 				sd.ID, sd.DatabaseID, sd.Name = 0, dbID, restoredSequenceName(p, s)
 				sd.OwnerTable = p.newID
+				sd.SchemaID = 0 // with its table, in public (the only schema a table restore goes to)
 				if !roles(catalog.OwnerOf(sd.Owner)) {
 					sd.Owner = catalog.RootRole
 				}

@@ -369,6 +369,11 @@ func (a *Accessor) SetTableSchema(ctx context.Context, txn *kvclient.Txn, d *Tab
 	if existing != nil {
 		return &ErrTableExists{Name: d.Name}
 	}
+	if existing, err := txn.Get(ctx, keys.SequenceNamespaceKey(d.DatabaseID, newEntry)); err != nil {
+		return err
+	} else if existing != nil {
+		return &ErrTableExists{Name: d.Name}
+	}
 	oldEntry := d.namespaceName()
 	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, oldEntry)); err != nil {
 		return err
@@ -781,3 +786,7 @@ func SchemaIDOfKey(k keys.Key) (uint64, bool) {
 	}
 	return id, true
 }
+
+// DisplayName is how a name is reported in an error: as written, but a
+// RelationName (of a table, a sequence or a type) by the object's name.
+func DisplayName(name string) string { return displayName(name) }

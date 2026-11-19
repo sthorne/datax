@@ -78,8 +78,51 @@ consequences fall out of the existing code:
   schema table as a `public` one. Schemas are still gated on the
   cluster version (below), so before finalize there are none.
 
-Sequences and types keep their own namespaces and stay in `public` for
-now (see Deferred).
+### Sequences and types (gap PG-D-035)
+
+Sequences and types keep their own per-database namespaces
+(`/system/seqns/<dbID>/<entry>`, `/system/typens/<dbID>/<entry>`) and
+file the same entries as tables: a `public` sequence or type under its
+name, as before; one of schema S under `SchemaNamespaceName(S, name)`.
+`SequenceDescriptor` and `TypeDescriptor` gain `schema_id` (omitempty),
+so every existing sequence and type, and its key, is unchanged. Names
+resolve through the same `resolve` as tables
+(`Accessor.LookupSequenceIn`, `LookupTypeIn`), and a listing names one
+exactly with `SequenceRelationName` / `TypeRelationName` (the
+`RelationName` form with the object's entry). A sequence and a table of
+one schema share the relation namespace; a type is refused a name a
+table or sequence of its schema has.
+
+A `SERIAL` or identity column's sequence goes in its table's schema,
+and `ALTER TABLE ... SET SCHEMA` moves the table's sequences with it
+(those of its columns and those `OWNED BY` it). `ALTER SEQUENCE ...
+SET SCHEMA` refuses a sequence a column owns (`0A000`, as PostgreSQL);
+`ALTER TYPE ... SET SCHEMA` moves a type, whose columns hold its ID.
+
+**Defaults bind their sequences.** PostgreSQL stores `DEFAULT
+nextval('x')` with the `regclass` resolved, so the default draws from
+the sequence `x` named when it was set. datax stores the default as
+text, so a column records beside it, for each literal sequence name of
+its `nextval` / `currval` / `setval` calls, the sequence it resolved to
+(`Column.SeqBindings`, name as written → sequence ID; 0 when the name
+named no sequence then, which resolves when used). The default is
+evaluated with the bound sequences, by ID, whatever the inserting
+session's search path: a sequence of the name created later in a schema
+earlier on that path changes nothing. A default set before bindings
+existed has none, and resolves its names through `public` alone (they
+could name nothing else then), so no descriptor is rewritten. Moving a
+bound sequence (or its table, or renaming its schema) rewrites the
+defaults' text to name it where it now is; `DROP SEQUENCE` of a bound
+sequence is `2BP01` unless `CASCADE`, which drops those defaults, and
+so is `DROP TABLE` of a table owning one. `LIKE ... INCLUDING DEFAULTS`
+copies the binding (the name is qualified when the path would resolve
+it to another sequence).
+
+Using a sequence or type of a schema other than `public` needs `USAGE`
+on the schema (`42501 permission denied for schema s`), creating one
+`CREATE` on it; the search path skips a schema without `USAGE` for
+sequences and types as for tables. The v22 gate needs nothing new:
+no schema, so no sequence or type in one, exists before v22.
 
 ### Version gate
 
@@ -244,8 +287,9 @@ schema's view's path, or moving a relation a view reads, is refused
   and CREATE on `s`; moves the name entry, keeps the ID (indexes,
   constraints, foreign keys, view dependencies all hold). `42P07` when
   `s` has a relation of that name. Refused for temporary tables
-  (`0A000`) and for tables that own sequences (see Deferred).
-  `ALTER SEQUENCE ... SET SCHEMA` is `0A000` except to `public`.
+  (`0A000`); a table's own sequences move with it.
+  `ALTER SEQUENCE ... SET SCHEMA` and `ALTER TYPE ... SET SCHEMA`
+  move sequences and types (see "Sequences and types").
 * `GRANT / REVOKE { USAGE | CREATE | ALL } ON SCHEMA s [, ...]` with
   grant options, on any schema. `ALL TABLES IN SCHEMA s` names any
   schema.
@@ -326,13 +370,19 @@ dropping its schemas; backup and restore of schemas.
 
 ## Deferred (leftovers)
 
-* **Sequences and types in non-`public` schemas**: `CREATE SEQUENCE
-  s.x`, `CREATE TYPE s.x`, `SERIAL` / identity columns in a schema
-  table, `ALTER SEQUENCE ... SET SCHEMA s`, and `SET SCHEMA` of a table
-  owning a sequence are refused (`0A000`). They need the same entry
-  encoding in the sequence and type namespaces and schema-aware
-  `nextval('s.x')` resolution. Until then a schema table draws ids from
-  a `public` sequence (`DEFAULT nextval('public.ids')`).
+* Sequences and types (gap PG-D-035, now implemented), leftovers:
+  an unqualified relation name resolves the path's tables before its
+  sequences (a sequence in an earlier schema does not hide a table of
+  the name in a later one, and `nextval` finds a sequence behind a table
+  of its name); `ALTER TABLE ... DROP COLUMN` of a `SERIAL` column whose
+  sequence another table's default is bound to drops it without asking
+  (that default then fails, `42P01`); `DROP SCHEMA ... CASCADE` refuses
+  a type a column of another schema uses, where PostgreSQL drops the
+  column; `SHOW CREATE TABLE` prints an enum type of another schema
+  unqualified (`format_type` qualifies it as PostgreSQL does);
+  `RESTORE TABLE` of a `public` table whose enum type is in another
+  schema restores it onto (or creates) a `public` type of that name
+  and labels.
 * Views store text and a search path, not resolved OIDs (the rules above
   keep them safe; renames under them are refused).
 * A per-session `pg_temp_N` namespace for temporary tables (they are

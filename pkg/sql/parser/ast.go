@@ -328,10 +328,12 @@ type CreateSequence struct {
 	Options     SequenceOptions
 }
 
-// DropSequence is DROP SEQUENCE [IF EXISTS] name.
+// DropSequence is DROP SEQUENCE [IF EXISTS] name [CASCADE | RESTRICT].
+// CASCADE also drops the column defaults bound to the sequence.
 type DropSequence struct {
 	Name     string
 	IfExists bool
+	Cascade  bool
 }
 
 // AlterSequence is ALTER SEQUENCE [IF EXISTS] name [options | RESTART [WITH n]].
@@ -1279,7 +1281,8 @@ type AlterSchemaRename struct {
 }
 
 // SetSchema is ALTER TABLE | VIEW | SEQUENCE [IF EXISTS] name SET
-// SCHEMA schema: Kind is "table", "view" or "sequence".
+// SCHEMA schema, or ALTER TYPE name SET SCHEMA schema: Kind is "table",
+// "view", "sequence" or "type".
 type SetSchema struct {
 	Kind     string
 	Name     string

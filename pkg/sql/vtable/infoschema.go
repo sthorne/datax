@@ -309,7 +309,7 @@ type columnTypeInfo struct {
 	datetimePrec                                 types.Datum
 }
 
-func describeColumnType(c *catalog.Column) columnTypeInfo {
+func (env *Env) describeColumnType(c *catalog.Column) columnTypeInfo {
 	info := columnTypeInfo{udtSchema: PgCatalog, udtName: ColumnTypeName(c),
 		charMax: null(), charOctet: null(), numPrec: null(), numRadix: null(), scale: null(), datetimePrec: null()}
 	switch {
@@ -317,7 +317,7 @@ func describeColumnType(c *catalog.Column) columnTypeInfo {
 		info.dataType = "ARRAY"
 		return info
 	case c.Type == types.Enum:
-		info.dataType, info.udtSchema = "USER-DEFINED", catalog.PublicSchema
+		info.dataType, info.udtSchema = "USER-DEFINED", env.schemaName(env.typeSchemaID(c.EnumType))
 		return info
 	}
 	oid := ColumnTypeOID(c)
@@ -411,6 +411,17 @@ func tableConstraints(t *catalog.TableDescriptor) []isConstraint {
 // NOT NULL column's constraint: namespace OID, table OID, attnum.
 func notNullName(t *catalog.TableDescriptor, attnum int) string {
 	return fmt.Sprintf("%d_%d_%d_not_null", SchemaOID(t.SchemaID), TableOID(t), attnum)
+}
+
+// typeSchemaID is the schema of user-defined type id (0, public, when
+// the type is not listed).
+func (env *Env) typeSchemaID(id uint64) uint64 {
+	for _, t := range env.currentTypes() {
+		if t.ID == id {
+			return t.SchemaID
+		}
+	}
+	return 0
 }
 
 // sequenceOf indexes the current database's sequences by ID.
@@ -654,7 +665,7 @@ func init() {
 			}
 			cols, nums := visibleColumns(t)
 			for i, c := range cols {
-				info := describeColumnType(c)
+				info := env.describeColumnType(c)
 				def := null()
 				if text := ColumnDefault(c); text != "" && c.Identity == "" {
 					def = str(text)
@@ -707,7 +718,7 @@ func init() {
 				if !env.pgHasRole(owner) {
 					continue
 				}
-				info := describeColumnType(c)
+				info := env.describeColumnType(c)
 				b.add("udt_catalog", env.Database, "udt_schema", info.udtSchema, "udt_name", info.udtName,
 					"table_catalog", env.Database, "table_schema", env.tableSchema(t), "table_name", t.Name, "column_name", c.Name)
 			}
@@ -948,7 +959,7 @@ func init() {
 			if env.isIdentitySequence(sq) || !env.sequenceVisible(sq) {
 				continue
 			}
-			b.add("sequence_catalog", env.Database, "sequence_schema", catalog.PublicSchema, "sequence_name", sq.Name,
+			b.add("sequence_catalog", env.Database, "sequence_schema", env.schemaName(sq.SchemaID), "sequence_name", sq.Name,
 				"data_type", "bigint", "numeric_precision", 64, "numeric_precision_radix", 2, "numeric_scale", 0,
 				"start_value", strconv.FormatInt(sq.Start, 10), "minimum_value", strconv.FormatInt(sq.MinValue, 10),
 				"maximum_value", strconv.FormatInt(sq.MaxValue, 10), "increment", strconv.FormatInt(sq.Increment, 10),
@@ -1017,7 +1028,7 @@ func init() {
 					if roleGrants && !env.grantListed(e) || !roleGrants && !env.privilegeListed(e) {
 						continue
 					}
-					b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "object_catalog", env.Database, "object_schema", catalog.PublicSchema,
+					b.add("grantor", e.grantor, "grantee", grantName(e.grantee), "object_catalog", env.Database, "object_schema", env.schemaName(sq.SchemaID),
 						"object_name", sq.Name, "object_type", "SEQUENCE", "privilege_type", "USAGE", "is_grantable", env.isGrantable(e, sq.Owner))
 				}
 			}

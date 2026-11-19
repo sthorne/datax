@@ -774,6 +774,11 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			ds.Name = name
+			if p.consumeIdentWord("cascade") {
+				ds.Cascade = true
+			} else {
+				p.consumeIdentWord("restrict")
+			}
 			return ds, nil
 		}
 		if nxt := p.toks[p.i+1]; nxt.isWord("view") {
@@ -2383,7 +2388,8 @@ func (p *parser) parseCreateType() (Statement, error) {
 	return ct, nil
 }
 
-// parseAlterType parses ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label'.
+// parseAlterType parses ALTER TYPE name ADD VALUE [IF NOT EXISTS]
+// 'label', OWNER TO role, or SET SCHEMA s.
 func (p *parser) parseAlterType() (Statement, error) {
 	p.i += 2 // ALTER TYPE
 	at := &AlterType{}
@@ -2395,8 +2401,11 @@ func (p *parser) parseAlterType() (Statement, error) {
 	if p.consumeIdentWord("owner") {
 		return p.parseOwnerTo("type", name)
 	}
+	if ss, ok, err := p.parseSetSchema("type", name, false); ok || err != nil {
+		return ss, err
+	}
 	if !p.consumeKeyword("ADD") || !p.consumeIdentWord("value") {
-		return nil, p.errf("ALTER TYPE supports ADD VALUE and OWNER TO, found %q", p.peek().text)
+		return nil, p.errf("ALTER TYPE supports ADD VALUE, OWNER TO and SET SCHEMA, found %q", p.peek().text)
 	}
 	if p.consumeKeyword("IF") {
 		if err := p.expectKeyword("NOT"); err != nil {
@@ -7081,6 +7090,18 @@ func castChain(e Expr, casts []string) Expr {
 // WITH[OUT] TIME ZONE) are read whole, and _T (PostgreSQL's name of
 // T's array type) is T[] for a built-in T. Whether the name is a type
 // at all is the executor's question: it may name a user-defined type.
+// isBuiltinTypeWord reports whether name (lower case) begins a builtin
+// type's name: one types.ParseType knows, or the first word of a
+// multi-word one.
+func isBuiltinTypeWord(name string) bool {
+	switch name {
+	case "double", "character", "char", "bit", "time", "timestamp", "interval":
+		return true
+	}
+	_, err := types.ParseType(name)
+	return err == nil
+}
+
 func (p *parser) skipTypeName() (string, error) {
 	var name string
 	// quoted: the (last part of the) name was written in double quotes,
@@ -7096,13 +7117,29 @@ func (p *parser) skipTypeName() (string, error) {
 	} else {
 		return "", p.errf("expected type name, found %q", t.text)
 	}
+	qualifier := ""
 	if p.consumeOp(".") {
 		t := p.peek()
 		n, err := p.expectIdent()
 		if err != nil {
 			return "", err
 		}
+		qualifier = name
 		name, quoted = n, t.quoted
+	}
+	if qualifier != "" && qualifier != "pg_catalog" && (quoted || !isBuiltinTypeWord(name)) {
+		// A user-defined type of a schema (s.mood): the qualifier
+		// stays, for the session to resolve the name in that schema
+		// (gap PG-D-035). pg_catalog.x, and a builtin's name under any
+		// qualifier, are the builtin as before.
+		name = qualifier + "." + name
+		for p.consumeOp("[") {
+			if err := p.expectOp("]"); err != nil {
+				return "", err
+			}
+			name += "[]"
+		}
+		return name, nil
 	}
 	if quoted && name != strings.ToLower(name) {
 		// A mixed-case quoted name is never a builtin: no typmod or
@@ -8002,7 +8039,7 @@ func (p *parser) parseWith() (Statement, error) {
 }
 
 // parseSetSchema parses SET SCHEMA s after ALTER TABLE | VIEW |
-// SEQUENCE name (ok false, nothing consumed, when it is not there).
+// SEQUENCE | TYPE name (ok false, nothing consumed, when it is not there).
 func (p *parser) parseSetSchema(kind, name string, ifExists bool) (Statement, bool, error) {
 	if !p.peekKeyword("SET") || !p.peekWord(1, "schema") {
 		return nil, false, nil

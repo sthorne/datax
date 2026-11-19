@@ -202,12 +202,13 @@ func TestSchemas(t *testing.T) {
 	tempWantCode(t, ctx, a, `ALTER SCHEMA public RENAME TO p`, "0A000")
 	tempWantCode(t, ctx, a, `ALTER SCHEMA nosuch RENAME TO p`, "3F000")
 
-	// Sequences and types stay in public for now: refused elsewhere,
-	// and a SERIAL column with them.
-	tempWantCode(t, ctx, a, `CREATE SEQUENCE r2.q`, "0A000")
-	tempWantCode(t, ctx, a, `CREATE TYPE r2.mood AS ENUM ('a')`, "0A000")
-	tempWantCode(t, ctx, a, `CREATE TABLE r2.ser (id SERIAL PRIMARY KEY)`, "0A000")
-	tempWantCode(t, ctx, a, `CREATE TABLE r2.ident (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY)`, "0A000")
+	// Sequences and types in a schema (gap PG-D-035, covered in
+	// pg_schema_objects_test.go), and a SERIAL column with them; a
+	// schema's table may still draw from a public sequence.
+	mustExec(t, ctx, a, `CREATE SEQUENCE r2.q`)
+	mustExec(t, ctx, a, `CREATE TYPE r2.mood AS ENUM ('a')`)
+	mustExec(t, ctx, a, `CREATE TABLE r2.ser (id SERIAL PRIMARY KEY)`)
+	mustExec(t, ctx, a, `CREATE TABLE r2.ident (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY)`)
 	mustExec(t, ctx, a, `CREATE SEQUENCE ids`)
 	mustExec(t, ctx, a, `CREATE TABLE r2.withseq (id INT8 PRIMARY KEY DEFAULT nextval('public.ids'), v TEXT)`)
 	mustExec(t, ctx, b, `INSERT INTO r2.withseq (v) VALUES ('a')`)
@@ -488,13 +489,15 @@ func TestSchemaSetSchema(t *testing.T) {
 	mustExec(t, ctx, a, `ALTER VIEW mv SET SCHEMA s`)
 	schemaWant(t, ctx, b, `SELECT count(*) FROM s.mv`, "3")
 
-	// Not supported yet: sequences out of public, tables owning
-	// sequences, temporary tables.
+	// Sequences, and tables owning sequences, move too (gap PG-D-035,
+	// covered in pg_schema_objects_test.go); temporary tables do not.
 	mustExec(t, ctx, a, `CREATE SEQUENCE q`)
-	tempWantCode(t, ctx, a, `ALTER SEQUENCE q SET SCHEMA s`, "0A000")
+	mustExec(t, ctx, a, `ALTER SEQUENCE q SET SCHEMA s`)
+	mustExec(t, ctx, a, `ALTER SEQUENCE s.q SET SCHEMA public`)
 	mustExec(t, ctx, a, `ALTER SEQUENCE q SET SCHEMA public`)
 	mustExec(t, ctx, a, `CREATE TABLE ser (id SERIAL PRIMARY KEY)`)
-	tempWantCode(t, ctx, a, `ALTER TABLE ser SET SCHEMA s`, "0A000")
+	mustExec(t, ctx, a, `ALTER TABLE ser SET SCHEMA s`)
+	schemaWant(t, ctx, b, `SELECT pg_get_serial_sequence('s.ser', 'id')`, "s.ser_id_seq")
 	mustExec(t, ctx, a, `CREATE TEMP TABLE tmp (a INT)`)
 	tempWantCode(t, ctx, a, `ALTER TABLE tmp SET SCHEMA s`, "0A000")
 }

@@ -353,6 +353,7 @@ func (s *Session) applySetDefault(ctx context.Context, txn *kvclient.Txn, desc *
 		} else {
 			col.Default, col.DefaultExpr = nil, ""
 		}
+		col.SeqBindings = nil
 	case sd.Default != nil:
 		if sd.Default.Null {
 			if col.FillDefault {
@@ -360,6 +361,7 @@ func (s *Session) applySetDefault(ctx context.Context, txn *kvclient.Txn, desc *
 			} else {
 				col.Default, col.DefaultExpr = nil, ""
 			}
+			col.SeqBindings = nil
 			break
 		}
 		d, cerr := coerceColumn(col, *sd.Default)
@@ -379,12 +381,15 @@ func (s *Session) applySetDefault(ctx context.Context, txn *kvclient.Txn, desc *
 		} else {
 			col.Default, col.DefaultExpr = &d, ""
 		}
+		col.SeqBindings = nil
 	default:
 		text, err := s.validateDefaultExpr(ctx, txn, colName, col.Type, *sd.Expr)
 		if err != nil {
 			return err
 		}
-		col.DefaultExpr = text
+		if err := s.setDefaultExpr(ctx, txn, &col, text); err != nil {
+			return err
+		}
 		if !col.FillDefault {
 			col.Default = nil
 		}

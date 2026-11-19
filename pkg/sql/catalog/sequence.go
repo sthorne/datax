@@ -22,12 +22,16 @@ type SequenceDescriptor struct {
 	ID         uint64 `json:"id"`
 	Name       string `json:"name"`
 	DatabaseID uint64 `json:"database_id,omitempty"`
-	Start      int64  `json:"start"`
-	Increment  int64  `json:"increment"`
-	MinValue   int64  `json:"min_value"`
-	MaxValue   int64  `json:"max_value"`
-	Cycle      bool   `json:"cycle,omitempty"`
-	Cache      int64  `json:"cache"`
+	// SchemaID is the schema the sequence is in (0 = public, gap
+	// PG-D-035). A public sequence's name entry is its name; one of
+	// another schema is filed under SchemaNamespaceName, as a table is.
+	SchemaID  uint64 `json:"schema_id,omitempty"`
+	Start     int64  `json:"start"`
+	Increment int64  `json:"increment"`
+	MinValue  int64  `json:"min_value"`
+	MaxValue  int64  `json:"max_value"`
+	Cycle     bool   `json:"cycle,omitempty"`
+	Cache     int64  `json:"cache"`
 	// OwnerTable / OwnerColumn: the column that owns this sequence
 	// (SERIAL, identity, OWNED BY); dropped with it.
 	OwnerTable  uint64   `json:"owner_table,omitempty"`
@@ -100,16 +104,41 @@ type ErrSequenceExists struct{ Name string }
 
 func (e *ErrSequenceExists) Error() string { return fmt.Sprintf("sequence %q already exists", e.Name) }
 
-// CreateSequence registers a sequence under its database (the name must
-// be free of tables and sequences alike) and seeds its counter so the
-// first nextval yields Start.
+// NamespaceName is the sequence's name entry within its database: its
+// name in public, SchemaNamespaceName's form in another schema.
+func (d *SequenceDescriptor) NamespaceName() string { return SchemaNamespaceName(d.SchemaID, d.Name) }
+
+// checkObjectSchema reads schema schemaID of database dbID in txn (so
+// that a DROP SCHEMA committing alongside either sees the new object or
+// fails this transaction): ErrSchemaNotFound when it is gone.
+func checkObjectSchema(ctx context.Context, txn *kvclient.Txn, dbID, schemaID uint64) error {
+	if schemaID == 0 {
+		return nil
+	}
+	sd, err := ReadSchema(ctx, txn, schemaID)
+	if err != nil {
+		return err
+	}
+	if sd == nil || sd.DatabaseID != dbID {
+		return &ErrSchemaNotFound{Name: fmt.Sprintf("#%d", schemaID)}
+	}
+	return nil
+}
+
+// CreateSequence registers a sequence under its database and schema
+// (the name must be free of tables and sequences alike in that schema)
+// and seeds its counter so the first nextval yields Start.
 func CreateSequence(ctx context.Context, txn *kvclient.Txn, d *SequenceDescriptor) error {
-	if existing, err := txn.Get(ctx, keys.SequenceNamespaceKey(d.DatabaseID, d.Name)); err != nil {
+	if err := checkObjectSchema(ctx, txn, d.DatabaseID, d.SchemaID); err != nil {
+		return err
+	}
+	entry := d.NamespaceName()
+	if existing, err := txn.Get(ctx, keys.SequenceNamespaceKey(d.DatabaseID, entry)); err != nil {
 		return err
 	} else if existing != nil {
 		return &ErrSequenceExists{Name: d.Name}
 	}
-	if existing, err := txn.Get(ctx, keys.TableNamespaceKey(d.DatabaseID, d.Name)); err != nil {
+	if existing, err := txn.Get(ctx, keys.TableNamespaceKey(d.DatabaseID, entry)); err != nil {
 		return err
 	} else if existing != nil {
 		return &ErrTableExists{Name: d.Name}
@@ -126,7 +155,7 @@ func CreateSequence(ctx context.Context, txn *kvclient.Txn, d *SequenceDescripto
 	if err := txn.Put(ctx, keys.SequenceDescKey(d.ID), raw); err != nil {
 		return err
 	}
-	if err := txn.Put(ctx, keys.SequenceNamespaceKey(d.DatabaseID, d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+	if err := txn.Put(ctx, keys.SequenceNamespaceKey(d.DatabaseID, entry), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
 	return txn.Put(ctx, keys.SequenceValueKey(d.ID), []byte(strconv.FormatInt(d.Start-d.Increment, 10)))
@@ -141,7 +170,9 @@ func UpdateSequence(ctx context.Context, txn *kvclient.Txn, d *SequenceDescripto
 	return txn.Put(ctx, keys.SequenceDescKey(d.ID), raw)
 }
 
-// LookupSequence resolves a sequence by name within a database.
+// LookupSequence resolves a sequence of the public schema of a database
+// by its name entry (SchemaNamespaceName's form reaches another
+// schema's).
 func LookupSequence(ctx context.Context, txn *kvclient.Txn, dbID uint64, name string) (*SequenceDescriptor, error) {
 	raw, err := txn.Get(ctx, keys.SequenceNamespaceKey(dbID, name))
 	if err != nil {
@@ -199,9 +230,71 @@ func ListSequences(ctx context.Context, txn *kvclient.Txn, dbID uint64) ([]*Sequ
 	return out, nil
 }
 
+// LookupSequenceIn resolves a sequence name as written ("x", "s.x",
+// "db.s.x", or a SequenceRelationName) in database db: through the
+// search path in ctx for an unqualified name (public alone without
+// one), where its qualifiers say otherwise — the rules tables follow
+// (resolve).
+func (a *Accessor) LookupSequenceIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*SequenceDescriptor, error) {
+	if IsReservedTableName(name) && !IsRelationName(name) {
+		return nil, &ErrSequenceNotFound{Name: name}
+	}
+	cands, err := a.resolve(ctx, txn, db, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cands {
+		raw, err := txn.Get(ctx, keys.SequenceNamespaceKey(c.dbID, c.entry))
+		if err != nil {
+			return nil, err
+		}
+		if raw == nil {
+			continue
+		}
+		id, err := strconv.ParseUint(string(raw), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("corrupt sequence namespace entry for %q", c.entry)
+		}
+		return ReadSequence(ctx, txn, id)
+	}
+	return nil, &ErrSequenceNotFound{Name: displayName(name)}
+}
+
+// SequenceRelationName is a name that resolves to exactly sequence d
+// whatever the search path (RelationName's form, with the sequence's
+// name entry).
+func SequenceRelationName(d *SequenceDescriptor) string {
+	return relMarker + strconv.FormatUint(d.DatabaseID, 10) + "\x00" + d.NamespaceName()
+}
+
+// SetSequenceSchema moves sequence d into schema schemaID of its
+// database: its name entry moves, its ID (and so its counter, its
+// owner column and every default bound to it) stays.
+func SetSequenceSchema(ctx context.Context, txn *kvclient.Txn, d *SequenceDescriptor, schemaID uint64) error {
+	if err := checkObjectSchema(ctx, txn, d.DatabaseID, schemaID); err != nil {
+		return err
+	}
+	newEntry := SchemaNamespaceName(schemaID, d.Name)
+	for _, k := range []keys.Key{keys.SequenceNamespaceKey(d.DatabaseID, newEntry), keys.TableNamespaceKey(d.DatabaseID, newEntry)} {
+		if existing, err := txn.Get(ctx, k); err != nil {
+			return err
+		} else if existing != nil {
+			return &ErrSequenceExists{Name: d.Name}
+		}
+	}
+	if err := txn.Delete(ctx, keys.SequenceNamespaceKey(d.DatabaseID, d.NamespaceName())); err != nil {
+		return err
+	}
+	if err := txn.Put(ctx, keys.SequenceNamespaceKey(d.DatabaseID, newEntry), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+		return err
+	}
+	d.SchemaID = schemaID
+	return UpdateSequence(ctx, txn, d)
+}
+
 // DropSequence removes a sequence's descriptor, name and counter.
 func DropSequence(ctx context.Context, txn *kvclient.Txn, d *SequenceDescriptor) error {
-	if err := txn.Delete(ctx, keys.SequenceNamespaceKey(d.DatabaseID, d.Name)); err != nil {
+	if err := txn.Delete(ctx, keys.SequenceNamespaceKey(d.DatabaseID, d.NamespaceName())); err != nil {
 		return err
 	}
 	if err := txn.Delete(ctx, keys.SequenceDescKey(d.ID)); err != nil {

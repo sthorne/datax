@@ -20,27 +20,25 @@ import (
 // draining those tables like any DDL; DROP TYPE refuses while a column
 // uses the type. Cluster version v10.
 
-// lookupType resolves a type name (optionally database-qualified) in
-// the session's database.
+// lookupType resolves a type name as written ("x", "s.x", "db.s.x",
+// "db.x") by the rules tables and sequences follow: an unqualified one
+// through the session's search path. A type of a schema other than
+// public needs USAGE on the schema (42501).
 func (s *Session) lookupType(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TypeDescriptor, error) {
-	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, name)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, newErrf(CodeUndefinedObject, "type %q does not exist", name)
-	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, db)
-	if err != nil {
-		return nil, ToSQLError(err)
-	}
-	d, err := catalog.LookupType(ctx, txn, dbID, bare)
+	d, err := s.cat.LookupTypeIn(s.rctx(ctx), txn, s.database, name)
 	if err != nil {
 		var nf *catalog.ErrTypeNotFound
 		if asErr(err, &nf) {
-			return nil, newErrf(CodeUndefinedObject, "type %q does not exist", name)
+			return nil, newErrf(CodeUndefinedObject, "type %q does not exist", catalog.DisplayName(name))
+		}
+		var snf *catalog.ErrSchemaNotFound
+		if asErr(err, &snf) {
+			return nil, newErrf(CodeUndefinedObject, "type %q does not exist", catalog.DisplayName(name))
 		}
 		return nil, ToSQLError(err)
+	}
+	if err := s.checkObjectSchemaUsage(ctx, txn, d.SchemaID); err != nil {
+		return nil, err
 	}
 	return d, nil
 }
@@ -106,24 +104,15 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.requireV10(types.Enum); err != nil {
 		return nil, err
 	}
-	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
-		return nil, err
-	}
-	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, t.Name)
+	target, err := s.objectTarget(ctx, txn, t.Name)
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
-		return nil, newErrf(CodeFeatureNotSupported, "types in schemas other than public are not supported yet (%q)", t.Name)
-	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, db)
-	if err != nil {
-		return nil, ToSQLError(err)
-	}
-	if isBuiltinTypeName(bare) {
+	bare, dbID := target.Name, target.DBID
+	if isBuiltinTypeName(bare) && target.Schema.IsPublic() {
 		return nil, newErrf(CodeDuplicateObject, "type %q is a builtin type", bare)
 	}
-	d := &catalog.TypeDescriptor{Name: bare, DatabaseID: dbID, Labels: append([]string{}, t.Labels...), Owner: s.user}
+	d := &catalog.TypeDescriptor{Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Labels: append([]string{}, t.Labels...), Owner: s.user}
 	if err := catalog.CreateType(ctx, txn, d); err != nil {
 		var ex *catalog.ErrTypeExists
 		if t.IfNotExists && asErr(err, &ex) {
