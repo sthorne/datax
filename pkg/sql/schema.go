@@ -455,10 +455,30 @@ func (s *Session) execAlterSchemaRename(ctx context.Context, txn *kvclient.Txn, 
 		return nil, err
 	}
 	// The column defaults bound to the schema's sequences keep drawing
-	// from them; their text is rewritten to the new name.
-	seqs, _, err := schemaSequencesAndTypes(ctx, txn, db.ID, sd.ID)
+	// from them; their text is rewritten to the new name. A view naming
+	// one of its sequences or types by text, or a default or CHECK
+	// casting to one of its types by a qualified name, would break.
+	seqs, typs, err := schemaSequencesAndTypes(ctx, txn, db.ID, sd.ID)
 	if err != nil {
 		return nil, err
+	}
+	if len(seqs) > 0 || len(typs) > 0 {
+		inSchema := map[uint64]bool{}
+		for _, sq := range seqs {
+			inSchema[sq.ID] = true
+		}
+		for _, td := range typs {
+			inSchema[td.ID] = true
+		}
+		hit := func(id uint64) bool { return inSchema[id] }
+		if err := s.refuseIfObjectViewed(ctx, txn, db.ID, "rename schema "+sd.Name, hit, hit); err != nil {
+			return nil, err
+		}
+	}
+	if len(typs) > 0 {
+		if err := s.refuseIfTypeCastByText(ctx, txn, db.ID, nil, sd.Name, "rename schema "+sd.Name); err != nil {
+			return nil, err
+		}
 	}
 	var refs []seqDefaultRef
 	if len(seqs) > 0 {
@@ -657,6 +677,10 @@ func (s *Session) execSetSchema(ctx context.Context, txn *kvclient.Txn, t *parse
 		for _, sq := range owned {
 			ids[sq.ID] = true
 		}
+		if err := s.refuseIfObjectViewed(ctx, txn, shared.DatabaseID, "move "+shared.Name+" to schema "+target.Name,
+			func(id uint64) bool { return ids[id] }, nil); err != nil {
+			return nil, err
+		}
 		if refs, err = s.seqDefaultRefs(ctx, txn, shared.DatabaseID, func(id uint64) bool { return ids[id] }); err != nil {
 			return nil, err
 		}
@@ -748,6 +772,12 @@ func (s *Session) setSequenceSchema(ctx context.Context, txn *kvclient.Txn, t *p
 	if err := s.checkCreateInSchema(ctx, txn, &catalog.Target{Database: db.Name, DBID: sd.DatabaseID, Schema: target, Name: sd.Name}); err != nil {
 		return nil, err
 	}
+	// A view names the sequence by text: moving it would break, or
+	// redirect, the view.
+	if err := s.refuseIfObjectViewed(ctx, txn, sd.DatabaseID, "move sequence "+sd.Name+" to schema "+target.Name,
+		func(id uint64) bool { return id == sd.ID }, nil); err != nil {
+		return nil, err
+	}
 	refs, err := s.seqDefaultRefs(ctx, txn, sd.DatabaseID, func(id uint64) bool { return id == sd.ID })
 	if err != nil {
 		return nil, err
@@ -792,6 +822,16 @@ func (s *Session) setTypeSchema(ctx context.Context, txn *kvclient.Txn, t *parse
 		db = &catalog.DatabaseDescriptor{Name: s.database}
 	}
 	if err := s.checkCreateInSchema(ctx, txn, &catalog.Target{Database: db.Name, DBID: td.DatabaseID, Schema: target, Name: td.Name}); err != nil {
+		return nil, err
+	}
+	// Views, column defaults and CHECK constraints name a type by text,
+	// resolved when they are evaluated: moving it would break, or
+	// redirect, them.
+	what := "move type " + td.Name + " to schema " + target.Name
+	if err := s.refuseIfObjectViewed(ctx, txn, td.DatabaseID, what, nil, func(id uint64) bool { return id == td.ID }); err != nil {
+		return nil, err
+	}
+	if err := s.refuseIfTypeCastByText(ctx, txn, td.DatabaseID, []string{td.Name}, "", what); err != nil {
 		return nil, err
 	}
 	if err := catalog.SetTypeSchema(ctx, txn, td, target.ID); err != nil {

@@ -526,8 +526,9 @@ func restoredDescriptor(p *tableRestorePlan, dbID uint64, ids, seqIDs map[uint64
 	for i := range d.Columns {
 		c := &d.Columns[i]
 		// A default bound to a sequence the restore brings back is bound
-		// to the restored copy; to any other, it resolves by its name
-		// when used (gap PG-D-035), as defaults did before bindings.
+		// to the restored copy; to any other, binding 0: its name
+		// resolves as written, an unqualified one in public, never
+		// through the inserting session's search path (gap PG-D-035).
 		var bindings map[string]uint64
 		if c.SeqBindings != nil {
 			bindings = make(map[string]uint64, len(c.SeqBindings))

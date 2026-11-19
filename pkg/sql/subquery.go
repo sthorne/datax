@@ -432,7 +432,29 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		visible := true
 		if !e.Args[0].Lit.Null {
-			if oid, err := strconv.ParseInt(e.Args[0].Lit.Text(), 10, 64); err == nil {
+			oid, perr := strconv.ParseInt(e.Args[0].Lit.Text(), 10, 64)
+			if perr != nil && isRegtypeCast(e.Args[0].Cast) {
+				// 'app.mood'::regtype: the type it names.
+				var td *catalog.TypeDescriptor
+				var ok bool
+				var err error
+				lookup := func(ctx context.Context, txn *kvclient.Txn) error {
+					td, ok, err = s.enumTypeByText(ctx, txn, e.Args[0].Lit.Text())
+					return nil
+				}
+				if txn != nil {
+					_ = lookup(ctx, txn)
+				} else if rerr := s.db.RunTxn(ctx, "type-is-visible", lookup); rerr != nil {
+					return out, rerr
+				}
+				if err != nil {
+					return out, err
+				}
+				if ok {
+					oid, perr = catalog.EnumOID(td.ID), nil
+				}
+			}
+			if perr == nil {
 				for _, h := range hidden {
 					visible = visible && oid != h
 				}
@@ -651,7 +673,14 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		if td, ok, err := s.enumTypeByText(ctx, txn, out.Lit.Text()); err != nil {
 			return e, err
 		} else if ok {
-			d := types.NewString(vtable.QuoteIdent(td.Name))
+			// Its OID, printing as format_type prints the type
+			// (qualified when the search path does not reach it).
+			names, err := s.typeDisplayNames(ctx, txn)
+			if err != nil {
+				return e, err
+			}
+			d := types.NewInt(catalog.EnumOID(td.ID))
+			d.Reg = names[td.ID]
 			out.Lit, out.Cast = &d, ""
 		}
 	}
@@ -1778,6 +1807,17 @@ func (s *Session) regclassOID(ctx context.Context, txn *kvclient.Txn, text strin
 		}
 		return 0, newErrf(CodeUndefinedTable, "relation %q does not exist", text)
 	}
+	// Reaching a relation of a schema by name takes USAGE on it (42501),
+	// as PostgreSQL's namespace lookup does.
+	schemaID := r.desc.SchemaID
+	if r.seq != nil {
+		schemaID = r.seq.SchemaID
+	} else if r.desc.Virtual != "" || r.desc.Temp != nil {
+		schemaID = 0
+	}
+	if err := s.checkObjectSchemaUsage(ctx, txn, schemaID); err != nil {
+		return 0, err
+	}
 	return r.oid, nil
 }
 
@@ -1923,10 +1963,12 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 		}
 	}
 	out := make([]oidName, 0, len(all))
+	// Names print quoted where they must be, as regclass output does
+	// ("Big"."Q" reads back).
 	for _, d := range all {
-		name := d.Name
+		name := quoteIdentifier(d.Name)
 		if d.SchemaID != 0 && !visible[d.SchemaID] {
-			name = schemaNames[d.SchemaID] + "." + d.Name
+			name = quoteIdentifier(schemaNames[d.SchemaID]) + "." + name
 		}
 		out = append(out, oidName{oid: vtable.TableOID(d), name: name})
 		if d.IsView() || d.Virtual != "" {
@@ -1935,10 +1977,10 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 		// Its indexes, as pg_class lists them and regclassOID resolves
 		// them (the primary key's as <table>_pkey when it is visible).
 		if oid, ok := vtable.IndexOIDByName(d, d.Name+"_pkey"); ok {
-			out = append(out, oidName{oid: oid, name: d.Name + "_pkey"})
+			out = append(out, oidName{oid: oid, name: quoteIdentifier(d.Name + "_pkey")})
 		}
 		for i := range d.Indexes {
-			out = append(out, oidName{oid: vtable.IndexOID(d, d.Indexes[i].ID), name: d.Indexes[i].Name})
+			out = append(out, oidName{oid: vtable.IndexOID(d, d.Indexes[i].ID), name: quoteIdentifier(d.Indexes[i].Name)})
 		}
 	}
 	// Sequences: bare when the name resolves to the sequence through
@@ -1968,13 +2010,13 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 			}
 		}
 		for _, sq := range seqs {
-			name := sq.Name
+			name := quoteIdentifier(sq.Name)
 			if f := first[sq.Name]; f == nil || f.ID != sq.ID {
 				schema := catalog.PublicSchema
 				if sq.SchemaID != 0 {
 					schema = schemaNames[sq.SchemaID]
 				}
-				name = schema + "." + sq.Name
+				name = quoteIdentifier(schema) + "." + name
 			}
 			out = append(out, oidName{oid: int64(sq.ID), name: name})
 		}
@@ -1999,6 +2041,53 @@ func floorDivInt(a, b int64) int64 {
 	return q
 }
 
+// typeDisplayNames maps each user-defined type of the current database
+// to its name as format_type and regtype print it: quoted, and
+// qualified by its schema unless the search path resolves the name to
+// it (PostgreSQL's TypeIsVisible).
+func (s *Session) typeDisplayNames(ctx context.Context, txn *kvclient.Txn) (map[uint64]string, error) {
+	dbID, err := s.currentDatabaseID(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	tds, err := catalog.ListTypes(ctx, txn, dbID)
+	if err != nil || len(tds) == 0 {
+		return nil, err
+	}
+	hidden, err := s.invisibleTypeOIDs(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	invisible := map[int64]bool{}
+	for _, h := range hidden {
+		invisible[h] = true
+	}
+	var schemaNames map[uint64]string
+	names := make(map[uint64]string, len(tds))
+	for _, td := range tds {
+		name := vtable.QuoteIdent(td.Name)
+		if invisible[catalog.EnumOID(td.ID)] {
+			if schemaNames == nil {
+				schemaNames = map[uint64]string{}
+				schemas, err := catalog.ListSchemas(ctx, txn, dbID)
+				if err != nil {
+					return nil, err
+				}
+				for _, sd := range schemas {
+					schemaNames[sd.ID] = sd.Name
+				}
+			}
+			schema := catalog.PublicSchema
+			if td.SchemaID != 0 {
+				schema = schemaNames[td.SchemaID]
+			}
+			name = vtable.QuoteIdent(schema) + "." + name
+		}
+		names[td.ID] = name
+	}
+	return names, nil
+}
+
 // formatEnumTypes resolves format_type(oid, ...) for the database's
 // enum types: a literal OID becomes the name, any other argument a
 // CASE over the enums' OIDs that falls back to the call.
@@ -2013,35 +2102,9 @@ func (s *Session) formatEnumTypes(ctx context.Context, txn *kvclient.Txn, e pars
 	}
 	// A type of a schema the search path does not reach prints
 	// qualified, as format_type does in PostgreSQL.
-	names := make(map[uint64]string, len(tds))
-	hidden, err := s.invisibleTypeOIDs(ctx, txn)
+	names, err := s.typeDisplayNames(ctx, txn)
 	if err != nil {
 		return e, err
-	}
-	var schemaNames map[uint64]string
-	for _, td := range tds {
-		name := vtable.QuoteIdent(td.Name)
-		for _, h := range hidden {
-			if h != catalog.EnumOID(td.ID) {
-				continue
-			}
-			if schemaNames == nil {
-				schemaNames = map[uint64]string{}
-				schemas, err := catalog.ListSchemas(ctx, txn, dbID)
-				if err != nil {
-					return e, err
-				}
-				for _, sd := range schemas {
-					schemaNames[sd.ID] = sd.Name
-				}
-			}
-			schema := catalog.PublicSchema
-			if td.SchemaID != 0 {
-				schema = schemaNames[td.SchemaID]
-			}
-			name = vtable.QuoteIdent(schema) + "." + name
-		}
-		names[td.ID] = name
 	}
 	if lit := e.Args[0].Lit; lit != nil && lit.Fam == types.Int && e.Args[0].BinOp == "" && e.Args[0].Cast == "" {
 		for _, td := range tds {
@@ -2090,6 +2153,11 @@ func (s *Session) enumTypeByText(ctx context.Context, txn *kvclient.Txn, text st
 	td, err := s.cat.LookupTypeIn(s.rctx(ctx), txn, s.database, name)
 	if err != nil || td == nil {
 		return nil, false, nil
+	}
+	// A type of a schema without USAGE is not to be reached by name
+	// (42501, as PostgreSQL's namespace lookup).
+	if err := s.checkObjectSchemaUsage(ctx, txn, td.SchemaID); err != nil {
+		return nil, false, err
 	}
 	return td, true, nil
 }
@@ -2177,8 +2245,9 @@ func (s *Session) invisibleTypeOIDs(ctx context.Context, txn *kvclient.Txn) ([]i
 			return err
 		}
 		// Visible: the first type of its name along the path, as
-		// PostgreSQL's TypeIsVisible.
-		path, err := s.lookupPathSchemas(ctx, txn)
+		// PostgreSQL's TypeIsVisible (an empty path reaches none, so
+		// pg_dump's prints every type qualified).
+		path, err := s.pathSchemas(ctx, txn)
 		if err != nil {
 			return err
 		}

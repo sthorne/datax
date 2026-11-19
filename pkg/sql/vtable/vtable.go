@@ -108,6 +108,10 @@ type Env struct {
 	// currentSequences and currentTypes).
 	Sequences []*catalog.SequenceDescriptor
 	Types     []*catalog.TypeDescriptor
+	// TypeNames maps a user-defined type's ID to its name as
+	// format_type prints it: qualified when the search path does not
+	// resolve the bare name to it (nil: every name bare).
+	TypeNames map[uint64]string
 	// Schemas are the current database's schemas other than public
 	// (gap PG-D-001), by name.
 	Schemas []*catalog.SchemaDescriptor
@@ -610,6 +614,25 @@ func TypeName(f types.Family) string {
 		return "vector"
 	}
 	return "text"
+}
+
+// formatType is FormatType with an enum type named as the session's
+// search path sees it (env.TypeNames).
+func (env *Env) formatType(c *catalog.Column) string {
+	if c.Type == types.Enum {
+		if n, ok := env.TypeNames[c.EnumType]; ok {
+			return n
+		}
+	}
+	return FormatType(c)
+}
+
+// typeName is how format_type prints user-defined type t.
+func (env *Env) typeName(t *catalog.TypeDescriptor) string {
+	if n, ok := env.TypeNames[t.ID]; ok {
+		return n
+	}
+	return QuoteIdent(t.Name)
 }
 
 // FormatType is format_type(): the SQL-standard spelling of a column's

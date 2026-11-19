@@ -652,6 +652,16 @@ func (s *Session) checkObjectSchemaUsage(ctx context.Context, txn *kvclient.Txn,
 	if schemaID == 0 || s.system || s.actor() == catalog.RootRole {
 		return nil
 	}
+	if txn == nil {
+		var out error
+		if err := s.db.RunTxn(ctx, "schema-usage", func(ctx context.Context, txn *kvclient.Txn) error {
+			out = s.checkObjectSchemaUsage(ctx, txn, schemaID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return out
+	}
 	set, err := s.roleSet(ctx, txn)
 	if err != nil {
 		return err
@@ -671,11 +681,10 @@ func (s *Session) checkObjectSchemaUsage(ctx context.Context, txn *kvclient.Txn,
 }
 
 // checkSequencePriv returns 42501 unless the actor holds priv on the
-// sequence, and USAGE on its schema.
+// sequence. (Reaching it by name takes USAGE on its schema too, which
+// sequenceArg checks; by OID — a regclass, a default's binding — it
+// does not, as in PostgreSQL.)
 func (s *Session) checkSequencePriv(ctx context.Context, txn *kvclient.Txn, d *catalog.SequenceDescriptor, priv string) error {
-	if err := s.checkObjectSchemaUsage(ctx, txn, d.SchemaID); err != nil {
-		return err
-	}
 	ok, err := s.sequencePrivAllowed(ctx, txn, d, priv)
 	if err != nil {
 		return err

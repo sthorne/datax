@@ -316,7 +316,7 @@ func init() {
 			return Row{i64(relid), str(c.Name), i64(ColumnTypeOID(c)), i64(-1),
 				i64(ColumnTypeLen(c)), i64(n), i64(ndims), i64(typmod), boolean(false), str("p"), str("i"), boolean(c.NotNull),
 				boolean(ColumnDefault(c) != "" && c.Identity == ""), boolean(false), str(identity), str(""), boolean(false), boolean(true), i64(0), i64(0), null(),
-				str(""), null(), null(), null(), str(FormatType(c)), indexdef, textOrNull(c.Comment)}
+				str(""), null(), null(), null(), str(env.formatType(c)), indexdef, textOrNull(c.Comment)}
 		}
 		for _, t := range env.currentTables() {
 			n := int64(0)
@@ -418,7 +418,7 @@ func init() {
 			oid := catalog.EnumOID(t.ID)
 			rows = append(rows, Row{i64(oid), str(t.Name), i64(SchemaOID(t.SchemaID)), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(4), boolean(true), str("e"), str("E"),
 				boolean(true), str(","), i64(0), i64(0), i64(0), str("enum_in"), str("enum_out"), boolean(false), i64(0), i64(-1), i64(0), i64(0), null(),
-				null(), str(QuoteIdent(t.Name))})
+				null(), str(env.typeName(t))})
 		}
 		// The array type of every element type: typelem points back,
 		// and the element row's typarray forward.

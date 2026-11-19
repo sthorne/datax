@@ -104,23 +104,39 @@ nextval('x')` with the `regclass` resolved, so the default draws from
 the sequence `x` named when it was set. datax stores the default as
 text, so a column records beside it, for each literal sequence name of
 its `nextval` / `currval` / `setval` calls, the sequence it resolved to
-(`Column.SeqBindings`, name as written → sequence ID; 0 when the name
-named no sequence then, which resolves when used). The default is
-evaluated with the bound sequences, by ID, whatever the inserting
-session's search path: a sequence of the name created later in a schema
-earlier on that path changes nothing. A default set before bindings
+(`Column.SeqBindings`, name as written → sequence ID). A name that
+names no sequence is refused when the default is set (`42P01`, as
+PostgreSQL's cast to `regclass`). The default is evaluated with the
+bound sequences, by ID, whatever the inserting session's search path,
+and without asking `USAGE` on their schemas (PostgreSQL checks none for
+a bound `regclass`): a sequence of the name created later in a schema
+earlier on that path changes nothing. A name is never resolved through
+the inserting session's path: binding 0 (a table restore leaves it for
+a sequence it does not bring back) resolves an unqualified name in
+`public`. A default set before bindings
 existed has none, and resolves its names through `public` alone (they
 could name nothing else then), so no descriptor is rewritten. Moving a
 bound sequence (or its table, or renaming its schema) rewrites the
 defaults' text to name it where it now is; `DROP SEQUENCE` of a bound
 sequence is `2BP01` unless `CASCADE`, which drops those defaults, and
-so is `DROP TABLE` of a table owning one. `LIKE ... INCLUDING DEFAULTS`
-copies the binding (the name is qualified when the path would resolve
-it to another sequence).
+so is `DROP TABLE` of a table owning one; every session's temporary
+tables count. `LIKE ... INCLUDING DEFAULTS` copies the binding (the
+name is qualified when the path would resolve it to another sequence).
 
-Using a sequence or type of a schema other than `public` needs `USAGE`
-on the schema (`42501 permission denied for schema s`), creating one
-`CREATE` on it; the search path skips a schema without `USAGE` for
+A view stores its query as text, and so do defaults and CHECK
+constraints for their casts: `ALTER SEQUENCE / TYPE ... SET SCHEMA`,
+`ALTER TABLE ... SET SCHEMA` of a table owning a sequence, and `ALTER
+SCHEMA ... RENAME` are refused (`2BP01`) while a view names an affected
+sequence or type (resolved through the view's path), or a default or
+CHECK casts to an affected type by a name that could be it. `CREATE
+SEQUENCE ... OWNED BY` takes a table of the same owner and schema
+(`55000`). Tables, views and sequences of a schema share its relation
+namespace (`42P07`, for `CREATE TABLE / VIEW` and `RENAME` too).
+
+Reaching a sequence, type or relation of a schema other than `public`
+by name (`nextval('s.q')`, `'s.q'::regclass`, `'a'::s.mood`,
+`'s.mood'::regtype`) needs `USAGE` on the schema (`42501 permission
+denied for schema s`), creating one `CREATE` on it; the search path skips a schema without `USAGE` for
 sequences and types as for tables. The v22 gate needs nothing new:
 no schema, so no sequence or type in one, exists before v22.
 
@@ -379,7 +395,10 @@ dropping its schemas; backup and restore of schemas.
   (that default then fails, `42P01`); `DROP SCHEMA ... CASCADE` refuses
   a type a column of another schema uses, where PostgreSQL drops the
   column; `SHOW CREATE TABLE` prints an enum type of another schema
-  unqualified (`format_type` qualifies it as PostgreSQL does);
+  unqualified (`format_type`, `regtype` output and the catalogs
+  qualify it off the path, as PostgreSQL does); a view, default or
+  CHECK naming a sequence or type by text blocks moving it (2BP01)
+  where PostgreSQL's OID binding lets it move;
   `RESTORE TABLE` of a `public` table whose enum type is in another
   schema restores it onto (or creates) a `public` type of that name
   and labels.

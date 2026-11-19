@@ -131,12 +131,21 @@ func (s *Session) sequenceByOID(ctx context.Context, txn *kvclient.Txn, oid int6
 }
 
 // sequenceArg resolves the sequence argument of nextval, currval and
-// setval: a regclass (an OID) or a name.
+// setval: a regclass (an OID) or a name (which needs USAGE on the
+// sequence's schema).
 func (s *Session) sequenceArg(ctx context.Context, txn *kvclient.Txn, arg types.Datum) (*catalog.SequenceDescriptor, error) {
 	if arg.Fam == types.Int && !arg.Null {
 		return s.sequenceByOID(ctx, txn, arg.I)
 	}
-	return s.lookupSequence(ctx, txn, arg.Text())
+	d, err := s.lookupSequence(ctx, txn, arg.Text())
+	if err != nil {
+		return nil, err
+	}
+	// By name, the sequence's schema takes USAGE, as a table's does.
+	if err := s.checkObjectSchemaUsage(ctx, txn, d.SchemaID); err != nil {
+		return nil, err
+	}
+	return d, nil
 }
 
 // nextvalDefault is the default expression of a column a sequence
@@ -206,6 +215,14 @@ func (s *Session) execCreateSequence(ctx context.Context, txn *kvclient.Txn, t *
 		c, ok := owner.Col(col)
 		if !ok {
 			return nil, newErrf(CodeUndefinedColumn, "column %q of table %q does not exist", col, table)
+		}
+		if owner.IsView() || owner.Virtual != "" {
+			return nil, newErrf(CodeWrongObjectType, "sequence cannot be owned by relation %q", table)
+		}
+		// As ALTER SEQUENCE ... OWNED BY: a sequence another role could
+		// hang on a table would go, and move, with it.
+		if catalog.OwnerOf(owner.Owner) != catalog.OwnerOf(d.Owner) {
+			return nil, newErrf(CodeObjectNotInState, "sequence must have same owner as table it is linked to")
 		}
 		if owner.SchemaID != d.SchemaID {
 			return nil, newErrf(CodeObjectNotInState, "sequence must be in same schema as table it is linked to")
