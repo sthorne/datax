@@ -478,3 +478,39 @@ func TestTempTableOrphanSweep(t *testing.T) {
 		t.Fatalf("the sweep dropped a live session's temporary table (%d left)", n)
 	}
 }
+
+// TestTempTableSweepSparesLiveNodes: a dead-node threshold shorter than
+// a node's liveness beat cannot make the sweep drop the temporary tables
+// of a live node's session. A live node's registry row is up to a beat
+// old, so another node's sweep judges on fresh rows and never on less
+// than two beats; the drop could not be undone.
+func TestTempTableSweepSparesLiveNodes(t *testing.T) {
+	tc := StartWithOptions(t, 3, func(c *server.Config) {
+		c.TempTableSweepInterval = -1 // the test runs the passes
+		c.DeadNodeThreshold = time.Millisecond
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	live := pgConn(t, ctx, tc, 0)
+	mustExec(t, ctx, live, `CREATE TEMP TABLE kept (x INT)`)
+	mustExec(t, ctx, live, `INSERT INTO kept VALUES (1)`)
+	db := tc.Node(0).DB()
+	// Sweep from the other nodes for longer than two beats, so that every
+	// phase of node 0's beat is seen.
+	deadline := time.Now().Add(7 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, i := range []int{1, 2} {
+			if n, err := tc.Node(i).SweepTempTablesOnce(ctx); err != nil || n != 0 {
+				t.Fatalf("node %d swept %d tables: %v", i, n, err)
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if n := tempDescriptors(t, ctx, db, "kept"); n != 1 {
+		t.Fatalf("the sweep dropped a live node's temporary table (%d left)", n)
+	}
+	if n := tempInt(t, ctx, live, `SELECT count(*) FROM kept`); n != 1 {
+		t.Fatalf("the live session's table holds %d rows after the sweeps", n)
+	}
+}

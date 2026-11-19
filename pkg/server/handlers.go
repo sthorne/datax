@@ -139,8 +139,12 @@ func (n *Node) serveReannounce(req cluster.JoinRequest) cluster.JoinResponse {
 // keys (range 1) and refreshes the in-memory registry from them. The first
 // beat runs immediately: a restarted node (possibly on a new address) must
 // publish its row as soon as quorum allows, not a tick later.
+// livenessBeat is how often a node writes its registry row (its
+// liveness) and reads everyone else's.
+const livenessBeat = 3 * time.Second
+
 func (n *Node) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(livenessBeat)
 	defer ticker.Stop()
 	for first := true; ; first = false {
 		if !first {
