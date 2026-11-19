@@ -62,7 +62,16 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 	if parser.CountParams(t.As) > len(params) {
 		return nil, newErrf(CodeSyntaxError, "CREATE TABLE AS: the query needs %d parameters", parser.CountParams(t.As))
 	}
-	if t.IfNotExists && s.tableExists(ctx, t.Name) {
+	t, perr := prepareTempCreate(t)
+	if perr != nil {
+		return nil, ToSQLError(perr)
+	}
+	exists := t.IfNotExists && s.tableExists(ctx, t.Name)
+	if t.IfNotExists && t.Temp {
+		// Only a temporary table of the name is in the way of one.
+		exists = s.tableExists(ctx, catalog.TempSchema+"."+t.Name)
+	}
+	if exists {
 		return &Result{Tag: "CREATE TABLE AS"}, nil
 	}
 	// The shape, described before anything is written.
@@ -116,8 +125,10 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 	var created bool
 	if err := s.db.RunTxn(ctx, "ctas-create", func(ctx context.Context, txn *kvclient.Txn) error {
 		created = false
-		if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
-			return err
+		if !ct.Temp {
+			if err := s.checkCreateInDatabase(ctx, txn, ct.Name); err != nil {
+				return err
+			}
 		}
 		res, err := s.execCreateTable(ctx, txn, &ct)
 		if err != nil {
@@ -132,6 +143,11 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 		return nil, ToSQLError(err)
 	}
 	if t.NoData {
+		if t.Temp && t.OnCommit == "drop" {
+			if serr := s.dropTempNow(ctx, ct.Name); serr != nil {
+				return nil, serr
+			}
+		}
 		return &Result{Tag: "CREATE TABLE AS"}, nil
 	}
 	drop := func(cause error) (*Result, *Error) {
@@ -178,6 +194,17 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 		return nil
 	}); err != nil {
 		return drop(err)
+	}
+	if t.Temp && t.OnCommit != "" && t.OnCommit != "preserve" {
+		// Outside a transaction block the statement is its own
+		// transaction, at whose commit ON COMMIT DELETE ROWS empties the
+		// table and ON COMMIT DROP drops it: the rows are never kept.
+		if t.OnCommit == "drop" {
+			if serr := s.dropTempNow(ctx, ct.Name); serr != nil {
+				return nil, serr
+			}
+		}
+		return &Result{Tag: fmt.Sprintf("CREATE TABLE AS %d", len(src.Rows))}, nil
 	}
 	ci := &CopyIn{s: s, table: ct.Name, target: target}
 	for _, row := range src.Rows {
@@ -453,4 +480,17 @@ func (s *Session) execCommentOn(ctx context.Context, txn *kvclient.Txn, t *parse
 	}
 	s.noteDDL(desc.Name)
 	return &Result{Tag: "COMMENT"}, nil
+}
+
+// dropTempNow drops the session's temporary table name in a transaction
+// of its own: CREATE TEMP TABLE ... ON COMMIT DROP AS, which is its own
+// transaction.
+func (s *Session) dropTempNow(ctx context.Context, name string) *Error {
+	err := s.db.RunTxn(ctx, "ctas-drop", func(ctx context.Context, txn *kvclient.Txn) error {
+		s.extraDrops = nil
+		_, err := s.execDropTable(ctx, txn, &parser.DropTable{Name: catalog.TempSchema + "." + name, IfExists: true})
+		return err
+	})
+	s.extraDrops = nil
+	return ToSQLError(err)
 }

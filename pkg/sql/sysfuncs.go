@@ -401,7 +401,7 @@ func (s *Session) relationDomain(ctx context.Context, txn *kvclient.Txn) ([]doma
 	if err != nil {
 		return nil, err
 	}
-	all, err := s.cat.List(ctx, txn)
+	all, err := s.listAll(ctx, txn)
 	if err != nil {
 		return nil, err
 	}

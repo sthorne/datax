@@ -239,17 +239,17 @@ func init() {
 				continue
 			}
 			rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(ns), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(2), i64(TableOID(t)), i64(0),
-				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0 || hasVisiblePK(t)), boolean(false), str("p"), str("r"), i64(int64(len(t.VisibleColumns()))),
+				i64(0), types.NewFloat(tuples), i64(0), boolean(len(t.Indexes) > 0 || hasVisiblePK(t)), boolean(false), str(t.Persistence()), str("r"), i64(int64(len(t.VisibleColumns()))),
 				i64(checks), boolean(false), boolean(triggers), boolean(false), boolean(t.RowSecurity), boolean(t.ForceRowSecurity), boolean(true), str("d"), boolean(false), i64(0), ObjectACL(t.Owner, "arwdDxt", t.Privileges, t.GrantOptions), null(), null(), null(), null(), textOrNull(t.Comment)})
 			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
 				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(ns), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(403), i64(IndexOID(t, 1)), i64(0),
-					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(t.PrimaryKey))),
+					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str(t.Persistence()), str("i"), i64(int64(len(t.PrimaryKey))),
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), null(),
 					null(), null(), str(IndexDef(t, pkIndex(t)))})
 			}
 			for _, idx := range t.Indexes {
 				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(ns), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(IndexMethodOID(&idx)), i64(IndexOID(t, idx.ID)), i64(0),
-					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str("p"), str("i"), i64(int64(len(idx.ColumnIDs))),
+					i64(0), types.NewFloat(tuples), i64(0), boolean(false), boolean(false), str(t.Persistence()), str("i"), i64(int64(len(idx.ColumnIDs))),
 					i64(0), boolean(false), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), null(), null(), null(), null(), null(), textOrNull(idx.Comment),
 					null(), null(), str(IndexDef(t, &idx))})
 			}

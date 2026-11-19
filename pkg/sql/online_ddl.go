@@ -157,6 +157,9 @@ func (s *Session) lookupForSchemaChange(ctx context.Context, txn *kvclient.Txn, 
 	if err := mustBeReal(d); err != nil {
 		return nil, err
 	}
+	if d.Temp != nil {
+		return d, nil // read in txn: temporary tables are never cached
+	}
 	return s.cat.LookupFreshIn(ctx, txn, s.database, name)
 }
 
@@ -650,6 +653,9 @@ func WipeIndexEntries(ctx context.Context, db *kvclient.DB, tableID, indexID uin
 func ddlTableName(stmt parser.Statement) string {
 	switch t := stmt.(type) {
 	case *parser.CreateTable:
+		if t.Temp {
+			return "" // a temporary table is never leased
+		}
 		return t.Name
 	case *parser.AlterTable:
 		if t.RenameTo != "" {

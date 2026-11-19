@@ -1310,10 +1310,21 @@ func (p *parser) atStatementEnd() bool {
 
 func (p *parser) parseCreateTable() (Statement, error) {
 	p.i++ // CREATE
+	ct := &CreateTable{}
+	// CREATE [GLOBAL | LOCAL] TEMP[ORARY] TABLE and CREATE UNLOGGED
+	// TABLE. GLOBAL and LOCAL are noise words, as in PostgreSQL.
+	if (p.peekWord(0, "global") || p.peekWord(0, "local")) && (p.peekWord(1, "temp") || p.peekWord(1, "temporary")) {
+		p.i++
+	}
+	switch {
+	case p.consumeIdentWord("temp") || p.consumeIdentWord("temporary"):
+		ct.Temp = true
+	case p.consumeIdentWord("unlogged"):
+		ct.Unlogged = true
+	}
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
-	ct := &CreateTable{}
 	if p.consumeKeyword("IF") {
 		if err := p.expectKeyword("NOT"); err != nil {
 			return nil, err
@@ -1328,20 +1339,34 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		return nil, err
 	}
 	ct.Name = name
-	// CREATE TABLE t AS query: the shape and rows of a query.
+	// CREATE TABLE t [ON COMMIT ...] AS query: the shape and rows of a
+	// query.
+	if err := p.parseOnCommit(ct); err != nil {
+		return nil, err
+	}
 	if p.consumeKeyword("AS") {
 		return p.finishCreateTableAs(ct)
+	}
+	if ct.OnCommit != "" {
+		return nil, p.errf("expected AS, found %q", p.peek().text)
 	}
 	if err := p.expectOp("("); err != nil {
 		return nil, err
 	}
-	// CREATE TABLE t (a, b [, PRIMARY KEY (a)]) AS query: bare names.
+	// CREATE TABLE t (a, b [, PRIMARY KEY (a)]) [ON COMMIT ...] AS
+	// query: bare names.
 	if save := p.i; p.peek().kind == tkIdent {
 		names, ok := p.tryBareColumnList()
+		if ok {
+			if err := p.parseOnCommit(ct); err != nil {
+				return nil, err
+			}
+		}
 		if ok && p.consumeKeyword("AS") {
 			ct.AsColumns = names
 			return p.finishCreateTableAs(ct)
 		}
+		ct.OnCommit = ""
 		p.i = save
 	}
 	for {
@@ -1406,7 +1431,34 @@ func (p *parser) parseCreateTable() (Statement, error) {
 		}
 		ct.Options = opts
 	}
+	if err := p.parseOnCommit(ct); err != nil {
+		return nil, err
+	}
 	return ct, nil
+}
+
+// parseOnCommit parses an optional ON COMMIT PRESERVE ROWS | DELETE ROWS
+// | DROP into ct.
+func (p *parser) parseOnCommit(ct *CreateTable) error {
+	if !p.peekWord(0, "on") || !p.peekWord(1, "commit") {
+		return nil
+	}
+	p.i += 2
+	switch {
+	case p.consumeIdentWord("preserve"):
+		ct.OnCommit = "preserve"
+	case p.consumeKeyword("DELETE"):
+		ct.OnCommit = "delete"
+	case p.consumeKeyword("DROP"):
+		ct.OnCommit = "drop"
+		return nil
+	default:
+		return p.errf("expected PRESERVE ROWS, DELETE ROWS or DROP after ON COMMIT, found %q", p.peek().text)
+	}
+	if !p.consumeIdentWord("rows") {
+		return p.errf("expected ROWS, found %q", p.peek().text)
+	}
+	return nil
 }
 
 // parsePlacementOptions parses the placement option list of
@@ -5370,6 +5422,9 @@ func (p *parser) parseAlterTableAction(at *AlterTable) (err error) {
 		default:
 			return p.errf("expected TYPE, SET DEFAULT, DROP DEFAULT, SET NOT NULL, DROP NOT NULL or ADD GENERATED, found %q", p.peek().text)
 		}
+	case p.peekKeyword("SET") && (p.peekWord(1, "logged") || p.peekWord(1, "unlogged")):
+		at.SetLogged = p.toks[p.i+1].text
+		p.i += 2
 	case p.consumeKeyword("SET"):
 		opts, err := p.parseOptionList()
 		if err != nil {

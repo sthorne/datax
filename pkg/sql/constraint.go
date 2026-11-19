@@ -259,6 +259,11 @@ func (s *Session) addConstraint(ctx context.Context, txn *kvclient.Txn, desc *ca
 			// then stand in the way of its records ageing out.
 			return nil, nil, sealedTableError(shared.Name)
 		}
+		if shared.Temp == nil && desc.Temp != nil {
+			return nil, nil, newErrf(CodeInvalidTableDefinition, "constraints on temporary tables may reference only temporary tables")
+		} else if shared.Temp != nil && desc.Temp == nil {
+			return nil, nil, newErrf(CodeInvalidTableDefinition, "constraints on permanent tables may reference only permanent tables")
+		}
 		ref := desc // self-reference: one descriptor, written once
 		if shared.ID != desc.ID {
 			if shared.DatabaseID != desc.DatabaseID {

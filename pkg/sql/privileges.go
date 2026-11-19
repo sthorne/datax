@@ -841,7 +841,8 @@ func (s *Session) execGrantRevoke(ctx context.Context, txn *kvclient.Txn, t *par
 				return nil, err
 			}
 			for _, d := range all {
-				if !catalog.IsSystemTable(d.Name) {
+				// A temporary table is in no schema a GRANT can name.
+				if !catalog.IsSystemTable(d.Name) && d.Temp == nil {
 					descs = append(descs, d)
 					given = append(given, d.Name)
 				}
@@ -1212,7 +1213,7 @@ func (s *Session) grantRows(ctx context.Context, txn *kvclient.Txn, t *parser.Sh
 	if err != nil {
 		return nil, err
 	}
-	tables, err := s.cat.ListIn(ctx, txn, db)
+	tables, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return nil, err
 	}

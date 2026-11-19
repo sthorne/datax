@@ -310,6 +310,9 @@ type Session struct {
 	// of them runs inside the block.
 	createdTxn    *kvclient.Txn
 	createdTables map[uint64]bool
+
+	// temp is the session's temporary tables (temptable.go).
+	temp tempState
 }
 
 // NewSession creates a root session (internal components, tests, tools).
@@ -400,6 +403,11 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 				}
 			}
 		}
+	}
+	// The session's temporary tables come before every other table, as
+	// pg_temp leads PostgreSQL's search path.
+	if d, ok, err := s.lookupTemp(ctx, txn, name); ok {
+		return d, err
 	}
 	if catalog.IsUnreadableSystemTable(bare) && !s.system && !vtable.IsSchema(db) {
 		// The named keys (issue #310): no session but the node's own
@@ -582,12 +590,12 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 	// answer the listing question the same way (issue #197).
 	denied := catalog.SchemaUsageDenied(dbs, set)
 	listed := func(d *catalog.TableDescriptor) bool {
-		return !filtered || (canSeeTable(set, d) && !denied[d.DatabaseID])
+		return s.tempVisible(d) && (!filtered || (canSeeTable(set, d) && !denied[d.DatabaseID]))
 	}
 	var all []*catalog.TableDescriptor
 	if scope == envCurrentTables {
 		if cur != nil {
-			if all, err = s.cat.ListIn(ctx, txn, cur); err != nil {
+			if all, err = s.listIn(ctx, txn, cur); err != nil {
 				return nil, err
 			}
 		}
@@ -722,6 +730,8 @@ func (s *Session) Close(ctx context.Context) {
 	s.advisoryClose()
 	s.releaseRowFuncs()
 	s.state = StateIdle
+	s.tempEndTxn()
+	s.closeTemp()
 }
 
 // Execute runs one parsed statement with the given parameter values,
@@ -852,6 +862,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			s.txn = s.db.NewHistoricalTxn("sql-asof", asOf)
 		}
 		s.state = StateOpen
+		s.tempEndTxn()
 		s.txnQueried = false
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
 		// BEGIN's modes run as the SET TRANSACTION they stand for.
@@ -873,6 +884,17 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 			s.rollback(ctx)
 			return nil, ToSQLError(lerr)
 		}
+		// ON COMMIT DROP and DELETE ROWS of the session's temporary
+		// tables, in the transaction itself.
+		s.extraDDL, s.extraDrops = nil, nil
+		if terr := s.tempPreCommit(ctx, s.txn); terr != nil {
+			s.rollback(ctx)
+			return nil, ToSQLError(terr)
+		}
+		s.pendingDDL = append(s.pendingDDL, s.extraDDL...)
+		s.pendingDrops = append(s.pendingDrops, s.extraDrops...)
+		s.extraDDL, s.extraDrops = nil, nil
+		s.tempEndTxn()
 		err := s.txn.Commit(ctx)
 		s.loEndTxn(ctx, err == nil)
 		s.txn = nil
@@ -975,7 +997,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	case *parser.CloseCursor:
 		return s.execCloseCursor(t)
 	case *parser.Discard:
-		return s.execDiscard(t)
+		return s.execDiscard(ctx, t)
 
 	default:
 		if s.state == StateOpen {
@@ -1135,6 +1157,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		}
 		if serr := s.checkTableOwnerNoTxn(ctx, at.Table); serr != nil {
 			return nil, serr
+		}
+		if s.namesTempTable(ctx, at.Table) {
+			return nil, newErrf(CodeFeatureNotSupported, "ALTER TABLE ... SET (...) is not supported on temporary tables")
 		}
 		for k := range at.SetOptions {
 			if sealOption(k) {
@@ -1308,12 +1333,17 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
 		s.advisoryRestart()
+		s.tempEndTxn()
 		res, err = s.execStmt(ctx, txn, stmt, params)
+		if err == nil {
+			err = s.tempPreCommit(ctx, txn)
+		}
 		if err == nil && TestingBeforeImplicitCommit != nil {
 			TestingBeforeImplicitCommit()
 		}
 		return err
 	})
+	s.tempEndTxn()
 	if err != nil {
 		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		return nil, ToSQLError(err)
@@ -1424,6 +1454,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.keyLeaseAfterCommit = false
 	s.discardNotify()
 	s.advisoryEndTxn()
+	s.tempEndTxn()
 	s.state = StateIdle
 }
 

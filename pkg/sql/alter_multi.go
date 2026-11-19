@@ -226,6 +226,8 @@ func alterActionName(t *parser.AlterTable) string {
 		return fmt.Sprintf("ALTER COLUMN %s TYPE", t.SetType.Column)
 	case t.RowSecurity != "":
 		return strings.ToUpper(t.RowSecurity) + " ROW LEVEL SECURITY"
+	case t.SetLogged != "":
+		return "SET " + strings.ToUpper(t.SetLogged)
 	case t.SetOptions != nil:
 		return "SET (...)"
 	case t.ResetOptions != nil:
@@ -335,7 +337,20 @@ func normalizeNextColumnID(desc *catalog.TableDescriptor) {
 // online check runs, and what the online flip applies for the actions
 // that waited.
 func (s *Session) applyAlterAction(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, t *parser.AlterTable, eff *alterEffects) error {
+	if desc.Temp != nil && ((t.AddCol != nil && (t.AddCol.Serial || t.AddCol.Identity != "")) || t.AddIdentity != nil) {
+		return newErrf(CodeFeatureNotSupported, "SERIAL and identity columns are not supported on temporary tables")
+	}
 	switch {
+	case t.SetLogged != "":
+		// SET LOGGED / UNLOGGED: every table is durable; only
+		// relpersistence follows (catalog.TableDescriptor.Unlogged).
+		if desc.Temp != nil {
+			return newErrf(CodeInvalidTableDefinition, "cannot change logged status of table %q because it is temporary", desc.Name)
+		}
+		if !eff.dry {
+			desc.Unlogged = t.SetLogged == "unlogged"
+		}
+		return nil
 	case t.RowSecurity != "":
 		if eff.dry {
 			return nil

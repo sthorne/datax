@@ -677,6 +677,9 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 		if (d.Name == catalog.MetricsTableName || d.Name == catalog.ShapesMetricsTableName || d.Name == catalog.StatementShapesTableName) && !includeMetrics {
 			return nil // the cluster's own metrics: bulky, regenerable, opt-in
 		}
+		if d.Temp != nil {
+			return nil // a session's temporary table ends with the session
+		}
 		// Every other system table is backed up unconditionally. The
 		// console's preferences (datax_ui_prefs) are small and are not
 		// regenerable from anything — losing them across a restore

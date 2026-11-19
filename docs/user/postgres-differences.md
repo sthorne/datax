@@ -55,6 +55,18 @@ syntax error or `0A000` feature not supported):
   are not served in arrival order; a deadlock between advisory locks is
   not detected (set `lock_timeout`); and the arguments must be constants
   or parameters, evaluated once per statement (`0A000` for a column).
+- **Temporary tables** (`CREATE TEMP TABLE`, `ON COMMIT PRESERVE ROWS |
+  DELETE ROWS | DROP`, `pg_temp.t`) are private to their session and
+  dropped when it ends, as in PostgreSQL, with these differences
+  ([details](sql.md#temporary-and-unlogged-tables)): they are listed in
+  schema `public` (with `relpersistence` `t`) rather than `pg_temp_N`;
+  `public.t` reaches a temporary table that shadows `t` (write
+  `<database>.t` for the ordinary one); `SERIAL` and identity columns,
+  `WITH (...)` options and views over them are refused (`0A000`); the
+  tables of a session whose node crashed are dropped by a background
+  sweep. **`UNLOGGED` tables** are accepted and are ordinary, durable
+  tables (`relpersistence` `u`); `ALTER TABLE ... SET LOGGED | UNLOGGED`
+  changes only that.
 - **Concurrent inserts of one key.** In PostgreSQL the second `INSERT`
   of a primary key another open transaction has just inserted waits for
   it, then fails with `23505` if it commits or succeeds if it rolls back.

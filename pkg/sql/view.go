@@ -373,6 +373,11 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 		if err != nil || d == nil || d.IsView() {
 			continue
 		}
+		if d.Temp != nil {
+			// PostgreSQL makes such a view temporary itself; datax has no
+			// temporary views.
+			return nil, newErrf(CodeFeatureNotSupported, "view %q cannot read temporary table %q: temporary views are not supported", bare, d.Name)
+		}
 		if err := s.checkTablePriv(ctx, txn, d, "SELECT"); err != nil {
 			return nil, err
 		}

@@ -668,6 +668,10 @@ func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	if q, bare := SplitTableName(name); q != "" {
 		db, name = q, bare
 	}
+	if db == TempSchema || IsReservedTableName(name) {
+		// A session's temporary table is never leased (temp.go).
+		return nil
+	}
 	var dbID uint64
 	if err := a.db.RunTxn(ctx, "ddl-database", func(ctx context.Context, txn *kvclient.Txn) error {
 		id, err := a.databaseID(ctx, txn, db)

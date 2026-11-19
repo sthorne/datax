@@ -1743,7 +1743,7 @@ func (s *Session) indexOIDByName(ctx context.Context, txn *kvclient.Txn, text st
 	if err != nil || db == nil {
 		return 0, false, nil
 	}
-	tables, err := s.cat.ListIn(ctx, txn, db)
+	tables, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return 0, false, ToSQLError(err)
 	}
@@ -1847,7 +1847,7 @@ func (s *Session) descriptionOf(ctx context.Context, txn *kvclient.Txn, oid int6
 // regclassNames lists the (OID, name) of every table the session can
 // see — real tables of every database, then the catalogs.
 func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidName, error) {
-	all, err := s.cat.List(ctx, txn)
+	all, err := s.listAll(ctx, txn)
 	if err != nil {
 		return nil, err
 	}

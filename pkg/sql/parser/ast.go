@@ -222,6 +222,13 @@ type CreateTable struct {
 	// names mapping to raw literal text (e.g. timeseries=true,
 	// retention='7d', shards=8). Nil when no WITH clause was given.
 	Options map[string]string
+	// Temp is CREATE [GLOBAL | LOCAL] TEMP[ORARY] TABLE; Unlogged is
+	// CREATE UNLOGGED TABLE.
+	Temp     bool
+	Unlogged bool
+	// OnCommit is the ON COMMIT clause: "preserve" (PRESERVE ROWS),
+	// "delete" (DELETE ROWS) or "drop"; "" when none was given.
+	OnCommit string
 }
 
 // LikeClause is LIKE source [INCLUDING | EXCLUDING option ...] inside a
@@ -934,6 +941,8 @@ type AlterTable struct {
 	// RowSecurity is ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL
 	// SECURITY: "enable", "disable", "force" or "no force".
 	RowSecurity string
+	// SetLogged is SET LOGGED ("logged") or SET UNLOGGED ("unlogged").
+	SetLogged string
 }
 
 // CreateView is CREATE [OR REPLACE] VIEW name [(cols)] AS query.

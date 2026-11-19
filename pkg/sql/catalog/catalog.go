@@ -775,6 +775,15 @@ type TableDescriptor struct {
 	// which replaces whatever a backed-up descriptor carried: the
 	// timestamps are the restoring cluster's.
 	RestoredRows []RestoredRowsBand `json:"restored_rows,omitempty"`
+	// Temp marks a temporary table (CREATE TEMP TABLE, gap PG-D-009): it
+	// belongs to one session, which alone resolves its name, and it is
+	// dropped when that session ends (temp.go). nil for every other table.
+	Temp *TempTable `json:"temp,omitempty"`
+	// Unlogged records CREATE UNLOGGED TABLE (and ALTER TABLE ... SET
+	// UNLOGGED). It changes nothing about how the table is stored: an
+	// unlogged table is as durable as any other, and only pg_class's
+	// relpersistence ('u') reports it.
+	Unlogged bool `json:"unlogged,omitempty"`
 }
 
 // RestoredRowsBand is one band of RestoredRows.
@@ -1241,6 +1250,11 @@ func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor 
 // name is qualified ("otherdb.t"), using the cache while its lease (if
 // any) is live.
 func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if IsReservedTableName(name) {
+		// A temporary table's name entry is reached only through
+		// LookupTemp, by its own session (temp.go).
+		return nil, &ErrTableNotFound{Name: name}
+	}
 	if q, bare := SplitTableName(name); q != "" {
 		db, name = q, bare
 	}
@@ -1422,6 +1436,11 @@ func (a *Accessor) LookupFresh(ctx context.Context, txn *kvclient.Txn, name stri
 
 // LookupFreshIn is LookupFresh within a database (or name's qualifier).
 func (a *Accessor) LookupFreshIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if IsReservedTableName(name) {
+		// A temporary table's name entry is reached only through
+		// LookupTemp, by its own session (temp.go).
+		return nil, &ErrTableNotFound{Name: name}
+	}
 	if q, bare := SplitTableName(name); q != "" {
 		db, name = q, bare
 	}
@@ -1505,6 +1524,11 @@ func lookupUncached(ctx context.Context, txn *kvclient.Txn, dbID uint64, name st
 	if err := json.Unmarshal(raw, &d); err != nil {
 		return nil, fmt.Errorf("corrupt descriptor %d: %w", id, err)
 	}
+	if d.Temp != nil && !IsReservedTableName(name) {
+		// A temporary table answers only to its session's name entry
+		// (temp.go), whatever entry points at it.
+		return nil, &ErrTableNotFound{Name: name}
+	}
 	return &d, nil
 }
 
@@ -1539,7 +1563,10 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 			return &ErrDatabaseNotFound{Name: fmt.Sprintf("#%d", d.DatabaseID)}
 		}
 	}
-	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.Name, a.isDefaultID(d.DatabaseID))
+	if d.Temp == nil && IsReservedTableName(d.Name) {
+		return fmt.Errorf("table name %q is reserved", d.Name)
+	}
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.namespaceName(), a.isDefaultID(d.DatabaseID) && d.Temp == nil)
 	if err != nil {
 		return err
 	}
@@ -1563,7 +1590,7 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if err := txn.Put(ctx, keys.TableDescKey(d.ID), raw); err != nil {
 		return err
 	}
-	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, d.namespaceName()), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
 	a.Invalidate(d.Name)
@@ -1658,7 +1685,14 @@ func (a *Accessor) invalidateID(id uint64) {
 // gateway leases — still holds; a gateway caching the old name drops
 // that entry at its next renewal (the old name resolves to nothing).
 func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableDescriptor, newName string) error {
-	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newName, a.isDefaultID(d.DatabaseID))
+	if IsReservedTableName(newName) {
+		return fmt.Errorf("table name %q is reserved", newName)
+	}
+	newEntry := newName
+	if d.Temp != nil {
+		newEntry = TempNamespaceName(d.Temp.Session, newName)
+	}
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newEntry, a.isDefaultID(d.DatabaseID) && d.Temp == nil)
 	if err != nil {
 		return err
 	}
@@ -1666,10 +1700,10 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 		return &ErrTableExists{Name: newName}
 	}
 	oldName := d.Name
-	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, oldName)); err != nil {
+	if err := txn.Delete(ctx, namespaceKey(d.DatabaseID, d.namespaceName())); err != nil {
 		return err
 	}
-	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newName), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newEntry), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
 	d.Name = newName
@@ -1690,6 +1724,11 @@ func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*T
 
 // DropIn drops a table by name in database db (or the qualifier in name).
 func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
+	if IsReservedTableName(name) {
+		// A temporary table's name entry is reached only through
+		// LookupTemp, by its own session (temp.go).
+		return nil, &ErrTableNotFound{Name: name}
+	}
 	if q, bare := SplitTableName(name); q != "" {
 		db, name = q, bare
 	}
@@ -1714,7 +1753,7 @@ func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name strin
 // (ListIn) and writes the drops of all its tables in one batch.
 func (a *Accessor) DropDescriptor(txn *kvclient.Txn, d *TableDescriptor, wb *kvclient.WriteBatch) error {
 	// The name entry is wherever the descriptor says it is.
-	wb.Delete(namespaceKey(d.DatabaseID, d.Name))
+	wb.Delete(namespaceKey(d.DatabaseID, d.namespaceName()))
 	wb.Delete(keys.TableDescKey(d.ID))
 	if err := recordDroppedTable(txn, d, wb); err != nil {
 		return err

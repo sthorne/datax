@@ -605,6 +605,9 @@ func init() {
 			if t.IsView() {
 				kind, insertable = "VIEW", "NO"
 			}
+			if t.Temp != nil {
+				kind = "LOCAL TEMPORARY"
+			}
 			b.add("table_catalog", env.Database, "table_schema", tableSchema(t), "table_name", t.Name, "table_type", kind,
 				"is_insertable_into", insertable, "is_typed", "NO")
 		}

@@ -33,7 +33,7 @@ func (s *Session) findIndex(ctx context.Context, txn *kvclient.Txn, name string)
 	if err != nil {
 		return nil, nil, ToSQLError(err)
 	}
-	all, err := s.cat.ListIn(ctx, txn, db)
+	all, err := s.listIn(ctx, txn, db)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -190,6 +190,7 @@ func (s *Session) execRenameTable(ctx context.Context, txn *kvclient.Txn, desc *
 	if err := s.cat.RenameTable(ctx, txn, desc, t.RenameTo); err != nil {
 		return nil, err
 	}
+	s.noteTempRenamed(desc)
 	log.Audit("table-ddl", "stmt", "ALTER TABLE RENAME", "target", old, "to", t.RenameTo, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: "ALTER TABLE"}, nil
 }

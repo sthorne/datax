@@ -635,6 +635,70 @@ waiting for size- and load-based splits to catch up.
   always did — the boundary is not held — and the other two are refused
   with `0A000`.
 
+### Temporary and unlogged tables
+
+```sql
+CREATE TEMP TABLE staging (id INT PRIMARY KEY, payload JSONB);
+CREATE TEMPORARY TABLE IF NOT EXISTS staging (id INT PRIMARY KEY, payload JSONB);
+CREATE TEMP TABLE batch (k INT) ON COMMIT DELETE ROWS;   -- emptied at every commit
+BEGIN;
+CREATE TEMP TABLE work (k INT) ON COMMIT DROP;           -- dropped when the block commits
+COMMIT;
+CREATE TEMP TABLE recent AS SELECT * FROM orders WHERE placed > now() - INTERVAL '1 day';
+CREATE INDEX ON staging (payload);  SELECT * FROM pg_temp.staging;
+CREATE UNLOGGED TABLE cache (k TEXT PRIMARY KEY, v BYTEA);  -- an ordinary, durable table
+ALTER TABLE cache SET LOGGED;                             -- accepted: only relpersistence changes
+```
+
+A temporary table belongs to the session that created it. Only that
+session can read or write it, by any name: another session — on any
+node, whatever role it has — gets `42P01` for it, and does not see it in
+`pg_class`, `information_schema` or `SHOW TABLES`. Two sessions can each
+have a temporary table of the same name. In its own session a temporary
+table hides an ordinary table of its name, as PostgreSQL's `pg_temp`
+schema comes first in `search_path`; `pg_temp.t` names the temporary
+table only, and `<database>.t` the ordinary one. `CREATE TABLE pg_temp.t`
+creates a temporary table.
+
+It is dropped when the session ends, however the connection goes, and
+by `DISCARD TEMP` and `DISCARD ALL`. `ON COMMIT PRESERVE ROWS` (the
+default) keeps the rows; `ON COMMIT DELETE ROWS` empties the table at
+the end of every transaction that used it; `ON COMMIT DROP` drops it at
+the end of the transaction that created it — outside a transaction
+block, at the end of the statement itself. `ON COMMIT` on any other
+table is `42P16`. If a session's node stops or crashes, its temporary
+tables are dropped by a background sweep: within a minute of the node
+restarting, or once the node has been out of contact for longer than
+the dead-node threshold (30 seconds by default).
+
+Temporary tables take indexes (unique ones too), constraints, foreign
+keys to other temporary tables (not to or from ordinary tables: `42P16`,
+as in PostgreSQL), `ALTER TABLE`, `TRUNCATE`, `COPY` and `CREATE TEMP
+TABLE ... AS`. What differs from PostgreSQL:
+
+- `SERIAL` and identity columns, `WITH (...)` storage options and
+  `ALTER TABLE ... SET (...)` are refused on a temporary table (`0A000`),
+  and so is a view that reads one (PostgreSQL makes such a view
+  temporary itself; datax has no temporary views, sequences or other
+  temporary objects).
+- A temporary table is listed in schema `public`, with `relpersistence`
+  `t` and `information_schema.tables.table_type` `LOCAL TEMPORARY`;
+  PostgreSQL lists it in the session's `pg_temp_N` schema.
+- `public.t` reads as `t`, so it reaches the temporary table when one
+  shadows an ordinary table; write `<database>.t` for the ordinary one.
+- A temporary table's rows are written to the replicated key space like
+  any other table's, and kept, as a dropped table's are, until the
+  cluster's GC window has passed; they are not readable by another
+  session at any time, `AS OF SYSTEM TIME` included.
+- `CREATE TEMP TABLE ... AS` cannot run inside a transaction block
+  (`25001`), like `CREATE TABLE ... AS`.
+
+`UNLOGGED` is accepted and has no effect on storage: an unlogged table is
+written, replicated and recovered like every other table, so it is as
+durable as an ordinary one (and not faster). `pg_class.relpersistence`
+reports it as `u`; `ALTER TABLE ... SET LOGGED` and `SET UNLOGGED` are
+accepted and change only that (`42P16` on a temporary table).
+
 ### Tables without a primary key
 
 A table created without a `PRIMARY KEY` — a join table, an imported
@@ -2200,7 +2264,8 @@ the extended protocol — stops listening (`UNLISTEN *`), releases the
 session's advisory locks (`pg_advisory_unlock_all()`) and forgets its
 cached plans and `currval` / `lastval`. It is refused inside a
 transaction block (`25001`). `DISCARD PLANS`, `DISCARD SEQUENCES` and
-`DISCARD TEMP` (there are no temporary tables: nothing to drop) do one
+`DISCARD TEMP` (which drops the session's [temporary
+tables](#temporary-and-unlogged-tables); `DISCARD ALL` does too) do one
 part each, in a block too.
 
 `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
