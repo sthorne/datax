@@ -16,6 +16,11 @@ import (
 const (
 	pgNumericPos = 0x0000
 	pgNumericNeg = 0x4000
+	// The special values' sign words (NUMERIC_NAN, NUMERIC_PINF,
+	// NUMERIC_NINF): no digit groups, weight and dscale zero.
+	pgNumericNaN  = 0xC000
+	pgNumericPInf = 0xD000
+	pgNumericNInf = 0xF000
 
 	// pgNumericMaxDigits bounds a value's integer digits and its scale,
 	// as PostgreSQL's NUMERIC(p, s) does (1,000 each): weight and dscale
@@ -29,6 +34,11 @@ const (
 // encodePGNumeric converts a canonical decimal string (as produced by
 // util/decimal — plain form, no exponent) to the binary wire format.
 func encodePGNumeric(s string) ([]byte, error) {
+	if sign, ok := map[string]uint16{"NaN": pgNumericNaN, "Infinity": pgNumericPInf, "-Infinity": pgNumericNInf}[s]; ok {
+		out := make([]byte, 8)
+		binary.BigEndian.PutUint16(out[4:6], sign)
+		return out, nil
+	}
 	neg := strings.HasPrefix(s, "-")
 	s = strings.TrimPrefix(s, "-")
 	intPart, fracPart := s, ""
@@ -108,8 +118,14 @@ func decodePGNumeric(raw []byte) (string, error) {
 	}
 	switch sign {
 	case pgNumericPos, pgNumericNeg:
+	case pgNumericNaN:
+		return "NaN", nil
+	case pgNumericPInf:
+		return "Infinity", nil
+	case pgNumericNInf:
+		return "-Infinity", nil
 	default:
-		return "", fmt.Errorf("unsupported numeric sign 0x%04x (NaN?)", sign)
+		return "", fmt.Errorf("unsupported numeric sign 0x%04x", sign)
 	}
 	if weight > pgNumericMaxWeight || weight < -pgNumericMaxWeight {
 		return "", fmt.Errorf("binary numeric weight %d out of range (at most %d digits of integer part)", weight, pgNumericMaxDigits)

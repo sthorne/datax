@@ -1,6 +1,8 @@
 package vtable
 
 import (
+	"strings"
+
 	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 )
@@ -87,4 +89,17 @@ func BuiltinTypeOID(oid int64) bool {
 		}
 	}
 	return false
+}
+
+// InformationSchemaClassOIDs are the pg_class OIDs of information_schema's
+// views, which pg_table_is_visible reports invisible (the schema is not on
+// PostgreSQL's search path).
+func InformationSchemaClassOIDs() []int64 {
+	var out []int64
+	for i, n := range Names() {
+		if strings.HasPrefix(n, InformationSchema+".") {
+			out = append(out, classOIDAt(i, n))
+		}
+	}
+	return out
 }

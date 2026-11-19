@@ -40,6 +40,11 @@ type Expr struct {
 	// Sub is a scalar subquery: (SELECT ...) used as a value. Uncorrelated
 	// only — the executor evaluates it once and splices the result.
 	Sub *Select `json:"sub,omitempty"`
+	// SubCol, when set, makes Sub a row subquery of SubCols columns of
+	// which this value is column SubCol (1-based): UPDATE ... SET (a, b)
+	// = (SELECT x, y ...) gives a and b one each.
+	SubCol  int `json:"sub_col,omitempty"`
+	SubCols int `json:"sub_cols,omitempty"`
 	// Func is a builtin call (lower-cased): coalesce, length, lower,
 	// upper, abs, now. Args are its arguments.
 	Func string `json:"func,omitempty"`
@@ -499,7 +504,9 @@ type OnConflict struct {
 	Where      []Comparison
 }
 
-// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET.
+// SetClause is one "column = value" of UPDATE SET or DO UPDATE SET. A
+// multiple-column assignment, SET (a, b) = (x, y) | ROW(x, y) | (SELECT
+// x, y ...), is one SetClause per column (see Expr.SubCol).
 type SetClause struct {
 	Column string
 	Value  Expr
@@ -525,13 +532,16 @@ func (f CopyFormat) String() string {
 	}
 }
 
-// CopyFrom is COPY table [(cols)] FROM STDIN [format clause]. The data
+// CopyFrom is COPY table [(cols)] FROM STDIN [[WITH] options]. The data
 // itself travels out of band (pgwire copy-in sub-protocol), so this
-// statement only names the target and the encoding.
+// statement only names the target and the encoding. Options holds the
+// option list as written (CopyTo's), which the session validates;
+// Format is the FORMAT among them, when it names one.
 type CopyFrom struct {
 	Table   string
 	Columns []string // empty = all visible columns in order
 	Format  CopyFormat
+	Options []CopyOption
 }
 
 // CopyTo is COPY {table [(cols)] | (query)} TO {STDOUT | 'file' |
@@ -788,6 +798,11 @@ type Select struct {
 	// and ranges that cannot serve it locally fall back to their leader.
 	// Mutually exclusive with AsOf by construction.
 	AsOfMaxStaleness string
+	// AsOfMinTimestamp is with_min_timestamp('...') ("" = none): bounded
+	// staleness with an absolute bound. AsOfNearestOnly is either
+	// form's nearest_only argument.
+	AsOfMinTimestamp string
+	AsOfNearestOnly  bool
 	// ForUpdate locks the selected rows (write intents) for the enclosing
 	// transaction, serializing read-modify-write against other writers.
 	ForUpdate bool
@@ -796,6 +811,10 @@ type Select struct {
 	// (SKIP LOCKED) or fail the statement (NOWAIT). Meaningful only with
 	// ForUpdate.
 	LockWait LockWait
+	// Values marks a row of a VALUES list: the rows are FROM-less
+	// selects chained with UNION ALL, whose column types are resolved
+	// across the rows as PostgreSQL resolves a VALUES list's.
+	Values bool
 	// DMLTarget is never set by the parser. It marks the select an
 	// UPDATE ... FROM or DELETE ... USING runs to join its target with
 	// the FROM list, naming the member (by alias) that is the target:
@@ -978,6 +997,14 @@ type CreateRole struct {
 	BypassRLS *bool
 	// InRoles are the roles the new role is made a member of (IN ROLE).
 	InRoles []string
+	// Superuser, CreateDB, CreateRole and Replication are the role
+	// attributes of those names (nil = not spelled; NOSUPERUSER etc.
+	// set false). SUPERUSER is membership in the built-in admin role.
+	Superuser, CreateDB, CreateRole, Replication *bool
+	// ConnLimit is CONNECTION LIMIT n (-1 = no limit); ValidUntil is
+	// VALID UNTIL 'timestamp' as written ('infinity' included).
+	ConnLimit  *int64
+	ValidUntil *string
 }
 
 // DropRole is DROP ROLE / DROP USER [IF EXISTS] name [, ...].
@@ -1053,7 +1080,30 @@ type AlterDefaultPrivileges struct {
 // (transaction-scoped SetVars), run once the block is open.
 type Begin struct {
 	Modes []*SetVar
+	// AsOf is BEGIN AS OF SYSTEM TIME (CockroachDB's): a read-only
+	// transaction pinned at a past timestamp. nil when not given.
+	AsOf *AsOfClause
 }
+
+// AsOfClause is an AS OF SYSTEM TIME operand: exactly one of Exact,
+// MaxStaleness and MinTimestamp is set.
+type AsOfClause struct {
+	// Exact is a fixed timestamp: a negative duration ('-5s'), an RFC
+	// 3339 timestamp, Unix nanoseconds, or FollowerReadTimestamp.
+	Exact string
+	// MaxStaleness and MinTimestamp are with_max_staleness('10s') and
+	// with_min_timestamp('...'): bounded staleness, the freshest
+	// timestamp the local replicas serve within the bound.
+	MaxStaleness, MinTimestamp string
+	// NearestOnly is their second argument: TRUE refuses a read the
+	// local replicas cannot serve rather than going to a leader.
+	NearestOnly bool
+}
+
+// SetTransactionAsOf is SET TRANSACTION AS OF SYSTEM TIME operand: the
+// block, before its first query, becomes a read-only transaction at
+// that timestamp.
+type SetTransactionAsOf struct{ AsOf AsOfClause }
 
 type Commit struct{}
 type Rollback struct{}
@@ -1155,6 +1205,22 @@ type Deallocate struct {
 // outside any transaction (chunked frozen-timestamp sweep); admin-only.
 type Analyze struct{ Table string }
 
+// Vacuum is VACUUM in every form PostgreSQL takes: VACUUM [FULL]
+// [FREEZE] [VERBOSE] [ANALYZE] [table [(columns)], ...] and VACUUM
+// (option [value], ...) [table [(columns)], ...]. datax's MVCC garbage
+// collection reclaims space on its own, so only the ANALYZE part does
+// anything (PG-O-003).
+type Vacuum struct {
+	Full, Freeze, Verbose, Analyze bool
+	Tables                         []VacuumTable
+}
+
+// VacuumTable is one table VACUUM names, with its optional column list.
+type VacuumTable struct {
+	Name    string
+	Columns []string
+}
+
 // ShowStats renders the stored statistics for a table (read-only).
 type ShowStats struct{ Table string }
 
@@ -1178,6 +1244,9 @@ type CreateDatabase struct {
 	Name        string
 	IfNotExists bool
 	Placement   *PlacementOptions
+	// Options are PostgreSQL's options (OWNER, ENCODING, TEMPLATE,
+	// LOCALE, CONNECTION LIMIT, ...), in the order written.
+	Options []DatabaseOption
 }
 
 // DropDatabase is DROP DATABASE [IF EXISTS] name [CASCADE | RESTRICT].
@@ -1193,6 +1262,15 @@ type AlterDatabase struct {
 	Name      string
 	NewName   string
 	Placement *PlacementOptions
+	// Set is ALTER DATABASE name SET param = value (a default for the
+	// database's new sessions) or RESET param | ALL (Reset, Name "" for
+	// ALL).
+	Set *SetVar
+	// Options are CONNECTION LIMIT, ALLOW_CONNECTIONS, IS_TEMPLATE and
+	// SET TABLESPACE.
+	Options []DatabaseOption
+	// RefreshCollation is REFRESH COLLATION VERSION.
+	RefreshCollation bool
 }
 
 // ShowPlacement is SHOW PLACEMENT FOR DATABASE name — the policy a
@@ -1271,10 +1349,12 @@ func (*DeclareCursor) stmt()          {}
 func (*Fetch) stmt()                  {}
 func (*CloseCursor) stmt()            {}
 func (*SetTransactionSnapshot) stmt() {}
+func (*SetTransactionAsOf) stmt()     {}
 func (*Unlisten) stmt()               {}
 func (*Notify) stmt()                 {}
 func (*ShowTables) stmt()             {}
 func (*Analyze) stmt()                {}
+func (*Vacuum) stmt()                 {}
 func (*ShowStats) stmt()              {}
 func (*SetVar) stmt()                 {}
 func (*CreateDatabase) stmt()         {}
@@ -1283,3 +1363,8 @@ func (*DropDatabase) stmt()           {}
 func (*AlterDatabase) stmt()          {}
 func (*ShowDatabases) stmt()          {}
 func (*Use) stmt()                    {}
+func (*Discard) stmt()                {}
+
+// Discard is DISCARD { ALL | PLANS | SEQUENCES | TEMP[ORARY] }: Kind is
+// "all", "plans", "sequences" or "temp".
+type Discard struct{ Kind string }

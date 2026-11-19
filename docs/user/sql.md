@@ -31,6 +31,17 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   `E'\0'` and `E'\x80'` are `22021` (invalid byte sequence); a short
   `\u` / `\U` escape is `22025`, `\u0000` "invalid Unicode escape value"
   and a lone surrogate "invalid Unicode surrogate pair" (`42601`).
+- **Dollar-quoted strings**: `$$...$$` and `$tag$...$tag$` are string
+  literals wherever a string may stand, taken exactly as written — no
+  escapes, quotes and backslashes are ordinary characters, and a `;`
+  inside does not end the statement. A tag is an identifier without
+  `$` and its case counts (`$Fn$` is not closed by `$fn$`). As in
+  PostgreSQL, a parameter run into an identifier character (`$1$`,
+  `$1a`) is `42601` "trailing junk after parameter", an unclosed quote
+  is "unterminated dollar-quoted string", and a `$` may continue an
+  unquoted identifier (`a$b`). The `datax sql` shell ends a statement at
+  a line ending in `;`, whatever quoting it is in (psql tracks dollar
+  quotes itself).
 
 ## Types
 
@@ -1026,13 +1037,27 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   so a keyed column's range becomes index bounds), `IS [NOT] TRUE |
   FALSE | UNKNOWN`, `IS [NOT] DISTINCT FROM`, `[NOT] LIKE / ILIKE ...
   [ESCAPE 'c']` (a literal prefix — `LIKE 'ab%'` — becomes index bounds
-  on a keyed column) and `[NOT] SIMILAR TO` (SQL regular expressions;
-  an invalid pattern is SQLSTATE `2201B`). A predicate used as a value
+  on a keyed column), `[NOT] SIMILAR TO` (SQL regular expressions;
+  an invalid pattern is SQLSTATE `2201B`) and `IS [NOT] [NFC | NFD |
+  NFKC | NFKD] NORMALIZED`. The regular-expression operators `~` /
+  `~*` take PostgreSQL's pattern syntax as the `regexp_*` functions
+  do; back references (`\1`) and lookahead / lookbehind (`(?=`, `(?!`,
+  `(?<=`, `(?<!`) are refused with `0A000`, since datax runs patterns
+  on RE2. A predicate used as a value
   (`qty > 3 AS big`) is three-valued: NULL when an input is NULL.
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
   parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
   always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), date and time arithmetic (`date + 1`, `date - date` in
+  `22003`), the integer bitwise operators `&` (and), `|` (or), `#`
+  (xor), `<<` and `>>` (shifts, which wrap rather than overflow; the
+  count is taken modulo 64) and the prefix `~` (not), the prefix `@`
+  (absolute value), `|/` (square root) and `||/` (cube root) — the
+  binary ones, like the vector distances and jsonb's `#-`, bind looser
+  than `+` and `-` and tighter than the comparisons, left to right, as
+  in PostgreSQL (`1 + 2 & 3` is `3`), and are computed on INT8, so
+  `1 << 31` over an `INT4` is `2147483648`, not PostgreSQL's
+  `-2147483648` (PostgreSQL 14 removed the factorial `!`; use
+  `factorial(n)`), date and time arithmetic (`date + 1`, `date - date` in
   days, `timestamp ± interval` and `date ± interval` on the calendar
   with month steps clamped to the end of the month, `timestamp -
   timestamp` an `INTERVAL`, `interval ± interval`, `interval * 2`,
@@ -1091,16 +1116,33 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   column's name (`at::date` describes as `at`).
 - **JSONB operators**: `->` / `->>` (key or array index: `j -> 0`),
   `#>` / `#>>` with a text-array path (`j #>> '{a,0,b}'`), containment
-  `@>` / `<@`, key existence `?`, `?|`, `?&`, and concatenation `||`
+  `@>` / `<@`, key existence `?`, `?|`, `?&`, concatenation `||`
   (objects merge, the right side winning; arrays concatenate; a
-  non-array is appended or prepended as an element) — everywhere an
+  non-array is appended or prepended as an element), deletion `-` (a
+  text key, from an object or the matching strings of an array; a
+  `text[]` of keys; an integer array index, from the end when
+  negative) and `#-` (at a text-array path), subscripting
+  (`j['a']['b'][0]`: an object's key, an array's 0-based index,
+  negative from the end; NULL when absent) and the ordering
+  comparisons `< <= > >=` in PostgreSQL's jsonb order — everywhere an
   expression goes, including HAVING and grouped select lists.
+  `UPDATE t SET j['a'][0] = '1'` assigns at a subscript path as
+  PostgreSQL does: missing keys are added and missing containers
+  created (an array where the next subscript is an integer), arrays
+  are padded with nulls up to the index, a NULL column starts from
+  `{}` (or `[]` when the first subscript is an integer), and a path
+  through an existing scalar is refused (`22023`); several such
+  assignments to one column apply in turn.
 - **Aggregates**: `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`,
   `string_agg(x, sep)`, `array_agg`, `bool_and` / `bool_or` / `every`,
   `stddev[_pop|_samp]`, `variance` / `var_pop` / `var_samp`,
   `percentile_cont(f) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
   `mode() WITHIN GROUP (ORDER BY x)`, `json[b]_agg`,
-  `json[b]_object_agg` — over a column or an expression (`SUM(qty *
+  `json[b]_object_agg` (and their `_strict` / `_unique` forms),
+  `corr`, `covar_pop` / `covar_samp`, `regr_avgx`, `regr_avgy`,
+  `regr_count`, `regr_intercept`, `regr_r2`, `regr_slope`, `regr_sxx`,
+  `regr_sxy`, `regr_syy`, `bit_and` / `bit_or` / `bit_xor`,
+  `any_value` — over a column or an expression (`SUM(qty *
   price)`, `MAX(lower(name))`), with `DISTINCT` and `FILTER (WHERE
   ...)`, whole-table or per `GROUP BY` group, including over joins. An
   `ORDER BY` among the arguments sets the order an aggregate takes its
@@ -1112,9 +1154,7 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   position. With `DISTINCT`, every `ORDER BY` expression must be an
   argument (`42P10` otherwise), and the input is sorted on the
   arguments as in PostgreSQL, so `array_agg(DISTINCT x)` lists `x`
-  ascending, NULL last. `jsonb` values have no order in datax: ordering
-  an aggregate's input by one is refused (`0A000`), and `DISTINCT` over
-  one keeps the input order. The select list, `HAVING` and `ORDER BY` take any expression
+  ascending, NULL last; `jsonb` sorts in PostgreSQL's jsonb order. The select list, `HAVING` and `ORDER BY` take any expression
   over aggregate calls and grouping columns: arithmetic (`SUM(a) /
   COUNT(*)`, `COUNT(*) * 100.0 / (SELECT COUNT(*) FROM t)`), function
   calls (`ROUND(AVG(x), 2)`, `COALESCE(MAX(x), 0)`), `CASE`, casts and
@@ -1151,7 +1191,10 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   from an earlier table are lookup keys; every other conjunct
   (`tc.relkind = 't'`, `NOT a.attisdropped`, `x IN (...)`) is a join
   condition, evaluated per candidate match — an outer join NULL-extends
-  when it fails, unlike a `WHERE` filter. An `ON` with no such equality
+  when it fails, unlike a `WHERE` filter. That includes subqueries
+  (`[NOT] IN (SELECT ...)`, `[NOT] EXISTS`, scalar): an uncorrelated
+  one is evaluated once, one reading the tables joined so far (`ON
+  EXISTS (SELECT 1 FROM c WHERE c.x = b.id)`) per candidate match. An `ON` with no such equality
   joins by nested loop: the joined table is read once and every row so
   far is tried against each of its rows (`EXPLAIN`: `fetched once,
   every row tried`; `+ join filter` marks a level with join
@@ -1205,6 +1248,19 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   wide `ROWS` frame over a large partition costs its width. `DISTINCT`,
   an `ORDER BY` among the arguments and `WITHIN GROUP` are refused on
   a window call (`0A000`), as in PostgreSQL; `FILTER` is too.
+- **Quantified comparisons**: `expr op ANY | SOME | ALL (SELECT ...)`
+  and `(array)`, for `= <> < <= > >=` and `[NOT] LIKE / ILIKE`, with
+  PostgreSQL's NULL rules: `ANY` is NULL when no element matches and
+  one comparison is NULL, `ALL` when none fails and one is NULL; over no
+  rows `ANY` is false and `ALL` true, whatever the left side. The
+  subquery may be correlated, and must return one column (`42601`).
+- **`COLLATE`**: `expr COLLATE "C"` (also `"POSIX"`, `"default"` and
+  `ucs_basic`, optionally `pg_catalog.`-qualified) in any expression,
+  `ORDER BY` and `GROUP BY`. Every string compares bytewise, which is
+  each of these collations' order, so the clause changes nothing; any
+  other collation is `42704` (`collation "x" for encoding "UTF8" does
+  not exist`), as in a PostgreSQL that lacks it, and a collation on a
+  number or boolean literal is `42804`.
 - **Subqueries**: scalars anywhere a value goes, `array(SELECT ...)`
   (the subquery's column as a text array, e.g. for `array_to_string`),
   derived tables `FROM (SELECT ...) AS d` — which join like tables, as
@@ -1229,7 +1285,10 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   and laterals chain and nest. A reference to a member further right is
   `42P01`; `RIGHT` and `FULL JOIN LATERAL` are refused (`42P10`). The
   lateral subquery is a plain select (over a table, a join or no
-  table; not over a derived table or a set operation of its own) and
+  table; not over a derived table or a set operation of its own) or a
+  `VALUES` list (`CROSS JOIN LATERAL (VALUES ('a', t.a), ('b', t.b))
+  AS v(k, val)` unpivots; a list of several rows whose values are
+  arrays is `0A000`), and
   reads the outer row anywhere but its `ORDER BY`, `GROUP BY` and
   aggregate arguments. Correlated subqueries — ones that reference
   the enclosing query's row, in `EXISTS`/`IN`/scalar positions, the
@@ -1245,6 +1304,21 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   (`FROM t AS a` hides `t`), so `t.x` inside a subquery over `t AS a`
   reads an enclosing `t`, and is `42P01` (invalid reference to
   FROM-clause entry) when there is none.
+- **`VALUES` and `TABLE`**: `VALUES (1, 'a'), (2, 'b')` is a query of
+  its own and a `FROM` item, `(VALUES ...) [AS] v(x, y)` (the columns
+  are `column1`, `column2`, ... unless aliased; more aliases than
+  columns is `42P10`), joined like a table or `LATERAL`. Each column
+  takes one type across the rows, as in PostgreSQL: a quoted literal
+  or `NULL` takes the type of the other rows (`VALUES ('1'), (2)` is
+  `INT8`; `'x'` there is `22P02`), numbers lift (`1` and `2.5` make
+  `DECIMAL`), all-literal columns are text, and other mixes are `42804`
+  (`VALUES types bigint and boolean cannot be matched`); rows of
+  different lengths are `42601`. `TABLE t` is `SELECT * FROM t`, as a
+  statement, a set-operation member, a subquery and an `INSERT`
+  source, with its own `ORDER BY` / `LIMIT`.
+- **No `FROM`**: `SELECT count(*)`, `SELECT max(1) WHERE false`, `SELECT
+  sum(2) HAVING sum(2) > 1` aggregate the one row a select without
+  `FROM` reads, as in PostgreSQL.
 - **Set operations**: `UNION`, `INTERSECT` and `EXCEPT`, each `[ALL]`,
   between selects, `VALUES` lists and parenthesized queries (which may
   carry their own `ORDER BY` / `LIMIT`) with the same number of
@@ -1376,7 +1450,15 @@ UPDATE orders o SET status = s.status FROM staging s WHERE o.id = s.id;   -- val
 DELETE FROM posts p USING users u WHERE p.uid = u.id AND u.banned;
 UPDATE t SET c = c + v.d FROM (VALUES (1, 10), (2, 20)) AS v(a, d)
   WHERE t.a = v.a RETURNING *;                                  -- t's columns, then v's
+UPDATE t SET (b, c) = ('z', DEFAULT) WHERE a = 1;              -- several columns; also = ROW(...)
+UPDATE t SET (b, c) = (SELECT y, z FROM u WHERE u.a = t.a);   -- one row (21000 for more; none sets NULLs)
 ```
+
+A multiple-column assignment, `SET (a, b) = (x, y)`, `= ROW(x, y)` or
+`= (SELECT x, y ...)`, works in `UPDATE`, `UPDATE ... FROM` and `ON
+CONFLICT DO UPDATE`; the subquery may be correlated. A row of the
+wrong length, a subquery with the wrong number of columns and a
+single parenthesized value are `42601`, as in PostgreSQL.
 
 `UPDATE ... FROM` and `DELETE ... USING` join the target (with an
 optional alias, `UPDATE t [AS] x`) to a `FROM` (`USING`) list that takes
@@ -1431,6 +1513,8 @@ one replication round; 100 single-row statements are 100.
 ```sql
 COPY t (a, b) FROM STDIN;                  -- text format (psql \copy sends this)
 COPY t FROM STDIN WITH (FORMAT csv);
+COPY t FROM STDIN WITH (FORMAT csv, HEADER match, DELIMITER ';', NULL 'NA', FORCE_NULL (b));
+COPY t FROM STDIN WITH CSV HEADER QUOTE '''' ESCAPE '\';  -- the pre-9.0 spelling
 ```
 
 ```sh
@@ -1446,8 +1530,14 @@ mid-load failure keeps the chunks already committed (the error reports
 the failing row and the committed count). Inside `BEGIN` the chunks
 are written in the block's transaction instead, so the load commits or
 rolls back with it (pg_restore's `BEGIN; TRUNCATE ONLY t; COPY t ...;
-COMMIT`). Only the `FORMAT text|csv|binary` option is supported on
-`COPY FROM`.
+COMMIT`). The options are PostgreSQL's, in either spelling (`WITH
+(FORMAT csv, HEADER true)` or `WITH CSV HEADER`), checked as PostgreSQL
+checks them: `FORMAT text | csv | binary`, `HEADER` (the first line is
+skipped; `HEADER MATCH` checks that it names the columns, `22P04`
+otherwise), `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL` and
+`FORCE_NOT_NULL` (a column list or `*`), `FREEZE` (accepted, no
+effect) and `ENCODING` (`UTF8` only; another encoding is `0A000`).
+`DEFAULT` and PostgreSQL 17's `ON_ERROR` are not supported.
 
 ### Exporting with COPY TO
 
@@ -2094,11 +2184,24 @@ SET LOCAL statement_timeout = '30s';          -- inside a block: until COMMIT / 
 SET TRANSACTION READ ONLY;                    -- this block refuses writes (25006); BEGIN READ ONLY does the same
 SET default_transaction_read_only = on;       -- every transaction, until reset
 RESET statement_timeout;  RESET ALL;  SET x = DEFAULT;
+DISCARD ALL;                                  -- a pooler's reset: RESET ALL and drop the session's state (below)
 SHOW statement_timeout;  SHOW ALL;  SELECT * FROM pg_settings;   -- source 'session' where this session changed it (psql's \dconfig)
 SET app.tenant = 'acme';                      -- a custom setting: any class.name
 SELECT set_config('app.tenant', $1, false);   -- the same, with the value as a parameter
 SELECT current_setting('app.tenant');         -- 42704 if never set; current_setting(name, true) gives NULL
 ```
+
+`DISCARD ALL` hands a connection on clean, as PostgreSQL's does: it
+closes every cursor, runs `RESET ALL` (the role included; as with
+`RESET ALL` here, an `application_name` the client gave at startup goes
+back to the default too, where PostgreSQL restores it), deallocates
+every prepared statement — `PREPARE`d ones and the named statements of
+the extended protocol — stops listening (`UNLISTEN *`), releases the
+session's advisory locks (`pg_advisory_unlock_all()`) and forgets its
+cached plans and `currval` / `lastval`. It is refused inside a
+transaction block (`25001`). `DISCARD PLANS`, `DISCARD SEQUENCES` and
+`DISCARD TEMP` (there are no temporary tables: nothing to drop) do one
+part each, in a block too.
 
 `SET [SESSION | LOCAL] name {TO | =} value`, `SET TIME ZONE`, `SET NAMES`,
 `SET [SESSION CHARACTERISTICS AS] TRANSACTION ...`, `RESET name`, `RESET
@@ -2127,7 +2230,7 @@ invalid value `22023`:
 | `bytea_output` | `hex` (default), `escape` | the text format of a `BYTEA` column on the wire |
 | `client_min_messages` | `debug5` ... `debug1`, `log`, `notice` (default), `warning`, `error` | at `warning` or `error`, `NOTICE`s are not sent |
 | `row_security` | `on` (default), `off` | `off` refuses (`42501`) a query that a table's row-level security policies would filter, as `pg_dump` expects |
-| `server_version_num`, `max_identifier_length` | `140000`, `63` | read only (`55P02`) |
+| `server_version_num`, `max_identifier_length`, `block_size`, `max_index_keys`, `max_function_args`, `lc_collate`, `lc_ctype`, `in_hot_standby`, `is_superuser`, `session_authorization`, ... | `140000`, `63`, `8192`, `32`, `100`, `C`, `C`, `off`, whether the session user is root or an admin, its name | read only (`55P02`) |
 | PostgreSQL's other common settings: `work_mem`, `synchronous_commit`, `jit`, `enable_*`, `lc_*`, `default_transaction_isolation`, ... | PostgreSQL's values, checked as PostgreSQL checks them | accepted, kept and reported, with no effect: the list is in [Differences from PostgreSQL](postgres-differences.md) |
 | `role`, `SET [LOCAL] ROLE name \| NONE`, `RESET ROLE` | a role the session user belongs to (admins: any) | the current role: privilege checks and `current_user` follow it, `session_user` stays; `SHOW role` reports `none` without one (see the [security guide](security.md#roles-and-privileges)) |
 
@@ -2191,11 +2294,35 @@ so multi-range results stay consistent. Watch
 `datax_follower_read_fallbacks_total` (sent to a leader) to see whether
 your bound is doing its job.
 
+CockroachDB's other forms are accepted too:
+
+```sql
+SELECT ... AS OF SYSTEM TIME follower_read_timestamp();
+SELECT ... AS OF SYSTEM TIME with_min_timestamp('2026-08-30T10:00:00Z');
+SELECT ... AS OF SYSTEM TIME with_max_staleness('10s', false);
+BEGIN AS OF SYSTEM TIME '-10s';             -- a read-only block in the past
+BEGIN; SET TRANSACTION AS OF SYSTEM TIME follower_read_timestamp(); ...
+```
+
+`follower_read_timestamp()` (also `experimental_follower_read_timestamp()`)
+is now minus 4.8s: past the closed-timestamp lag and its publication
+interval, so any replica serves the read. `with_min_timestamp(ts)` is
+bounded staleness with an absolute bound: the freshest timestamp the
+local replicas serve, never older than `ts` (a `ts` in the future is
+`22023`). The `nearest_only` argument of both bounded forms must be
+`false` (`true` is `0A000`: a range the node cannot serve within the
+bound is read from its leader rather than refused). `BEGIN AS OF SYSTEM
+TIME` and `SET TRANSACTION AS OF SYSTEM TIME` (before the block's first
+query; `25001` after it) pin the whole block at an exact timestamp: it
+is read-only (`25006` for a write), and privileges are today's, as for
+a single historical read. Bounded staleness is a single statement's:
+it cannot open a block (`0A000`).
+
 All forms: bounded by the GC window on the old side (25h, or the
-table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); not allowed
-inside `BEGIN`; a freshly written row may be invisible until the closed
-timestamp passes its write (~the lag) — that is the staleness you signed
-up for.
+table's own `gc_ttl`; nothing from before a [purge](#gc-window-and-purge)); a
+statement's own `AS OF SYSTEM TIME` is not allowed inside `BEGIN`; a
+freshly written row may be invisible until the closed timestamp passes
+its write (~the lag) — that is the staleness you signed up for.
 
 ## Table statistics
 
@@ -2218,6 +2345,18 @@ minute (configurable) one node re-collects at most one table whose
 statistics are missing or older than 10 minutes, in paced 1024-row
 chunks. Watch `datax_stats_refreshes_total` and
 `datax_stats_rows_scanned_total` for its cost.
+
+`VACUUM` is accepted in all its forms — `VACUUM`, `VACUUM FULL t`,
+`VACUUM ANALYZE t`, `VACUUM (VERBOSE, ANALYZE) t (col)` — for the tools
+and migrations that send it. There is nothing for it to reclaim: MVCC
+garbage collection removes old row versions once they pass the table's
+`gc_ttl`, and `ALTER TABLE ... PURGE` removes history on demand
+([GC window and purge](#gc-window-and-purge)). With `ANALYZE` it
+refreshes the statistics as `ANALYZE` does (admins; others get a
+warning and are skipped). Like PostgreSQL's it cannot run inside a
+transaction block (`25001`), refuses an unknown option (`42601`) or
+table (`42P01`), and skips a view, or a table the role does not own,
+with a warning.
 
 ## Timeseries tables
 
@@ -2539,10 +2678,11 @@ the live schema: `pg_catalog.pg_database`, `pg_namespace`, `pg_class`,
 `pgcrypto`, `uuid-ossp` and `vector`, always installed)
 (and empty stand-ins for the catalogs of features datax lacks —
 publications, functions, triggers, operator classes and
-families, `pg_amop`, `pg_amproc`, ...), plus
-`information_schema.schemata`, `tables`, `views`, `columns`,
-`table_constraints`, `key_column_usage`, `statistics` and
-`role_table_grants`. OIDs are stable across the cluster (a table's is its
+families, `pg_amop`, `pg_amproc`, ...), plus `pg_timezone_names` and `pg_timezone_abbrevs`, and every view of
+PostgreSQL 16's `information_schema` (`tables`, `columns`, `views`,
+`sequences`, `table_constraints`, `key_column_usage`,
+`table_privileges`, `role_table_grants`, `routines`, ..., the ones for
+features datax lacks empty) and MySQL's `information_schema.statistics`. OIDs are stable across the cluster (a table's is its
 descriptor ID; `'t'::regclass` gives it); a catalog whose rows have OIDs
 also has PostgreSQL's `tableoid` system column (not in `*`). A bare `pg_class` resolves to
 the catalog when no table of that name exists in the current database.
@@ -2644,6 +2784,8 @@ guide names) and a reserved, empty `system` database.
 ```sql
 CREATE DATABASE app;
 CREATE DATABASE IF NOT EXISTS app;
+CREATE DATABASE app2 WITH OWNER = alice ENCODING = 'UTF8' TEMPLATE = template0
+  LC_COLLATE = 'C' LC_CTYPE = 'C' CONNECTION LIMIT = 50;
 SHOW DATABASES;
 USE app;                      -- or: SET database = app
 SELECT current_database();    -- app
@@ -2666,6 +2808,32 @@ dropped or renamed, and the session cannot drop the database it is in.
 drops: it retries itself like any single statement, and if it still
 loses to DDL running in the same database it fails with `40001` having
 dropped nothing.
+
+`CREATE DATABASE` takes an admin, or a role with the `CREATEDB`
+attribute. Its PostgreSQL options are accepted as Rails, Django and
+pg_dump send them: `ENCODING` UTF8 (the only encoding; any other is
+`22023`), `TEMPLATE` `template0` or `template1` (both an empty
+database), `LOCALE` / `LC_COLLATE` / `LC_CTYPE` `C`, `POSIX`,
+`C.UTF-8` or `en_US.UTF-8` (shown in `pg_database`; text compares
+bytewise, as in `C`, whichever is named), `OWNER` (a role the creator
+belongs to, unless an admin), `CONNECTION LIMIT`, `STRATEGY`,
+`TABLESPACE pg_default`, `ALLOW_CONNECTIONS true` and `IS_TEMPLATE
+false`. The database's owner (or an admin) may run:
+
+```sql
+ALTER DATABASE app SET statement_timeout = '30s';  -- a default for new sessions
+ALTER DATABASE app SET TimeZone TO 'Europe/Paris';
+ALTER DATABASE app RESET statement_timeout;        -- or RESET ALL
+ALTER DATABASE app CONNECTION LIMIT 100;           -- -1: no limit
+ALTER DATABASE app OWNER TO alice;
+```
+
+A default set with `ALTER DATABASE ... SET` applies to the sessions
+that connect to the database afterwards, before the client's own
+startup parameters, as in PostgreSQL. A database's (and a role's)
+`CONNECTION LIMIT` counts the sessions on the node a client connects
+to — not the whole cluster — and refuses one more with `53300` "too
+many connections"; admins are exempt.
 
 Database privileges: `GRANT CREATE | CONNECT | ALL ON DATABASE app TO
 bob`. `CREATE` lets a non-admin create tables there (admins and the

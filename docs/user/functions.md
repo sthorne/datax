@@ -2,7 +2,7 @@
 
 <!-- Generated from pkg/sql/builtins by `go generate ./pkg/sql/builtins`; do not edit by hand. -->
 
-Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, the jsonb `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, the text-search `@@`, the vector distances `<->`, `<=>`, `<#>`) and casts are described in [the SQL reference](sql.md#reading).
+Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures show argument types (`any` accepts every type; `[x]` is optional; `...` is variadic) and the result type. An **immutable** function depends on its arguments alone and may appear in a `DEFAULT` or a `CHECK`; a **stable** one is fixed within a statement; a **volatile** one is evaluated afresh for every row. Strict functions (the default) return NULL when any argument is NULL; the entries that say otherwise handle NULLs themselves. Text arguments accept any value rendered as text; numeric arguments accept the three numeric types. The operators (`||`, `%`, `^`, the bitwise `&`, `|`, `#`, `~`, `<<`, `>>`, the prefix `@`, `|/`, `||/`, the comparisons, `LIKE`, `SIMILAR TO`, `BETWEEN`, `IS DISTINCT FROM`, `IS NORMALIZED`, the jsonb `->`, `->>`, `#>`, `#>>`, `-`, `#-`, `@>`, `<@`, `?`, `?|`, `?&` and subscripts, the text-search `@@`, the vector distances `<->`, `<=>`, `<#>`) and casts are described in [the SQL reference](sql.md#reading).
 
 ## Conditionals
 
@@ -14,24 +14,37 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 ## Strings
 
 - `ascii(text) → int8` — The code point of the first character (0 for the empty string). *immutable*
+- `bit_length(text) → int8` — Number of bits in the string or bytea (8 × octet_length). *immutable*
 - `chr(int8) → text` — The character with the code point. *immutable*
 - `concat(any, ...) → text` — Concatenates the arguments as text; NULLs are skipped. *immutable, handles NULL arguments*
 - `concat_ws(text, any, ...) → text` — Concatenates the arguments after the first with it as the separator; NULLs are skipped. *immutable, handles NULL arguments*
+- `convert(bytes, text, text) → bytes` — convert(bytes, source, destination): the bytes re-encoded from one encoding into another. *immutable*
+- `convert_from(bytes, text) → text` — The bytes decoded from the named encoding (UTF8, SQL_ASCII, LATIN1 to LATIN10, ISO_8859_5 to 8, WIN866, WIN874, WIN1250 to WIN1258, KOI8R, KOI8U) into text. *immutable*
+- `convert_to(text, text) → bytes` — The text encoded into the named encoding, as bytes (22P05 for a character the encoding lacks). *immutable*
+- `crc32(any) → int8` — The CRC-32 checksum of the bytes. *immutable*
+- `crc32c(any) → int8` — The CRC-32C (Castagnoli) checksum of the bytes. *immutable*
 - `decode(text, text) → bytes` — Decodes 'hex', 'base64' or 'escape' text into bytes. *immutable*
 - `encode(any, text) → text` — Encodes bytes (or text) as 'hex', 'base64' or 'escape' text. *immutable*
-- `format(text, [any], ...) → text` — Formats with %s (text), %I (an identifier, quoted when needed), %L (a literal, quoted; NULL for NULL) and %%. *immutable, handles NULL arguments*
+- `format(text, [any], ...) → text` — Formats with %s (text), %I (an identifier, quoted when needed), %L (a literal, quoted; NULL for NULL) and %%; a specifier may take an argument position (%2$s), the flag - (left-justify) and a width (%10s, %-10s, %*s, %*3$s). *immutable, handles NULL arguments*
+- `get_bit(any, int8) → int8` — The bit at the 0-based offset (bit n is bit n mod 8 of byte n / 8, from the least significant). *immutable*
+- `get_byte(any, int8) → int8` — The byte at the 0-based offset, as an integer. *immutable*
 - `initcap(text) → text` — The first letter of each word upper-cased, the rest lower-cased. *immutable*
+- `is_normalized(text, [text]) → bool` — Whether the string is in the Unicode normal form (NFC by default); also s IS [NOT] [NFC | NFD | NFKC | NFKD] NORMALIZED. *immutable*
 - `left(text, int8) → text` — The first n characters (all but the last -n when negative). *immutable*
 - `length(text) → int8` (also `char_length`, `character_length`) — Number of characters in the string (of bytes in a bytea). *immutable*
 - `lower(text) → text` — The string in lower case. *immutable*
 - `lpad(text, int8, [text]) → text` — Pads the string on the left to the length with the fill (spaces by default), truncating when longer. *immutable*
-- `ltrim(text, [text]) → text` — Removes the given characters (spaces by default) from the start. *immutable*
+- `ltrim(text, [text]) → text` — Removes the given characters (spaces by default) from the start; over a bytea, the given bytes. *immutable*
 - `md5(text) → text` — The MD5 hash as 32 hex characters (of a bytea's bytes). *immutable*
+- `normalize(text, [text]) → text` — The string in a Unicode normal form: normalize(s [, NFC | NFD | NFKC | NFKD]), NFC by default. *immutable*
 - `octet_length(text) → int8` — Number of bytes in the string or bytea. *immutable*
+- `overlay(text, text, int8, [int8]) → text` — overlay(s PLACING r FROM start [FOR n]): s with the n characters (r's length by default) from the 1-based start replaced by r; over bytea, bytes. *immutable*
+- `parse_ident(text, [bool]) → text[]` — The parts of a qualified SQL identifier as a text array ('Sch."Tbl"' is {sch,Tbl}); with strict false, text after the identifier is ignored. *immutable*
 - `position(text, text) → int8` — 1-based position of the first argument's first occurrence in the second, 0 when absent (also position(needle IN haystack); over bytea, the byte offset); strpos(haystack, needle) takes them the other way round. *immutable*
 - `quote_literal(any) → text` — The value as a quoted SQL literal. *immutable*
 - `quote_nullable(any) → text` — The value as a quoted SQL literal, or NULL unquoted. *immutable, handles NULL arguments*
 - `regexp_count(text, text, [int8], [text]) → int8` — The number of non-overlapping matches of the POSIX pattern, from the 1-based character start. *immutable*
+- `regexp_instr(text, text, [int8], [int8], [int8], [text], [int8]) → int8` — The 1-based character position of the n-th match (the first by default) of the POSIX pattern from the character start, or of its subexpr-th subexpression: where it begins, or just after it ends with endoption 1; 0 when there is none. *immutable*
 - `regexp_like(text, text, [text]) → bool` — Whether the POSIX pattern matches anywhere in the string (the ~ operator, with flags). *immutable*
 - `regexp_match(text, text, [text]) → text[]` — The first match of the POSIX pattern as a text array: its parenthesized subexpressions, or the whole match when there are none (NULL when nothing matches). *immutable*
 - `regexp_matches(text, text, [text]) → setof text[]` — One row per match of the POSIX pattern (the first only, unless the g flag is given), each a text array as regexp_match returns. *immutable*
@@ -41,37 +54,76 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `regexp_substr(text, text, [int8], [int8], [text], [int8]) → text` — The text of the n-th match (the first by default) of the POSIX pattern from the character start, or of its subexpr-th subexpression; NULL when there is none. *immutable*
 - `repeat(text, int8) → text` — The string repeated n times. *immutable*
 - `replace(text, text, text) → text` — Replaces every occurrence of the second argument with the third. *immutable*
-- `reverse(text) → text` — The characters in reverse order. *immutable*
+- `reverse(text) → text` — The characters in reverse order (a bytea's bytes). *immutable*
 - `right(text, int8) → text` — The last n characters (all but the first -n when negative). *immutable*
 - `rpad(text, int8, [text]) → text` — Pads the string on the right to the length with the fill (spaces by default), truncating when longer. *immutable*
-- `rtrim(text, [text]) → text` — Removes the given characters (spaces by default) from the end. *immutable*
+- `rtrim(text, [text]) → text` — Removes the given characters (spaces by default) from the end; over a bytea, the given bytes. *immutable*
+- `set_bit(any, int8, int8) → bytes` — The bytes with the bit at the 0-based offset set to 0 or 1. *immutable*
+- `set_byte(any, int8, int8) → bytes` — The bytes with the one at the 0-based offset set to the value (its low 8 bits). *immutable*
+- `sha224(any) → bytes` — The SHA-224 hash, as bytes. *immutable*
 - `sha256(any) → bytes` — The SHA-256 hash, as bytes (encode(sha256(x), 'hex') for the hex text). *immutable*
+- `sha384(any) → bytes` — The SHA-384 hash, as bytes. *immutable*
+- `sha512(any) → bytes` — The SHA-512 hash, as bytes. *immutable*
 - `split_part(text, text, int8) → text` — The n-th field (1-based; negative counts from the end) after splitting on the delimiter. *immutable*
 - `starts_with(text, text) → bool` — Whether the string starts with the prefix. *immutable*
-- `substring(text, int8, [int8]) → text` (also `substr`) — The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes. *immutable*
+- `substring(text, int8, [int8]) → text` (also `substr`) — The substring starting at a 1-based position, optionally of a given length (also substring(s FROM n [FOR m])); over a bytea, the bytes. With a text pattern in place of the position, substring(s FROM pattern) is the part the first match of the POSIX pattern covers (of its first parenthesized subexpression, if any), and substring(s SIMILAR pattern ESCAPE e) (or substring(s FROM pattern FOR e)) the part between the escape-double-quote separators of a SIMILAR TO pattern matching the whole string; NULL when it does not match. *immutable*
+- `to_ascii(text, [any]) → text` — Transliterates the value's bytes, read in the given encoding (LATIN1, LATIN2, LATIN9 or WIN1250; also by its number), to ASCII by dropping accents, as PostgreSQL does. Without an encoding it reads the database's, UTF8, which PostgreSQL does not convert (0A000). *immutable*
 - `to_hex(int8) → text` — The integer in hexadecimal. *immutable*
 - `translate(text, text, text) → text` — Replaces each character found in the second argument with the one at the same position in the third (dropped when the third is shorter). *immutable*
-- `trim(text, [text]) → text` (also `btrim`) — Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)). *immutable*
+- `trim(text, [text]) → text` (also `btrim`) — Removes the given characters (spaces by default) from both ends (also trim([BOTH | LEADING | TRAILING] [chars] FROM s)); over a bytea, the given bytes. *immutable*
+- `unistr(text) → text` — The string with its Unicode escapes decoded: \XXXX, \+XXXXXX, \uXXXX, \UXXXXXXXX (hex code points; a UTF-16 surrogate pair combines) and \\ for a backslash. *immutable*
 - `upper(text) → text` — The string in upper case. *immutable*
 
 ## Math
 
 - `abs(any) → the type of argument 1` — The absolute value, in the argument's type. *immutable*
+- `acos(any) → float8` — The arccosine, in radians (an argument outside [-1, 1] is out of range). *immutable*
+- `acosd(any) → float8` — The arccosine, in degrees. *immutable*
+- `acosh(any) → float8` — The inverse hyperbolic cosine (out of range below 1). *immutable*
+- `asin(any) → float8` — The arcsine, in radians (an argument outside [-1, 1] is out of range). *immutable*
+- `asind(any) → float8` — The arcsine, in degrees. *immutable*
+- `asinh(any) → float8` — The inverse hyperbolic sine. *immutable*
+- `atan(any) → float8` — The arctangent, in radians. *immutable*
+- `atan2(any, any) → float8` — atan2(y, x): the arctangent of y/x, in radians, in the quadrant of (x, y). *immutable*
+- `atan2d(any, any) → float8` — atan2d(y, x): the arctangent of y/x, in degrees. *immutable*
+- `atand(any) → float8` — The arctangent, in degrees. *immutable*
+- `atanh(any) → float8` — The inverse hyperbolic tangent (out of range outside [-1, 1]; ±Infinity at ±1). *immutable*
 - `cbrt(any) → float8` — The cube root. *immutable*
 - `ceil(any) → the type of argument 1` (also `ceiling`) — The smallest integer not less than the argument, in its type. *immutable*
+- `cos(any) → float8` — The cosine of an angle in radians. *immutable*
+- `cosd(any) → float8` — The cosine of an angle in degrees (exact at the special angles: cosd(60) = 0.5). *immutable*
+- `cosh(any) → float8` — The hyperbolic cosine. *immutable*
+- `cot(any) → float8` — The cotangent of an angle in radians (Infinity at 0). *immutable*
+- `cotd(any) → float8` — The cotangent of an angle in degrees (Infinity at 0). *immutable*
+- `degrees(any) → float8` — Radians converted to degrees. *immutable*
 - `div(any, any) → int8` — The integer quotient, truncated toward zero. *immutable*
+- `erf(any) → float8` — The error function. *immutable*
+- `erfc(any) → float8` — The complementary error function, 1 - erf(x) without the loss of precision. *immutable*
 - `exp(any) → float8` — e raised to the argument. *immutable*
+- `factorial(int8) → decimal` — n! as a numeric (an error for a negative n). *immutable*
 - `floor(any) → the type of argument 1` — The largest integer not greater than the argument, in its type. *immutable*
 - `gcd(int8, int8) → int8` — The greatest common divisor. *immutable*
+- `lcm(int8, int8) → int8` — The least common multiple (0 when either argument is 0). *immutable*
 - `ln(any) → float8` — The natural logarithm (an error at or below zero). *immutable*
 - `log(any, [any]) → float8` (also `log10`) — log(x) is the base-10 logarithm; log(b, x) the logarithm of x in base b. *immutable*
+- `min_scale(decimal) → int8` — The fewest fractional digits that represent the value exactly. *immutable*
 - `mod(any, any) → the type of argument 1` — The remainder of the division (the sign of the dividend), as the % operator. *immutable*
 - `pi() → float8` — π. *immutable*
 - `power(any, any) → float8` (also `pow`) — The first argument raised to the second (also the ^ operator). *immutable*
-- `random() → float8` — A random value in [0, 1), fresh per row. *volatile*
+- `radians(any) → float8` — Degrees converted to radians. *immutable*
+- `random([any], [any]) → float8` — A random value in [0, 1), fresh per row; random(min, max) one in [min, max]: an integer for integer bounds, else a numeric at the larger of their scales. *volatile*
+- `random_normal([float8], [float8]) → float8` — A normally distributed random value with the given mean (0) and standard deviation (1), fresh per row. *volatile*
 - `round(any, [int8]) → the type of argument 1` — Rounds to the nearest integer, or to the given number of decimal places (halves away from zero); a decimal stays exact. *immutable*
+- `scale(decimal) → int8` — The number of decimal digits in the fractional part (of the value as datax holds it: without trailing zeros). *immutable*
 - `sign(any) → int8` — -1, 0 or 1 by the argument's sign. *immutable*
+- `sin(any) → float8` — The sine of an angle in radians. *immutable*
+- `sind(any) → float8` — The sine of an angle in degrees (exact at the special angles: sind(30) = 0.5). *immutable*
+- `sinh(any) → float8` — The hyperbolic sine. *immutable*
 - `sqrt(any) → float8` — The square root (an error below zero). *immutable*
+- `tan(any) → float8` — The tangent of an angle in radians. *immutable*
+- `tand(any) → float8` — The tangent of an angle in degrees (exact at the special angles: tand(45) = 1). *immutable*
+- `tanh(any) → float8` — The hyperbolic tangent. *immutable*
+- `trim_scale(decimal) → decimal` — The value with its trailing fractional zeros removed. *immutable*
 - `trunc(any, [int8]) → the type of argument 1` — Truncates toward zero, to an integer or to the given number of decimal places. *immutable*
 - `width_bucket(any, any, any, int8) → int8` — The bucket (1..count) the operand falls in when [low, high) is split into count equal buckets; 0 below, count+1 above. *immutable*
 
@@ -116,6 +168,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 ## Set-returning functions
 
 - `generate_series(any, any, [any]) → setof the type of its bounds` — The values from start to stop (inclusive) by step (1 by default): integers, numerics, or timestamps stepped by an interval (generate_series(start, stop, interval '1 day')). A zero step is an error (22023). *immutable*
+- `generate_subscripts(any, int8, [bool]) → setof int8` — The subscripts of the array's given dimension (1 to its length for dimension 1; none for an empty array or another dimension), in reverse when the third argument is true. *immutable*
 
 ## Full-text search
 
@@ -221,14 +274,23 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 - `array_append(any, any) → the type of argument 1` — The array with the value appended. *immutable, handles NULL arguments*
 - `array_cat(any, any) → the type of argument 1` — The two arrays concatenated. *immutable, handles NULL arguments*
+- `array_dims(any) → text` — The text of an array's dimensions ([1:3] for three elements; NULL when empty). *immutable*
+- `array_fill(any, any, [any]) → the type of argument 1` — An array of the given length (ARRAY[n]; one dimension, lower bound 1) filled with the value. *immutable, handles NULL arguments*
 - `array_length(any, int8) → int8` — The number of elements of an array (dimension 1; NULL for an empty array or another dimension). *immutable*
 - `array_lower(any, int8) → int8` — The lower bound of an array's dimension (1; NULL when empty). *immutable*
 - `array_ndims(any) → int8` — The number of dimensions of an array (1; NULL when empty). *immutable*
 - `array_position(any, any) → int8` — The 1-based position of the first element equal to the value (NULL when absent). *immutable, handles NULL arguments*
+- `array_positions(any, any) → int8[]` — The 1-based positions of every element equal to the value (IS NOT DISTINCT FROM: NULL finds the NULLs); empty when there is none. *immutable, handles NULL arguments*
 - `array_prepend(any, any) → the type of argument 2` — The array with the value prepended. *immutable, handles NULL arguments*
 - `array_remove(any, any) → the type of argument 1` — The array without the elements equal to the value. *immutable, handles NULL arguments*
+- `array_replace(any, any, any) → the type of argument 1` — The array with each element equal to the second argument (IS NOT DISTINCT FROM) replaced by the third. *immutable, handles NULL arguments*
+- `array_reverse(any) → the type of argument 1` — The array's elements in reverse order. *immutable*
+- `array_sample(any, int8) → the type of argument 1` — n elements of the array chosen at random, in random order (22023 unless 0 ≤ n ≤ its length). *volatile*
+- `array_shuffle(any) → the type of argument 1` — The array's elements in random order. *volatile*
+- `array_sort(any, [bool], [bool]) → the type of argument 1` — The array's elements sorted: ascending with NULLs last by default; descending (second argument true) puts NULLs first unless the third argument (nulls_first) says otherwise. *immutable*
 - `array_to_string(any, text, [text]) → text` — The elements joined by the separator; NULL elements are skipped unless the third argument gives their text. *immutable, handles NULL arguments*
 - `array_upper(any, int8) → int8` — The upper bound of an array's dimension (its length; NULL when empty). *immutable*
 - `cardinality(any) → int8` — The number of elements of an array (0 for an empty one). *immutable*
 - `string_to_array(text, text, [text]) → text[]` — The text split on the separator into a text array (an empty separator yields one element; a NULL separator splits into characters); the third argument names the text that becomes NULL. *immutable, handles NULL arguments*
+- `trim_array(any, int8) → the type of argument 1` — The array without its last n elements (2202E unless 0 ≤ n ≤ its length). *immutable*
 

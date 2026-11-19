@@ -64,6 +64,10 @@ type Builtin struct {
 	NotStrict bool
 	// Fn evaluates the call on coerced arguments.
 	Fn func(args []types.Datum) (types.Datum, error)
+	// Alt, when set, sees the arguments before coercion and may take
+	// the call (ok true) for a form the declared families do not
+	// describe: substring's text pattern in place of its position.
+	Alt func(args []types.Datum) (d types.Datum, ok bool, err error)
 	// Category and Doc feed the reference: a section and one line.
 	Category string
 	Doc      string
@@ -121,6 +125,8 @@ const (
 	CodeNotSupported    = "0A000"
 	CodeInvalidRegexp   = "2201B"
 	CodeInvalidEscape   = "22025"
+	// CodeInvalidEscapeUse is invalid_use_of_escape_character.
+	CodeInvalidEscapeUse = "2200C"
 )
 
 func errf(code, format string, args ...any) error {
@@ -226,6 +232,11 @@ func (b *Builtin) CallIn(args []types.Datum, loc *time.Location) (types.Datum, e
 	if b.Rows != nil {
 		return types.Datum{}, errf(CodeNotSupported, "set-returning function %s() is only supported in FROM or in a select list without FROM", b.Name)
 	}
+	if b.Alt != nil && b.ArityOK(len(args)) {
+		if d, ok, err := b.Alt(args); ok {
+			return d, err
+		}
+	}
 	coerced, null, err := b.coerceArgs(args)
 	if err != nil || null {
 		return types.DNull, err
@@ -305,9 +316,14 @@ func (b *Builtin) coerceArgs(args []types.Datum) (coerced []types.Datum, null bo
 			coerced[i] = a
 			continue
 		}
-		if want == types.String && a.Fam == types.Bytes && b.Bytea {
-			coerced[i] = a
-			continue
+		if want == types.String && a.Fam == types.Bytes {
+			if b.Bytea {
+				coerced[i] = a
+				continue
+			}
+			// bytea has no implicit cast to text: a text function
+			// without a bytea form does not take one.
+			return nil, false, errf(CodeUndefined, "function %s(%s) does not exist", b.Name, familiesText(args))
 		}
 		if want == types.String {
 			// Anything renders as text (lenient, like the || operator).
@@ -328,6 +344,8 @@ func familiesText(args []types.Datum) string {
 	for i, a := range args {
 		if a.Null {
 			names[i] = "unknown"
+		} else if a.Fam == types.Bytes {
+			names[i] = "bytea"
 		} else {
 			names[i] = strings.ToLower(a.Fam.String())
 		}

@@ -180,6 +180,10 @@ type Datum struct {
 	// A holds an array's elements (Fam is ArrayOf(elem)); a NULL element
 	// is a Null datum.
 	A []Datum `json:"a,omitempty"`
+	// Reg is DISPLAY-ONLY: an Int datum that is a reg* value
+	// ('t'::regclass, 'lower'::regproc) carries the object's name, which
+	// it renders as; the OID in I is what it compares and casts as.
+	Reg string `json:"-"`
 	// Loc is a READ hint, never stored: a String datum the session took
 	// from a statement's literal or text parameter carries the
 	// session's TimeZone, in which it reads as a TIMESTAMPTZ when its
@@ -280,7 +284,7 @@ func ParseTimestampNoTZ(s string) (int64, error) {
 			if wall.Before(minTimestamp) || !wall.Before(maxTimestamp) {
 				return 0, fmt.Errorf("%w: %q (1678-01-01 to 2261-12-31)", ErrTimestampRange, s)
 			}
-			return wall.UnixNano(), nil
+			return RoundMicros(wall.UnixNano()), nil
 		}
 	}
 	return 0, fmt.Errorf("could not parse %q as TIMESTAMP", s)
@@ -304,6 +308,22 @@ func RoundTimestamp(nanos int64, p int32) int64 {
 	return -((-nanos + half) / unit * unit)
 }
 
+// RoundMicros rounds UTC nanoseconds to whole microseconds, the
+// precision PostgreSQL keeps: timestamp input rounds to it, and text
+// output never shows more than six fractional digits.
+func RoundMicros(nanos int64) int64 { return RoundTimestamp(nanos, 6) }
+
+// TruncMicros truncates UTC nanoseconds to whole microseconds (toward
+// the past): a clock reading at PostgreSQL's precision, which takes
+// the microseconds gettimeofday reports.
+func TruncMicros(nanos int64) int64 {
+	m := nanos / 1000
+	if nanos%1000 < 0 {
+		m--
+	}
+	return m * 1000
+}
+
 // ParseDate parses a YYYY-MM-DD date string to days since the Unix epoch.
 func ParseDate(s string) (int64, error) {
 	t, err := time.ParseInLocation("2006-01-02", s, time.UTC)
@@ -313,18 +333,56 @@ func ParseDate(s string) (int64, error) {
 	return t.Unix() / 86400, nil
 }
 
-// ParseBytes parses PostgreSQL bytea text input: \x-prefixed hex, or the
-// raw string bytes otherwise.
+// ParseBytes parses PostgreSQL bytea text input: \x-prefixed hex
+// (whitespace between digit pairs allowed), or the escape format
+// otherwise (ParseByteaEscape).
 func ParseBytes(s string) ([]byte, error) {
 	if strings.HasPrefix(s, `\x`) {
-		b, err := hex.DecodeString(s[2:])
+		h := s[2:]
+		if strings.ContainsAny(h, " \t\n\r") {
+			h = strings.Join(strings.Fields(h), "")
+		}
+		b, err := hex.DecodeString(h)
 		if err != nil {
 			return nil, fmt.Errorf("could not parse %q as BYTES", s)
 		}
 		return b, nil
 	}
-	return []byte(s), nil
+	return ParseByteaEscape(s)
 }
+
+// ParseByteaEscape reads bytea's escape format: \\ is a backslash,
+// \ooo (three octal digits, at most \377) the byte so numbered, and
+// every other character itself; any other backslash is an error, as
+// PostgreSQL's byteain raises it.
+func ParseByteaEscape(s string) ([]byte, error) {
+	if !strings.Contains(s, `\`) {
+		return []byte(s), nil
+	}
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' {
+			out = append(out, c)
+			continue
+		}
+		switch {
+		case i+1 < len(s) && s[i+1] == '\\':
+			out = append(out, '\\')
+			i++
+		case i+3 < len(s) && s[i+1] >= '0' && s[i+1] <= '3' && s[i+2] >= '0' && s[i+2] <= '7' && s[i+3] >= '0' && s[i+3] <= '7':
+			out = append(out, (s[i+1]-'0')<<6|(s[i+2]-'0')<<3|(s[i+3]-'0'))
+			i += 3
+		default:
+			return nil, ErrByteaSyntax
+		}
+	}
+	return out, nil
+}
+
+// ErrByteaSyntax is a bytea input with a backslash that starts no
+// escape.
+var ErrByteaSyntax = errors.New("invalid input syntax for type bytea")
 
 // ParseUUID parses the canonical 8-4-4-4-12 form (dashes optional).
 func ParseUUID(s string) ([16]byte, error) {
@@ -343,6 +401,9 @@ func ParseUUID(s string) ([16]byte, error) {
 
 // ParseDecimal parses and canonicalizes a decimal literal.
 func ParseDecimal(s string) (Datum, error) {
+	if sp, ok := parseDecimalSpecial(s); ok {
+		return NewDecimal(sp), nil
+	}
 	d, err := decimal.Parse(s)
 	if err != nil {
 		return Datum{}, fmt.Errorf("could not parse %q as DECIMAL", s)
@@ -484,6 +545,9 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 	case d.Fam == Decimal && target == Float:
 		// Lossy narrowing is allowed on demand (the reverse is not:
 		// Float→Decimal would launder binary rounding into "exact").
+		if f, ok := DecimalSpecial(d); ok {
+			return NewFloat(f), nil
+		}
 		v, err := d.DecimalVal()
 		if err != nil {
 			return Datum{}, err
@@ -545,6 +609,11 @@ func (d Datum) Compare(o Datum) (int, error) {
 	if d.Fam == Decimal || o.Fam == Decimal {
 		if (d.Fam == Decimal || d.Fam == Int || d.Fam == Float) &&
 			(o.Fam == Decimal || o.Fam == Int || o.Fam == Float) {
+			// NaN and the infinities order by rank: -Infinity, the
+			// finite values, Infinity, NaN.
+			if dr, or := specialRank(d), specialRank(o); dr != 0 || or != 0 {
+				return cmpInt(int64(dr), int64(or)), nil
+			}
 			dv, err := d.liftDecimal()
 			if err != nil {
 				return 0, err
@@ -611,11 +680,17 @@ func (d Datum) Compare(o Datum) (int, error) {
 	case Decimal:
 		return 0, fmt.Errorf("unreachable") // handled above
 	case Jsonb:
-		// Equality by canonical text; no defined ordering.
+		// Equality by canonical text; the order is PostgreSQL's jsonb
+		// order, with documents it ties (1 and 1.0) ordered by their
+		// text so that only equal texts compare equal.
 		if d.S == o.S {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("JSONB values have no order")
+		c, ok := compareJSONB(d.S, o.S)
+		if !ok || c == 0 {
+			return strings.Compare(d.S, o.S), nil
+		}
+		return c, nil
 	case Tsvector, Tsquery:
 		// Equality by canonical text, like JSONB.
 		if d.S == o.S {
@@ -692,17 +767,18 @@ func cmpBool(a, b bool) int {
 // FormatTimestamp renders UTC nanoseconds in PostgreSQL's text form,
 // with the "+00" offset (TIMESTAMPTZ) or without it (TIMESTAMP).
 func FormatTimestamp(nanos int64, noTZ bool) string {
+	nanos = RoundMicros(nanos)
 	if noTZ {
-		return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999")
+		return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999")
 	}
-	return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999999-07")
+	return time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.999999-07")
 }
 
 // FormatTimestampIn renders UTC nanoseconds in loc, PostgreSQL style:
 // the offset as "-05" for whole hours, "+05:30" otherwise.
 func FormatTimestampIn(nanos int64, loc *time.Location) string {
-	t := time.Unix(0, nanos).In(loc)
-	s := t.Format("2006-01-02 15:04:05.999999999-07:00")
+	t := time.Unix(0, RoundMicros(nanos)).In(loc)
+	s := t.Format("2006-01-02 15:04:05.999999-07:00")
 	s = strings.TrimSuffix(s, ":00")
 	return s
 }
@@ -766,6 +842,9 @@ func (d Datum) Text() string {
 	}
 	switch d.Fam {
 	case Int:
+		if d.Reg != "" {
+			return d.Reg
+		}
 		return strconv.FormatInt(d.I, 10)
 	case Float:
 		return FormatFloat8(d.F)
@@ -795,7 +874,7 @@ func (d Datum) Text() string {
 		h := hex.EncodeToString(b)
 		return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 	case Decimal:
-		if d.Dscale > 0 {
+		if _, special := DecimalSpecial(d); d.Dscale > 0 && !special {
 			return padDecimalScale(d.S, d.Dscale)
 		}
 		return d.S // canonical text IS the wire text

@@ -50,6 +50,8 @@ type CopyIn struct {
 	committed int64
 	// inBlock: the COPY runs in the session's transaction block.
 	inBlock bool
+	// opts is the data format, its options validated.
+	opts *CopyOut
 }
 
 // Text returns a COPY field's text as a datum to coerce to its column:
@@ -80,6 +82,7 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 	}
 	s.policyMemo = nil // a statement of its own, though not run by Execute
 	var target []catalog.Column
+	var opts *CopyOut
 	err := s.copyTxn(ctx, inBlock, "copy-begin", func(ctx context.Context, txn *kvclient.Txn) error {
 		desc, err := s.lookup(ctx, txn, cf.Table)
 		if err != nil {
@@ -91,7 +94,10 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 		if err := s.checkTablePriv(ctx, txn, desc, "INSERT"); err != nil {
 			return err
 		}
-		target, err = resolveInsertTargets(desc, cf.Columns)
+		if target, err = resolveInsertTargets(desc, cf.Columns); err != nil {
+			return err
+		}
+		opts, err = copyFromOptions(cf, desc, target)
 		return err
 	})
 	if err != nil {
@@ -100,8 +106,53 @@ func (s *Session) BeginCopy(ctx context.Context, cf *parser.CopyFrom) (*CopyIn, 
 		}
 		return nil, err
 	}
-	return &CopyIn{s: s, table: cf.Table, target: target, inBlock: inBlock}, nil
+	return &CopyIn{s: s, table: cf.Table, target: target, inBlock: inBlock, opts: opts}, nil
 }
+
+// copyFromOptions validates a COPY FROM's options and resolves its
+// FORCE_NOT_NULL and FORCE_NULL columns against the columns it reads,
+// with PostgreSQL's errors.
+func copyFromOptions(cf *parser.CopyFrom, desc *catalog.TableDescriptor, target []catalog.Column) (*CopyOut, error) {
+	co, lists, err := processCopyOptions(cf.Options, true)
+	if err != nil {
+		return nil, err
+	}
+	resolve := func(option string, names []string, all bool) ([]bool, error) {
+		if names == nil && !all {
+			return nil, nil
+		}
+		flags := make([]bool, len(target))
+		for i := range flags {
+			flags[i] = all
+		}
+		visible := desc.VisibleColumns()
+		for _, name := range names {
+			if !hasColumn(visible, name) {
+				return nil, newErrf(CodeUndefinedColumn, "column %q of relation %q does not exist", name, desc.Name)
+			}
+			found := false
+			for i, c := range target {
+				if c.Name == name {
+					flags[i], found = true, true
+				}
+			}
+			if !found {
+				return nil, newErrf(CodeInvalidColumnReference, "%s column %q not referenced by COPY", option, name)
+			}
+		}
+		return flags, nil
+	}
+	if co.ForceNotNull, err = resolve("FORCE_NOT_NULL", lists.forceNotNull, lists.forceNotNullAll); err != nil {
+		return nil, err
+	}
+	if co.ForceNull, err = resolve("FORCE_NULL", lists.forceNull, lists.forceNullAll); err != nil {
+		return nil, err
+	}
+	return co, nil
+}
+
+// Options returns the COPY's data format and options.
+func (ci *CopyIn) Options() *CopyOut { return ci.opts }
 
 // copyTxn runs fn in the transaction block's transaction (once: a
 // conflict fails the block, as any statement's would) or, outside one,

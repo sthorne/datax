@@ -189,9 +189,13 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execShowStats(ctx, txn, t)
 	case *parser.LockTable:
 		return s.execLockTable(ctx, txn, t)
-	case *parser.Analyze:
-		// ANALYZE runs a multi-transaction sweep and is intercepted before
-		// execStmt; reaching here means an unsupported calling context.
+	case *parser.Analyze, *parser.Vacuum:
+		// ANALYZE (and VACUUM, which may run it) sweeps in transactions
+		// of its own and is intercepted before execStmt; reaching here
+		// means an unsupported calling context.
+		if _, ok := stmt.(*parser.Vacuum); ok {
+			return nil, newErrf(CodeFeatureNotSupported, "VACUUM cannot run in this context")
+		}
 		return nil, newErrf(CodeFeatureNotSupported, "ANALYZE cannot run in this context")
 	default:
 		return nil, newErrf(CodeFeatureNotSupported, "unsupported statement %T", stmt)
@@ -2359,6 +2363,12 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	if t.Union != nil {
 		return s.execSetOps(ctx, txn, t, params)
 	}
+	if fromlessGrouped(t) {
+		// SELECT count(*), SELECT max(1) ... HAVING ...: an aggregate in
+		// a select without FROM groups the one row such a select reads,
+		// as PostgreSQL's does. It runs over a one-row derived table.
+		return s.execSelect(ctx, txn, oneRowFrom(t), params)
+	}
 	// Correlated conjuncts leave the WHERE clause before eager subquery
 	// resolution and access planning ever see them; they come back as a
 	// per-row filter after the fetch. Only the plain single-table path
@@ -2368,8 +2378,18 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	var grouped *groupedCorr
 	var post *postSort
 	var jc *joinCorr
+	var onCorrs []*onCorr
 	if t.Table != "" && t.Derived == nil {
 		if outer, rowOf, ok := s.selectScope(ctx, txn, t); ok {
+			if len(t.Joins) > 0 {
+				// Correlated ON conjuncts leave the join filters the
+				// same way, for the join to evaluate per candidate row.
+				ons, c, oerr := s.splitCorrelatedOn(ctx, txn, t, outer.sides)
+				if oerr != nil {
+					return nil, oerr
+				}
+				t, onCorrs = c, ons
+			}
 			plannable, cc, serr := s.splitCorrelatedWhereScope(ctx, txn, t.Where, outer)
 			if serr != nil {
 				return nil, serr
@@ -2411,8 +2431,8 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				}
 				t, grouped = c, g
 			}
-			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0 || grouped != nil) {
-				jc = &joinCorr{conds: corr, projs: corrProjs, grouped: grouped, desc: outer.desc, rowOf: rowOf}
+			if len(t.Joins) > 0 && (len(corr) > 0 || len(corrProjs) > 0 || grouped != nil || onCorrs != nil) {
+				jc = &joinCorr{conds: corr, projs: corrProjs, grouped: grouped, on: onCorrs, desc: outer.desc, rowOf: rowOf}
 			}
 		}
 	}
@@ -3345,6 +3365,15 @@ func (s *Session) execExplain(ctx context.Context, txn *kvclient.Txn, t *parser.
 	// Correlated conjuncts are stripped exactly as execution strips them,
 	// so the plan below describes the plannable remainder.
 	var corr []correlatedConjunct
+	if sel.Table != "" && len(sel.Joins) > 0 && sel.Derived == nil {
+		if outer, _, ok := s.selectScope(ctx, txn, sel); ok {
+			_, c, oerr := s.splitCorrelatedOn(ctx, txn, sel, outer.sides)
+			if oerr != nil {
+				return nil, oerr
+			}
+			sel = c
+		}
+	}
 	if sel.Table != "" && len(sel.Joins) == 0 && sel.Derived == nil {
 		if cdesc, derr := s.lookup(ctx, txn, sel.Table); derr == nil {
 			plannable, cc, serr := s.splitCorrelatedWhere(ctx, txn, sel.Where, cdesc, sel.Table, sel.Alias)
@@ -3730,6 +3759,7 @@ func (s *Session) selectScope(ctx context.Context, txn *kvclient.Txn, t *parser.
 		return scopeLevel{}, nil, false
 	}
 	level, rowOf := joinScope(sides)
+	level.sides = sides
 	return level, rowOf, true
 }
 

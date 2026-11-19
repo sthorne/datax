@@ -689,13 +689,9 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			cd.Name = name
-			withKW := p.consumeIdentWord("with")
-			if withKW || (p.peek().kind == tkOp && p.peek().text == "(") {
-				opts, err := p.parsePlacementOptions()
-				if err != nil {
-					return nil, err
-				}
-				cd.Placement = opts
+			p.consumeIdentWord("with")
+			if err := p.parseCreateDatabaseOptions(cd); err != nil {
+				return nil, err
 			}
 			return cd, nil
 		}
@@ -868,6 +864,9 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parseInsert(true)
 	case "SELECT":
 		return p.parseSelect()
+	case "TABLE":
+		// TABLE name: SELECT * FROM name.
+		return p.parseTableQuery()
 	case "UPDATE":
 		return p.parseUpdate()
 	case "DELETE":
@@ -981,15 +980,8 @@ func (p *parser) parseStatement() (Statement, error) {
 			if p.consumeIdentWord("owner") {
 				return p.parseOwnerTo("database", name)
 			}
-			if p.consumeKeyword("SET") {
-				opts, err := p.parsePlacementOptions()
-				if err != nil {
-					return nil, err
-				}
-				return &AlterDatabase{Name: name, Placement: opts}, nil
-			}
 			if !p.consumeIdentWord("rename") {
-				return nil, p.errf("ALTER DATABASE supports RENAME TO, OWNER TO and SET (placement)")
+				return p.parseAlterDatabaseTail(name)
 			}
 			if err := p.expectKeyword("TO"); err != nil {
 				return nil, err
@@ -1013,11 +1005,11 @@ func (p *parser) parseStatement() (Statement, error) {
 		} else if !p.consumeKeyword("TRANSACTION") {
 			p.consumeIdentWord("work")
 		}
-		readOnly, isolation, _, err := p.parseTransactionModes(t.text)
+		readOnly, isolation, _, asOf, err := p.parseTransactionModesAsOf(t.text)
 		if err != nil {
 			return nil, err
 		}
-		b := &Begin{}
+		b := &Begin{AsOf: asOf}
 		if isolation != "" {
 			b.Modes = append(b.Modes, &SetVar{Name: "transaction_isolation", Value: isolation, Local: true})
 		}
@@ -1063,6 +1055,23 @@ func (p *parser) parseStatement() (Statement, error) {
 			return nil, err
 		}
 		return &ReleaseSavepoint{Name: name}, nil
+	case "discard": // not a reserved word; lexes as an identifier
+		p.i++
+		var kind string
+		switch t := p.peek(); {
+		case t.kind == tkKeyword && t.text == "ALL" || t.isWord("all"):
+			kind = "all"
+		case t.isWord("plans"):
+			kind = "plans"
+		case t.isWord("sequences"):
+			kind = "sequences"
+		case t.isWord("temp") || t.isWord("temporary"):
+			kind = "temp"
+		default:
+			return nil, &SyntaxError{Code: "42601", Pos: t.pos, Msg: fmt.Sprintf("syntax error at or near %q", t.text)}
+		}
+		p.i++
+		return &Discard{Kind: kind}, nil
 	case "listen", "unlisten", "notify": // not reserved words; they lex as identifiers
 		return p.parseListenNotify(t.text)
 	case "lock": // not a reserved word; lexes as an identifier
@@ -1071,6 +1080,8 @@ func (p *parser) parseStatement() (Statement, error) {
 		return p.parsePrepared(t.text)
 	case "declare", "fetch", "move", "close": // not reserved words; they lex as identifiers
 		return p.parseCursor(t.text)
+	case "vacuum": // not a reserved word; lexes as an identifier
+		return p.parseVacuum()
 	case "analyze": // not a reserved word; lexes as an identifier
 		p.i++
 		a := &Analyze{}
@@ -2065,19 +2076,29 @@ func exprContainsColumn(e Expr) bool {
 	return false
 }
 
-// parseTransactionModes parses the transaction modes of SET TRANSACTION,
+// parseTransactionModesAsOf parses the transaction modes of SET TRANSACTION,
 // SET SESSION CHARACTERISTICS AS TRANSACTION, BEGIN and START
 // TRANSACTION, up to the statement's end: ISOLATION LEVEL x, READ ONLY |
 // READ WRITE and [NOT] DEFERRABLE, separated by commas or whitespace.
 // readOnly is "on", "off" or "" (not given); isolation is the lower-cased
 // level or ""; deferrable is "on", "off" or "". what names the
 // statement in errors.
-func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferrable string, err error) {
+// It also takes CockroachDB's AS OF SYSTEM TIME mode (BEGIN AS OF
+// SYSTEM TIME '-5s', SET TRANSACTION AS OF SYSTEM TIME ...); asOf is
+// nil when not given.
+func (p *parser) parseTransactionModesAsOf(what string) (readOnly, isolation, deferrable string, asOf *AsOfClause, err error) {
 	for !p.atStatementEnd() {
 		switch {
+		case p.peek().kind == tkKeyword && p.peek().text == "AS" && p.peekWord(1, "of"):
+			p.i++
+			c, err := p.parseAsOfSystemTime()
+			if err != nil {
+				return "", "", "", nil, err
+			}
+			asOf = &c
 		case p.consumeIdentWord("isolation"):
 			if !p.consumeIdentWord("level") {
-				return "", "", "", p.errf("expected LEVEL after ISOLATION")
+				return "", "", "", nil, p.errf("expected LEVEL after ISOLATION")
 			}
 			var words []string
 			for !p.atStatementEnd() {
@@ -2095,7 +2116,7 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferr
 			switch isolation {
 			case "serializable", "repeatable read", "read committed", "read uncommitted":
 			default:
-				return "", "", "", p.errf("expected an isolation level, found %q", isolation)
+				return "", "", "", nil, p.errf("expected an isolation level, found %q", isolation)
 			}
 		case p.peekIdentSeq("read", "only"):
 			p.i += 2
@@ -2105,17 +2126,17 @@ func (p *parser) parseTransactionModes(what string) (readOnly, isolation, deferr
 			readOnly = "off"
 		case p.consumeKeyword("NOT"):
 			if !p.consumeIdentWord("deferrable") {
-				return "", "", "", p.errf("expected DEFERRABLE after NOT")
+				return "", "", "", nil, p.errf("expected DEFERRABLE after NOT")
 			}
 			deferrable = "off"
 		case p.consumeIdentWord("deferrable"):
 			deferrable = "on"
 		case p.consumeOp(","):
 		default:
-			return "", "", "", p.errf("unexpected %q in %s", p.peek().text, what)
+			return "", "", "", nil, p.errf("unexpected %q in %s", p.peek().text, what)
 		}
 	}
-	return readOnly, isolation, deferrable, nil
+	return readOnly, isolation, deferrable, asOf, nil
 }
 
 // parseCreateSequence parses CREATE SEQUENCE [IF NOT EXISTS] name [options].
@@ -2152,9 +2173,18 @@ func (p *parser) parseSet() (Statement, error) {
 				return &SetTransactionSnapshot{ID: t.text}, nil
 			}
 		}
-		readOnly, isolation, deferrable, err := p.parseTransactionModes("SET TRANSACTION")
+		readOnly, isolation, deferrable, asOf, err := p.parseTransactionModesAsOf("SET TRANSACTION")
 		if err != nil {
 			return nil, err
+		}
+		if asOf != nil {
+			if characteristics {
+				return nil, p.errf("AS OF SYSTEM TIME is not a session characteristic")
+			}
+			if readOnly != "" || isolation != "" || deferrable != "" {
+				return nil, p.errf("SET TRANSACTION AS OF SYSTEM TIME takes no other mode (the transaction is read-only)")
+			}
+			return &SetTransactionAsOf{AsOf: *asOf}, nil
 		}
 		switch {
 		case readOnly != "" && characteristics:
@@ -2834,7 +2864,7 @@ func (p *parser) parseInsert(upsert bool) (Statement, error) {
 			return nil, p.errf("DEFAULT VALUES takes no column list")
 		}
 	}
-	if t := p.peek(); !ins.DefaultValues && ((t.kind == tkKeyword && t.text == "SELECT") || (t.kind == tkOp && t.text == "(") || (t.isWord("with"))) {
+	if t := p.peek(); !ins.DefaultValues && ((t.kind == tkKeyword && (t.text == "SELECT" || t.text == "TABLE")) || (t.kind == tkOp && t.text == "(") || (t.isWord("with"))) {
 		// INSERT INTO t [(cols)] SELECT ... | (query) | WITH ... SELECT ...
 		src, err := p.parseSetMember()
 		if err != nil {
@@ -2944,23 +2974,141 @@ func (p *parser) parseSetClauses() ([]SetClause, error) {
 	}
 	var out []SetClause
 	for {
-		col, err := p.expectIdent()
-		if err != nil {
-			return nil, err
+		if p.peek().kind == tkOp && p.peek().text == "(" {
+			multi, err := p.parseMultiSet()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, multi...)
+		} else {
+			col, err := p.expectIdent()
+			if err != nil {
+				return nil, err
+			}
+			// col[sub]...: a subscripted assignment (jsonb).
+			var subs []Expr
+			for p.consumeOp("[") {
+				sub, err := p.parseAddExpr()
+				if err != nil {
+					return nil, err
+				}
+				if p.peek().kind == tkOp && p.peek().text == ":" {
+					return nil, p.errf("array slices (v[i:j]) are not supported")
+				}
+				if err := p.expectOp("]"); err != nil {
+					return nil, err
+				}
+				subs = append(subs, sub)
+			}
+			if err := p.expectOp("="); err != nil {
+				return nil, err
+			}
+			e, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			if len(subs) == 0 {
+				out = append(out, SetClause{Column: col, Value: e})
+			} else {
+				out = appendSubscriptSet(out, col, e, subs)
+			}
 		}
-		if err := p.expectOp("="); err != nil {
-			return nil, err
-		}
-		e, err := p.parseValueOrColumnExpr()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, SetClause{Column: col, Value: e})
 		if !p.consumeOp(",") {
 			break
 		}
 	}
 	return out, nil
+}
+
+// parseMultiSet parses a multiple-column assignment, (a, b, ...) =
+// source, where the source is a row of values, (x, y) or ROW(x, y), or
+// a subquery, (SELECT x, y ...); each value may be DEFAULT. It yields
+// one SetClause per column. PostgreSQL's errors: a source that is
+// neither is 42601, as is a row of the wrong length.
+func (p *parser) parseMultiSet() ([]SetClause, error) {
+	p.i++ // (
+	var cols []string
+	for {
+		col, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, col)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if err := p.expectOp("="); err != nil {
+		return nil, err
+	}
+	at := p.peek()
+	if sub, ok, err := p.parseSubquery(); err != nil {
+		return nil, err
+	} else if ok {
+		out := make([]SetClause, len(cols))
+		for i, col := range cols {
+			out[i] = SetClause{Column: col, Value: Expr{Sub: sub, SubCol: i + 1, SubCols: len(cols)}}
+		}
+		return out, nil
+	}
+	explicitRow := false
+	if at.isWord("row") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == "(" {
+		p.i++
+		explicitRow = true
+	}
+	if t := p.peek(); t.kind != tkOp || t.text != "(" {
+		return nil, &SyntaxError{Code: "42601", Pos: at.pos, Msg: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"}
+	}
+	p.i++ // (
+	var vals []Expr
+	if !(explicitRow && p.peek().kind == tkOp && p.peek().text == ")") {
+		for {
+			v, err := p.parseValueOrColumnExpr()
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, v)
+			if !p.consumeOp(",") {
+				break
+			}
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if len(vals) == 1 && !explicitRow {
+		// (x) is x, a value, not a row.
+		return nil, &SyntaxError{Code: "42601", Pos: at.pos, Msg: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"}
+	}
+	if len(vals) != len(cols) {
+		return nil, &SyntaxError{Code: "42601", Pos: at.pos, Msg: "number of columns does not match number of values"}
+	}
+	out := make([]SetClause, len(cols))
+	for i, col := range cols {
+		out[i] = SetClause{Column: col, Value: vals[i]}
+	}
+	return out, nil
+}
+
+// appendSubscriptSet adds SET col[subs] = v as an assignment of the
+// whole column, col = subscript_assign(col, 'col', v, subs...). A
+// further subscripted assignment to the same column applies to the
+// result of the earlier ones (SET j['a'] = 1, j['b'] = 2 sets both),
+// as in PostgreSQL.
+func appendSubscriptSet(out []SetClause, col string, v Expr, subs []Expr) []SetClause {
+	name := types.NewString(col)
+	target := Expr{Column: col}
+	for i := range out {
+		if out[i].Column == col && out[i].Value.Func == builtins.SubscriptAssignFunc && out[i].Value.BinOp == "" && out[i].Value.Cast == "" {
+			prev := out[i].Value
+			out[i].Value = Expr{Func: builtins.SubscriptAssignFunc, Args: append([]Expr{prev, {Lit: &name}, v}, subs...)}
+			return out
+		}
+	}
+	return append(out, SetClause{Column: col, Value: Expr{Func: builtins.SubscriptAssignFunc, Args: append([]Expr{target, {Lit: &name}, v}, subs...)}})
 }
 
 // parseOptReturning parses RETURNING * | expr [AS alias], ... ("returning"
@@ -3058,17 +3206,34 @@ func (p *parser) parseCopy() (Statement, error) {
 	if !p.consumeIdentWord("stdin") {
 		return nil, p.errf("only COPY ... FROM STDIN is supported, found %q", p.peek().text)
 	}
-	switch {
-	case p.consumeIdentWord("binary"):
-		cf.Format = CopyFormatBinary
-	default:
-		hasWith := p.consumeIdentWord("with")
-		if p.consumeOp("(") {
-			if err := p.parseCopyOptions(cf); err != nil {
-				return nil, err
-			}
-		} else if hasWith {
-			return nil, p.errf("expected ( after WITH, found %q", p.peek().text)
+	if binaryPrefix {
+		cf.Options = append(cf.Options, CopyOption{Name: "format", Arg: "binary", HasArg: true})
+	}
+	// [WITH] (option [argument], ...) or the pre-9.0 keywords (BINARY,
+	// CSV HEADER, DELIMITER ',', ...), validated by the session as
+	// PostgreSQL validates them, at execution.
+	p.consumeIdentWord("with")
+	var opts []CopyOption
+	if p.consumeOp("(") {
+		opts, err = p.parseCopyGenericOptions()
+	} else {
+		opts, err = p.parseCopyLegacyOptions()
+	}
+	if err != nil {
+		return nil, err
+	}
+	cf.Options = append(cf.Options, opts...)
+	for _, o := range cf.Options {
+		if o.Name != "format" || !o.HasArg {
+			continue
+		}
+		switch o.Arg {
+		case "text":
+			cf.Format = CopyFormatText
+		case "csv":
+			cf.Format = CopyFormatCSV
+		case "binary":
+			cf.Format = CopyFormatBinary
 		}
 	}
 	return cf, nil
@@ -3284,42 +3449,6 @@ func (p *parser) parseCopyLegacyOptions() ([]CopyOption, error) {
 	return out, nil
 }
 
-// parseCopyOptions parses the body of a COPY option list after its opening
-// paren: option [value] pairs with NO "=" (unlike parseOptionList's
-// name = value shape used by CREATE TABLE ... WITH).
-func (p *parser) parseCopyOptions(cf *CopyFrom) error {
-	for {
-		name, err := p.expectIdent()
-		if err != nil {
-			return err
-		}
-		switch name {
-		case "format":
-			t := p.peek()
-			if t.kind != tkIdent && t.kind != tkString {
-				return p.errf("expected a format name, found %q", t.text)
-			}
-			p.i++
-			switch strings.ToLower(t.text) {
-			case "text":
-				cf.Format = CopyFormatText
-			case "csv":
-				cf.Format = CopyFormatCSV
-			case "binary":
-				cf.Format = CopyFormatBinary
-			default:
-				return p.errf("unknown COPY format %q", t.text)
-			}
-		default:
-			return p.errf("unsupported COPY option %q", name)
-		}
-		if !p.consumeOp(",") {
-			break
-		}
-	}
-	return p.expectOp(")")
-}
-
 func (p *parser) parseSelect() (Statement, error) {
 	if err := p.enter(); err != nil {
 		return nil, err
@@ -3418,42 +3547,98 @@ func (p *parser) parseSelect() (Statement, error) {
 		// AS OF SYSTEM TIME <literal> (parseOptTableAlias leaves this AS
 		// untouched; SYSTEM and TIME lex as identifiers).
 		if p.consumeKeyword("AS") {
-			for _, word := range []string{"of", "system", "time"} {
-				if t := p.peek(); t.isWord(word) {
-					p.i++
-				} else {
-					return nil, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
-				}
+			aost, err := p.parseAsOfSystemTime()
+			if err != nil {
+				return nil, err
 			}
-			// with_max_staleness('10s') asks for the freshest timestamp
-			// the local store can serve within the bound (bounded
-			// staleness); a bare literal pins an exact timestamp.
-			if p.consumeIdentWord("with_max_staleness") {
-				if err := p.expectOp("("); err != nil {
-					return nil, err
-				}
-				t := p.peek()
-				if t.kind != tkString {
-					return nil, p.errf("with_max_staleness expects a duration string, found %q", t.text)
-				}
-				sel.AsOfMaxStaleness = t.text
-				p.i++
-				if err := p.expectOp(")"); err != nil {
-					return nil, err
-				}
-			} else {
-				t := p.peek()
-				switch t.kind {
-				case tkString, tkNumber:
-					sel.AsOf = t.text
-					p.i++
-				default:
-					return nil, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
-				}
-			}
+			sel.AsOf, sel.AsOfMaxStaleness, sel.AsOfMinTimestamp, sel.AsOfNearestOnly = aost.Exact, aost.MaxStaleness, aost.MinTimestamp, aost.NearestOnly
 		}
 	}
 	return p.finishSelect(sel)
+}
+
+// FollowerReadTimestamp is the AS OF SYSTEM TIME operand
+// follower_read_timestamp() (CockroachDB's), as AsOfClause.Exact holds
+// it: a timestamp old enough for any replica to serve.
+const FollowerReadTimestamp = "follower_read_timestamp()"
+
+// parseAsOfOperand parses what follows AS OF SYSTEM TIME:
+//
+//	'-5s' | '2026-08-30T10:00:00Z' | 1756548000000000000
+//	follower_read_timestamp()
+//	with_max_staleness('10s' [, nearest_only])
+//	with_min_timestamp('2026-08-30T10:00:00Z' [, nearest_only])
+//
+// with_max_staleness and with_min_timestamp ask for the freshest
+// timestamp the local replicas can serve within the bound (bounded
+// staleness); the others pin an exact timestamp.
+func (p *parser) parseAsOfOperand() (AsOfClause, error) {
+	var c AsOfClause
+	t := p.peek()
+	switch {
+	case t.kind == tkString || t.kind == tkNumber:
+		c.Exact = t.text
+		p.i++
+		return c, nil
+	case t.isWord("follower_read_timestamp") || t.isWord("experimental_follower_read_timestamp"):
+		p.i++
+		if err := p.expectOp("("); err != nil {
+			return c, err
+		}
+		if err := p.expectOp(")"); err != nil {
+			return c, err
+		}
+		c.Exact = FollowerReadTimestamp
+		return c, nil
+	case t.isWord("with_max_staleness") || t.isWord("with_min_timestamp"):
+		p.i++
+		if err := p.expectOp("("); err != nil {
+			return c, err
+		}
+		arg := p.peek()
+		if arg.kind != tkString {
+			what := "a duration"
+			if t.text == "with_min_timestamp" {
+				what = "a timestamp"
+			}
+			return c, p.errf("%s expects %s string, found %q", t.text, what, arg.text)
+		}
+		p.i++
+		if t.text == "with_max_staleness" {
+			c.MaxStaleness = arg.text
+		} else {
+			c.MinTimestamp = arg.text
+		}
+		if p.consumeOp(",") {
+			b := p.peek()
+			switch {
+			case b.kind == tkKeyword && b.text == "TRUE":
+				c.NearestOnly = true
+			case b.kind == tkKeyword && b.text == "FALSE":
+			default:
+				return c, p.errf("%s's nearest_only argument must be TRUE or FALSE, found %q", t.text, b.text)
+			}
+			p.i++
+		}
+		if err := p.expectOp(")"); err != nil {
+			return c, err
+		}
+		return c, nil
+	}
+	return c, p.errf("expected AS OF SYSTEM TIME operand, found %q", t.text)
+}
+
+// parseAsOfSystemTime parses AS OF SYSTEM TIME operand, the AS already
+// consumed.
+func (p *parser) parseAsOfSystemTime() (AsOfClause, error) {
+	for _, word := range []string{"of", "system", "time"} {
+		if t := p.peek(); t.isWord(word) {
+			p.i++
+		} else {
+			return AsOfClause{}, p.errf("expected %s in AS OF SYSTEM TIME, found %q", strings.ToUpper(word), t.text)
+		}
+	}
+	return p.parseAsOfOperand()
 }
 
 // parseDerivedTable parses a FROM-list subquery member — (SELECT ...),
@@ -3515,7 +3700,8 @@ func (p *parser) parseDerivedTable() (*Select, string, bool, error) {
 			}
 		}
 		if len(cols) > len(sub.Exprs) {
-			return nil, "", false, p.errf("table %q has %d columns available but %d columns specified", alias, len(sub.Exprs), len(cols))
+			return nil, "", false, &SyntaxError{Code: "42P10", Pos: p.peek().pos,
+				Msg: fmt.Sprintf("table %q has %d columns available but %d columns specified", alias, len(sub.Exprs), len(cols))}
 		}
 		// The head member names a set operation's columns.
 		for i, c := range cols {
@@ -3523,6 +3709,36 @@ func (p *parser) parseDerivedTable() (*Select, string, bool, error) {
 		}
 	}
 	return sub, alias, true, nil
+}
+
+// lateralValues rewrites a LATERAL VALUES list of several rows, which
+// may read the columns of the members to its left, into the one select
+// the lateral machinery runs per row: each column the unnest of the
+// array of its rows' values, the unnests in lockstep (SELECT
+// unnest(ARRAY[a1, a2]) AS column1, unnest(ARRAY[b1, b2]) AS column2
+// for VALUES (a1, b1), (a2, b2)). An array's elements take one type the
+// way a VALUES column does. Any other query is returned as it is.
+func lateralValues(sub *Select) *Select {
+	if !sub.Values || sub.Union == nil || len(sub.OrderBy) > 0 || sub.Limit >= 0 || sub.Offset > 0 ||
+		sub.LimitParam > 0 || sub.OffsetParam > 0 {
+		return sub
+	}
+	var rows []*Select
+	for m := sub; m != nil; m = m.Union {
+		if !m.Values || len(m.Exprs) != len(sub.Exprs) || (m.Union != nil && (m.SetOp != "" || !m.UnionAll)) {
+			return sub
+		}
+		rows = append(rows, m)
+	}
+	out := &Select{Limit: -1}
+	for c, head := range sub.Exprs {
+		arr := Expr{Func: "array_construct"}
+		for _, r := range rows {
+			arr.Args = append(arr.Args, r.Exprs[c].Expr)
+		}
+		out.Exprs = append(out.Exprs, SelectExpr{Expr: Expr{Func: "unnest", Args: []Expr{arr}}, Alias: head.Alias})
+	}
+	return out
 }
 
 // parseFromList parses a FROM list — the members after FROM, and after
@@ -3592,6 +3808,9 @@ func (p *parser) parseFromList(sel *Select) error {
 		} else if sub, alias, ok, err := p.parseDerivedTable(); err != nil {
 			return err
 		} else if ok {
+			if jc.Lateral {
+				sub = lateralValues(sub)
+			}
 			jc.Derived, jc.Alias = sub, alias
 			jc.Table = jc.Alias
 		} else if jc.Lateral {
@@ -4347,6 +4566,8 @@ func (p *parser) parseSetMember() (*Select, error) {
 			return nil, p.errf("a WITH used as a query must end in a SELECT")
 		}
 		return sel, nil
+	case t.kind == tkKeyword && t.text == "TABLE":
+		return p.parseTableQuery()
 	case t.kind == tkKeyword && t.text == "VALUES":
 		stmt, err := p.parseValuesQuery()
 		if err != nil {
@@ -4366,6 +4587,29 @@ func (p *parser) parseSetMember() (*Select, error) {
 		return head, nil
 	}
 	return nil, p.errf("expected SELECT, VALUES or a parenthesized query, found %q", t.text)
+}
+
+// parseTableQuery parses TABLE [ONLY] name [*] [ORDER BY ...] [LIMIT
+// ...] [set operations]: the SQL standard's shorthand for SELECT * FROM
+// name.
+func (p *parser) parseTableQuery() (*Select, error) {
+	p.i++ // TABLE
+	if t := p.peek(); t.isWord("only") && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+		p.i++
+	}
+	name, err := p.parseTableName()
+	if err != nil {
+		return nil, err
+	}
+	p.consumeOp("*") // name * (descendant tables: there are none)
+	sel := &Select{Limit: -1, Exprs: []SelectExpr{{Star: true}}, Table: name}
+	if err := p.parseOrderLimit(sel, true); err != nil {
+		return nil, err
+	}
+	if err := p.parseSetOps(sel); err != nil {
+		return nil, err
+	}
+	return sel, nil
 }
 
 // parseParenMember parses (query) [ORDER BY ...] [LIMIT ...] [set ops]:
@@ -4403,7 +4647,8 @@ func (p *parser) parseValuesQuery() (Statement, error) {
 		if err := p.expectOp("("); err != nil {
 			return nil, err
 		}
-		row := &Select{Limit: -1}
+		at := p.peek().pos
+		row := &Select{Limit: -1, Values: true}
 		for {
 			e, err := p.parseValueOrColumnExpr()
 			if err != nil {
@@ -4416,6 +4661,9 @@ func (p *parser) parseValuesQuery() (Statement, error) {
 		}
 		if err := p.expectOp(")"); err != nil {
 			return nil, err
+		}
+		if head != nil && len(row.Exprs) != len(head.Exprs) {
+			return nil, &SyntaxError{Code: "42601", Pos: at, Msg: "VALUES lists must all be the same length"}
 		}
 		if head == nil {
 			head = row
@@ -4550,6 +4798,11 @@ var aggNames = map[string]bool{
 	"stddev": true, "stddev_samp": true, "stddev_pop": true, "variance": true, "var_samp": true, "var_pop": true,
 	"percentile_cont": true, "percentile_disc": true,
 	"json_agg": true, "jsonb_agg": true, "json_object_agg": true, "jsonb_object_agg": true,
+	"json_agg_strict": true, "jsonb_agg_strict": true, "json_object_agg_strict": true, "jsonb_object_agg_strict": true,
+	"json_object_agg_unique": true, "jsonb_object_agg_unique": true, "json_object_agg_unique_strict": true, "jsonb_object_agg_unique_strict": true,
+	"any_value": true, "bit_and": true, "bit_or": true, "bit_xor": true,
+	"corr": true, "covar_pop": true, "covar_samp": true, "regr_avgx": true, "regr_avgy": true, "regr_count": true, "regr_intercept": true,
+	"regr_r2": true, "regr_slope": true, "regr_sxx": true, "regr_sxy": true, "regr_syy": true,
 }
 
 // parseAggExpr parses an aggregate call when the next tokens form one:
@@ -5868,7 +6121,10 @@ func (p *parser) continuesValue() bool {
 	t := p.peek()
 	if t.kind == tkOp {
 		switch t.text {
-		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>", "<->", "<=>", "<#>":
+		case "::", "+", "-", "*", "/", "%", "^", "||", "->", "->>", "#>", "#>>":
+			return true
+		}
+		if otherOps[t.text] {
 			return true
 		}
 	}
@@ -5927,6 +6183,18 @@ func (p *parser) parseConjuncts() ([]Comparison, bool, error) {
 				return nil, false, err
 			}
 			base.Op, base.Value = neg("IS DISTINCT FROM"), v
+		case p.peekIdentWord("normalized") || (unicodeForms[p.peek().text] && p.peek().kind == tkIdent && p.i+1 < len(p.toks) && p.toks[p.i+1].isWord("normalized")):
+			// x IS [NOT] [NFC | NFD | NFKC | NFKD] NORMALIZED is
+			// is_normalized(x, form) (NULL for a NULL x).
+			form := "NFC"
+			if !p.peekIdentWord("normalized") {
+				form = strings.ToUpper(p.peek().text)
+				p.i++
+			}
+			p.i++ // normalized
+			f := types.NewString(form)
+			want := types.NewBool(!not)
+			return one(Comparison{Expr: &Expr{Func: "is_normalized", Args: []Expr{lhs, {Lit: &f}}}, Op: "=", Value: Expr{Lit: &want}})
 		default:
 			return nil, false, p.errf("expected NULL, TRUE, FALSE or DISTINCT FROM after IS, found %q", p.peek().text)
 		}
@@ -6069,8 +6337,11 @@ func (p *parser) parseOptEscape() (string, error) {
 
 // finishComparison parses the right-hand side of "lhs op": a value, or
 // ANY/SOME/ALL over a parenthesized array value or subquery. "= ANY
-// (SELECT ...)" is IN and "<> ALL (SELECT ...)" is NOT IN; array forms
-// keep the quantifier in the operator ("= ANY", "!= ALL").
+// (SELECT ...)" is IN and "<> ALL (SELECT ...)" is NOT IN; the other
+// quantified forms keep the quantifier in the operator ("< ANY", "!=
+// ALL"), a subquery as the array of its rows (op ANY (SELECT x ...) is
+// op ANY (ARRAY(SELECT x ...)) in PostgreSQL, NULLs and an empty result
+// included).
 func (p *parser) finishComparison(cmp Comparison, op string) (Comparison, error) {
 	cmp.Op = op
 	if t := p.peek(); t.kind == tkIdent && !t.quoted && (t.text == "any" || t.text == "some" || t.text == "all") &&
@@ -6089,7 +6360,10 @@ func (p *parser) finishComparison(cmp Comparison, op string) (Comparison, error)
 			case op == "!=" && quant == "ALL":
 				cmp.Op, cmp.Sub = "NOT IN", sub
 			default:
-				return cmp, p.errf("%s %s (SELECT ...) is not supported", op, quant)
+				if wide := len(sub.Exprs) > 1; wide && !sub.Exprs[0].Star && !sub.Exprs[1].Star {
+					return cmp, &SyntaxError{Code: "42601", Pos: t.pos, Msg: "subquery has too many columns"}
+				}
+				cmp.Op, cmp.Value = op+" "+quant, Expr{Func: "array", Args: []Expr{{Sub: sub}}}
 			}
 			return cmp, nil
 		}
@@ -6390,12 +6664,35 @@ func negateComparison(c Comparison) (Comparison, error) {
 		// OR (a disjunction with one conjunction is just that conjunction).
 		return Comparison{Op: "OR", Or: [][]Comparison{conj}}, nil
 	}
+	if base, quant, ok := SplitQuantified(c.Op); ok {
+		// NOT (x op ANY a) is x (NOT op) ALL a, and the other way round:
+		// De Morgan over the elements, exact in three-valued logic.
+		nb, ok := neg[base]
+		if !ok {
+			return Comparison{}, fmt.Errorf("cannot negate %q", c.Op)
+		}
+		flip := "ALL"
+		if quant == "ALL" {
+			flip = "ANY"
+		}
+		c.Op = nb + " " + flip
+		return c, nil
+	}
 	op, ok := neg[c.Op]
 	if !ok {
 		return Comparison{}, fmt.Errorf("cannot negate %q", c.Op)
 	}
 	c.Op = op
 	return c, nil
+}
+
+// SplitQuantified splits a quantified comparison operator ("< ANY",
+// "NOT LIKE ALL") into its base operator and quantifier.
+func SplitQuantified(op string) (base, quant string, ok bool) {
+	if len(op) > 4 && (strings.HasSuffix(op, " ANY") || strings.HasSuffix(op, " ALL")) {
+		return op[:len(op)-4], op[len(op)-3:], true
+	}
+	return "", "", false
 }
 
 // parseExistsCond parses [NOT] EXISTS (SELECT ...) when present.
@@ -6490,13 +6787,15 @@ func (p *parser) parseSubquery() (*Select, bool, error) {
 		return nil, false, nil
 	}
 	nxt := p.toks[p.i+1]
-	if !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.isWord("with")) {
+	if !(nxt.kind == tkKeyword && (nxt.text == "SELECT" || nxt.text == "TABLE")) && !(nxt.isWord("with")) {
 		return nil, false, nil
 	}
 	p.i++ // (
 	var stmt Statement
 	var err error
-	if nxt.kind == tkIdent {
+	if nxt.kind == tkKeyword && nxt.text == "TABLE" {
+		stmt, err = p.parseTableQuery()
+	} else if nxt.kind == tkIdent {
 		stmt, err = p.parseWith()
 		if _, isSel := stmt.(*Select); err == nil && !isSel {
 			return nil, false, p.errf("a WITH inside a subquery must end in a SELECT")
@@ -6657,7 +6956,62 @@ func (p *parser) applyCasts(e Expr) (Expr, error) {
 		e.Path = steps
 		return p.applyCasts(e)
 	}
+	if p.peekIdentWord("collate") {
+		// x COLLATE name: binds tighter than any binary operator, and a
+		// cast may follow it.
+		at := p.peek().pos
+		if err := p.parseCollate(); err != nil {
+			return e, err
+		}
+		if l := e.Lit; l != nil && !l.Null && l.Fam != types.String && e.Cast == "" && e.BinOp == "" && e.Left == nil {
+			// A number or boolean literal: a type without collations.
+			name := map[types.Family]string{types.Int: "integer", types.Decimal: "numeric", types.Bool: "boolean"}[l.Fam]
+			if name != "" {
+				return e, &SyntaxError{Code: "42804", Pos: at, Msg: fmt.Sprintf("collations are not supported by type %s", name)}
+			}
+		}
+		return p.applyCasts(e)
+	}
 	return e, nil
+}
+
+// Collations are the collations an expression may name. Every string
+// in datax compares bytewise, which is the order each of these gives a
+// UTF8 string ("C" and "POSIX" by byte, ucs_basic by code point, and
+// the database default, which is C; see
+// docs/user/postgres-differences.md).
+var Collations = map[string]bool{"default": true, "C": true, "POSIX": true, "ucs_basic": true}
+
+// parseCollate parses COLLATE [schema.]name, after an expression: a
+// collation that datax knows changes nothing, any other is refused as
+// PostgreSQL refuses a collation that does not exist (42704).
+func (p *parser) parseCollate() error {
+	at := p.peek().pos
+	p.i++ // collate
+	parts := []string{}
+	for {
+		name, err := p.expectIdent()
+		if err != nil {
+			return err
+		}
+		parts = append(parts, name)
+		if !p.consumeOp(".") {
+			break
+		}
+	}
+	name := parts[len(parts)-1]
+	ok := Collations[name]
+	switch {
+	case len(parts) > 2:
+		ok = false
+	case len(parts) == 2:
+		ok = ok && parts[0] == "pg_catalog"
+	}
+	if !ok {
+		return &SyntaxError{Code: "42704", Pos: at,
+			Msg: fmt.Sprintf("collation %q for encoding \"UTF8\" does not exist", strings.Join(parts, "."))}
+	}
+	return nil
 }
 
 func castChain(e Expr, casts []string) Expr {
@@ -6855,6 +7209,24 @@ func (p *parser) parseSQLFuncForm(name string) (Expr, bool, error) {
 	switch name {
 	case "substring", "substr":
 		s, err := p.parseAddExpr()
+		if err == nil && name == "substring" && p.consumeIdentWord("similar") {
+			// substring(s SIMILAR pattern ESCAPE e).
+			pat, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			if !p.consumeIdentWord("escape") {
+				return Expr{}, false, p.errf("expected ESCAPE after the SIMILAR pattern, found %q", p.peek().text)
+			}
+			esc, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			if err := p.expectOp(")"); err != nil {
+				return Expr{}, false, err
+			}
+			return Expr{Func: "substring", Args: []Expr{s, pat, esc}}, true, nil
+		}
 		if err != nil || !p.consumeKeyword("FROM") {
 			return plain()
 		}
@@ -6874,6 +7246,49 @@ func (p *parser) parseSQLFuncForm(name string) (Expr, bool, error) {
 			return Expr{}, false, err
 		}
 		return Expr{Func: name, Args: args}, true, nil
+	case "overlay":
+		// overlay(s PLACING r FROM start [FOR n]).
+		s, err := p.parseAddExpr()
+		if err != nil || !p.consumeIdentWord("placing") {
+			return plain()
+		}
+		r, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		if err := p.expectKeyword("FROM"); err != nil {
+			return Expr{}, false, err
+		}
+		from, err := p.parseAddExpr()
+		if err != nil {
+			return Expr{}, false, err
+		}
+		args := []Expr{s, r, from}
+		if p.consumeIdentWord("for") {
+			n, err := p.parseAddExpr()
+			if err != nil {
+				return Expr{}, false, err
+			}
+			args = append(args, n)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return Expr{}, false, err
+		}
+		return Expr{Func: "overlay", Args: args}, true, nil
+	case "normalize":
+		// normalize(s [, NFC | NFD | NFKC | NFKD]): the form is a
+		// keyword, passed as text.
+		s, err := p.parseAddExpr()
+		if err != nil || !p.consumeOp(",") {
+			return plain()
+		}
+		t := p.peek()
+		if t.kind != tkIdent || t.quoted || !unicodeForms[t.text] || !(p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkOp && p.toks[p.i+1].text == ")") {
+			return Expr{}, false, p.errf("syntax error at or near %q: normalize() takes NFC, NFD, NFKC or NFKD", t.text)
+		}
+		p.i += 2
+		f := types.NewString(strings.ToUpper(t.text))
+		return Expr{Func: "normalize", Args: []Expr{s, {Lit: &f}}}, true, nil
 	case "position":
 		needle, err := p.parseAddExpr()
 		if err != nil || !p.consumeIdentWord("in") {
@@ -6963,7 +7378,7 @@ func (p *parser) parseAddExpr() (Expr, error) {
 	}
 	for {
 		op := p.peek()
-		if op.kind != tkOp || (op.text != "<->" && op.text != "<=>" && op.text != "<#>") {
+		if op.kind != tkOp || !otherOps[op.text] {
 			return e, nil
 		}
 		p.i++
@@ -6974,6 +7389,23 @@ func (p *parser) parseAddExpr() (Expr, error) {
 		e = foldBinOp(e, op.text, rhs)
 	}
 }
+
+// unicodeForms are the Unicode normal forms normalize() and IS
+// NORMALIZED name as keywords.
+var unicodeForms = map[string]bool{"nfc": true, "nfd": true, "nfkc": true, "nfkd": true}
+
+// otherOps are the binary operators PostgreSQL has no precedence rule
+// for, which all bind alike (looser than + and -, tighter than the
+// comparisons) and associate to the left: the vector distances, the
+// integer bitwise operators & | # << >>, and jsonb's #- (delete path).
+var otherOps = map[string]bool{"<->": true, "<=>": true, "<#>": true, "&": true, "|": true, "#": true, "<<": true, ">>": true, "#-": true}
+
+// prefixOps are the prefix operators, as the functions they call: ~
+// (bitwise not), @ (absolute value), |/ (square root), ||/ (cube
+// root). Like PostgreSQL's, a prefix operator takes the operand that
+// follows up to + and - (~ 1 + 2 is ~3), and binds tighter than the
+// other operators (~1 & 2 is (~1) & 2).
+var prefixOps = map[string]string{"~": "int8not", "@": "abs", "|/": "sqrt", "||/": "cbrt"}
 
 func (p *parser) parseSumExpr() (Expr, error) {
 	e, err := p.parseMulExpr()
@@ -7117,6 +7549,14 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 	}
 	defer p.leave()
 	t := p.peek()
+	if fn, ok := prefixOps[t.text]; ok && t.kind == tkOp {
+		p.i++
+		x, err := p.parseSumExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{Func: fn, Args: []Expr{x}}, nil
+	}
 	if t.kind == tkKeyword && t.text == "KEY" {
 		// KEY is a keyword only in key definitions; as a value it is a
 		// column, as in PostgreSQL (jsonb_each's key column).
@@ -7142,7 +7582,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 		}
 		// A scalar subquery is "(SELECT" or "(WITH"; anything else is
 		// grouping — of a value, or of a predicate used as a boolean value.
-		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && nxt.text == "SELECT") && !(nxt.isWord("with")) {
+		if nxt := p.toks[p.i+1]; !(nxt.kind == tkKeyword && (nxt.text == "SELECT" || nxt.text == "TABLE")) && !(nxt.isWord("with")) {
 			p.i++
 			e, err := p.parseValueOrBool()
 			if err != nil {

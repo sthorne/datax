@@ -101,6 +101,20 @@ func (s *Session) lookupForPlan(ctx context.Context, name string) (*catalog.Tabl
 // executing it (nil for row-less statements). The wire protocol's Describe
 // needs this before Execute.
 func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
+	cols, serr := s.planColumns(ctx, stmt)
+	if sel, ok := stmt.(*parser.Select); ok && serr == nil && len(cols) == len(sel.Exprs) {
+		// A catalog function's call is named as execution names it
+		// (resolveSelectSubs): pg_get_indexdef, not ?column?.
+		for i, se := range sel.Exprs {
+			if !se.Star && se.Alias == "" && catalogRenderingFuncs[se.Expr.Func] && cols[i].Name == "?column?" {
+				cols[i].Name = se.Expr.Func
+			}
+		}
+	}
+	return cols, serr
+}
+
+func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
 	expanded, err := s.expandViews(ctx, nil, stmt)
 	if err != nil {
 		return nil, ToSQLError(err)
@@ -167,16 +181,22 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			c.Derived, c.Table = nil, name
 			return s.PlanColumns(ctx, &c)
 		}
+		if fromlessGrouped(t) {
+			return s.PlanColumns(ctx, oneRowFrom(t))
+		}
 		if t.Union != nil {
 			// A set operation's output is named by its head and typed by
 			// unifying every member (the numeric families lift, anything
-			// else meets as text).
+			// else meets as text); a VALUES list's as execution types it
+			// (resolveValuesTypes).
 			head := *t
 			head.Union, head.OrderBy, head.Limit, head.Offset = nil, nil, -1, 0
 			cols, err := s.PlanColumns(ctx, &head)
 			if err != nil {
 				return nil, err
 			}
+			asts := []*parser.Select{t}
+			memberCols := [][]ResultColumn{cols}
 			for m := t.Union; m != nil; m = m.Union {
 				one := *m
 				one.Union = nil
@@ -187,6 +207,19 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 				if len(mc) != len(cols) {
 					return nil, newErrf(CodeSyntaxError, "each set operation member must have the same number of columns")
 				}
+				asts, memberCols = append(asts, m), append(memberCols, mc)
+			}
+			if valuesList(asts) {
+				for i := range cols {
+					fam, verr := valuesColumnType(asts, i, func(mi int) types.Family { return memberCols[mi][i].Type })
+					if verr != nil {
+						return nil, ToSQLError(verr)
+					}
+					cols[i].Type = fam
+				}
+				return cols, nil
+			}
+			for _, mc := range memberCols[1:] {
 				for i := range cols {
 					cols[i].Type = unifyFamily(cols[i].Type, mc[i].Type)
 				}
@@ -362,7 +395,7 @@ func (s *Session) PlanColumns(ctx context.Context, stmt parser.Statement) ([]Res
 	case *parser.ShowStats:
 		return showStatsColumns(), nil
 
-	case *parser.Analyze, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot:
+	case *parser.Analyze, *parser.Vacuum, *parser.LockTable, *parser.Prepare, *parser.Deallocate, *parser.DeclareCursor, *parser.CloseCursor, *parser.SetTransactionSnapshot, *parser.SetTransactionAsOf:
 		return nil, nil
 	case *parser.Fetch:
 		if c, ok := s.cursors[t.Name]; ok && !t.Move {

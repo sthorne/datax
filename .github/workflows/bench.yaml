@@ -1,7 +1,11 @@
 name: bench
 on:
-  schedule:
-    - cron: '17 3 * * *'
+  # Paused (automatic triggers removed): the account is out of GitHub
+  # Actions minutes, so every run would fail. Run by hand (workflow
+  # dispatch) or locally (docs/testing.md); restore the triggers below
+  # when minutes are available again.
+  #   schedule:
+  #     - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       duration_scale:

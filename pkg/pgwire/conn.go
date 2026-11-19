@@ -12,6 +12,8 @@ import (
 	"math"
 	"net"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -341,6 +343,10 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	ctx, done := c.beginStatement(ctx)
 	defer done()
 	_, isSet := stmt.(*parser.SetVar)
+	discardAll := false
+	if d, ok := stmt.(*parser.Discard); ok && d.Kind == "all" {
+		isSet, discardAll = true, true
+	}
 	var before [][2]string
 	if isSet {
 		before = c.session.ReportedParams()
@@ -375,6 +381,15 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 		tok.scanned = c.session.TakeScanned()
 		tok.end(rows, serr, c.session.State() == sql.StateOpen)
 		c.act.setSession(c, c.session.Database(), c.session.ApplicationName())
+	}
+	if discardAll && serr == nil {
+		// DISCARD ALL deallocates every prepared statement: the named
+		// protocol-level ones too (they share PostgreSQL's one table).
+		for name := range c.stmts {
+			if name != "" {
+				delete(c.stmts, name)
+			}
+		}
 	}
 	if isSet && serr == nil {
 		// A changed reported parameter (application_name, TimeZone, ...)
@@ -701,20 +716,38 @@ func (c *conn) handleStartup(ctx context.Context) error {
 					return fmt.Errorf("startup database %q: %v", dbName, serr)
 				}
 			}
-			for _, kv := range [][2]string{
-				{"server_version", "14.0 datax"},
-				{"server_encoding", "UTF8"},
-				{"client_encoding", "UTF8"},
-				{"DateStyle", "ISO"},
-				{"IntervalStyle", "postgres"},
-				{"integer_datetimes", "on"},
-				{"standard_conforming_strings", "on"},
-				{"TimeZone", "UTC"},
-			} {
-				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
+			// The limits and defaults are read best effort: a catalog
+			// that cannot be read in time costs them, not the session.
+			ictx, icancel := context.WithTimeout(ctx, 5*time.Second)
+			info, serr := c.session.StartupInfo(ictx)
+			icancel()
+			if serr != nil {
+				log.Warnf("reading connection limits and database defaults for %q: %v", m.Parameters["user"], serr)
+				info = sql.StartupInfo{RoleLimit: -1, DatabaseLimit: -1}
+			}
+			if serr = c.checkConnectionLimits(info); serr != nil {
+				c.sendError(serr)
+				_ = c.backend.Flush()
+				return fmt.Errorf("startup refused: %v", serr)
+			}
+			// ALTER DATABASE ... SET's defaults, before the client's own
+			// parameters, as PostgreSQL applies them; the reported
+			// parameters below carry their values.
+			c.session.ApplyDatabaseDefaults(ctx, info.Settings)
+			// Then the settings the startup packet carries (TimeZone,
+			// DateStyle, ... and those of options' -c name=value), so
+			// ParameterStatus tells the client the session's own
+			// TimeZone, as PostgreSQL's does.
+			for _, kv := range startupSettings(m.Parameters) {
+				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: kv[0], Value: kv[1]}, nil)
 			}
 			if app := m.Parameters["application_name"]; app != "" {
 				_, _ = c.session.Execute(ctx, &parser.SetVar{Name: "application_name", Value: app}, nil)
+			}
+			// PostgreSQL 14's reported parameters, each once, with the
+			// session's values.
+			for _, kv := range c.session.StartupParams(ctx) {
+				c.backend.Send(&pgproto3.ParameterStatus{Name: kv[0], Value: kv[1]})
 			}
 			c.backend.Send(&pgproto3.BackendKeyData{ProcessID: uint32(c.pid), SecretKey: binary.BigEndian.AppendUint32(nil, c.secret)})
 			c.sendReady()
@@ -952,6 +985,10 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 	if d.Null {
 		return nil
 	}
+	if d.Reg != "" && col.Type != types.Int {
+		// A reg* value under a column described as its name.
+		return []byte(d.Reg)
+	}
 	if d.Fam.IsArray() {
 		if format == 0 {
 			return []byte(d.Text())
@@ -990,7 +1027,9 @@ func encodeDatum(d types.Datum, format int16, col sql.ResultColumn) []byte {
 		return []byte{0}
 	case types.Timestamp:
 		// Binary timestamptz: microseconds since 2000-01-01.
-		return binary.BigEndian.AppendUint64(nil, uint64(d.I/1000-pgEpochOffsetMicros))
+		// A value with nanoseconds (one written before input rounded to
+		// microseconds) rounds as its text form does.
+		return binary.BigEndian.AppendUint64(nil, uint64(types.RoundMicros(d.I)/1000-pgEpochOffsetMicros))
 	case types.Date:
 		// Binary date: days since 2000-01-01, int32.
 		return binary.BigEndian.AppendUint32(nil, uint32(int32(d.I-pgEpochOffsetDays)))
@@ -1288,7 +1327,7 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 func (c *conn) handleBind(m *pgproto3.Bind) {
 	p, ok := c.stmts[m.PreparedStatement]
 	if !ok {
-		c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown prepared statement %q", m.PreparedStatement)})
+		c.extError(&sql.Error{Code: sql.CodeInvalidSQLStatementName, Msg: fmt.Sprintf("prepared statement %q does not exist", m.PreparedStatement)})
 		return
 	}
 	if len(m.Parameters) != p.nParams {
@@ -1352,7 +1391,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 	case 'S':
 		p, ok := c.stmts[m.Name]
 		if !ok {
-			c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown prepared statement %q", m.Name)})
+			c.extError(&sql.Error{Code: sql.CodeInvalidSQLStatementName, Msg: fmt.Sprintf("prepared statement %q does not exist", m.Name)})
 			return
 		}
 		pd := &pgproto3.ParameterDescription{}
@@ -1372,7 +1411,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 	case 'P':
 		pt, ok := c.portals[m.Name]
 		if !ok {
-			c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown portal %q", m.Name)})
+			c.extError(&sql.Error{Code: sql.CodeInvalidCursorName, Msg: fmt.Sprintf("portal %q does not exist", m.Name)})
 			return
 		}
 		if pt.stmt.cols != nil {
@@ -1386,7 +1425,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	pt, ok := c.portals[m.Portal]
 	if !ok {
-		c.extError(&sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("unknown portal %q", m.Portal)})
+		c.extError(&sql.Error{Code: sql.CodeInvalidCursorName, Msg: fmt.Sprintf("portal %q does not exist", m.Portal)})
 		return
 	}
 	if pt.stmt.stmt == nil {
@@ -1611,4 +1650,60 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 	finish()
 	st.Flushed()
 	return sent, true, nil
+}
+
+// startupSettings lists the settings a startup packet carries, in a
+// fixed order: every parameter but the connection's own (user,
+// database, replication, options), then each -c name=value (or
+// --name=value) of options.
+func startupSettings(params map[string]string) [][2]string {
+	var out [][2]string
+	for k, v := range params {
+		switch strings.ToLower(k) {
+		case "user", "database", "replication", "options":
+			continue
+		}
+		out = append(out, [2]string{k, v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0] < out[j][0] })
+	fields := strings.Fields(params["options"])
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		switch {
+		case f == "-c" && i+1 < len(fields):
+			i++
+			f = fields[i]
+		case strings.HasPrefix(f, "-c"):
+			f = f[2:]
+		case strings.HasPrefix(f, "--"):
+			f = f[2:]
+		default:
+			continue
+		}
+		if name, value, ok := strings.Cut(f, "="); ok {
+			out = append(out, [2]string{strings.ReplaceAll(name, "-", "_"), value})
+		}
+	}
+	return out
+}
+
+// checkConnectionLimits refuses a session past its role's or its
+// database's CONNECTION LIMIT (53300, PostgreSQL's too_many_connections),
+// counting this node's sessions: the limits are per node. An admin is
+// exempt, as PostgreSQL exempts superusers. As in PostgreSQL, two
+// sessions starting at once may both get in at the limit.
+func (c *conn) checkConnectionLimits(info sql.StartupInfo) *sql.Error {
+	if c.act == nil {
+		return nil
+	}
+	user, db := c.session.SessionUser(), c.session.Database()
+	byUser, byDB := c.act.countSessions(c, user, db)
+	switch {
+	case info.Exempt:
+	case info.RoleLimit >= 0 && byUser >= info.RoleLimit:
+		return &sql.Error{Code: "53300", Msg: fmt.Sprintf("too many connections for role %q", user)}
+	case info.DatabaseLimit >= 0 && byDB >= info.DatabaseLimit:
+		return &sql.Error{Code: "53300", Msg: fmt.Sprintf("too many connections for database %q", db)}
+	}
+	return nil
 }

@@ -67,7 +67,7 @@ func TestRegexpFunctions(t *testing.T) {
 		{fn: "regexp_replace", args: []types.Datum{s("A PostgreSQL function"), s("a|e|i|o|u"), s("X"), types.NewInt(1), types.NewInt(3), s("i")}, want: "A PostgrXSQL function"},
 		{fn: "regexp_replace", args: []types.Datum{s("a$b"), s("$"), s("$1")}, want: "a$b$1"},
 		{fn: "regexp_replace", args: []types.Datum{s("x"), s("("), s("y")}, code: CodeInvalidRegexp},
-		{fn: "regexp_replace", args: []types.Datum{s("x"), s(`(a)\1`), s("y")}, code: CodeInvalidRegexp},
+		{fn: "regexp_replace", args: []types.Datum{s("x"), s(`(a)\1`), s("y")}, code: CodeNotSupported},
 		{fn: "regexp_replace", args: []types.Datum{s("x"), s("x"), s("y"), s("z")}, code: CodeInvalidArgument},
 		{fn: "regexp_replace", args: []types.Datum{s("x"), s("x"), s("y"), types.NewInt(0)}, code: CodeInvalidArgument},
 		{fn: "regexp_replace", args: []types.Datum{types.DNull, s("x"), s("y")}, want: "NULL"},

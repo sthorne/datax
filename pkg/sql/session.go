@@ -40,6 +40,9 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 		}
 		return now.AddNanos(d.Nanoseconds()), nil
 	}
+	if operand == parser.FollowerReadTimestamp {
+		return now.AddNanos(-FollowerReadLag.Nanoseconds()), nil
+	}
 	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
 		ts := hlc.Timestamp{WallTime: t.UnixNano()}
 		if !ts.Less(now) {
@@ -174,6 +177,9 @@ type Session struct {
 	// identity. user is the current role — the session user, or the role
 	// SET ROLE selected (current_user vs session_user).
 	sessionUser string
+	// isSuperuser is whether sessionUser is a superuser, read when the
+	// connection starts (StartupParams; nil until then).
+	isSuperuser *bool
 	user        string
 	// privAs, when set, is the role privilege checks run as instead of
 	// user: a view's owner while its query executes (cte.go).
@@ -333,6 +339,7 @@ func (s *Session) SetUser(user string) {
 		user = "root"
 	}
 	s.sessionUser = user
+	s.isSuperuser = nil
 	s.vars.role = ""
 	s.applyRole()
 }
@@ -517,7 +524,7 @@ const (
 // gathered only for the tables the reader may read rows of, and a
 // sequence's counter only for one it may read.
 func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTables, filtered bool) (*vtable.Env, error) {
-	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}}
+	env := &vtable.Env{User: s.user, SessionUser: s.sessionUser, Database: s.database, Stats: map[uint64]*catalog.TableStatistics{}, Now: s.statementTime()}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -829,7 +836,21 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "there is already a transaction in progress")
 		}
-		s.txn = s.db.NewTxn("sql")
+		var asOf hlc.Timestamp
+		if t.AsOf != nil {
+			ts, serr := s.resolveTxnAsOf(*t.AsOf)
+			if serr != nil {
+				return nil, serr
+			}
+			asOf = ts
+		}
+		if asOf.IsEmpty() {
+			s.txn = s.db.NewTxn("sql")
+		} else {
+			// BEGIN AS OF SYSTEM TIME: the read-only historical
+			// transaction SET TRANSACTION SNAPSHOT also makes.
+			s.txn = s.db.NewHistoricalTxn("sql-asof", asOf)
+		}
 		s.state = StateOpen
 		s.txnQueried = false
 		s.txnStartedReadOnly = s.vars.defaultReadOnly
@@ -945,12 +966,16 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return s.execExecutePrepared(ctx, t, params)
 	case *parser.SetTransactionSnapshot:
 		return s.execSetTransactionSnapshot(t)
+	case *parser.SetTransactionAsOf:
+		return s.execSetTransactionAsOf(t)
 	case *parser.DeclareCursor:
 		return s.execDeclareCursor(ctx, t, params)
 	case *parser.Fetch:
 		return s.execFetch(t)
 	case *parser.CloseCursor:
 		return s.execCloseCursor(t)
+	case *parser.Discard:
+		return s.execDiscard(t)
 
 	default:
 		if s.state == StateOpen {
@@ -1167,6 +1192,12 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// ANALYZE sweeps tables at a frozen timestamp in paced chunks outside
 	// any transaction, so — like the other multi-transaction statements —
 	// it cannot run inside an explicit transaction block.
+	if v, ok := stmt.(*parser.Vacuum); ok {
+		if s.state == StateOpen {
+			return nil, newErrf(CodeActiveTransaction, "VACUUM cannot run inside a transaction block")
+		}
+		return s.execVacuum(ctx, v)
+	}
 	if an, ok := stmt.(*parser.Analyze); ok {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "ANALYZE cannot run inside a transaction block")
@@ -1187,26 +1218,16 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	// AS OF SYSTEM TIME pins a SELECT to a fixed past timestamp: it runs
 	// in its own read-only historical transaction (servable by follower
 	// replicas), so it cannot join an explicit transaction's timestamp.
-	if sel, ok := stmt.(*parser.Select); ok && (sel.AsOf != "" || sel.AsOfMaxStaleness != "") {
+	if sel, ok := stmt.(*parser.Select); ok && (sel.AsOf != "" || sel.AsOfMaxStaleness != "" || sel.AsOfMinTimestamp != "") {
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "AS OF SYSTEM TIME cannot run inside a transaction block")
 		}
 		if sel.ForUpdate {
 			return nil, newErrf(CodeFeatureNotSupported, "FOR UPDATE is not allowed with AS OF SYSTEM TIME")
 		}
-		var ts hlc.Timestamp
-		if sel.AsOfMaxStaleness != "" {
-			var err error
-			ts, err = resolveMaxStaleness(sel.AsOfMaxStaleness, s.db.Clock().Now(), s.db.LocalClosedTimestamp())
-			if err != nil {
-				return nil, newErrf(CodeInvalidParameterValue, "with_max_staleness: %v", err)
-			}
-		} else {
-			var err error
-			ts, err = resolveAsOf(sel.AsOf, s.db.Clock().Now())
-			if err != nil {
-				return nil, newErrf(CodeSyntaxError, "AS OF SYSTEM TIME: %v", err)
-			}
+		ts, aerr := s.resolveAsOfClause(parser.AsOfClause{Exact: sel.AsOf, MaxStaleness: sel.AsOfMaxStaleness, MinTimestamp: sel.AsOfMinTimestamp, NearestOnly: sel.AsOfNearestOnly})
+		if aerr != nil {
+			return nil, aerr
 		}
 		// Historical reads plan against the descriptor current AT their
 		// timestamp (the catalog reads it through the historical txn), so
@@ -1229,7 +1250,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 			}
 		}
 		s.streamTop = true
-		s.asofLocal, s.asofTS = sel.AsOfMaxStaleness != "", ts
+		s.asofLocal, s.asofTS = sel.AsOfMaxStaleness != "" || sel.AsOfMinTimestamp != "", ts
 		res, serr := s.execSelect(ctx, txn, sel, params)
 		s.streamTop = false
 		s.asofLocal, s.asofTS = false, hlc.Timestamp{}
@@ -1548,6 +1569,11 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			if handled {
 				base = d
 			}
+			if !handled {
+				// An untyped literal beside a bytea is a bytea
+				// ('\x01'::bytea || '\x02').
+				base, rhs = byteaConcatOperands(e, base, rhs)
+			}
 		}
 		if !handled {
 			if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
@@ -1576,6 +1602,17 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	if l.Null || r.Null {
 		return types.DNull, nil
 	}
+	switch {
+	case op == "-" && l.Fam == types.Jsonb:
+		d, _, err := builtins.JSONBDelete(l, r)
+		return d, builtinErr(err)
+	case op == "#-":
+		d, err := builtins.JSONBDeletePath(l, r)
+		return d, builtinErr(err)
+	case builtins.IsBitwiseOp(op):
+		d, err := builtins.Bitwise(l, op, r)
+		return d, builtinErr(err)
+	}
 	if d, ok, err := builtins.DateArithIn(l, op, r, loc); ok {
 		return d, builtinErr(err)
 	}
@@ -1594,10 +1631,21 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 			d, err := builtins.ConcatArrays(l, r)
 			return d, builtinErr(err)
 		}
+		if l.Fam == types.Bytes && r.Fam == types.Bytes {
+			// bytea || bytea is bytea (byteacat), not the hex texts
+			// joined.
+			return types.NewBytes([]byte(l.S + r.S)), nil
+		}
 		// A CHAR(n) operand concatenates trimmed, as PostgreSQL's
 		// bpchar-to-text cast strips the padding.
 		return types.NewString(concatTextIn(l, loc) + concatTextIn(r, loc)), nil
 	case "%":
+		if d, ok, err := types.DecimalSpecialArith(l, op, r); ok && r.Fam != types.Float && l.Fam != types.Float {
+			if err != nil {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "%v", err)
+			}
+			return d, nil
+		}
 		d, err := builtins.Mod(l, r)
 		return d, builtinErr(err)
 	case "^":
@@ -1643,6 +1691,12 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	if (l.Fam == types.Decimal || r.Fam == types.Decimal) &&
 		(l.Fam == types.Decimal || l.Fam == types.Int) &&
 		(r.Fam == types.Decimal || r.Fam == types.Int) {
+		if d, ok, err := types.DecimalSpecialArith(l, op, r); ok {
+			if err != nil {
+				return types.Datum{}, newErrf(CodeDivisionByZero, "%v", err)
+			}
+			return d, nil
+		}
 		ld, err := l.Coerce(types.Decimal)
 		if err != nil {
 			return types.Datum{}, newErrf(CodeInternal, "%v", err)
@@ -1951,7 +2005,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 		if err != nil {
 			return false, err
 		}
-		if lhs.Null || rhs.Null {
+		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil // NULL comparisons never match
 		}
 		if !plainCmpOp(cmp.Op) {
@@ -2110,7 +2164,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 			}
 			continue
 		}
-		if lhs.Null || rhs.Null {
+		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil
 		}
 		ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
@@ -2195,6 +2249,9 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 	if nullAwareOp(cmp.Op) {
 		ok, err := applyNullAware(cmp.Op, lhs, rhs)
 		return ok, false, err
+	}
+	if _, _, q := parser.SplitQuantified(cmp.Op); q {
+		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape)
 	}
 	if lhs.Null || rhs.Null {
 		return false, true, nil
@@ -2373,11 +2430,13 @@ func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
 func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
 	switch op {
 	case "~", "!~", "~*", "!~*":
-		re, err := regexFor(rhs.Text(), op == "~*" || op == "!~*")
+		// Compiled as the regexp_* functions compile a pattern: the
+		// ARE escapes translated, back references and lookaround
+		// refused (0A000), an invalid pattern 2201B.
+		m, err := builtins.RegexpMatch(lhs.Text(), rhs.Text(), op == "~*" || op == "!~*")
 		if err != nil {
-			return false, err
+			return false, builtinErr(err)
 		}
-		m := re.MatchString(lhs.Text())
 		return m == (op == "~" || op == "~*"), nil
 	}
 	switch op {
@@ -2408,38 +2467,11 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		}
 		return ok == !strings.HasPrefix(op, "NOT "), nil
 	}
-	if i := strings.IndexByte(op, ' '); i >= 0 {
+	if _, _, ok := parser.SplitQuantified(op); ok {
 		// Quantified comparison over an array value (or a text array
-		// literal '{a,b}'): ANY holds when some element does, ALL when
-		// every element does.
-		base, quant := op[:i], op[i+1:]
-		var elems []types.Datum
-		if rhs.Fam.IsArray() {
-			elems = rhs.A
-		} else {
-			for _, el := range arrayElems(rhs.Text()) {
-				elems = append(elems, types.NewString(el))
-			}
-		}
-		for _, ed := range elems {
-			if ed.Null {
-				continue // never holds, never fails (three-valued: UNKNOWN)
-			}
-			if c, err := ed.Coerce(lhs.Fam); err == nil {
-				ed = c
-			}
-			ok, err := applyCmpOp(base, lhs, ed)
-			if err != nil {
-				return false, err
-			}
-			if ok && quant == "ANY" {
-				return true, nil
-			}
-			if !ok && quant == "ALL" {
-				return false, nil
-			}
-		}
-		return quant == "ALL", nil
+		// literal '{a,b}'); UNKNOWN is not a match.
+		ok, _, err := quantCmp3(op, lhs, rhs, escape)
+		return ok, err
 	}
 	if lhs.Fam != rhs.Fam {
 		if c, err := rhs.Coerce(lhs.Fam); err == nil {
@@ -2451,6 +2483,74 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		return false, err
 	}
 	return cmpHolds(op, c), nil
+}
+
+// quantCmp3 evaluates a quantified comparison, x op ANY | ALL (array),
+// under three-valued logic, as PostgreSQL does: (value, false), or (_,
+// true) when it is UNKNOWN. ANY holds when some element does and is
+// UNKNOWN when none does but some comparison is UNKNOWN (a NULL); ALL
+// fails when some element fails and is UNKNOWN when none does but some
+// is UNKNOWN. Over no elements ANY is false and ALL true, whatever x
+// is; a NULL array is UNKNOWN.
+func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, error) {
+	base, quant, _ := parser.SplitQuantified(op)
+	if rhs.Null {
+		return false, true, nil
+	}
+	var elems []types.Datum
+	if rhs.Fam.IsArray() {
+		elems = rhs.A
+	} else {
+		for _, el := range arrayElems(rhs.Text()) {
+			elems = append(elems, types.NewString(el))
+		}
+	}
+	if len(elems) == 0 {
+		return quant == "ALL", false, nil
+	}
+	if lhs.Null {
+		return false, true, nil
+	}
+	unknown := false
+	for _, ed := range elems {
+		if ed.Null {
+			unknown = true
+			continue
+		}
+		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) {
+			if c, err := ed.Coerce(lhs.Fam); err == nil {
+				ed = c
+			}
+		}
+		ok, err := applyCmpOpEsc(base, lhs, ed, escape)
+		if err != nil {
+			return false, false, err
+		}
+		if ok && quant == "ANY" {
+			return true, false, nil
+		}
+		if !ok && quant == "ALL" {
+			return false, false, nil
+		}
+	}
+	if unknown {
+		return false, true, nil
+	}
+	return quant == "ALL", false, nil
+}
+
+// numericFam reports the numeric families, which compare with each
+// other as they are.
+func numericFam(f types.Family) bool {
+	return f == types.Int || f == types.Decimal || f == types.Float
+}
+
+// quantDecides reports a quantified comparison whose result a NULL
+// operand does not settle (an empty array: ANY false, ALL true), for
+// the evaluators that refuse a NULL operand up front.
+func quantDecides(op string, lhs, rhs types.Datum) bool {
+	_, _, ok := parser.SplitQuantified(op)
+	return ok && lhs.Null && !rhs.Null
 }
 
 // escapeRune resolves a pattern's ESCAPE character: backslash by
@@ -2677,4 +2777,24 @@ func (s *Session) execRollbackToSavepoint(ctx context.Context, name string) (*Re
 	s.createdTxn, s.createdTables = nil, nil
 	s.state = StateOpen
 	return &Result{Tag: "ROLLBACK"}, nil
+}
+
+// byteaConcatOperands reads the untyped string literal on one side of
+// a || whose other side is a bytea as bytea input, as PostgreSQL
+// resolves an unknown literal to the other operand's type.
+func byteaConcatOperands(e parser.Expr, l, r types.Datum) (types.Datum, types.Datum) {
+	untyped := func(x *parser.Expr, d types.Datum) bool {
+		return x != nil && x.Lit != nil && x.Cast == "" && x.BinOp == "" && x.Func == "" && !d.Null && d.Fam == types.String
+	}
+	switch {
+	case l.Fam == types.Bytes && untyped(e.Right, r):
+		if b, err := r.Coerce(types.Bytes); err == nil {
+			r = b
+		}
+	case r.Fam == types.Bytes && untyped(e.Left, l):
+		if b, err := l.Coerce(types.Bytes); err == nil {
+			l = b
+		}
+	}
+	return l, r
 }

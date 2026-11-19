@@ -45,10 +45,19 @@ func (s *Session) execCreateDatabase(ctx context.Context, txn *kvclient.Txn, t *
 	if err := s.requireV6(ctx, txn); err != nil {
 		return nil, err
 	}
+	// An admin, or a role with the CREATEDB attribute.
+	if ok, err := s.canCreateDatabase(ctx, txn); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, newErrf(CodeInsufficientPriv, "permission denied to create database")
+	}
 	if t.Name == catalog.PublicSchema || t.Name == "" {
 		return nil, newErrf(CodeSyntaxError, "%q is not a valid database name", t.Name)
 	}
 	d := &catalog.DatabaseDescriptor{Name: t.Name, Owner: s.user}
+	if err := s.applyCreateDatabaseOptions(ctx, txn, d, t.Options); err != nil {
+		return nil, err
+	}
 	if t.Placement != nil {
 		if err := s.requireV16(); err != nil {
 			return nil, err
@@ -139,6 +148,9 @@ func (s *Session) execDropDatabase(ctx context.Context, txn *kvclient.Txn, t *pa
 func (s *Session) execAlterDatabase(ctx context.Context, txn *kvclient.Txn, t *parser.AlterDatabase) (*Result, error) {
 	if t.Placement != nil {
 		return s.execAlterDatabasePlacement(ctx, txn, t)
+	}
+	if t.Set != nil || len(t.Options) > 0 || t.RefreshCollation {
+		return s.execAlterDatabaseOptions(ctx, txn, t)
 	}
 	if err := s.requireV6(ctx, txn); err != nil {
 		return nil, err

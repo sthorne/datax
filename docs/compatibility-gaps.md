@@ -46,30 +46,30 @@ Open gaps by area and priority.
 
 | Area | P1 | P2 | P3 | P4 | Total |
 |---|---:|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 0 | 17 | 9 | 0 | 26 |
-| [PG: Functions and operators](#functions-and-operators) | 0 | 15 | 6 | 0 | 21 |
-| [PG: Types](#types) | 0 | 12 | 16 | 0 | 28 |
-| [PG: DDL](#ddl) | 2 | 14 | 6 | 1 | 23 |
-| [PG: Programmability](#programmability) | 2 | 3 | 2 | 0 | 7 |
+| [PG: Query language](#query-language) | 0 | 10 | 12 | 0 | 22 |
+| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
+| [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
+| [PG: DDL](#ddl) | 2 | 13 | 7 | 1 | 23 |
+| [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 0 | 12 |
-| [PG: Security](#security) | 0 | 6 | 4 | 0 | 10 |
+| [PG: Security](#security) | 0 | 5 | 5 | 0 | 10 |
 | [PG: Extensions](#extensions) | 0 | 6 | 4 | 0 | 10 |
-| [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 3 | 4 | 0 | 7 |
-| [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 1 | 7 | 6 | 0 | 14 |
-| [PG: Operations](#operations) | 0 | 5 | 7 | 0 | 12 |
+| [PG: Wire protocol and clients](#wire-protocol-and-clients) | 0 | 2 | 4 | 0 | 6 |
+| [PG: System catalogs and introspection](#system-catalogs-and-introspection) | 0 | 5 | 7 | 0 | 12 |
+| [PG: Operations](#operations) | 0 | 4 | 7 | 0 | 11 |
 | [CR: Changefeeds / CDC](#changefeeds-and-cdc) | 1 | 0 | 1 | 0 | 2 |
 | [CR: Multi-region and placement](#multi-region-and-placement) | 0 | 5 | 2 | 0 | 7 |
 | [CR: Indexes, computed columns, spatial](#indexes-computed-columns-and-spatial) | 0 | 6 | 1 | 0 | 7 |
 | [CR: Bulk I/O, backup and restore](#bulk-io-backup-and-restore) | 0 | 5 | 4 | 0 | 9 |
 | [CR: Jobs](#jobs) | 0 | 1 | 1 | 0 | 2 |
 | [CR: Transactions and programmability](#transactions-and-programmability) | 1 | 2 | 3 | 0 | 6 |
-| [CR: Row-level TTL and historical reads](#row-level-ttl-and-historical-reads) | 0 | 1 | 1 | 0 | 2 |
+| [CR: Row-level TTL and historical reads](#row-level-ttl-and-historical-reads) | 0 | 0 | 2 | 0 | 2 |
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **6** | **94** | **69** | **1** | **170** |
-| **CockroachDB total** | **2** | **25** | **18** | **0** | **45** |
-| **All** | **8** | **119** | **87** | **1** | **215** |
+| **PostgreSQL total** | **5** | **68** | **80** | **1** | **154** |
+| **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
+| **All** | **7** | **92** | **99** | **1** | **199** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -93,22 +93,18 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 |---|---|---|---|---|---|---|---|
 | PG-Q-003 | `DISTINCT ON` together with window functions; `DISTINCT ON` in a select without `FROM` (ignored) | `0A000`; ignored | `row_number() OVER (PARTITION BY ...)` in a derived table | P3 | S | D | — |
 | PG-Q-004 | What `LATERAL` (#338) does not cover yet: a lateral subquery over a derived table or a set operation of its own, an outer reference in a lateral subquery's `ORDER BY` / `GROUP BY` / aggregate arguments, `RIGHT` / `FULL JOIN LATERAL` (PostgreSQL allows it when nothing to the left is read); `ROWS FROM (...)`; `json_table`; multi-argument `unnest`; a set-returning function in the select list of a query with `FROM` | `0A000 correlated subqueries are not supported`; `42P10`; `0A000` | a plain lateral select; expand in `FROM` | P2 | M | D | — |
-| PG-Q-008 | Aggregates in a `SELECT` without `FROM` (`SELECT count(*)`, `SELECT max(1)`) | `XX000 empty expression` (an internal error) | `SELECT count(*) FROM (SELECT 1) s` (works) | P2 | S | V | — |
+| PG-Q-034 | An aggregate that appears only in `HAVING` (`SELECT 1 HAVING count(*) > 0`, also with `FROM t`) | `42803` | put the aggregate in the select list too | P3 | S | D | — |
 | PG-Q-009 | Window functions over aggregates (`sum(count(*)) OVER ()`), a window call in `ORDER BY` | `0A000 grouped SELECT items must be plain columns or aggregates`; `42803 aggregate functions in ORDER BY require GROUP BY ...` | derived table | P2 | M | V | — |
 | PG-Q-010 | Window frames: `RANGE` with an offset, `GROUPS`, `EXCLUDE`; `FILTER` and `DISTINCT` on a window call | `0A000 RANGE frames with an offset are not supported; use ROWS`; `42601 expected ")", found "groups" / "exclude"`; `0A000` for `FILTER` on a window call, with PostgreSQL's messages for `DISTINCT` / `ORDER BY` / `WITHIN GROUP` (which PostgreSQL refuses too) | `ROWS` frames; `CASE` inside the aggregate | P2 | M | V | — |
 | PG-Q-011 | Functional dependency on the primary key: `GROUP BY t.id` then selecting `t.b` | `42803 column "t.b" must appear in the GROUP BY clause ...` | list every column in `GROUP BY` | P2 | M | V | — |
 | PG-Q-012 | Row constructors and comparisons: `(a, b) > (1, 5)`, `(a, b) IN (SELECT ...)`, `ROW(1, 'a')`, whole-row references (`SELECT u FROM u`, `row_to_json(u)`) | `42601 expected ")", found ","`; `42883 unknown function "row"`; `42703 column "u" does not exist` | expand to column-wise `AND`/`OR`; build JSON with `jsonb_build_object` | P2 | M | V | — |
-| PG-Q-013 | Quantified comparison other than `= ANY`: `> ALL (SELECT ...)`, `< ANY (SELECT ...)` | `42601 > ALL (SELECT ...) is not supported` | `max()` / `min()` subquery | P2 | S | V | — |
 | PG-Q-014 | Correlated subqueries over a set operation; a correlated subquery in `UPDATE ... SET` | `0A000 correlated subqueries are not supported (column "t.id" does not exist)` | rewrite as join or per-row update | P2 | M | V | — |
-| PG-Q-015 | `VALUES` as a `FROM` item (`(VALUES (1,'a')) AS v(x, y)`); `TABLE t` | `42601 expected identifier, found "("`; `42601 unsupported statement "TABLE"` | `WITH v(x, y) AS (VALUES ...)` (works) | P2 | S | V | — |
 | PG-Q-016 | `MERGE` (and PG 17's `MERGE ... RETURNING`, `WHEN NOT MATCHED BY SOURCE`) | `42601 unsupported statement "merge"` | `INSERT ... ON CONFLICT DO UPDATE`; `UPSERT` | P2 | L | V | — |
-| PG-Q-017 | Multi-column `UPDATE ... SET (a, b) = (...)` and `= (SELECT ...)` | `42601 expected identifier, found "("` | one assignment per column | P2 | S | V | — |
-| PG-Q-019 | `COPY FROM` options other than `FORMAT`: `HEADER`, `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL`, `ON_ERROR` (17), `ENCODING` | `42601 unsupported COPY option "header"` | strip the header; default delimiters | P2 | S | V | — |
+| PG-Q-035 | `COPY FROM` `DEFAULT` (16) and `ON_ERROR` (17); `ENCODING` other than UTF8 / SQL_ASCII (no conversion); `FREEZE` is accepted and ignored | `42601`; `0A000` | convert the file to UTF8 first | P3 | S | D | — |
 | PG-Q-020 | `COPY FROM` is not atomic (commits in 128-row / 1 MiB chunks) and is refused inside `BEGIN` | `25001 COPY FROM cannot run inside a transaction block`; silently different on failure (earlier chunks stay) | load into a staging table, then `INSERT ... SELECT` | P2 | L | V | — |
 | PG-Q-021 | SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`; cursors: `DECLARE`, `FETCH`, `MOVE`, `CLOSE`, `WITH HOLD` (psycopg named cursors, some reporting tools) | `42601 unsupported statement "prepare" / "declare"` | protocol-level prepare and portal suspension (both work) | P2 | M | V | — |
 | PG-Q-022 | `EXPLAIN` options (`FORMAT JSON`, `VERBOSE`, `BUFFERS`, `COSTS`, `SETTINGS`, `GENERIC_PLAN`), `EXPLAIN` of `INSERT`/`UPDATE`/`DELETE`, a plan tree | `42601 expected SELECT, VALUES or a parenthesized query, found "format"`; `0A000 EXPLAIN supports table SELECT statements only` | plain `EXPLAIN` / `EXPLAIN ANALYZE` of a `SELECT` (one line per stage) | P2 | M | V | — |
-| PG-Q-023 | `COLLATE` in expressions and `ORDER BY` (`ORDER BY b COLLATE "C"`) | `42601 unexpected "collate" after statement` | — (everything already sorts bytewise) | P2 | S | V | — |
-| PG-Q-024 | `DISCARD ALL` / `DISCARD PLANS` (connection poolers' reset query) | `42601 unsupported statement "discard"` | `RESET ALL` (works) | P2 | S | V | — |
+| PG-Q-036 | Collations other than C / POSIX / default / ucs_basic (`"en_US"`, ICU): text compares bytewise | `42704 collation "x" for encoding "UTF8" does not exist` | sort client-side, or `ORDER BY lower(x)` | P3 | M | D | — |
 | PG-Q-025 | `WITH ... AS [NOT] MATERIALIZED`; `SEARCH` and `CYCLE` clauses of recursive CTEs | `42601 expected "(", found "materialized"`; `42601 unsupported statement "search" / "cycle"` | drop the keyword; track depth by hand | P3 | S | V | — |
 | PG-Q-026 | `SELECT ... INTO new_table` | `42601 SELECT ... INTO is not supported: use CREATE TABLE ... AS SELECT` | `CREATE TABLE ... AS` | P3 | S | V | — |
 | PG-Q-027 | `FETCH FIRST n ROWS WITH TIES`; `TABLESAMPLE` | `42601 expected ONLY in FETCH FIRST, found "with"`; `42601 unexpected "system"` | rank in a derived table; `random()` filter | P3 | S | V | — |
@@ -128,22 +124,17 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-F-001 | **Regex leftovers**: `regexp_instr`; `substring(s from pattern)`; back references and lookaround (patterns run on RE2) | `42883`; `2201B` | the other `regexp_*` functions (#339) | P2 | S | D | — |
+| PG-F-025 | Regular-expression back references and lookaround (patterns run on RE2) | `0A000` | rewrite the pattern, or match client-side | P3 | M | D | — |
 | PG-F-002 | **Set-returning function leftovers**: `generate_subscripts`, `string_to_table`, `pg_get_keywords` | `42883` | `generate_series`, `regexp_split_to_table`, `unnest` (#339) | P3 | S | D | — |
 | PG-F-003 | **JSON processing leftovers**: `jsonb_to_record[set]`, `jsonb_populate_record[set]`, `jsonb_set_lax`, `jsonb_object`, `array_to_json`, `row_to_json` (no row type); `jsonb_each` returns keys in stored order, not PostgreSQL's length-then-bytes order | `42883`; silently different order | `jsonb_each`, `jsonb_array_elements`, `jsonb_object_keys`, `jsonb_insert` (#339) | P2 | M | D | — |
-| PG-F-005 | Other **jsonb operators**: `-` (delete key or index), `#-` (delete path), subscripting `j['a']` (14), ordering comparisons (`ORDER BY j`) | `0A000 unsupported operand for -: JSONB`; `42601 unexpected character '#'`; `42883 function array_subscript(jsonb, text) does not exist`; `XX000 ORDER BY: JSONB values have no order` | `jsonb_set`; `->` | P2 | S | V | — |
 | PG-F-006 | **Date/time function leftovers**: `date_bin`, `date_add` / `date_subtract` (16), `make_timestamptz(..., zone)` (and it ignores the session zone), `timeofday`, `to_char(interval, ...)`, `to_number` | `42883 unknown function "date_bin"`; `42601 make_timestamptz() takes 6 argument(s), got 7`; `42883 function does not exist for argument type INTERVAL` | `date_trunc`; `AT TIME ZONE` (#340) | P2 | M | V | — |
-| PG-F-009 | **String functions**: `overlay`, `bit_length`, `to_ascii`, `convert_from` / `convert_to`, `unistr`, `normalize`, `parse_ident`, `sha224` / `sha384` / `sha512`, `crc32` (18), `get_byte` / `set_byte` / `get_bit`; `format()` width and flags (`%5s`, `%-3s`) | `42883 unknown function "overlay"`; `22023 unrecognized format() type specifier '5'` | `substring` + `\|\|`; `sha256` | P2 | S | V | — |
-| PG-F-010 | **Math functions**: trigonometric (`sin` ... `atan2`, the degree variants, hyperbolic), `degrees`, `radians`, `factorial`, `lcm`, `scale`, `min_scale`, `trim_scale`, `setseed`, `random(min, max)` (17), `random_normal` (16), `erf` | `42883 unknown function "sin"`; `42601 random() takes 0 argument(s), got 2` | client-side | P2 | S | V | — |
-| PG-F-011 | **Integer and bitwise operators**: `&`, `\|`, `#`, `~`, `<<`, `>>`, `@`, `\|/`, `\|\|/`, `!` | `42601 unexpected character '&'`; `42601 expected value, found "<"` | `div`, `mod`, `power` | P2 | S | V | — |
-| PG-F-012 | **Array functions**: `array_dims`, `array_fill`, `array_replace`, `array_positions`, `array_sample` / `array_shuffle` (16), `trim_array`, `generate_subscripts`; `array_reverse` / `array_sort` (18) | `42883 unknown function "array_replace"` | `array_remove` + `array_append` | P2 | S | V | — |
-| PG-F-013 | **Aggregates**: `corr`, `covar_pop` / `covar_samp`, `regr_*`, `bit_and` / `bit_or` / `bit_xor`, `any_value` (16), `range_agg`, `xmlagg`, `jsonb_agg_strict` / `json_*agg_strict` (16) | `42883 unknown function "corr"` | compute from `sum`/`avg` in a derived table (needs PG-Q-001) | P2 | S | V | — |
+| PG-F-026 | `setseed` (no per-session random generator); `scale(1.50)` is 1, PostgreSQL says 2 | `42883`; silently different | — | P3 | S | D | — |
+| PG-F-027 | Bitwise operators on `int2` / `int4` compute in `int8`: `1 << 31` on an `int4` is 2147483648, PostgreSQL wraps to -2147483648 | silently different | cast the result | P3 | S | D | — |
+| PG-F-028 | `range_agg`, `xmlagg` (no range or xml types) | `42883` | — | P3 | S | D | — |
 | PG-F-014 | **SQL/JSON**: the `jsonpath` type, `@?`, `@@`, `jsonb_path_query[_array\|_first]`, `jsonb_path_exists`, `jsonb_path_match`; SQL/JSON constructors and query functions `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_TABLE` (17), `JSON_ARRAYAGG` / `JSON_OBJECTAGG` (16), `json_scalar`, `json_serialize` | `42601 unexpected character '@'`; `42883 unknown function "jsonb_path_query"`; `42601 expected ")", found ":"` | `->` / `@>` / `?` | P2 | L | V | — |
 | PG-F-015 | **Size functions return NULL**: `pg_table_size`, `pg_total_relation_size`, `pg_relation_size`, `pg_database_size`; `pg_indexes_size` and `pg_column_size` do not exist | silently different (NULL; psql's `\dt+`, `\l+`, `\di+` show blank sizes); `42883` for the last two | `datax debug` ranges, the console's data view | P2 | M | V | — |
 | PG-F-016 | **Integer typing**: integer literals and `INT4` expressions are `int8` (`pg_typeof(1)` and `pg_typeof(int4_col)` are `int8`), so `2147483647::int4 + 1` is `2147483648` where PostgreSQL raises `22003`; `to_regtype('int4')` and `to_regtype('integer')` return `20` (int8's OID; PostgreSQL returns `integer`) | silently different | cast results; the column's own check still raises `22003` on store | P2 | M | V | — |
 | PG-F-017 | **More system functions**: `inet_server_addr` / `inet_client_addr` / `inet_server_port`, `pg_postmaster_start_time`, `pg_conf_load_time`, `txid_current` / `pg_current_xact_id` / snapshot functions, `pg_reload_conf`, `pg_get_expr` outside a catalog query, `to_regproc` / `to_regnamespace` / `to_regrole`, `has_function_privilege`, `pg_collation_for`, `pg_input_is_valid` (16), `pg_listening_channels`, `pg_notification_queue_usage`, `num_nulls` / `num_nonnulls`, `current_query`, `pg_blocking_pids`, `pg_stat_reset`, `row_security_active`, `pg_partition_tree`, `pg_index_column_has_property`, `pg_options_to_table` | `42883 unknown function "..."` | — | P2 | M | V | — |
-| PG-F-018 | **Session functions nested in a call**: `pg_cancel_backend(pg_backend_pid())` fails though each works alone | `42883 unknown function "pg_backend_pid"` | call them separately | P2 | S | V | — |
-| PG-F-019 | **Timestamp text output carries nanoseconds**: `now()`, `clock_timestamp()` and values written from them render 9 fractional digits (`2026-11-17 13:18:04.787705724+00`; PostgreSQL prints at most 6), and `jsonb_build_object('a', now())` gives `"2026-11-17 13:17:05.944604664+00"` where PostgreSQL gives `"2026-11-17T13:17:05.944604+00:00"`. Text-format timestamp parsers that expect at most 6 digits may reject or misread them | silently different | binary format (pgx default); `date_trunc('microseconds', ...)` | P2 | S | V | — |
 | PG-F-020 | Named-argument calls `f(x => 1)` | `42601 expected ")", found "="` | positional arguments | P3 | S | V | — |
 | PG-F-021 | Ordered-set and hypothetical-set aggregates beyond scalar `percentile_cont` / `percentile_disc`: `percentile_*` over an array of fractions, `rank` / `dense_rank` / `percent_rank` / `cume_dist` `WITHIN GROUP` | `42601 RANK() requires an OVER clause`; `XX000 empty expression` | window functions | P3 | M | V | — |
 | PG-F-022 | `SHOW FUNCTIONS` and `docs/user/functions.md` list 141 scalar functions but no aggregates, window functions or catalog functions, which exist | silently incomplete | `pg_proc` (173 rows) | P3 | S | V | — |
@@ -154,8 +145,7 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-T-001 | **Time-zone leftovers** after #340: a literal without an offset in a join's `ON` condition is read as UTC (`ON` conditions are not zone-resolved); `to_jsonb`, `array_to_string` and `format` render a `timestamptz` in UTC; zone abbreviations are a fixed list; whether the startup `ParameterStatus` reports the session zone is not re-checked | silently different | put such a filter in `WHERE`; write offsets in literals | P2 | S | D | — |
-| PG-T-003 | **`bytea` in the remaining expressions**: `bytea \|\| bytea` returns text (`\x0102\x03`, not `\x010203`); `btrim`, `ltrim`, `rtrim`, `reverse`, `repeat`, `lower`, `left`, `right` and `split_part` of a `bytea` work on its hex text; `get_byte`, `set_byte`, `get_bit`, `bit_length` and `convert_from` do not exist; bytea input does not take the escape format (`'abc\000'::bytea` is 7 bytes, not 4); `char_length(bytea)` answers instead of `42883` (`length`, `octet_length`, `substring`, `position` and `md5` work on bytes since #344) | silently different; `42883 unknown function "get_byte"` | do byte work client-side | P2 | S | V | — |
+| PG-T-031 | `json_agg` / `jsonb_agg` render a `timestamptz` in UTC; zone abbreviations are a fixed list (no `timezone_abbreviations`, none DST-dependent); an invalid startup setting is ignored where PostgreSQL ends the connection | silently different | `to_jsonb` per row | P3 | S | D | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
 | PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; years outside 1678–2261; special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'` | `22007 invalid input syntax for type date: "infinity"` (and likewise) | sentinel values; `now()` | P2 | M | V | — |
 | PG-T-006 | `TIMESTAMP` (without time zone) expressions and casts become `timestamptz`; `date + interval` is `timestamptz` (PostgreSQL: `timestamp`); a bind parameter for a `TIMESTAMP` column describes as `timestamptz` | silently different (wire type) | pass UTC | P2 | M | V | — |
@@ -164,8 +154,7 @@ which do exist: see PG-F-022.
 | PG-T-009 | Domains: `CREATE DOMAIN` | `42601 expected TABLE, found "domain"` | `CHECK` on each column | P2 | M | V | — |
 | PG-T-010 | Range and multirange types (`int4range`, `tstzrange`, `daterange`, ..., operators `@>`, `&&`, `-\|-`, functions `lower`, `upper`, `isempty`) | columns `42704 type "tstzrange" does not exist`; `42883 unknown function "int4range"`; `'{[1,3)}'::int4multirange` is `42704` (since #343) | two columns | P2 | L | V | — |
 | PG-T-011 | Network types `inet`, `cidr`, `macaddr`, `macaddr8`, their operators (`<<`, `>>`, `&&`, `+`) and functions (`host`, `network`, `masklen`, ...) | `42704 type "inet" does not exist` (casts too, since #343); `42883 unknown function "host"` | `TEXT` with `CHECK` | P2 | M | V | — |
-| PG-T-012 | OID and reg* types: OIDs are 64-bit (`'pg_class'::regclass::oid` is `1099511627777`), `'t'::regclass` prints the number (PostgreSQL prints `t`), `regproc` / `regnamespace` / `regrole` resolve only partly, `'vector'::regtype` does not resolve | silently different | `oid::regclass` on a column gives the name (works) | P2 | S | V | — |
-| PG-T-013 | `numeric` `NaN` and `±Infinity` (14) | `22P02 invalid input syntax for type numeric: "NaN"` | `float8` | P2 | S | V | — |
+| PG-T-032 | reg* values describe as `int8` on the wire and `pg_typeof` says `bigint`; reg casts of a column other than `::regclass` pass the number through; index and constraint OIDs (`relOID<<16 \| n`) pass 32 bits once table IDs reach 65536 | silently different | `::regclass` on a column | P2 | M | D | — |
 | PG-T-014 | Geometric types (`point`, `line`, `lseg`, `box`, `path`, `polygon`, `circle`) and operators | `42704 type "point" does not exist`; `42883 unknown function "point"` | two `float8` columns; PostGIS is PG-E-002 | P3 | L | V | — |
 | PG-T-015 | Bit strings `BIT(n)`, `BIT VARYING`, `B'1010'` and bit operators | `42601 expected ")", found "("`; `42601 unexpected character '&'` | `INT8` or `BYTEA` | P3 | M | V | — |
 | PG-T-016 | `money` | `42704 type "money" does not exist`, for columns and casts | `DECIMAL(19,2)` | P3 | S | V | — |
@@ -200,7 +189,7 @@ which do exist: see PG-F-022.
 | PG-D-019 | Views: updatable views, `WITH CHECK OPTION`, `CREATE RECURSIVE VIEW`, `ALTER VIEW ... RENAME` and other forms, `security_invoker`; renaming a column a view reads | `42809 cannot modify view "vup": views are read-only`; `42601 unexpected "with"`; `42601 ALTER VIEW supports only OWNER TO`; `2BP01 cannot rename column v: view "vup" depends on table "u"` | `CREATE OR REPLACE VIEW`; write the base table | P2 | M | V | — |
 | PG-D-020 | Declarative partitioning (`PARTITION BY RANGE / LIST / HASH`, `ATTACH` / `DETACH PARTITION`) | `42601 unexpected "partition" after statement` | ranges split automatically; `SPLIT AT` | P2 | XL | V | — |
 | PG-D-021 | `ALTER TABLE` forms: `ENABLE` / `DISABLE TRIGGER` (Rails fixtures use `DISABLE TRIGGER ALL`), `SET LOGGED` / `UNLOGGED`, `REPLICA IDENTITY`, `ALTER COLUMN SET STATISTICS` / `STORAGE` / `COMPRESSION`, `CLUSTER ON`, `INHERIT`, `OF type` | `42601 expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found ...` | — | P2 | M | V | — |
-| PG-D-022 | `CREATE DATABASE` options (`ENCODING`, `TEMPLATE`, `LOCALE`, `OWNER`, `CONNECTION LIMIT`); `ALTER DATABASE ... SET param` | `42601 expected "=", found "UTF8"`; `42601 unknown placement option "search_path"` | — | P2 | S | V | — |
+| PG-D-033 | `ALTER DATABASE ... SET param FROM CURRENT`; `pg_db_role_setting` / `\drds` do not show database defaults; `LC_COLLATE` is reported, not applied | `42601`; silently different | — | P3 | S | D | — |
 | PG-D-023 | Inheritance (`INHERITS`) | `42601 expected identifier, found ")"` | — | P3 | L | V | — |
 | PG-D-024 | Tablespaces (`TABLESPACE` clause, `CREATE TABLESPACE`) | `42601 unexpected "tablespace" after statement` | omit; placement is per database | P3 | S | V | — |
 | PG-D-025 | Storage parameters (`WITH (fillfactor = 70)`, `autovacuum_*`, `toast.*`) | `42601 unknown table option "fillfactor"` | omit | P3 | S | V | — |
@@ -219,7 +208,6 @@ which do exist: see PG-F-022.
 | PG-P-002 | **Triggers** (`CREATE TRIGGER`, row and statement, `BEFORE` / `AFTER` / `INSTEAD OF`, transition tables) — `updated_at` and audit triggers, many schema generators | `42601 expected TABLE, found "trigger"` | application code; the `datax_audit` table for auditing | P1 | XL | V | — |
 | PG-P-003 | **PL/pgSQL** and `DO` blocks (migration scripts use `DO $$ BEGIN IF NOT EXISTS ... END $$` for idempotent DDL) | `42601 invalid parameter at position 3` | `IF NOT EXISTS` forms (widely supported here) | P2 | XL | V | — |
 | PG-P-004 | Procedures and `CALL` | `42601 invalid parameter at position 38`; `42601 unsupported statement "call"` | — | P2 | L | V | — |
-| PG-P-005 | Dollar-quoted string literals (`$$...$$`, `$tag$...$tag$`) anywhere, not only in function bodies | `42601 syntax error: invalid parameter at position 7` | single-quoted strings | P2 | S | V | — |
 | PG-P-006 | Event triggers | `42601 expected TABLE, found "event"` (`\dy` lists none) | — | P3 | L | V | — |
 | PG-P-007 | Rules (`CREATE RULE`) | `42601 expected TABLE, found "rule"` | — | P3 | M | V | — |
 
@@ -244,7 +232,7 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-S-001 | Role attributes `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `REPLICATION`, `VALID UNTIL`, `CONNECTION LIMIT` | `42601 role option CREATEDB is not supported (roles: LOGIN, NOLOGIN, PASSWORD, INHERIT, NOINHERIT, BYPASSRLS, NOBYPASSRLS, IN ROLE)` | `GRANT admin TO r` | P2 | S | V | — |
+| PG-S-011 | `CREATEROLE` grants nothing; `CONNECTION LIMIT` counts per node, not cluster-wide; `VALID UNTIL 'infinity'` shows as NULL | silently different | an admin manages roles | P3 | S | D | — |
 | PG-S-002 | Per-role and per-database setting defaults: `ALTER ROLE ... SET`, `ALTER DATABASE ... SET`, `pg_db_role_setting` (empty) | `42601 unexpected "SET" in role options` | set at connect | P2 | M | V | — |
 | PG-S-003 | Column-level privileges (`GRANT SELECT (col) ON t`) | `42601 expected ON, found "("` | a view (definer's rights) | P2 | M | V | — |
 | PG-S-004 | Row-level security differences: no subqueries in a policy, no `security_invoker` views, `row_security` not a setting, admins exempt like owners, `TRUNCATE` refused to a filtered role, policies on views (user doc) | `0A000 USING: subqueries are not supported in a policy expression`; `42704 unrecognized configuration parameter "row_security"` | `current_setting` in policies | P2 | M | V | — |
@@ -289,7 +277,6 @@ SCRAM-SHA-256-PLUS with `tls-server-end-point` channel binding, and
 |---|---|---|---|---|---|---|---|
 | PG-W-001 | Replication protocol and logical decoding: a `replication=database` startup is accepted but `IDENTIFY_SYSTEM`, `CREATE_REPLICATION_SLOT`, `START_REPLICATION` are not; no `pgoutput`, `wal2json` or `test_decoding`; no physical streaming; `pg_replication_slots` missing (Debezium and other CDC tools) | `ERROR: syntax error: unsupported statement "identify_system"` | `LISTEN`/`NOTIFY` (not durable); polling with `AS OF SYSTEM TIME` | P2 | XL | V | — |
 | PG-W-002 | `CopyOutResponse` / `CopyBothResponse` (COPY TO, PG-Q-018; COPY BOTH for replication) | as PG-Q-018 | — | P2 | M | V | — |
-| PG-W-003 | Startup and reported parameters: `server_version` is `14.0` (clients pick PG 14 queries); `server_version_num`, `max_identifier_length`, `extra_float_digits` are not settings | `42704 unrecognized configuration parameter "server_version_num"` | — | P2 | S | V | — |
 | PG-W-004 | Fast-path function calls other than the large-object functions | `0A000` | SQL calls | P3 | S | D | — |
 | PG-W-005 | GSSAPI encryption (`GSSENCRequest`) | declined: psql `gssencmode=require` fails with "GSSAPI encryption required but was impossible" | TLS | P3 | M | V | — |
 | PG-W-006 | Protocol version 3.2 (PostgreSQL 18: longer cancel keys) and `NegotiateProtocolVersion` | not offered | protocol 3.0 | P3 | S | D | — |
@@ -321,14 +308,12 @@ the empty list commands all render.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-C-001 | `information_schema.sequences` (Hibernate reads it at startup), `table_privileges`, `column_privileges`, `usage_privileges`, `routines`, `parameters`, `triggers`, `element_types`, `domains`, `applicable_roles`, `enabled_roles`, `character_sets`, `collations`, `view_table_usage`, `column_udt_usage`, `user_defined_types`, `attributes` | `42P01 table "information_schema.sequences" does not exist` | `pg_sequences` | P1 | M | V | — |
+| PG-C-015 | `information_schema` leftovers: its own domains (`cardinal_number`, ...) are not listed in `domains` / `usage_privileges`; `routines` lists no builtins; `sequences.data_type` is always `bigint`; `check_clause` is datax's stored text | silently different | — | P3 | S | D | — |
 | PG-C-002 | `pg_stat_*` and `pg_statio_*` views: `pg_stat_database`, `pg_stat_all_tables` / `sys_tables`, `pg_stat_[user\|all]_indexes`, `pg_statio_user_tables`, `pg_stat_bgwriter`, `pg_stat_wal`, `pg_stat_io` (16), `pg_stat_replication`, `pg_stat_ssl`, `pg_stat_progress_*`, `pg_stat_user_functions`; `pg_stat_user_tables` has six columns (monitoring agents, `postgres_exporter`) | `42P01 table "pg_catalog.pg_stat_database" does not exist` | `/metrics`, the console | P2 | M | V | — |
 | PG-C-003 | `pg_locks` (and `pg_blocking_pids`) | `42P01` | the console's sessions; `SHOW SESSIONS` | P2 | M | V | — |
 | PG-C-004 | `pg_stats` / `pg_statistic` (and data in `pg_statistic_ext`): no histograms or most-common values | `42P01 table "pg_catalog.pg_stats" does not exist` | `SHOW STATS FOR t` | P2 | M | V | — |
 | PG-C-005 | `pg_depend` is empty (tools use it for sequences owned by columns, view dependencies, extension membership) | silently empty | `pg_sequences`, `pg_attrdef` | P2 | M | V | — |
 | PG-C-006 | `ANALYZE` is admin-only, takes no column list or options, stores row counts and distinct / NULL counts only | `42601 unexpected "(" after statement` for `ANALYZE u (v)` | `ANALYZE t` | P2 | M | V | — |
-| PG-C-007 | `pg_get_indexdef` / `pg_get_constraintdef` for a table with the hidden `rowid` key render an empty column list (`CREATE UNIQUE INDEX ctas_pkey ON public.ctas USING btree ()`, `PRIMARY KEY ()`) — DDL generators emit invalid statements | silently wrong | skip `rowid` tables | P2 | S | V | — |
-| PG-C-008 | `pg_timezone_names`, `pg_timezone_abbrevs` | `42P01` | — | P2 | S | V | — |
 | PG-C-009 | `pg_prepared_statements`, `pg_cursors`, `pg_prepared_xacts` | `42P01` | — | P3 | S | V | — |
 | PG-C-010 | `pg_file_settings`, `pg_hba_file_rules`, `pg_config`, `pg_authid`, `pg_shadow` | `42P01` | `pg_settings`, `pg_roles` | P3 | S | V | — |
 | PG-C-011 | `pg_aggregate`, `pg_init_privs`, `pg_default_acl`, `pg_seclabel`, `pg_shdepend`, `pg_rules`, `pg_user_mapping`, `pg_largeobject` | `42P01` | `pg_proc`; `SHOW GRANTS` | P3 | S | V | — |
@@ -341,7 +326,6 @@ the empty list commands all render.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-O-001 | **Settings leftovers** (the common settings were added in #345): `IntervalStyle` and `bytea_output` change only top-level text columns on the wire, not `::text`, arrays, records or JSON; `SHOW statement_timeout` (and the other timeouts) gives `5000` where PostgreSQL gives `5s`; error HINTs are missing; `pg_settings` has no `enumvals`, `min_val` or `max_val`; `lc_messages` and `session_replication_role` need no superuser | silently different | — | P3 | S | D | — |
-| PG-O-003 | `VACUUM` (all forms, including `VACUUM ANALYZE`) | `42601 unsupported statement "vacuum"` | none needed for space (MVCC GC, `ALTER TABLE ... PURGE`); `ANALYZE` | P2 | S | V | — |
 | PG-O-004 | Logical replication: `CREATE PUBLICATION`, `CREATE SUBSCRIPTION` (the catalogs are empty stubs) | `42601` | backup / restore; LISTEN/NOTIFY | P2 | XL | V | — |
 | PG-O-005 | Collations and ICU: the only ordering is bytewise (`'a' < 'B'` is false, as under `C`); no ICU or nondeterministic (case-insensitive) collations, no `CREATE COLLATION`, no `COLLATE` in expressions or indexes; `\l` shows `C` | silently different from an `en_US` database | sort client-side | P2 | L | V | — |
 | PG-O-006 | Encodings: UTF8 only | `22023 invalid value for parameter "client_encoding": only UTF8 is supported` | convert client-side | P2 | M | V | — |
@@ -451,7 +435,7 @@ and `with_max_staleness(...)` bounded-staleness reads.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| CR-AOST-001 | Follower-read and historical-read forms: `follower_read_timestamp()`, `with_min_timestamp(...)`, `with_max_staleness(..., nearest_only)`, `BEGIN AS OF SYSTEM TIME` / `SET TRANSACTION AS OF SYSTEM TIME`, `AS OF SYSTEM TIME` in `BACKUP` / `EXPORT` | `42601 expected AS OF SYSTEM TIME operand, found "follower_read_timestamp"`; `42601 unexpected "AS" after statement` | `AS OF SYSTEM TIME '-4s'`; `with_max_staleness('10s')` | P2 | S | K, V | — |
+| CR-AOST-002 | `nearest_only = TRUE`; `follower_read_timestamp()` in a select list; expression operands (`now() - '10s'::interval`) | `0A000`; `42883`; `42601` | a literal timestamp or interval | P3 | S | D | — |
 | CR-TTL-001 | CockroachDB's TTL options and controls: `ttl_expire_after` (with the hidden `crdb_internal_expiration` column), `ttl_expiration_expression` (any expression), `ttl_job_cron`, `ttl_select_batch_size`, `ttl_delete_batch_size`, `ttl_delete_rate_limit`, `ttl_pause`, `ttl_row_stats_poll_interval`; one TTL job per table, visible in `SHOW JOBS` | `42601 unknown table option "ttl_expire_after"` | datax's `ttl_column` + `ttl`, `ttl_expiration = col` | P3 | M | K, V | — |
 
 ### Virtual clusters and cluster settings
@@ -532,6 +516,35 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| Aggregates in a `SELECT` without `FROM` (was PG-Q-008; leftovers are PG-Q-034) | PR (this branch) |
+| Quantified comparisons `< <= > >= = <>` and `LIKE` with `ANY` / `SOME` / `ALL` over subqueries and arrays, PostgreSQL's NULL rules (was PG-Q-013) | PR (this branch) |
+| `VALUES` column types resolved across rows; multi-row `LATERAL (VALUES ...)`; `TABLE t` (was PG-Q-015) | PR (this branch) |
+| Multi-column `UPDATE ... SET (a, b) = (...) / ROW(...) / (SELECT ...)`, also in `UPDATE ... FROM` and `ON CONFLICT DO UPDATE` (was PG-Q-017) | PR (this branch) |
+| `COPY FROM` options `HEADER [MATCH]`, `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL`, `FORCE_NOT_NULL`, `ENCODING` in both syntaxes (was PG-Q-019; leftovers are PG-Q-035) | PR (this branch) |
+| `COLLATE "C" / "POSIX" / "default" / ucs_basic` in expressions and `ORDER BY` (was PG-Q-023; leftovers are PG-Q-036) | PR (this branch) |
+| `DISCARD ALL / PLANS / SEQUENCES / TEMP` (was PG-Q-024) | PR (this branch) |
+| `regexp_instr`; `substring(s FROM pattern)` / `SIMILAR ... ESCAPE` (was PG-F-001; leftovers are PG-F-025) | PR (this branch) |
+| jsonb `-`, `#-`, subscripting (also in `UPDATE ... SET j['a']`), PostgreSQL's jsonb ordering (was PG-F-005) | PR (this branch) |
+| String functions: `overlay`, `bit_length`, `to_ascii`, `convert*`, `unistr`, `normalize`, `parse_ident`, sha2 / crc32, byte and bit access, `format()` widths (was PG-F-009) | PR (this branch) |
+| Math functions: trigonometric, degree and hyperbolic variants, `degrees`, `radians`, `factorial`, `lcm`, `scale`, `min_scale`, `trim_scale`, `random(min, max)`, `random_normal`, `erf` (was PG-F-010; leftovers are PG-F-026) | PR (this branch) |
+| Integer bitwise operators `& \| # << >>` and prefix `~ @ \|/ \|\|/` with PostgreSQL's precedence (was PG-F-011; leftovers are PG-F-027) | PR (this branch) |
+| Array functions `array_dims`, `array_fill`, `array_replace`, `array_positions`, `array_sample`, `array_shuffle`, `trim_array`, `generate_subscripts`, `array_reverse`, `array_sort` (was PG-F-012) | PR (this branch) |
+| Aggregates `corr`, `covar_*`, `regr_*`, `bit_and` / `bit_or` / `bit_xor`, `any_value`, the `json[b]_*agg_strict` / `_unique` forms (was PG-F-013; leftovers are PG-F-028) | PR (this branch) |
+| Session functions nested in a call (`pg_cancel_backend(pg_backend_pid())`) (was PG-F-018) | PR (this branch) |
+| Timestamps keep microsecond precision; jsonb renders them as PostgreSQL does (was PG-F-019) | PR (this branch) |
+| Time zones in `ON` conditions, in `to_jsonb` / `format` / `array_to_string` / `concat`; more abbreviations; the startup `TimeZone` in `ParameterStatus` (was PG-T-001; leftovers are PG-T-031) | PR (this branch) |
+| `bytea` `||`, trim / reverse on bytes, escape-format input, text-only functions refuse `bytea` (was PG-T-003) | PR (this branch) |
+| reg* literals resolve to OIDs and print as names; catalog OIDs fit in 32 bits (was PG-T-012; leftovers are PG-T-032) | PR (this branch) |
+| `numeric` `NaN` and `±Infinity`, ordering, arithmetic, wire format (was PG-T-013; `power` with them is not done) | PR (this branch) |
+| `CREATE DATABASE` options (`ENCODING`, `TEMPLATE`, `LOCALE`, `OWNER`, `CONNECTION LIMIT`, ...); `ALTER DATABASE ... SET / RESET` and the other forms (was PG-D-022; leftovers are PG-D-033) | PR (this branch) |
+| Dollar-quoted string literals anywhere (was PG-P-005) | PR (this branch) |
+| Role attributes `SUPERUSER` (the admin role), `CREATEDB`, `CREATEROLE`, `REPLICATION`, `CONNECTION LIMIT`, `VALID UNTIL`; admin-only `pg_authid` (was PG-S-001; leftovers are PG-S-011) | PR (this branch) |
+| PostgreSQL 14's full set of reported parameters and preset settings; `server_version` stays 14 on purpose, since pg_dump 16 dumps nothing from a server reporting 16 (was PG-W-003) | PR (this branch) |
+| Every PostgreSQL 16 `information_schema` view, with PostgreSQL's columns, types and visibility rules (was PG-C-001; leftovers are PG-C-015) | PR (this branch) |
+| `pg_get_indexdef` / `pg_get_constraintdef` of a literal OID or regclass; an index name is a regclass (was PG-C-007) | PR (this branch) |
+| `pg_timezone_names`, `pg_timezone_abbrevs` (was PG-C-008) | PR (this branch) |
+| `VACUUM` in all forms, a no-op; with `ANALYZE` it refreshes statistics (was PG-O-003) | PR (this branch) |
+| `follower_read_timestamp()`, `with_min_timestamp`, `with_max_staleness` in `AS OF SYSTEM TIME`; `BEGIN` / `SET TRANSACTION AS OF SYSTEM TIME` (was CR-AOST-001; leftovers are CR-AOST-002) | PR (this branch) |
 | Concurrent online `CREATE INDEX` on one table lost an index (was PG-D-032) | PR (this branch) (#368) |
 | Quoted mixed-case type names, `""` in identifiers, quoted keywords, `E''` escapes (was PG-T-029; leftovers are PG-T-030) | PR (this branch) (#367) |
 | Correlated subqueries follow PostgreSQL scoping; grouped correlated subqueries (was PG-Q-031) | PR (this branch) (#361) |
@@ -595,10 +608,10 @@ earlier list's items 1–2 are closed (#367, #368); pg_dump 17/18 and
 parallel restore (#370, #371) are tabled for now, and Rails migration
 requirements (PG-D-031) are P4, out of this list.
 
-1. **PG-F-001 / PG-F-002 / PG-F-003 / PG-F-006** what is left of the
+1. **PG-F-002 / PG-F-003 / PG-F-006** what is left of the
    missing function families.
 2. **PG-X-014** advisory locks taken per row (job queues).
-3. **PG-D-030 / PG-D-029 / PG-T-003** index and `bytea` leftovers.
+3. **PG-D-030 / PG-D-029** index leftovers.
 4. **PG-Q-033** a hash join, for large joins without a usable equality.
 5. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
 6. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and

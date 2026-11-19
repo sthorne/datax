@@ -386,11 +386,28 @@ func TestCopyFrom(t *testing.T) {
 		t.Fatalf("pgx spelling: %+v", cf)
 	}
 
+	// The options, in both syntaxes, as written (the session validates
+	// them, as PostgreSQL does at execution).
+	cf = parse1(t, "COPY t FROM STDIN WITH (FORMAT csv, HEADER match, DELIMITER ';', NULL 'x', FORCE_NULL (a, b), ENCODING 'UTF8')")
+	if cf.Format != CopyFormatCSV || len(cf.Options) != 6 || cf.Options[1].Arg != "match" || cf.Options[2].Arg != ";" ||
+		cf.Options[4].Name != "force_null" || len(cf.Options[4].List) != 2 || cf.Options[5].Arg != "UTF8" {
+		t.Fatalf("option list: %+v", cf)
+	}
+	cf = parse1(t, `COPY t FROM STDIN WITH CSV HEADER DELIMITER AS '|' NULL 'n' QUOTE '''' ESCAPE '\' FORCE NOT NULL a`)
+	if cf.Format != CopyFormatCSV || len(cf.Options) != 7 || cf.Options[1].Name != "header" || cf.Options[2].Arg != "|" ||
+		cf.Options[4].Arg != "'" || cf.Options[5].Arg != `\` || cf.Options[6].Name != "force_not_null" {
+		t.Fatalf("old syntax: %+v", cf)
+	}
+	cf = parse1(t, "COPY t FROM STDIN WITH (FORMAT nope)")
+	if cf.Format != CopyFormatText || cf.Options[0].Arg != "nope" {
+		t.Fatalf("unknown format: %+v", cf)
+	}
+	parse1(t, "COPY t FROM STDIN WITH")
+
 	for _, bad := range []string{
 		"COPY t FROM '/tmp/f'",
-		"COPY t FROM STDIN WITH (DELIMITER ',')",
-		"COPY t FROM STDIN WITH (FORMAT nope)",
-		"COPY t FROM STDIN WITH",
+		"COPY t FROM STDIN WITH (",
+		"COPY t FROM STDIN DELIMITER",
 	} {
 		if _, err := Parse(bad); err == nil {
 			t.Fatalf("%q parsed", bad)

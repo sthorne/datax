@@ -23,6 +23,10 @@ func TestLeftoverReplicaIsCollected(t *testing.T) {
 	tc := StartWithOptions(t, 4, func(c *server.Config) {
 		c.TestingKnobs.BeforeProposeDescriptorChange = hold.knob
 		c.RebalanceThreshold = -1
+		// The fast housekeeping tick below also drives the merge queue,
+		// which would otherwise merge the fixture's tiny halves back
+		// before the test acts on them; the test merges explicitly.
+		c.MergeSizeThreshold = -1
 		c.GCInterval = time.Second
 		c.ReplicaGCGrace = grace
 	})

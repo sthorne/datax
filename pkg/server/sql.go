@@ -155,11 +155,12 @@ func (n *Node) catalogAccessor() (*catalog.Accessor, error) {
 }
 
 // lookupVerifier reads a role's stored SCRAM verifier (nil, nil = no such
-// role, a role that cannot log in, or one without a password; the wire
-// layer reports every failure uniformly).
+// role, a role that cannot log in, one without a password, or one whose
+// VALID UNTIL has passed, as PostgreSQL refuses an expired password;
+// the wire layer reports every failure uniformly).
 func (n *Node) lookupVerifier(ctx context.Context, user string) (*security.ScramVerifier, error) {
 	r, err := catalog.LookupRole(ctx, n.db, user)
-	if err != nil || r == nil || !r.Login || len(r.Verifier) == 0 {
+	if err != nil || r == nil || !r.Login || len(r.Verifier) == 0 || r.PasswordExpired(time.Now()) {
 		return nil, err
 	}
 	return security.UnmarshalVerifier(r.Verifier)

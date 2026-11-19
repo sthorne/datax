@@ -212,7 +212,7 @@ func TestCommonFunctions(t *testing.T) {
 		`SELECT jsonb_each('{"a":1}')`:                             "0A000",
 		`SELECT generate_series(1, id) FROM fx`:                    "0A000",
 		`SELECT * FROM regexp_split_to_table('a', 'a', 'g')`:       "22023",
-		`SELECT * FROM regexp_matches('a', '(?=a)')`:               "2201B",
+		`SELECT * FROM regexp_matches('a', '(?=a)')`:               "0A000",
 		`SELECT * FROM generate_series(1, 10000000000) LIMIT 1`:    "53200",
 		`SELECT * FROM generate_series(1, 2) AS g(a, b)`:           "42P10",
 		`SELECT * FROM jsonb_each('{"a":1}') AS e(k, v, extra)`:    "42P10",

@@ -92,10 +92,22 @@ func TestPGNumericRoundTrip(t *testing.T) {
 	if _, err := decodePGNumeric(golden(1, 0, false, 0)[:6]); err == nil {
 		t.Fatal("truncated numeric accepted")
 	}
-	nan := golden(0, 0, false, 0)
-	binary.BigEndian.PutUint16(nan[4:6], 0xC000)
-	if _, err := decodePGNumeric(nan); err == nil {
-		t.Fatal("NaN numeric accepted")
+	// The special values (PG-T-013): their sign words alone, both ways.
+	for word, text := range map[uint16]string{0xC000: "NaN", 0xD000: "Infinity", 0xF000: "-Infinity"} {
+		raw := golden(0, 0, false, 0)
+		binary.BigEndian.PutUint16(raw[4:6], word)
+		if got, err := decodePGNumeric(raw); err != nil || got != text {
+			t.Fatalf("decode sign 0x%04x = %q, %v; want %q", word, got, err, text)
+		}
+		enc, err := encodePGNumeric(text)
+		if err != nil || !bytes.Equal(enc, raw) {
+			t.Fatalf("encode %q = %x, %v; want %x", text, enc, err, raw)
+		}
+	}
+	bad := golden(0, 0, false, 0)
+	binary.BigEndian.PutUint16(bad[4:6], 0x8000)
+	if _, err := decodePGNumeric(bad); err == nil {
+		t.Fatal("unknown numeric sign accepted")
 	}
 }
 

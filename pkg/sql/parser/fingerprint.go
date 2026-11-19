@@ -250,7 +250,7 @@ func (f *fingerprinter) selectStmt(s *Select) {
 			f.kw("NOWAIT")
 		}
 	}
-	if s.AsOf != "" || s.AsOfMaxStaleness != "" {
+	if s.AsOf != "" || s.AsOfMaxStaleness != "" || s.AsOfMinTimestamp != "" {
 		f.kw("AS OF SYSTEM TIME ?")
 	}
 	if s.Union != nil {

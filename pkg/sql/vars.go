@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -140,8 +141,6 @@ func canonicalVar(name string) string {
 		return "transaction_isolation"
 	case "datestyle":
 		return "DateStyle"
-	case "session_authorization":
-		return ""
 	}
 	for _, v := range varNames {
 		if strings.EqualFold(v.name, name) {
@@ -283,7 +282,42 @@ func (s *Session) ReportedParams() [][2]string {
 		{"DateStyle", s.vars.dateStyle},
 		{"TimeZone", s.vars.timeZoneName},
 		{"IntervalStyle", s.IntervalStyle()},
+		{"default_transaction_read_only", s.varValue("default_transaction_read_only")},
 	}
+}
+
+// StartupParams are the parameters a new connection is told of
+// (ParameterStatus after authentication): PostgreSQL 14's GUC_REPORT
+// settings, in the order PostgreSQL sends them. It reads whether the
+// session user is a superuser, which is_superuser reports from then on.
+func (s *Session) StartupParams(ctx context.Context) [][2]string {
+	admin := s.sessionUser == catalog.RootRole
+	if !admin && s.db != nil {
+		_ = s.db.RunTxn(ctx, "startup-roles", func(ctx context.Context, txn *kvclient.Txn) error {
+			set, err := catalog.LazyRoleGraph(ctx, txn).Effective(s.sessionUser)
+			if err == nil {
+				admin = set.IsAdmin()
+			}
+			return err
+		})
+	}
+	s.isSuperuser = &admin
+	params := make([][2]string, 0, 13)
+	for _, name := range []string{"application_name", "client_encoding", "DateStyle", "default_transaction_read_only", "in_hot_standby",
+		"integer_datetimes", "IntervalStyle", "is_superuser", "server_encoding", "server_version", "session_authorization",
+		"standard_conforming_strings", "TimeZone"} {
+		params = append(params, [2]string{name, s.varValue(name)})
+	}
+	return params
+}
+
+// superuser reports whether the session user is a superuser (root or an
+// admin) as of the connection's start; root before that is known.
+func (s *Session) superuser() bool {
+	if s.isSuperuser != nil {
+		return *s.isSuperuser
+	}
+	return s.sessionUser == catalog.RootRole
 }
 
 // TimeZone is the session's zone for rendering TIMESTAMPTZ values on
@@ -670,10 +704,13 @@ func (s *Session) endTxnVars() {
 }
 
 // readOnly reports whether the statement running now is in a read-only
-// transaction: SET TRANSACTION / BEGIN READ ONLY, or
-// default_transaction_read_only for an implicit or a block's start.
+// transaction: SET TRANSACTION / BEGIN READ ONLY, a historical block,
+// or default_transaction_read_only for an implicit or a block's start.
 func (s *Session) readOnly() bool {
-	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly)
+	return s.vars.txnReadOnly || (s.state != StateOpen && s.vars.defaultReadOnly) || (s.state == StateOpen && s.txnStartedReadOnly) ||
+		// A block pinned in the past (BEGIN AS OF SYSTEM TIME, SET
+		// TRANSACTION SNAPSHOT) can only read.
+		(s.state == StateOpen && s.txn != nil && s.txn.Historical())
 }
 
 // readOnlyViolation refuses a write in a read-only transaction (25006).
@@ -698,6 +735,13 @@ func writeKind(stmt parser.Statement) string {
 		return "DELETE"
 	case *parser.CopyFrom:
 		return "COPY"
+	case *parser.Vacuum:
+		// A bare VACUUM changes nothing; with ANALYZE it writes
+		// statistics, as ANALYZE does.
+		if t.Analyze {
+			return "VACUUM"
+		}
+		return ""
 	case *parser.CopyTo:
 		// COPY (INSERT ... RETURNING) TO writes; COPY t TO reads.
 		if t.Query != nil {

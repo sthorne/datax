@@ -90,6 +90,13 @@ func decimalSeries(a []types.Datum) (RowIter, error) {
 		if err != nil {
 			return nil, errf(CodeInvalidText, "invalid input syntax for type numeric: %q", d.Text())
 		}
+		if f, ok := types.DecimalSpecial(v); ok {
+			what := [3]string{"start value", "stop value", "step size"}[i]
+			if math.IsNaN(f) {
+				return nil, errf(CodeInvalidArgument, "%s cannot be NaN", what)
+			}
+			return nil, errf(CodeInvalidArgument, "%s cannot be infinity", what)
+		}
 		if vals[i], err = v.DecimalVal(); err != nil {
 			return nil, errf(CodeInvalidText, "invalid input syntax for type numeric: %q", d.Text())
 		}

@@ -83,6 +83,26 @@ type DatabaseDescriptor struct {
 	// and ALTER DATABASE ... SET, read by the allocator through the
 	// range's table, and gated on cluster version v16.
 	Placement base.PlacementPolicy `json:"placement,omitzero"`
+	// Collate and Ctype are the database's LC_COLLATE and LC_CTYPE as
+	// CREATE DATABASE named them ("" = C). They are reported, not
+	// applied: text compares bytewise, as in the C locale, whatever
+	// they say (PG-D-022).
+	Collate string `json:"collate,omitempty"`
+	Ctype   string `json:"ctype,omitempty"`
+	// ConnLimit is CONNECTION LIMIT: how many sessions may be open on
+	// the database at once on one node; nil for no limit.
+	ConnLimit *int64 `json:"conn_limit,omitempty"`
+	// Settings are ALTER DATABASE ... SET's defaults for the
+	// database's new sessions: parameter name to value.
+	Settings map[string]string `json:"settings,omitempty"`
+}
+
+// ConnectionLimit is the database's CONNECTION LIMIT, -1 for none.
+func (d *DatabaseDescriptor) ConnectionLimit() int64 {
+	if d.ConnLimit == nil {
+		return -1
+	}
+	return *d.ConnLimit
 }
 
 // Clone returns a deep copy.
@@ -100,6 +120,16 @@ func (d *DatabaseDescriptor) Clone() *DatabaseDescriptor {
 	}
 	if len(out.DefaultPrivileges) == 0 {
 		out.DefaultPrivileges = nil
+	}
+	if d.ConnLimit != nil {
+		n := *d.ConnLimit
+		out.ConnLimit = &n
+	}
+	if d.Settings != nil {
+		out.Settings = make(map[string]string, len(d.Settings))
+		for k, v := range d.Settings {
+			out.Settings[k] = v
+		}
 	}
 	return &out
 }
