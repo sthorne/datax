@@ -23,9 +23,12 @@ import (
 // lookupType resolves a type name (optionally database-qualified) in
 // the session's database.
 func (s *Session) lookupType(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TypeDescriptor, error) {
-	db, bare := catalog.SplitTableName(name)
-	if db == "" {
-		db = s.database
+	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newErrf(CodeUndefinedObject, "type %q does not exist", name)
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {
@@ -106,9 +109,12 @@ func (s *Session) execCreateType(ctx context.Context, txn *kvclient.Txn, t *pars
 	if err := s.checkCreateInDatabase(ctx, txn, t.Name); err != nil {
 		return nil, err
 	}
-	db, bare := catalog.SplitTableName(t.Name)
-	if db == "" {
-		db = s.database
+	db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, t.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, newErrf(CodeFeatureNotSupported, "types in schemas other than public are not supported yet (%q)", t.Name)
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, db)
 	if err != nil {

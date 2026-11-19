@@ -244,7 +244,7 @@ func (n *Node) recordRestoredRows(ctx context.Context, t backupTable, bands []ca
 		return err
 	}
 	cat.Invalidate(d.Name)
-	return cat.FinishDDLByID(ctx, d.DatabaseID, d.Name)
+	return cat.FinishDDLByID(ctx, d.DatabaseID, d.NamespaceName())
 }
 
 // descriptorWithRestoredRows is a backed-up descriptor as a restore of

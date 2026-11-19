@@ -563,7 +563,7 @@ func TestSQLSurfaceForTools(t *testing.T) {
 	if r := execSQL(t, ctx, root, `SHOW GRANTS`); len(r.Rows) != 2 {
 		t.Fatalf("SHOW GRANTS (all): %+v", r.Rows)
 	}
-	for q, want := range map[string]string{`SHOW TIME ZONE`: "UTC", `SHOW transaction isolation level`: "serializable", `SHOW server_version`: "14.0 datax", `SHOW search_path`: "public", `SHOW database`: "datax"} {
+	for q, want := range map[string]string{`SHOW TIME ZONE`: "UTC", `SHOW transaction isolation level`: "serializable", `SHOW server_version`: "14.0 datax", `SHOW search_path`: `"$user", public`, `SHOW database`: "datax"} {
 		if r := execSQL(t, ctx, root, q); len(r.Rows) != 1 || r.Rows[0][0].S != want {
 			t.Fatalf("%s: %+v", q, r.Rows)
 		}

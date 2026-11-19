@@ -980,7 +980,7 @@ func (s *Session) execAlterTableOnline(ctx context.Context, at *parser.AlterTabl
 // drainAlter waits until no gateway can still use the descriptors of
 // the table and the tables named before their last change.
 func (s *Session) drainAlter(ctx context.Context, table string, others []string) error {
-	if err := s.cat.FinishDDLIn(ctx, s.database, table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, table); err != nil {
 		return err
 	}
 	seen := map[string]bool{}
@@ -989,7 +989,7 @@ func (s *Session) drainAlter(ctx context.Context, table string, others []string)
 			continue
 		}
 		seen[name] = true
-		if err := s.cat.FinishDDLIn(ctx, s.database, name); err != nil {
+		if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); err != nil {
 			return err
 		}
 	}

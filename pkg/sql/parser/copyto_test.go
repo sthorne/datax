@@ -38,7 +38,7 @@ func TestCopyTo(t *testing.T) {
 	}
 	for _, c := range []struct{ src, table, cols, opts, file string }{
 		{`COPY t TO STDOUT`, "t", "", "", ""},
-		{`copy public.t (a, b) to stdout;`, "t", "a,b", "", ""},
+		{`copy public.t (a, b) to stdout;`, "public.t", "a,b", "", ""},
 		{`COPY t TO STDIN`, "t", "", "", ""},
 		{`COPY t TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER ';', NULL 'n', QUOTE '''', ESCAPE '\', FORCE_QUOTE (a, b), ENCODING 'UTF8')`, "t", "",
 			`format=csv header delimiter=; null=n quote=' escape=\ force_quote=(a,b) encoding=UTF8`, ""},

@@ -112,7 +112,7 @@ func (s *Session) checkHistoricalLayout(ctx context.Context, htxn *kvclient.Txn,
 	var cur *catalog.TableDescriptor
 	gctx, gcancel := context.WithTimeout(ctx, 2*time.Second)
 	_ = s.db.RunTxn(gctx, "asof-guard", func(ctx context.Context, gtxn *kvclient.Txn) error {
-		cur, _ = s.cat.LookupFreshIn(ctx, gtxn, s.database, table)
+		cur, _ = s.cat.LookupFreshIn(s.rctx(ctx), gtxn, s.database, table)
 		return nil
 	})
 	gcancel()
@@ -189,7 +189,7 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 	if rerr != nil {
 		return nil, ToSQLError(rerr)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	// The drain waits for every gateway's LEASE to adopt the dual-write
@@ -261,14 +261,14 @@ func (s *Session) execReshardOnline(ctx context.Context, t *parser.AlterTable) (
 			desc.Reshard = nil
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDLIn(cctx, s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, t.Table)
 		s.wipeIndexEntries(cctx, tableID, newIndexID)
 		for _, id := range newSecondaryIDs {
 			s.wipeIndexEntries(cctx, tableID, id)
 		}
 		return nil, ToSQLError(backfillErr)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	// Same grace on the way out: stale-descriptor readers may still be

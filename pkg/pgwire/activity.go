@@ -299,7 +299,8 @@ func statementKind(stmt parser.Statement) string {
 	case *parser.Begin, *parser.Commit, *parser.Rollback, *parser.Savepoint, *parser.ReleaseSavepoint, *parser.RollbackToSavepoint:
 		return "txn"
 	case *parser.CreateTable, *parser.CreateIndex, *parser.DropTable, *parser.AlterTable, *parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned, *parser.AlterDefaultPrivileges, *parser.Analyze, *parser.Vacuum,
-		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase:
+		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
+		*parser.CreateSchema, *parser.DropSchema, *parser.AlterSchemaRename, *parser.SetSchema:
 		return "ddl"
 	default:
 		return "other"

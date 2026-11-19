@@ -72,6 +72,7 @@ const (
 	CodeInvalidCatalogName        = "3D000"
 	CodeInvalidSchemaName         = "3F000"
 	CodeDuplicateDatabase         = "42P04"
+	CodeDuplicateSchema           = "42P06"
 	CodeDependentObjectsExist     = "2BP01"
 	CodeObjectInUse               = "55006"
 	CodeWrongObjectType           = "42809"
@@ -190,6 +191,22 @@ func ToSQLError(err error) *Error {
 	var dbNF *catalog.ErrDatabaseNotFound
 	if errors.As(err, &dbNF) {
 		return &Error{Code: CodeInvalidCatalogName, Msg: dbNF.Error()}
+	}
+	var schNF *catalog.ErrSchemaNotFound
+	if errors.As(err, &schNF) {
+		return &Error{Code: CodeInvalidSchemaName, Msg: schNF.Error()}
+	}
+	var schEx *catalog.ErrSchemaExists
+	if errors.As(err, &schEx) {
+		return &Error{Code: CodeDuplicateSchema, Msg: schEx.Error()}
+	}
+	var noSchema *catalog.ErrNoCreationSchema
+	if errors.As(err, &noSchema) {
+		return &Error{Code: CodeInvalidSchemaName, Msg: noSchema.Error()}
+	}
+	var crossDB *catalog.ErrCrossDatabase
+	if errors.As(err, &crossDB) {
+		return &Error{Code: CodeFeatureNotSupported, Msg: crossDB.Error()}
 	}
 	var dbEx *catalog.ErrDatabaseExists
 	if errors.As(err, &dbEx) {

@@ -665,22 +665,34 @@ func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	if !leasing {
 		return nil
 	}
-	if q, bare := SplitTableName(name); q != "" {
-		db, name = q, bare
-	}
-	if db == TempSchema || IsReservedTableName(name) {
+	if IsReservedTableName(name) && !IsRelationName(name) {
 		// A session's temporary table is never leased (temp.go).
 		return nil
 	}
-	var dbID uint64
+	if parts := SplitName(name); len(parts) == 2 && parts[0] == TempSchema {
+		return nil
+	}
+	var cands []nameCandidate
 	if err := a.db.RunTxn(ctx, "ddl-database", func(ctx context.Context, txn *kvclient.Txn) error {
-		id, err := a.databaseID(ctx, txn, db)
-		dbID = id
+		var err error
+		cands, err = a.resolve(ctx, txn, db, name)
 		return err
 	}); err != nil {
 		return err
 	}
-	return a.finishDDL(ctx, dbID, name)
+	// The first place of the name that holds a table is the table the
+	// statement changed (the others hold none of that name, or come
+	// after it on the search path).
+	for _, c := range cands {
+		desc, err := a.refreshOne(ctx, cacheKey(c.dbID, c.entry))
+		if err != nil {
+			return err
+		}
+		if desc != nil {
+			return a.waitForAdoption(ctx, desc.ID, desc.Version)
+		}
+	}
+	return nil
 }
 
 // FinishDDLByID is FinishDDL for a table named by its database's id and

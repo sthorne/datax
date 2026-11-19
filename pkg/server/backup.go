@@ -1051,7 +1051,9 @@ var manifestKeyGroups = []manifestKeyGroup{
 		func() [][2]keys.Key { return [][2]keys.Key{spanOf(keys.RoleSpan())} }},
 	{"databases", func(m *backupManifest) *[]backupKV { return &m.Databases },
 		func() [][2]keys.Key {
-			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan())}
+			// The schemas (gap PG-D-001) travel with their databases.
+			return [][2]keys.Key{spanOf(keys.DatabaseDescSpan()), spanOf(keys.DatabaseNamespaceSpan()),
+				spanOf(keys.SchemaDescSpan()), spanOf(keys.AllSchemaNamespaceSpan())}
 		}},
 	{"sequences", func(m *backupManifest) *[]backupKV { return &m.Sequences },
 		func() [][2]keys.Key {
@@ -1414,6 +1416,10 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 		var wb kvclient.WriteBatch
 		for _, kv := range final.Databases {
 			wb.Put(keys.Key(kv.Key), kv.Value)
+			// Schemas keep their ids, which the restored tables name.
+			if id, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
+				maxID = id
+			}
 		}
 		for _, kv := range final.Sequences {
 			wb.Put(keys.Key(kv.Key), kv.Value)
@@ -1445,7 +1451,9 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 				}
 			}
 			if json.Unmarshal(t.Descriptor, &d) == nil && d.DatabaseID != 0 {
-				wb.Put(keys.TableNamespaceKey(d.DatabaseID, t.Name), []byte(fmt.Sprintf("%d", t.ID)))
+				// Under its schema's entry when it has one (the name itself
+				// in public).
+				wb.Put(keys.TableNamespaceKey(d.DatabaseID, catalog.SchemaNamespaceName(d.SchemaID, t.Name)), []byte(fmt.Sprintf("%d", t.ID)))
 			} else {
 				wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
 			}

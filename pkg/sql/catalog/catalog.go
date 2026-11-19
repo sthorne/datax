@@ -5,6 +5,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -784,6 +785,16 @@ type TableDescriptor struct {
 	// unlogged table is as durable as any other, and only pg_class's
 	// relpersistence ('u') reports it.
 	Unlogged bool `json:"unlogged,omitempty"`
+	// SchemaID is the schema the table or view belongs to (gap
+	// PG-D-001, schema.go): 0 is the public schema, which every table
+	// written before schemas belongs to. A table of another schema is
+	// filed under SchemaNamespaceName(SchemaID, Name).
+	SchemaID uint64 `json:"schema_id,omitempty"`
+	// ViewSearchPath is the search path a view's query resolves its
+	// unqualified names through: the schemas of the creator's path when
+	// the view was created. Empty means public alone, which is how
+	// every view made before schemas resolved.
+	ViewSearchPath []string `json:"view_search_path,omitempty"`
 }
 
 // RestoredRowsBand is one band of RestoredRows.
@@ -1250,20 +1261,42 @@ func (a *Accessor) Leased(dbID uint64, name string, id uint64) *TableDescriptor 
 // name is qualified ("otherdb.t"), using the cache while its lease (if
 // any) is live.
 func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
-	if IsReservedTableName(name) {
+	if IsReservedTableName(name) && !IsRelationName(name) {
 		// A temporary table's name entry is reached only through
 		// LookupTemp, by its own session (temp.go).
 		return nil, &ErrTableNotFound{Name: name}
 	}
-	if q, bare := SplitTableName(name); q != "" {
-		db, name = q, bare
-	}
-	dbID, err := a.databaseID(ctx, txn, db)
+	cands, err := a.resolve(ctx, txn, db, name)
 	if err != nil {
 		return nil, err
 	}
+	for _, c := range cands {
+		d, err := a.lookupEntry(ctx, txn, c.dbID, c.entry, c.isDefault)
+		if err == nil {
+			return d, nil
+		}
+		var nf *ErrTableNotFound
+		if !errors.As(err, &nf) {
+			return nil, err
+		}
+	}
+	return nil, &ErrTableNotFound{Name: displayName(name)}
+}
+
+// displayName is how a name is reported: as written, but a
+// RelationName by its table's name.
+func displayName(name string) string {
+	if IsRelationName(name) {
+		return BareName(name)
+	}
+	return name
+}
+
+// lookupEntry resolves the table filed under name entry name of
+// database dbID, using the cache while its lease (if any) is live.
+func (a *Accessor) lookupEntry(ctx context.Context, txn *kvclient.Txn, dbID uint64, name string, isDefault bool) (*TableDescriptor, error) {
 	if txn != nil && txn.Historical() {
-		return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+		return lookupUncached(ctx, txn, dbID, name, isDefault)
 	}
 	key := cacheKey(dbID, name)
 	a.mu.Lock()
@@ -1274,7 +1307,7 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 		// this gateway adopt it, so the old entry must not be handed out.
 		// The statement reads the descriptor in its own transaction.
 		a.mu.Unlock()
-		return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+		return lookupUncached(ctx, txn, dbID, name, isDefault)
 	} else if ok && (c.expiration == 0 || now < c.expiration) {
 		// This statement plans against a descriptor it did not read in
 		// its own transaction, so its only bound is the deadline below.
@@ -1290,7 +1323,7 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 		return desc, nil
 	}
 	a.mu.Unlock()
-	d, err := lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	d, err := lookupUncached(ctx, txn, dbID, name, isDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -1436,19 +1469,34 @@ func (a *Accessor) LookupFresh(ctx context.Context, txn *kvclient.Txn, name stri
 
 // LookupFreshIn is LookupFresh within a database (or name's qualifier).
 func (a *Accessor) LookupFreshIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
-	if IsReservedTableName(name) {
+	if IsReservedTableName(name) && !IsRelationName(name) {
 		// A temporary table's name entry is reached only through
 		// LookupTemp, by its own session (temp.go).
 		return nil, &ErrTableNotFound{Name: name}
 	}
-	if q, bare := SplitTableName(name); q != "" {
-		db, name = q, bare
-	}
-	dbID, err := a.databaseID(ctx, txn, db)
+	d, _, err := a.lookupUncachedByName(ctx, txn, db, name)
+	return d, err
+}
+
+// lookupUncachedByName resolves name in database db (see resolve)
+// reading every entry in txn, never the cache; it returns the
+// descriptor and the candidate it was found at.
+func (a *Accessor) lookupUncachedByName(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, nameCandidate, error) {
+	cands, err := a.resolve(ctx, txn, db, name)
 	if err != nil {
-		return nil, err
+		return nil, nameCandidate{}, err
 	}
-	return lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	for _, c := range cands {
+		d, err := lookupUncached(ctx, txn, c.dbID, c.entry, c.isDefault)
+		if err == nil {
+			return d, c, nil
+		}
+		var nf *ErrTableNotFound
+		if !errors.As(err, &nf) {
+			return nil, nameCandidate{}, err
+		}
+	}
+	return nil, nameCandidate{}, &ErrTableNotFound{Name: displayName(name)}
 }
 
 // isDefaultID reports whether dbID is the default database's (0 before
@@ -1470,10 +1518,14 @@ func (a *Accessor) DatabaseID(ctx context.Context, txn *kvclient.Txn, db string)
 
 // Invalidate drops a cached entry (after DDL or a stale-descriptor error).
 func (a *Accessor) Invalidate(name string) {
-	_, bare := SplitTableName(name)
+	bare := BareName(name)
 	a.mu.Lock()
 	for k := range a.cache {
-		if _, n := splitCacheKey(k); n == bare {
+		_, n := splitCacheKey(k)
+		if _, sn, ok := splitSchemaEntry(n); ok {
+			n = sn // a table of a schema other than public
+		}
+		if n == bare {
 			delete(a.cache, k)
 		}
 	}
@@ -1566,7 +1618,21 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if d.Temp == nil && IsReservedTableName(d.Name) {
 		return fmt.Errorf("table name %q is reserved", d.Name)
 	}
-	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.namespaceName(), a.isDefaultID(d.DatabaseID) && d.Temp == nil)
+	if d.SchemaID != 0 {
+		// The schema too is read here, so that a DROP SCHEMA committing
+		// alongside either sees the table or fails this transaction.
+		if d.Temp != nil {
+			return fmt.Errorf("a temporary table belongs to no schema")
+		}
+		sd, err := ReadSchema(ctx, txn, d.SchemaID)
+		if err != nil {
+			return err
+		}
+		if sd == nil || sd.DatabaseID != d.DatabaseID {
+			return &ErrSchemaNotFound{Name: fmt.Sprintf("#%d", d.SchemaID)}
+		}
+	}
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, d.namespaceName(), a.isDefaultID(d.DatabaseID) && d.Temp == nil && d.SchemaID == 0)
 	if err != nil {
 		return err
 	}
@@ -1688,11 +1754,11 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 	if IsReservedTableName(newName) {
 		return fmt.Errorf("table name %q is reserved", newName)
 	}
-	newEntry := newName
+	newEntry := SchemaNamespaceName(d.SchemaID, newName)
 	if d.Temp != nil {
 		newEntry = TempNamespaceName(d.Temp.Session, newName)
 	}
-	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newEntry, a.isDefaultID(d.DatabaseID) && d.Temp == nil)
+	existing, err := namespaceLookup(ctx, txn, d.DatabaseID, newEntry, a.isDefaultID(d.DatabaseID) && d.Temp == nil && d.SchemaID == 0)
 	if err != nil {
 		return err
 	}
@@ -1724,19 +1790,12 @@ func (a *Accessor) Drop(ctx context.Context, txn *kvclient.Txn, name string) (*T
 
 // DropIn drops a table by name in database db (or the qualifier in name).
 func (a *Accessor) DropIn(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, error) {
-	if IsReservedTableName(name) {
+	if IsReservedTableName(name) && !IsRelationName(name) {
 		// A temporary table's name entry is reached only through
 		// LookupTemp, by its own session (temp.go).
 		return nil, &ErrTableNotFound{Name: name}
 	}
-	if q, bare := SplitTableName(name); q != "" {
-		db, name = q, bare
-	}
-	dbID, err := a.databaseID(ctx, txn, db)
-	if err != nil {
-		return nil, err
-	}
-	d, err := lookupUncached(ctx, txn, dbID, name, isDefaultDatabase(db))
+	d, _, err := a.lookupUncachedByName(ctx, txn, db, name)
 	if err != nil {
 		return nil, err
 	}

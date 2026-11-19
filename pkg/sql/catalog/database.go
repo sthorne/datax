@@ -31,7 +31,8 @@ const (
 	// SystemDatabase is reserved for the cluster (catalog views later);
 	// it cannot be dropped, renamed, or used as a home for tables.
 	SystemDatabase = "system"
-	// PublicSchema is the only schema; qualified names may spell it.
+	// PublicSchema is the implicit schema of every database (schema ID
+	// 0, schema.go), which every table made before schemas belongs to.
 	PublicSchema = "public"
 )
 
@@ -321,6 +322,9 @@ func (a *Accessor) DropDatabase(ctx context.Context, txn *kvclient.Txn, d *Datab
 		return err
 	}
 	if err := txn.Delete(ctx, keys.DatabaseDescKey(d.ID)); err != nil {
+		return err
+	}
+	if err := dropSchemasOf(ctx, txn, d.ID); err != nil {
 		return err
 	}
 	a.invalidateDatabase(d.Name)

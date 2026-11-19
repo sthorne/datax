@@ -90,8 +90,9 @@ func TestParseRoles(t *testing.T) {
 	if gr.ObjectKind != "schema" || gr.Objects[0] != "public" {
 		t.Fatalf("grant on schema: %+v", gr)
 	}
-	if _, err := Parse(`GRANT USAGE ON SCHEMA other TO bob`); err == nil {
-		t.Fatal("unknown schema accepted")
+	gr = parseOne(t, `GRANT USAGE ON SCHEMA other, public TO bob`).(*GrantRevoke)
+	if gr.ObjectKind != "schema" || !reflect.DeepEqual(gr.Objects, []string{"other", "public"}) {
+		t.Fatalf("grant on schemas: %+v", gr)
 	}
 	gr = parseOne(t, `GRANT CONNECT ON DATABASE app, shop TO GROUP ops`).(*GrantRevoke)
 	if gr.ObjectKind != "database" || len(gr.Objects) != 2 || gr.Grantees[0] != "ops" {

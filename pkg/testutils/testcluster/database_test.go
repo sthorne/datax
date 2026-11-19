@@ -121,10 +121,14 @@ func TestDatabases(t *testing.T) {
 	if _, serr := trySQL(ctx, root, `USE nope`); serr == nil || serr.Code != sql.CodeInvalidCatalogName {
 		t.Fatalf("USE nope: %v", serr)
 	}
-	if _, serr := trySQL(ctx, root, `SELECT id FROM nope.items`); serr == nil || serr.Code != sql.CodeInvalidCatalogName {
+	// A two-part name is a schema of the current database, or failing
+	// that a database (schemas, gap PG-D-001): naming neither, the
+	// relation does not exist, as in PostgreSQL. Another database's
+	// schema other than public is a cross-database reference.
+	if _, serr := trySQL(ctx, root, `SELECT id FROM nope.items`); serr == nil || serr.Code != sql.CodeUndefinedTable {
 		t.Fatalf("nope.items: %v", serr)
 	}
-	if _, serr := trySQL(ctx, root, `SELECT id FROM app.other.items`); serr == nil || serr.Code != sql.CodeSyntaxError {
+	if _, serr := trySQL(ctx, root, `SELECT id FROM app.other.items`); serr == nil || serr.Code != sql.CodeFeatureNotSupported {
 		t.Fatalf("other schema: %v", serr)
 	}
 
@@ -168,7 +172,9 @@ func TestDatabases(t *testing.T) {
 	}
 	execSQL(t, ctx, root, `USE datax`)
 	execSQL(t, ctx, root, `DROP DATABASE analytics CASCADE`)
-	if _, serr := trySQL(ctx, root, `SELECT id FROM analytics.items`); serr == nil || serr.Code != sql.CodeInvalidCatalogName {
+	// Neither a schema nor a database of that name: the relation does
+	// not exist (schemas, gap PG-D-001).
+	if _, serr := trySQL(ctx, root, `SELECT id FROM analytics.items`); serr == nil || serr.Code != sql.CodeUndefinedTable {
 		t.Fatalf("after CASCADE: %v", serr)
 	}
 	execSQL(t, ctx, root, `DROP DATABASE IF EXISTS analytics`)
@@ -178,7 +184,7 @@ func TestDatabases(t *testing.T) {
 	if r := execSQL(t, ctx, root, `SELECT name FROM shop.items ORDER BY id`); len(r.Rows) != 2 {
 		t.Fatalf("shop.items after rename: %+v", r.Rows)
 	}
-	if _, serr := trySQL(ctx, root, `SELECT id FROM app.items`); serr == nil || serr.Code != sql.CodeInvalidCatalogName {
+	if _, serr := trySQL(ctx, root, `SELECT id FROM app.items`); serr == nil || serr.Code != sql.CodeUndefinedTable {
 		t.Fatalf("old name after rename: %v", serr)
 	}
 

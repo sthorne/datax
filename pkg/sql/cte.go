@@ -146,7 +146,12 @@ func (s *Session) bindWith(ctx context.Context, txn *kvclient.Txn, with []parser
 				seed.Union, seed.SetOp, seed.UnionAll = nil, "", false
 				shape = &seed
 			}
+			savedPath := s.viewPath
+			if cte.Definer != "" {
+				s.viewPath = viewResolutionPath(cte.SearchPath)
+			}
 			cols, serr := s.PlanColumns(ctx, shape)
+			s.viewPath = savedPath
 			if serr != nil {
 				restore()
 				return nil, serr
@@ -158,12 +163,15 @@ func (s *Session) bindWith(ctx context.Context, txn *kvclient.Txn, with []parser
 			// A view's query runs with its owner's privileges (definer
 			// semantics): the tables it reads are checked as the owner,
 			// the view itself was checked as the reader when it was bound.
-			savedAs := s.privAs
+			// Its names resolve through the view's own search path, not
+			// the reader's.
+			savedAs, savedPath := s.privAs, s.viewPath
 			if cte.Definer != "" {
 				s.privAs = cte.Definer
+				s.viewPath = viewResolutionPath(cte.SearchPath)
 			}
 			res, err = s.execStmt(ctx, txn, cte.Query, params)
-			s.privAs = savedAs
+			s.privAs, s.viewPath = savedAs, savedPath
 		}
 		if err != nil {
 			restore()

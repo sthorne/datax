@@ -150,7 +150,16 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		d := types.NewString(s.database)
 		out.Func, out.Lit = "", &d
 	case "current_schema":
-		d := types.NewString(catalog.PublicSchema)
+		// The first schema of the search path that exists; NULL when
+		// none does.
+		schemas, err := s.pathSchemasAnyTxn(ctx, txn)
+		if err != nil {
+			return out, err
+		}
+		d := types.DNull
+		if len(schemas) > 0 {
+			d = types.NewString(schemas[0].Name)
+		}
 		out.Func, out.Lit = "", &d
 	case "current_user", "current_role", "user":
 		d := types.NewString(s.user)
@@ -357,13 +366,17 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 	case "acldefault":
 		return s.spliceACLDefault(ctx, txn, e, params, keepVolatile)
 	case "pg_get_userbyid":
-		// Every object is owned by root (there is no ownership yet).
-		d := types.NewString("root")
-		out.Func, out.Args, out.Lit = "", nil, &d
+		// The role of that OID (vtable.RoleOID): owners differ now that
+		// schemas, tables and the rest change hands (\dn's Owner).
+		return s.spliceUserByID(ctx, txn, e)
 	case "pg_table_is_visible":
 		// Every relation is on the search path but information_schema's
-		// views, which PostgreSQL's search path leaves out.
-		hidden := vtable.InformationSchemaClassOIDs()
+		// views, which PostgreSQL's search path leaves out, and the
+		// relations of the schemas the session's path does not reach.
+		hidden, err := s.invisibleClassOIDs(ctx, txn)
+		if err != nil {
+			return out, err
+		}
 		if len(e.Args) == 1 && e.Args[0].Column != "" && len(e.Args[0].Path) == 0 && e.Args[0].BinOp == "" {
 			vals := make([]parser.Expr, len(hidden))
 			for i, oid := range hidden {
@@ -1851,9 +1864,27 @@ func (s *Session) regclassNames(ctx context.Context, txn *kvclient.Txn) ([]oidNa
 	if err != nil {
 		return nil, err
 	}
+	// A table of a schema the search path does not reach prints
+	// qualified, as PostgreSQL's regclass output does.
+	visible := map[uint64]bool{0: true}
+	schemaNames := map[uint64]string{}
+	if path, err := s.lookupPathSchemas(ctx, txn); err == nil {
+		for _, sd := range path {
+			visible[sd.ID] = true
+		}
+	}
+	if schemas, err := catalog.ListAllSchemas(ctx, txn); err == nil {
+		for _, sd := range schemas {
+			schemaNames[sd.ID] = sd.Name
+		}
+	}
 	out := make([]oidName, 0, len(all))
 	for _, d := range all {
-		out = append(out, oidName{oid: vtable.TableOID(d), name: d.Name})
+		name := d.Name
+		if d.SchemaID != 0 && !visible[d.SchemaID] {
+			name = schemaNames[d.SchemaID] + "." + d.Name
+		}
+		out = append(out, oidName{oid: vtable.TableOID(d), name: name})
 		if d.IsView() || d.Virtual != "" {
 			continue
 		}
@@ -1966,4 +1997,104 @@ func argsNeedSplice(args []parser.Expr) bool {
 		}
 	}
 	return false
+}
+
+// spliceUserByID resolves pg_get_userbyid(oid): a literal OID becomes
+// the role's name, any other argument a CASE over the roles' OIDs
+// (NULL for an OID no role has).
+func (s *Session) spliceUserByID(ctx context.Context, txn *kvclient.Txn, e parser.Expr) (parser.Expr, error) {
+	if len(e.Args) != 1 {
+		return e, newErrf(CodeUndefinedFunction, "function pg_get_userbyid takes one argument")
+	}
+	var roles []*catalog.RoleDescriptor
+	read := func(ctx context.Context, txn *kvclient.Txn) error {
+		var err error
+		roles, err = catalog.ListRoles(ctx, txn)
+		return err
+	}
+	var err error
+	if txn != nil {
+		err = read(ctx, txn)
+	} else {
+		err = s.db.RunTxn(ctx, "pg-get-userbyid", read)
+	}
+	if err != nil {
+		return e, err
+	}
+	if lit := e.Args[0].Lit; lit != nil && e.Args[0].BinOp == "" {
+		if lit.Null {
+			d := types.DNull
+			return parser.Expr{Lit: &d}, nil
+		}
+		oid, cerr := lit.Coerce(types.Int)
+		if cerr == nil {
+			for _, r := range roles {
+				if vtable.RoleOID(r.Name) == oid.I {
+					d := types.NewString(r.Name)
+					return parser.Expr{Lit: &d}, nil
+				}
+			}
+		}
+		d := types.DNull
+		return parser.Expr{Lit: &d}, nil
+	}
+	null := types.DNull
+	ce := &parser.CaseExpr{Operand: &e.Args[0], Else: &parser.Expr{Lit: &null}}
+	for _, r := range roles {
+		oid, name := types.NewInt(vtable.RoleOID(r.Name)), types.NewString(r.Name)
+		ce.Whens = append(ce.Whens, parser.CaseWhen{Value: &parser.Expr{Lit: &oid}, Result: parser.Expr{Lit: &name}})
+	}
+	return parser.Expr{Case: ce}, nil
+}
+
+// invisibleClassOIDs are the pg_class OIDs pg_table_is_visible is false
+// for: information_schema's views, and the tables, views and indexes of
+// the current database's schemas that the search path does not reach.
+func (s *Session) invisibleClassOIDs(ctx context.Context, txn *kvclient.Txn) ([]int64, error) {
+	hidden := vtable.InformationSchemaClassOIDs()
+	read := func(ctx context.Context, txn *kvclient.Txn) error {
+		path, err := s.lookupPathSchemas(ctx, txn)
+		if err != nil {
+			return err
+		}
+		visible := map[uint64]bool{}
+		for _, sd := range path {
+			visible[sd.ID] = true
+		}
+		db, err := catalog.LookupDatabase(ctx, txn, s.database)
+		if err != nil || db.ID == 0 {
+			return nil
+		}
+		schemas, err := catalog.ListSchemas(ctx, txn, db.ID)
+		if err != nil || len(schemas) == 0 {
+			return err
+		}
+		all, err := s.listIn(ctx, txn, db)
+		if err != nil {
+			return err
+		}
+		for _, d := range all {
+			if d.Temp != nil || visible[d.SchemaID] {
+				continue
+			}
+			hidden = append(hidden, vtable.TableOID(d))
+			if d.IsView() {
+				continue
+			}
+			if oid, ok := vtable.IndexOIDByName(d, d.Name+"_pkey"); ok {
+				hidden = append(hidden, oid)
+			}
+			for i := range d.Indexes {
+				hidden = append(hidden, vtable.IndexOID(d, d.Indexes[i].ID))
+			}
+		}
+		return nil
+	}
+	var err error
+	if txn != nil {
+		err = read(ctx, txn)
+	} else {
+		err = s.db.RunTxn(ctx, "table-is-visible", read)
+	}
+	return hidden, err
 }

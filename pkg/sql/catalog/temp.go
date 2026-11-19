@@ -66,7 +66,7 @@ func (d *TableDescriptor) namespaceName() string {
 	if d.Temp != nil {
 		return TempNamespaceName(d.Temp.Session, d.Name)
 	}
-	return d.Name
+	return SchemaNamespaceName(d.SchemaID, d.Name)
 }
 
 // IsTemp reports whether d is a temporary table.

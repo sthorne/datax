@@ -115,7 +115,11 @@ func (s *Session) resolveRegLiteral(ctx context.Context, txn *kvclient.Txn, kind
 	case "regnamespace":
 		parts, ok := parseQualifiedName(text)
 		if ok && len(parts) == 1 {
-			oid, found = schemaOIDs[parts[0]]
+			o, ok, err := s.schemaOID(ctx, txn, parts[0])
+			if err != nil {
+				return types.Datum{}, err
+			}
+			oid, found = o, ok
 		}
 		if !found {
 			return types.Datum{}, newErrf(CodeInvalidSchemaName, "schema %q does not exist", text)
@@ -174,11 +178,7 @@ func (s *Session) regName(ctx context.Context, txn *kvclient.Txn, kind string, o
 			}
 		}
 	case "regnamespace":
-		for name, o := range schemaOIDs {
-			if o == oid {
-				return name, true, nil
-			}
-		}
+		return s.schemaByOID(ctx, txn, oid)
 	case "regrole":
 		return s.roleByOID(ctx, txn, oid)
 	}

@@ -684,8 +684,8 @@ TABLE ... AS`. What differs from PostgreSQL:
 - A temporary table is listed in schema `public`, with `relpersistence`
   `t` and `information_schema.tables.table_type` `LOCAL TEMPORARY`;
   PostgreSQL lists it in the session's `pg_temp_N` schema.
-- `public.t` reads as `t`, so it reaches the temporary table when one
-  shadows an ordinary table; write `<database>.t` for the ordinary one.
+- `public.t` names the ordinary table even when a temporary table `t`
+  shadows it; `pg_temp.t` names the temporary one.
 - A temporary table's rows are written to the replicated key space like
   any other table's, and kept, as a dropped table's are, until the
   cluster's GC window has passed; they are not readable by another
@@ -2282,7 +2282,7 @@ invalid value `22023`:
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
 | `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it; storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
-| `search_path` | any list | accepted and reported; `public` is the only schema (`pg_catalog` and `information_schema` are always visible) |
+| `search_path` | a list of schema names; default `"$user", public` | where unqualified names resolve and where `CREATE` puts an unqualified object: see [Schemas](#schemas). `pg_catalog` and `information_schema` are always visible, after the path's schemas |
 | `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` (also as `BEGIN` / `START TRANSACTION` modes) | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY`, DDL, `nextval()` and `setval()` with `25006` |
 | `transaction_isolation`, `SET TRANSACTION ISOLATION LEVEL ...` (also as a `BEGIN` / `START TRANSACTION` mode) | any level | accepted (drivers set one on connect); every transaction is serializable and `SHOW` says so |
 | `DateStyle`, `client_encoding` | `ISO[, order]`, `UTF8` | the supported values; anything else is `22023` |
@@ -2840,6 +2840,73 @@ The catalogs show views as PostgreSQL does — `pg_class` with `relkind =
 `psql`'s `\dv` and `\d view` work. Views need **cluster version v9**
 (`0A000` until `datax debug upgrade` finalizes it).
 
+## Schemas
+
+A database holds schemas, as in PostgreSQL; every database has `public`,
+where every table made before schemas existed lives.
+
+```sql
+CREATE SCHEMA sales;
+CREATE SCHEMA IF NOT EXISTS sales AUTHORIZATION alice;
+CREATE SCHEMA AUTHORIZATION alice;          -- named alice
+CREATE TABLE sales.orders (id INT8 PRIMARY KEY, total DECIMAL(10,2));
+SELECT * FROM sales.orders JOIN public.customers USING (id);
+SET search_path = sales, public;
+SELECT * FROM orders;                       -- sales.orders
+ALTER TABLE public.leads SET SCHEMA sales;  -- also ALTER VIEW ... SET SCHEMA
+ALTER SCHEMA sales RENAME TO revenue;
+ALTER SCHEMA revenue OWNER TO bob;
+GRANT USAGE, CREATE ON SCHEMA revenue TO alice;
+DROP SCHEMA revenue;                        -- refused (2BP01) while it holds objects ...
+DROP SCHEMA revenue CASCADE;                -- ... unless CASCADE drops them too
+```
+
+**Names.** An unqualified name resolves through `search_path` (default
+`"$user", public`): the session's temporary tables first, then each
+schema of the path that exists (`"$user"` is the current role's name),
+then the `pg_catalog` / `information_schema` views. `CREATE` puts an
+unqualified table or view in the first schema of the path that exists
+(`3F000` when none does). A path that names no schema at all
+(`SET search_path = ''`, as pg_dump sets it) still resolves existing
+names through `public`, so a dump of a database whose objects are all
+in `public` restores as before (datax renders view and constraint
+definitions unqualified); it creates nothing unqualified. `s.t` is schema `s` of the current database;
+`db.s.t` is the same with the database written out, which must be the
+current one (`0A000 cross-database references are not implemented`)
+unless the schema is `public`. `current_schema()` and
+`current_schemas(bool)` report the path; `pg_namespace`, `pg_class`,
+`pg_tables`, `information_schema.schemata` / `tables` / `columns` and
+psql's `\dn` and `\dt s.*` show the schemas.
+
+**Two-part names and databases.** datax has long read `app.t` as table
+`t` of *database* `app`. That still works, with a lower precedence: a
+schema of the current database named `app` wins, and only when there is
+none does `app.t` mean database `app` (its `public` schema). Creating a
+schema named after a database you address this way redirects those
+names, so this form is **deprecated**: write `app.public.t`, or connect
+to the database.
+
+**Privileges.** A new schema belongs to its creator (or the
+`AUTHORIZATION` role) and PUBLIC holds nothing on it: reaching its
+objects needs `USAGE` on it (`42501 permission denied for schema s`) on
+top of the objects' own grants, and creating in it needs `CREATE`.
+`CREATE SCHEMA` needs `CREATE` on the database. `public` keeps its
+rules: `USAGE` for PUBLIC (revocable), `CREATE` for the database's owner
+and its grantees (PostgreSQL 15's default). A view's query resolves its
+names through the search path its creator had, whatever the reader's.
+
+**Limits.** Sequences and enum types live in `public` only for now:
+`CREATE SEQUENCE s.x`, `CREATE TYPE s.x`, `SERIAL` / identity columns in
+a table of another schema, and `SET SCHEMA` of a sequence or of a table
+that owns one are `0A000` (use a sequence of `public`: `DEFAULT
+nextval('public.ids')`). `CREATE SCHEMA ... CREATE TABLE ...` (schema
+elements), `COMMENT ON SCHEMA` and `ALTER DEFAULT PRIVILEGES IN SCHEMA`
+for a schema other than `public` are not supported. Renaming a schema,
+or moving a relation, that a view reads is refused (`2BP01`). A
+schema-qualified column reference (`s.t.c`) binds by the table's name:
+alias two same-named tables of different schemas in one query.
+Schemas need **cluster version v22**.
+
 ## Databases
 
 A cluster holds any number of databases; a table belongs to exactly one.
@@ -2856,7 +2923,7 @@ USE app;                      -- or: SET database = app
 SELECT current_database();    -- app
 CREATE TABLE orders (id INT8 PRIMARY KEY);      -- app.orders
 SELECT id FROM app.orders;                      -- from any database
-SELECT id FROM app.public.orders;               -- public is the only schema
+SELECT id FROM app.public.orders;               -- another database's public schema
 ALTER DATABASE app RENAME TO shop;
 DROP DATABASE shop;           -- refused while it holds tables ...
 DROP DATABASE shop CASCADE;   -- ... unless CASCADE drops them too
@@ -2864,8 +2931,10 @@ DROP DATABASE shop CASCADE;   -- ... unless CASCADE drops them too
 
 A connection starts in the database its URL names (`postgres://.../app`);
 an unknown one is refused with SQLSTATE `3D000`, as in PostgreSQL. An
-unqualified table name resolves in the session's current database;
-`db.table` reaches another database. `SHOW TABLES` (tables only; `SHOW
+unqualified table name resolves in the session's current database,
+through its [search path](#schemas); `db.public.table` reaches another
+database, and so does `db.table` while the current database has no
+schema named `db` (see [Schemas](#schemas)). `SHOW TABLES` (tables only; `SHOW
 VIEWS` lists the views) and `ANALYZE` (with no table) act on the current
 database. `datax` and `system` cannot be
 dropped or renamed, and the session cannot drop the database it is in.

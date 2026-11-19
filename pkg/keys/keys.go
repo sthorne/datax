@@ -597,8 +597,9 @@ func DatabaseNamespaceSpan() (Key, Key) {
 }
 
 // TableNamespaceKey maps a table name within a database to its table ID
-// (the v6 layout). Schemas are not encoded: public is the only one, and
-// a schema level would slot in between the database and the name.
+// (the v6 layout). A table of the public schema is filed under its
+// name; a table of another schema under a name that encodes the
+// schema's ID (catalog.SchemaNamespaceName), so the layout is the same.
 func TableNamespaceKey(dbID uint64, name string) Key {
 	k := Key(encoding.EncodeUint64(systemKey("nsdb"), dbID))
 	return Key(encoding.EncodeString(k, name))
@@ -613,6 +614,37 @@ func TableNamespaceSpan(dbID uint64) (Key, Key) {
 // AllTableNamespaceSpan covers every database's table names.
 func AllTableNamespaceSpan() (Key, Key) {
 	p := systemKey("nsdb")
+	return p, p.PrefixEnd()
+}
+
+// SchemaDescKey holds the JSON descriptor of a schema (gap PG-D-001)
+// for a schema ID (from the shared descriptor counter). The public
+// schema of every database is implicit and has none.
+func SchemaDescKey(schemaID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("schemadesc"), schemaID))
+}
+
+// SchemaDescSpan covers all schema descriptors.
+func SchemaDescSpan() (Key, Key) {
+	p := systemKey("schemadesc")
+	return p, p.PrefixEnd()
+}
+
+// SchemaNamespaceKey maps a schema name within a database to its ID.
+func SchemaNamespaceKey(dbID uint64, name string) Key {
+	k := Key(encoding.EncodeUint64(systemKey("schemans"), dbID))
+	return Key(encoding.EncodeString(k, name))
+}
+
+// SchemaNamespaceSpan covers one database's schema names.
+func SchemaNamespaceSpan(dbID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("schemans"), dbID))
+	return p, p.PrefixEnd()
+}
+
+// AllSchemaNamespaceSpan covers every database's schema names.
+func AllSchemaNamespaceSpan() (Key, Key) {
+	p := systemKey("schemans")
 	return p, p.PrefixEnd()
 }
 

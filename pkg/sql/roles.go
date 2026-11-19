@@ -330,6 +330,15 @@ func (s *Session) ownedObjects(ctx context.Context, txn *kvclient.Txn, name stri
 			out = append(out, "owner of type "+qualify(d.DatabaseID, d.Name))
 		}
 	}
+	schemas, err := catalog.ListAllSchemas(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	for _, sd := range schemas {
+		if catalog.OwnerOf(sd.Owner) == name {
+			out = append(out, "owner of schema "+qualify(sd.DatabaseID, sd.Name))
+		}
+	}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -357,6 +366,27 @@ func (s *Session) ownedObjects(ctx context.Context, txn *kvclient.Txn, name stri
 // rules naming them — and reports how many objects changed.
 func (s *Session) revokeAllFrom(ctx context.Context, txn *kvclient.Txn, owned map[string]bool) (int, error) {
 	revoked := 0
+	schemas, err := catalog.ListAllSchemas(ctx, txn)
+	if err != nil {
+		return 0, err
+	}
+	for _, sd := range schemas {
+		c := sd.Clone()
+		changed := false
+		for r := range owned {
+			if _, ok := c.Privileges[r]; ok {
+				delete(c.Privileges, r)
+				changed = true
+			}
+			delete(c.GrantOptions, r)
+		}
+		if changed {
+			if err := s.cat.UpdateSchema(ctx, txn, c); err != nil {
+				return 0, err
+			}
+			revoked++
+		}
+	}
 	names, err := s.databaseNames(ctx, txn)
 	if err != nil {
 		return 0, err
@@ -751,13 +781,16 @@ func (s *Session) execAlterOwner(ctx context.Context, txn *kvclient.Txn, t *pars
 			return nil, err
 		}
 	case "schema":
-		// The public schema, the only one, is the database's owner's
-		// (PostgreSQL 15's pg_database_owner): naming that owner, or
-		// pg_database_owner itself, changes nothing — what pg_dump
-		// writes for it — and any other role is refused rather than
-		// ignored.
+		// Another schema changes hands like any object. The public
+		// schema is the database's owner's (PostgreSQL 15's
+		// pg_database_owner): naming that owner, or pg_database_owner
+		// itself, changes nothing — what pg_dump writes for it — and any
+		// other role is refused rather than ignored.
 		if t.Name != catalog.PublicSchema {
-			return nil, newErrf(CodeInvalidSchemaName, "schema %q does not exist", t.Name)
+			if err := s.alterSchemaOwner(ctx, txn, t.Name, owner); err != nil {
+				return nil, err
+			}
+			break
 		}
 		db, err := catalog.LookupDatabase(ctx, txn, s.database)
 		if err != nil {
@@ -863,6 +896,20 @@ func (s *Session) execReassignOwned(ctx context.Context, txn *kvclient.Txn, t *p
 			moved++
 		}
 	}
+	schemas, err := catalog.ListAllSchemas(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	for _, sd := range schemas {
+		if owned[catalog.OwnerOf(sd.Owner)] {
+			c := sd.Clone()
+			c.Owner = to
+			if err := s.cat.UpdateSchema(ctx, txn, c); err != nil {
+				return nil, err
+			}
+			moved++
+		}
+	}
 	dbs, err := catalog.ListDatabases(ctx, txn)
 	if err != nil {
 		return nil, err
@@ -941,14 +988,15 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 		if !owned[catalog.OwnerOf(d.Owner)] || catalog.IsSystemTable(d.Name) {
 			continue
 		}
-		if cur, err := s.cat.LookupIn(ctx, txn, names[d.DatabaseID], d.Name); err != nil || cur == nil || cur.ID != d.ID {
+		rel := catalog.RelationName(d)
+		if cur, err := s.cat.LookupIn(ctx, txn, names[d.DatabaseID], rel); err != nil || cur == nil || cur.ID != d.ID {
 			continue // already gone with an earlier cascade
 		}
 		if d.IsView() {
-			if _, err := s.execDropView(ctx, txn, &parser.DropView{Names: []string{qualify(d.DatabaseID, d.Name)}, Cascade: t.Cascade, IfExists: true}); err != nil {
+			if _, err := s.execDropView(ctx, txn, &parser.DropView{Names: []string{rel}, Cascade: t.Cascade, IfExists: true}); err != nil {
 				return nil, err
 			}
-		} else if _, err := s.execDropTable(ctx, txn, &parser.DropTable{Name: qualify(d.DatabaseID, d.Name), Cascade: t.Cascade, IfExists: true}); err != nil {
+		} else if _, err := s.execDropTable(ctx, txn, &parser.DropTable{Name: rel, Cascade: t.Cascade, IfExists: true}); err != nil {
 			return nil, err
 		}
 		dropped++
@@ -978,6 +1026,39 @@ func (s *Session) execDropOwned(ctx context.Context, txn *kvclient.Txn, t *parse
 			continue
 		}
 		if _, err := s.execDropType(ctx, txn, &parser.DropType{Name: qualify(d.DatabaseID, d.Name), IfExists: true}); err != nil {
+			return nil, err
+		}
+		dropped++
+	}
+	// The schemas the roles own, once their own objects are gone: one
+	// still holding another role's objects goes only under CASCADE.
+	schemas, err := catalog.ListAllSchemas(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	for _, sd := range schemas {
+		if !owned[catalog.OwnerOf(sd.Owner)] {
+			continue
+		}
+		db, err := catalog.ReadDatabase(ctx, txn, sd.DatabaseID)
+		if err != nil {
+			return nil, err
+		}
+		if db == nil {
+			continue
+		}
+		left, err := s.cat.TablesInSchema(ctx, txn, db, sd.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(left) > 0 {
+			if !t.Cascade || db.Name != s.database {
+				return nil, newErrf(CodeDependentObjectsExist, "cannot drop schema %s because other objects depend on it (use DROP OWNED ... CASCADE in database %s)", sd.Name, db.Name)
+			}
+			if _, err := s.execDropSchema(ctx, txn, &parser.DropSchema{Names: []string{sd.Name}, Cascade: true, IfExists: true}); err != nil {
+				return nil, err
+			}
+		} else if err := s.cat.DropSchema(ctx, txn, sd); err != nil {
 			return nil, err
 		}
 		dropped++
@@ -1043,11 +1124,8 @@ func (s *Session) stripPolicyRoles(ctx context.Context, txn *kvclient.Txn, roles
 
 // drainName names a table for the post-commit lease drain: db.name, or
 // the bare name for a table that predates databases.
-func drainName(names map[uint64]string, d *catalog.TableDescriptor) string {
-	if db := names[d.DatabaseID]; db != "" {
-		return db + "." + d.Name
-	}
-	return d.Name
+func drainName(_ map[uint64]string, d *catalog.TableDescriptor) string {
+	return catalog.RelationName(d)
 }
 
 // checkSetRole validates SET ROLE name for the session user: the role

@@ -67,11 +67,13 @@ A restored database dumps exactly as its source did.
   already exist where it is restored. `pg_dumpall` (which dumps roles)
   does not work against datax; create the roles with `CREATE ROLE` /
   `CREATE USER` first.
-- **Schemas, functions, triggers, extensions, ...** do not exist in
-  datax, so a datax dump has none. `public` is the only schema. The dump
-  says `ALTER SCHEMA public OWNER TO` the database's owner: datax accepts
-  that (the public schema is always its database owner's) and refuses
-  any other owner.
+- **Functions, triggers, extensions, ...** do not exist in datax, so a
+  datax dump has none. Schemas other than `public` exist (since cluster
+  version v22), but dumping and restoring them with `pg_dump` has not
+  been verified yet: a database whose tables are all in `public` dumps
+  as before. The dump says `ALTER SCHEMA public OWNER TO` the database's
+  owner: datax accepts that (the public schema is always its database
+  owner's) and refuses any other owner.
 - <a id="primary-keys"></a>**Primary keys.** pg_dump creates each table
   without its key, loads the rows, and adds the key afterwards with
   `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY`. A datax table created

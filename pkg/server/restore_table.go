@@ -415,7 +415,7 @@ func planTableRestore(final *backupManifest, opts RestoreOptions) (*restorePlan,
 		var found *backupTable
 		for i, t := range final.Tables {
 			var d catalog.TableDescriptor
-			if json.Unmarshal(t.Descriptor, &d) == nil && t.Name == name && dbNameOf(d.DatabaseID) == db {
+			if json.Unmarshal(t.Descriptor, &d) == nil && t.Name == name && dbNameOf(d.DatabaseID) == db && d.SchemaID == 0 {
 				found = &final.Tables[i]
 			}
 		}
@@ -436,6 +436,10 @@ func planTableRestore(final *backupManifest, opts RestoreOptions) (*restorePlan,
 	for _, p := range plan.tables {
 		d := p.srcDesc
 		switch {
+		case d != nil && d.SchemaID != 0:
+			// Its name entry, and the schema it needs on this side, are
+			// not planned yet (docs/design/schemas.md, Deferred).
+			return nil, fmt.Errorf("table %s is in a schema other than public, which a table-level restore does not support yet (restore the whole cluster)", p.from())
 		case catalog.IsSystemTableID(p.src.ID) || catalog.IsSystemTable(p.src.Name):
 			return nil, fmt.Errorf("table %s belongs to the cluster itself and is not restored on its own", p.from())
 		case d.IsView():

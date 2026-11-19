@@ -53,7 +53,7 @@ func TestQuantifiedParse(t *testing.T) {
 
 func TestTableAndValuesParse(t *testing.T) {
 	sel := parseOne(t, `TABLE ONLY public.t ORDER BY 1 LIMIT 2`).(*Select)
-	if sel.Table != "t" || len(sel.Exprs) != 1 || !sel.Exprs[0].Star || sel.Limit != 2 || len(sel.OrderBy) != 1 {
+	if sel.Table != "public.t" || len(sel.Exprs) != 1 || !sel.Exprs[0].Star || sel.Limit != 2 || len(sel.OrderBy) != 1 {
 		t.Fatalf("TABLE: %+v", sel)
 	}
 	sel = parseOne(t, `TABLE a UNION TABLE b`).(*Select)

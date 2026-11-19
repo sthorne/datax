@@ -589,11 +589,11 @@ func TestAnalyzeAndShowStats(t *testing.T) {
 func TestParseDatabases(t *testing.T) {
 	for src, want := range map[string]string{
 		`SELECT id FROM t`:                         "t",
-		`SELECT id FROM public.t`:                  "t",
+		`SELECT id FROM public.t`:                  "public.t",
 		`SELECT id FROM app.t`:                     "app.t",
-		`SELECT id FROM app.public.t`:              "app.t",
+		`SELECT id FROM app.public.t`:              "app.public.t",
 		`INSERT INTO app.t VALUES (1)`:             "app.t",
-		`DELETE FROM app.public.t`:                 "app.t",
+		`DELETE FROM app.public.t`:                 "app.public.t",
 		`UPDATE app.t SET x = 1`:                   "app.t",
 		`DROP TABLE app.t`:                         "app.t",
 		`ALTER TABLE app.t ADD COLUMN y INT8`:      "app.t",
@@ -624,8 +624,13 @@ func TestParseDatabases(t *testing.T) {
 			t.Errorf("%s: table %q, want %q", src, got, want)
 		}
 	}
-	if _, err := Parse(`SELECT 1 FROM app.other.t`); err == nil {
-		t.Fatal("a schema other than public parsed")
+	// Qualifiers are kept for the catalog to resolve (schemas, gap
+	// PG-D-001); a fourth part is an error.
+	if stmts, err := Parse(`SELECT 1 FROM app.other.t`); err != nil || stmts[0].(*Select).Table != "app.other.t" {
+		t.Fatalf("three-part name: %v", err)
+	}
+	if _, err := Parse(`SELECT 1 FROM a.b.c.d`); err == nil {
+		t.Fatal("a four-part name parsed")
 	}
 	stmts, err := Parse(`SELECT a.id FROM app.t AS a JOIN app.u AS b ON a.id = b.id`)
 	if err != nil {

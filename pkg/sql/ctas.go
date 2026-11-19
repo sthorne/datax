@@ -139,7 +139,7 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 	}); err != nil {
 		return nil, ToSQLError(err)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, ct.Name); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, ct.Name); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if t.NoData {
@@ -165,7 +165,7 @@ func (s *Session) execCreateTableAs(ctx context.Context, t *parser.CreateTable, 
 				_ = s.finishDrops(cctx, s.extraDrops)
 			}
 			s.extraDrops = nil
-			_ = s.cat.FinishDDLIn(cctx, s.database, ct.Name)
+			_ = s.cat.FinishDDLIn(s.rctx(cctx), s.database, ct.Name)
 		}
 		return nil, ToSQLError(cause)
 	}

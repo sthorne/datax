@@ -83,6 +83,14 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execGrantRevoke(ctx, txn, t)
 	case *parser.CreateDatabase:
 		return s.execCreateDatabase(ctx, txn, t)
+	case *parser.CreateSchema:
+		return s.execCreateSchema(ctx, txn, t)
+	case *parser.DropSchema:
+		return s.execDropSchema(ctx, txn, t)
+	case *parser.AlterSchemaRename:
+		return s.execAlterSchemaRename(ctx, txn, t)
+	case *parser.SetSchema:
+		return s.execSetSchema(ctx, txn, t)
 	case *parser.DropDatabase:
 		return s.execDropDatabase(ctx, txn, t)
 	case *parser.AlterDatabase:
@@ -221,21 +229,34 @@ func (s *Session) execCreateTable(ctx context.Context, txn *kvclient.Txn, t *par
 	if t, err = withRowidKey(t); err != nil {
 		return nil, err
 	}
-	dbName, bare := catalog.SplitTableName(t.Name)
-	if dbName == "" {
-		dbName = s.database
+	// Where the table goes: the schema its qualifier names, or the first
+	// schema of the search path that exists (a temporary table: the
+	// session's own, in the current database).
+	var target *catalog.Target
+	if t.Temp {
+		dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
+		if err != nil {
+			return nil, ToSQLError(err)
+		}
+		target = &catalog.Target{Database: s.database, DBID: dbID, Schema: &catalog.SchemaDescriptor{Name: catalog.PublicSchema, DatabaseID: dbID}, Name: catalog.BareName(t.Name)}
+	} else if target, err = s.createTarget(ctx, txn, t.Name); err != nil {
+		return nil, err
 	}
+	dbName, bare, dbID := target.Database, target.Name, target.DBID
 	if catalog.IsSystemTable(bare) && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "table name %q is reserved for the cluster's own use", bare)
 	}
 	if dbName == catalog.SystemDatabase && !s.system {
 		return nil, newErrf(CodeInsufficientPriv, "database %q is reserved for the cluster", dbName)
 	}
-	dbID, err := s.cat.DatabaseID(ctx, txn, dbName)
-	if err != nil {
-		return nil, ToSQLError(err)
+	if !target.Schema.IsPublic() {
+		for _, cd := range t.Columns {
+			if cd.Serial || cd.Identity != "" {
+				return nil, newErrf(CodeFeatureNotSupported, "SERIAL and identity columns in schemas other than public are not supported yet (schema %q): use a sequence of the public schema and DEFAULT nextval('public.seq')", target.Schema.Name)
+			}
+		}
 	}
-	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, Owner: s.user, Unlogged: t.Unlogged}
+	desc := &catalog.TableDescriptor{Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Owner: s.user, Unlogged: t.Unlogged}
 	if id, ok := catalog.SystemTableID(bare); ok {
 		desc.ID = id
 	}
@@ -959,7 +980,11 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 		}
 		return &Result{Tag: "DROP TABLE"}, nil
 	}
-	if existing, err := s.cat.LookupIn(ctx, txn, s.database, t.Name); err == nil && existing != nil {
+	// Read in the transaction, never from the gateway's cache: a DROP
+	// SCHEMA ... CASCADE or DROP OWNED dropping several tables has just
+	// written the descriptors of those that referenced each other, and a
+	// lease on one of them would wait for this very transaction.
+	if existing, err := s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, t.Name); err == nil && existing != nil {
 		if existing.IsView() {
 			return nil, newErrf(CodeWrongObjectType, "%q is a view (use DROP VIEW)", t.Name)
 		}
@@ -973,7 +998,7 @@ func (s *Session) execDropTable(ctx context.Context, txn *kvclient.Txn, t *parse
 			return nil, err
 		}
 	}
-	desc, err := s.cat.DropIn(ctx, txn, s.database, t.Name)
+	desc, err := s.cat.DropIn(s.rctx(ctx), txn, s.database, t.Name)
 	if err != nil {
 		var nf *catalog.ErrTableNotFound
 		if t.IfExists && asErr(err, &nf) {

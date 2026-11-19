@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -280,9 +281,11 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 		if !p.consumeWord("in") || !p.consumeWord("schema") {
 			return nil, p.errf("expected IN SCHEMA after ON ALL %sS", strings.ToUpper(gr.ObjectKind))
 		}
-		if err := p.expectSchemaList(); err != nil {
+		schemas, err := p.parseSchemaList()
+		if err != nil {
 			return nil, err
 		}
+		gr.Schemas = schemas
 	case p.peekEncryptionKey(0):
 		p.i += 2
 		gr.ObjectKind = "encryption key"
@@ -305,10 +308,11 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 		gr.Objects = names
 	case p.consumeWord("schema"):
 		gr.ObjectKind = "schema"
-		if err := p.expectSchemaList(); err != nil {
+		schemas, err := p.parseSchemaList()
+		if err != nil {
 			return nil, err
 		}
-		gr.Objects = []string{"public"}
+		gr.Objects = schemas
 	case p.consumeWord("sequence"):
 		gr.ObjectKind = "sequence"
 		names, err := p.parseTableNameList()
@@ -346,19 +350,17 @@ func (p *parser) parseGrantRevoke(revoke bool) (Statement, error) {
 	return gr, nil
 }
 
-// expectSchemaList consumes a schema name list, which may only name
-// public (the sole schema).
-func (p *parser) expectSchemaList() error {
+// parseSchemaList consumes a schema name list.
+func (p *parser) parseSchemaList() ([]string, error) {
+	var out []string
 	for {
 		name, err := p.expectIdent()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if name != "public" {
-			return p.errf("schema %q does not exist (public is the only schema)", name)
-		}
+		out = append(out, name)
 		if !p.consumeOp(",") {
-			return nil
+			return out, nil
 		}
 	}
 }
@@ -467,8 +469,14 @@ func (p *parser) parseAlterDefaultPrivileges() (Statement, error) {
 			if !p.consumeWord("schema") {
 				return nil, p.errf("expected SCHEMA after IN")
 			}
-			if err := p.expectSchemaList(); err != nil {
+			schemas, err := p.parseSchemaList()
+			if err != nil {
 				return nil, err
+			}
+			for _, sc := range schemas {
+				if sc != "public" {
+					return nil, &SyntaxError{Msg: fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA %s is not supported: only the public schema takes default privileges", sc), Pos: p.peek().pos, Code: "0A000"}
+				}
 			}
 			continue
 		}

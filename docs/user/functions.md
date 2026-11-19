@@ -200,7 +200,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 - `current_database() → text` — The session's database (also the keyword current_catalog, without parentheses). *stable*
 - `current_date() → date` — Today's date, from the statement's start time. *stable*
-- `current_schema() → text` — public: the only schema. *stable*
+- `current_schema() → text` — The first schema of search_path that exists in the current database ("$user" naming the current role), or NULL when none does. *stable*
 - `current_setting(text, [bool]) → text` — The value of a session setting, built in or custom (app.tenant). An unknown or never-set name is an error (42704) unless missing_ok is true, which returns NULL. Its arguments may name columns: the name is looked up per row. *stable*
 - `current_time() → time` (also `localtime`) — The time of day of the statement's start time, in the session's time zone. current_time, current_timestamp, localtime and localtimestamp are written without parentheses, as in PostgreSQL, and take an optional fractional-seconds precision: current_timestamp(3). *stable*
 - `current_user() → text` — The current role: the session user, or the role SET ROLE selected. Also written current_role and user; like session_user, all three are keywords written without parentheses. *stable*
@@ -218,7 +218,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 
 ## System information and privileges
 
-- `current_schemas(bool) → text[]` — The schemas of the search path: {pg_catalog,public} when the argument (include implicit schemas) is true, {public} when false. *stable*
+- `current_schemas(bool) → text[]` — The schemas of the search path that exist in the current database, in order, with pg_catalog first when the argument (include implicit schemas) is true. *stable*
 - `has_any_column_privilege(any, any, [text]) → bool` — has_any_column_privilege([user,] table, privilege): SELECT, INSERT, UPDATE or REFERENCES on any column of the table. datax grants on tables, so this is has_table_privilege's answer. *stable*
 - `has_column_privilege(any, any, any, [text]) → bool` — has_column_privilege([user,] table, column, privilege): SELECT, INSERT, UPDATE or REFERENCES on the column (a name, or an attribute number). datax grants on tables, so this is the table's answer. 42703 for an unknown column name, NULL for an unknown number. *stable*
 - `has_database_privilege(any, any, [text]) → bool` — has_database_privilege([user,] database, privilege): CREATE, CONNECT, or TEMPORARY (TEMP), which follows CONNECT. 3D000 for an unknown database. *stable*

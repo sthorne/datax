@@ -35,9 +35,24 @@ func (s *Session) applyAddIdentity(ctx context.Context, txn *kvclient.Txn, desc 
 	if !col.NotNull {
 		return newErrf(CodeObjectNotInState, "column %q of relation %q must be declared NOT NULL before identity can be added", col.Name, desc.Name)
 	}
+	if desc.SchemaID != 0 {
+		return newErrf(CodeFeatureNotSupported, "identity columns in schemas other than public are not supported yet")
+	}
 	seqName := desc.Name + "_" + col.Name + "_seq"
 	if ai.Seq != nil && ai.Seq.SeqName != "" {
-		seqName = ai.Seq.SeqName
+		// [public.]name: the sequence lives with the table, in public.
+		db, bare, ok, err := s.publicOnlyDatabase(ctx, txn, ai.Seq.SeqName)
+		if err != nil {
+			return err
+		}
+		if ok {
+			dbID, err := s.cat.DatabaseID(ctx, txn, db)
+			ok = err == nil && dbID == desc.DatabaseID
+		}
+		if !ok {
+			return newErrf(CodeFeatureNotSupported, "the sequence of an identity column must be in its table's schema (%q)", ai.Seq.SeqName)
+		}
+		seqName = bare
 	}
 	if eff.dry {
 		return nil

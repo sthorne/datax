@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -160,7 +161,7 @@ func (s *Session) lookupForSchemaChange(ctx context.Context, txn *kvclient.Txn, 
 	if d.Temp != nil {
 		return d, nil // read in txn: temporary tables are never cached
 	}
-	return s.cat.LookupFreshIn(ctx, txn, s.database, name)
+	return s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, name)
 }
 
 // TestingCreateIndexHook, when set, is called by an online CREATE INDEX
@@ -300,7 +301,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	if TestingCreateIndexHook != nil {
 		TestingCreateIndexHook(CreateIndexPublished, t.Name)
 	}
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	if TestingCreateIndexHook != nil {
@@ -351,7 +352,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 			desc.Indexes = kept
 			return s.cat.Update(ctx, txn, desc)
 		})
-		_ = s.cat.FinishDDLIn(ctx, s.database, t.Table)
+		_ = s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table)
 		if tableID != 0 {
 			s.wipeIndexEntries(ctx, tableID, indexID)
 			if vec != nil {
@@ -362,7 +363,7 @@ func (s *Session) execCreateIndexOnline(ctx context.Context, t *parser.CreateInd
 	}
 
 	// Step 3: drain adoption of the public index.
-	if err := s.cat.FinishDDLIn(ctx, s.database, t.Table); err != nil {
+	if err := s.cat.FinishDDLIn(s.rctx(ctx), s.database, t.Table); err != nil {
 		return nil, ToSQLError(err)
 	}
 	return &Result{Tag: "CREATE INDEX", Notices: notices}, nil
@@ -660,8 +661,8 @@ func ddlTableName(stmt parser.Statement) string {
 	case *parser.AlterTable:
 		if t.RenameTo != "" {
 			// The drain looks the table up by name: the new one.
-			if q, _ := catalog.SplitTableName(t.Table); q != "" {
-				return q + "." + t.RenameTo
+			if parts := catalog.SplitName(t.Table); len(parts) > 1 {
+				return strings.Join(parts[:len(parts)-1], ".") + "." + t.RenameTo
 			}
 			return t.RenameTo
 		}

@@ -190,29 +190,6 @@ func (p *parser) parseFuncTableAlias(fe *Expr) (string, []string, error) {
 	return alias, cols, nil
 }
 
-// parseColumnRef parses ident['.' ident] into a ColumnRef.
-func (p *parser) parseColumnRef() (ColumnRef, error) {
-	name, err := p.expectIdent()
-	if err != nil {
-		return ColumnRef{}, err
-	}
-	if p.consumeOp(".") {
-		col, err := p.expectIdent()
-		if err != nil {
-			return ColumnRef{}, err
-		}
-		if name == "public" && p.consumeOp(".") {
-			// public.t.c: the only schema's qualifier is dropped.
-			name = col
-			if col, err = p.expectIdent(); err != nil {
-				return ColumnRef{}, err
-			}
-		}
-		return ColumnRef{Table: name, Column: col}, nil
-	}
-	return ColumnRef{Column: name}, nil
-}
-
 // joinEquality reports whether c is "colref = colref" — the join-key
 // form — and returns both references.
 func joinEquality(c Comparison) (l, r ColumnRef, ok bool) {
@@ -284,10 +261,11 @@ func (p *parser) expectOp(op string) error {
 	return nil
 }
 
-// parseTableName parses a possibly qualified table name: t, public.t,
-// db.t or db.public.t. The only schema is public, so the result is the
-// bare name or "db.name"; the session resolves an unqualified name in
-// its current database.
+// parseTableName parses a possibly qualified table name: t, s.t or
+// db.s.t, kept as written ("s.t", "db.s.t") for the catalog to resolve
+// (catalog.Accessor.resolve, docs/design/schemas.md): a two-part name
+// is a schema of the current database, or a database (a datax
+// extension) when no schema has that name.
 func (p *parser) parseTableName() (string, error) {
 	first, err := p.expectIdent()
 	if err != nil {
@@ -301,21 +279,10 @@ func (p *parser) parseTableName() (string, error) {
 		}
 		parts = append(parts, next)
 	}
-	switch len(parts) {
-	case 1:
-		return parts[0], nil
-	case 2:
-		if parts[0] == "public" {
-			return parts[1], nil
-		}
-		return parts[0] + "." + parts[1], nil
-	case 3:
-		if parts[1] != "public" {
-			return "", p.errf("schema %q does not exist (public is the only schema)", parts[1])
-		}
-		return parts[0] + "." + parts[2], nil
+	if len(parts) > 3 {
+		return "", p.errf("improper qualified name (too many dotted names): %s", strings.Join(parts, "."))
 	}
-	return "", p.errf("too many qualifiers in table name %q", strings.Join(parts, "."))
+	return strings.Join(parts, "."), nil
 }
 
 func (p *parser) expectIdent() (string, error) {
@@ -672,6 +639,9 @@ func (p *parser) parseStatement() (Statement, error) {
 			p.i-- // parseCreateView consumes one token, then VIEW
 			return p.parseCreateView(true)
 		}
+		if nxt := p.toks[p.i+1]; nxt.isWord("schema") {
+			return p.parseCreateSchema()
+		}
 		if nxt := p.toks[p.i+1]; nxt.isWord("database") {
 			p.i += 2 // CREATE DATABASE
 			cd := &CreateDatabase{}
@@ -832,6 +802,9 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return dv, nil
 		}
+		if nxt := p.toks[p.i+1]; nxt.isWord("schema") {
+			return p.parseDropSchema()
+		}
 		if nxt := p.toks[p.i+1]; nxt.isWord("database") {
 			p.i += 2 // DROP DATABASE
 			dd := &DropDatabase{}
@@ -926,6 +899,9 @@ func (p *parser) parseStatement() (Statement, error) {
 				return nil, err
 			}
 			as.Name = name
+			if ss, ok, err := p.parseSetSchema("sequence", name, as.IfExists); ok || err != nil {
+				return ss, err
+			}
 			if p.consumeIdentWord("owner") {
 				return p.parseOwnerTo("sequence", name)
 			}
@@ -950,24 +926,44 @@ func (p *parser) parseStatement() (Statement, error) {
 			return p.parseOwnerTo("large object", t.text)
 		}
 		if nxt := p.toks[p.i+1]; nxt.isWord("schema") {
-			p.i += 2 // ALTER SCHEMA name OWNER TO role
+			p.i += 2 // ALTER SCHEMA name OWNER TO role | RENAME TO new
 			name, err := p.expectIdent()
 			if err != nil {
 				return nil, err
 			}
+			if p.consumeIdentWord("rename") {
+				if err := p.expectKeyword("TO"); err != nil {
+					return nil, err
+				}
+				newName, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterSchemaRename{Name: name, NewName: newName}, nil
+			}
 			if !p.consumeIdentWord("owner") {
-				return nil, p.errf("ALTER SCHEMA supports only OWNER TO")
+				return nil, p.errf("ALTER SCHEMA supports only OWNER TO and RENAME TO")
 			}
 			return p.parseOwnerTo("schema", name)
 		}
 		if nxt := p.toks[p.i+1]; nxt.isWord("view") {
-			p.i += 2 // ALTER VIEW name OWNER TO role
+			p.i += 2 // ALTER VIEW [IF EXISTS] name OWNER TO role | SET SCHEMA s
+			ifExists := false
+			if p.consumeKeyword("IF") {
+				if err := p.expectKeyword("EXISTS"); err != nil {
+					return nil, err
+				}
+				ifExists = true
+			}
 			name, err := p.parseTableName()
 			if err != nil {
 				return nil, err
 			}
-			if !p.consumeIdentWord("owner") {
-				return nil, p.errf("ALTER VIEW supports only OWNER TO")
+			if ss, ok, err := p.parseSetSchema("view", name, ifExists); ok || err != nil {
+				return ss, err
+			}
+			if ifExists || !p.consumeIdentWord("owner") {
+				return nil, p.errf("ALTER VIEW supports only OWNER TO and SET SCHEMA")
 			}
 			return p.parseOwnerTo("view", name)
 		}
@@ -2300,7 +2296,13 @@ func (p *parser) parseSet() (Statement, error) {
 		t := p.peek()
 		switch t.kind {
 		case tkIdent, tkKeyword, tkString, tkNumber:
-			parts = append(parts, t.text)
+			if t.kind == tkIdent && t.quoted && sv.Name == "search_path" {
+				// A quoted schema name keeps its quotes, and with them
+				// its case ("$user", "MySchema").
+				parts = append(parts, `"`+strings.ReplaceAll(t.text, `"`, `""`)+`"`)
+			} else {
+				parts = append(parts, t.text)
+			}
 			p.i++
 		case tkOp:
 			if t.text == "-" && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkNumber {
@@ -2536,20 +2538,23 @@ func (p *parser) parseSequenceOptions(o *SequenceOptions, alter bool) error {
 				o.OwnedBy = "none"
 				continue
 			}
-			ref, err := p.parseColumnRef()
+			// [schema.]table.column (pg_dump's public.t.c): the table
+			// keeps its qualifier, for the catalog to resolve.
+			first, err := p.expectIdent()
 			if err != nil {
 				return err
 			}
-			if p.consumeOp(".") {
-				// schema.table.column (pg_dump's public.t.c).
-				col, err := p.expectIdent()
+			parts := []string{first}
+			for len(parts) < 4 && p.consumeOp(".") {
+				n, err := p.expectIdent()
 				if err != nil {
 					return err
 				}
-				if ref.Table != "public" {
-					return p.errf("schema %q does not exist (public is the only schema)", ref.Table)
-				}
-				ref = ColumnRef{Table: ref.Column, Column: col}
+				parts = append(parts, n)
+			}
+			var ref ColumnRef
+			if len(parts) >= 2 {
+				ref = ColumnRef{Table: strings.Join(parts[:len(parts)-1], "."), Column: parts[len(parts)-1]}
 			}
 			if ref.Table == "" {
 				return p.errf("OWNED BY takes table.column")
@@ -5157,6 +5162,9 @@ func (p *parser) parseAlterTable() (Statement, error) {
 	if !at.Only {
 		p.consumeOp("*")
 	}
+	if ss, ok, err := p.parseSetSchema("table", name, at.IfExists); ok || err != nil {
+		return ss, err
+	}
 	switch {
 	case p.consumeIdentWord("owner"):
 		return p.parseOwnerTo("table", name)
@@ -5899,21 +5907,7 @@ func (p *parser) parseCommentOn() (Statement, error) {
 		}
 		co.Column = parts[len(parts)-1]
 		tbl := parts[:len(parts)-1]
-		switch len(tbl) {
-		case 1:
-			co.Name = tbl[0]
-		case 2:
-			if tbl[0] == "public" {
-				co.Name = tbl[1]
-			} else {
-				co.Name = tbl[0] + "." + tbl[1]
-			}
-		default:
-			if tbl[1] != "public" {
-				return nil, p.errf("schema %q does not exist (public is the only schema)", tbl[1])
-			}
-			co.Name = tbl[0] + "." + tbl[2]
-		}
+		co.Name = strings.Join(tbl, ".")
 	} else {
 		name, err := p.parseTableName()
 		if err != nil {
@@ -7820,9 +7814,10 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if err != nil {
 				return Expr{}, err
 			}
-			if name == "public" && p.peek().kind == tkOp && p.peek().text == "." && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
-				// public.t.c: the only schema's qualifier is dropped
-				// (Prisma qualifies every column so).
+			if p.peek().kind == tkOp && p.peek().text == "." && p.i+1 < len(p.toks) && p.toks[p.i+1].kind == tkIdent {
+				// s.t.c: the schema's qualifier is dropped and the
+				// column binds by its table's name (Prisma qualifies
+				// every column so).
 				p.i++
 				name, col = col, p.peek().text
 				p.i++
@@ -7997,4 +7992,87 @@ func (p *parser) parseWith() (Statement, error) {
 		return nil, p.errf("WITH must be followed by SELECT, INSERT, UPDATE or DELETE")
 	}
 	return stmt, nil
+}
+
+// parseSetSchema parses SET SCHEMA s after ALTER TABLE | VIEW |
+// SEQUENCE name (ok false, nothing consumed, when it is not there).
+func (p *parser) parseSetSchema(kind, name string, ifExists bool) (Statement, bool, error) {
+	if !p.peekKeyword("SET") || !p.peekWord(1, "schema") {
+		return nil, false, nil
+	}
+	p.i += 2
+	schema, err := p.expectIdent()
+	if err != nil {
+		return nil, true, err
+	}
+	return &SetSchema{Kind: kind, Name: name, Schema: schema, IfExists: ifExists}, true, nil
+}
+
+// parseCreateSchema parses CREATE SCHEMA [IF NOT EXISTS] [name]
+// [AUTHORIZATION role]: one of the name and the role must be there.
+func (p *parser) parseCreateSchema() (Statement, error) {
+	p.i += 2 // CREATE SCHEMA
+	cs := &CreateSchema{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		cs.IfNotExists = true
+	}
+	if !p.peekWord(0, "authorization") {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		cs.Name = name
+	}
+	if p.consumeWord("authorization") {
+		role, err := p.parseRoleName()
+		if err != nil {
+			return nil, err
+		}
+		cs.Authorization = role
+	}
+	if cs.Name == "" && cs.Authorization == "" {
+		return nil, p.errf("CREATE SCHEMA takes a name or AUTHORIZATION role")
+	}
+	if !p.atStatementEnd() {
+		if p.peekKeyword("CREATE") || p.peekKeyword("GRANT") {
+			return nil, &SyntaxError{Msg: "CREATE SCHEMA with schema elements is not supported: create the schema, then its objects", Pos: p.peek().pos, Code: "0A000"}
+		}
+		return nil, p.errf("unexpected %q after CREATE SCHEMA", p.peek().text)
+	}
+	return cs, nil
+}
+
+// parseDropSchema parses DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE
+// | RESTRICT].
+func (p *parser) parseDropSchema() (Statement, error) {
+	p.i += 2 // DROP SCHEMA
+	ds := &DropSchema{}
+	if p.consumeKeyword("IF") {
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		ds.IfExists = true
+	}
+	for {
+		name, err := p.expectIdent()
+		if err != nil {
+			return nil, err
+		}
+		ds.Names = append(ds.Names, name)
+		if !p.consumeOp(",") {
+			break
+		}
+	}
+	if p.consumeIdentWord("cascade") {
+		ds.Cascade = true
+	} else {
+		p.consumeIdentWord("restrict")
+	}
+	return ds, nil
 }

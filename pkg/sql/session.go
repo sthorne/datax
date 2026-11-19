@@ -223,7 +223,15 @@ type Session struct {
 	// holds the session's values while a transaction block's SET LOCAL
 	// overrides them; txnStartedReadOnly marks a block begun under
 	// default_transaction_read_only.
-	vars               sessionVars
+	vars sessionVars
+	// pathMemo is the parsed form of vars.searchPath (schema.go);
+	// viewPath, while a view's query runs, is the view's own search path
+	// (nil otherwise).
+	pathMemo struct {
+		raw    string
+		parsed []string
+	}
+	viewPath           []string
 	localVars          *sessionVars
 	txnStartedReadOnly bool
 	// BackendPID is the wire's process ID for this session (0 for an
@@ -390,6 +398,9 @@ func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version,
 // the current database shadows) or a table in the session's current
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
+	if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
+		name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+	}
 	db, bare := catalog.SplitTableName(name)
 	if len(s.rels) > 0 {
 		if db == "" {
@@ -405,9 +416,12 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 		}
 	}
 	// The session's temporary tables come before every other table, as
-	// pg_temp leads PostgreSQL's search path.
-	if d, ok, err := s.lookupTemp(ctx, txn, name); ok {
-		return d, err
+	// pg_temp leads PostgreSQL's search path; never inside a view's
+	// query, whose names resolve through the view's own path.
+	if s.viewPath == nil {
+		if d, ok, err := s.lookupTemp(ctx, txn, name); ok {
+			return d, err
+		}
 	}
 	if catalog.IsUnreadableSystemTable(bare) && !s.system && !vtable.IsSchema(db) {
 		// The named keys (issue #310): no session but the node's own
@@ -435,15 +449,21 @@ func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*
 	var d *catalog.TableDescriptor
 	var err error
 	if s.state == StateOpen && s.ddlTouched(name) {
-		d, err = s.cat.LookupFreshIn(ctx, txn, s.database, name)
+		d, err = s.cat.LookupFreshIn(s.rctx(ctx), txn, s.database, name)
 	} else {
 		memo := s.stmtLookups
+		if s.viewPath != nil {
+			// A view's query resolves through the view's own path: the
+			// memo holds what the statement's names resolved to under the
+			// session's.
+			memo = nil
+		}
 		if memo != nil && memo.txn == txn {
 			if md, ok := memo.m[name]; ok {
 				return md, nil
 			}
 		}
-		d, err = s.cat.LookupIn(ctx, txn, s.database, name)
+		d, err = s.cat.LookupIn(s.rctx(ctx), txn, s.database, name)
 		if err == nil && memo != nil && memo.txn == txn {
 			memo.m[name] = d
 		}
@@ -551,6 +571,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 			return nil, err
 		}
 		if env.Types, err = catalog.ListTypes(ctx, txn, cur.ID); err != nil {
+			return nil, err
+		}
+		if env.Schemas, err = catalog.ListSchemas(ctx, txn, cur.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -918,7 +941,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// Schema changes are visible everywhere once COMMIT returns: drain
 		// lease adoption for every table this transaction altered.
 		for _, name := range pending {
-			if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
+			if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); derr != nil {
 				return nil, ToSQLError(derr)
 			}
 		}
@@ -1315,10 +1338,15 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 				}
 			})
 		}
+		// The drain runs at COMMIT, under the search path in force then
+		// (a SET LOCAL has ended by then): each table is recorded by a
+		// name that resolves to it alone.
 		if name := ddlTableName(stmt); name != "" {
-			s.pendingDDL = append(s.pendingDDL, name)
+			s.pendingDDL = append(s.pendingDDL, s.drainName(ctx, s.txn, name))
 		}
-		s.pendingDDL = append(s.pendingDDL, s.extraDDL...)
+		for _, name := range s.extraDDL {
+			s.pendingDDL = append(s.pendingDDL, s.drainName(ctx, s.txn, name))
+		}
 		s.pendingDrops = append(s.pendingDrops, s.extraDrops...)
 		s.extraDDL, s.extraDrops = nil, nil
 		return res, nil
@@ -1354,7 +1382,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		names = append([]string{name}, names...)
 	}
 	for _, name := range names {
-		if derr := s.cat.FinishDDLIn(ctx, s.database, name); derr != nil {
+		if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, name); derr != nil {
 			return nil, ToSQLError(derr)
 		}
 	}
@@ -1460,10 +1488,10 @@ func (s *Session) rollback(ctx context.Context) {
 
 // ddlTouched reports whether the open transaction's DDL changed name.
 func (s *Session) ddlTouched(name string) bool {
-	_, bare := catalog.SplitTableName(name)
+	bare := catalog.BareName(name)
 	for _, lists := range [][]string{s.pendingDDL, s.extraDDL} {
 		for _, n := range lists {
-			if _, b := catalog.SplitTableName(n); strings.EqualFold(b, bare) {
+			if b := catalog.BareName(n); strings.EqualFold(b, bare) {
 				return true
 			}
 		}

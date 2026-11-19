@@ -91,7 +91,7 @@ func setCustomVar(vars *sessionVars, name, value string) {
 }
 
 func defaultVars() sessionVars {
-	return sessionVars{searchPath: catalog.PublicSchema, timeZone: time.UTC, timeZoneName: "UTC", dateStyle: "ISO, MDY", clientEncoding: "UTF8", isolation: "serializable", memoryLimit: defaultMemoryLimit}
+	return sessionVars{searchPath: defaultSearchPath, timeZone: time.UTC, timeZoneName: "UTC", dateStyle: "ISO, MDY", clientEncoding: "UTF8", isolation: "serializable", memoryLimit: defaultMemoryLimit}
 }
 
 // varNames are the settings in SHOW ALL order, with their pg_settings
@@ -554,7 +554,9 @@ func (s *Session) applyVar(vars *sessionVars, name, value string, reset bool) er
 	case "search_path":
 		vars.searchPath = def.searchPath
 		if !reset {
-			vars.searchPath = unquote(value)
+			// Kept in SHOW's normal form: names that need it quoted,
+			// joined by ", " (an empty value is an empty path).
+			vars.searchPath = formatSearchPath(catalog.ParseSearchPath(value))
 		}
 	case "TimeZone":
 		vars.timeZone, vars.timeZoneName = time.UTC, "UTC"
@@ -751,6 +753,7 @@ func writeKind(stmt parser.Statement) string {
 	case *parser.CreateTable, *parser.DropTable, *parser.AlterTable, *parser.CreateIndex, *parser.DropIndex, *parser.AlterIndex,
 		*parser.CreateSequence, *parser.AlterSequence, *parser.DropSequence, *parser.CreateType, *parser.AlterType, *parser.DropType,
 		*parser.CreateView, *parser.DropView, *parser.CreateDatabase, *parser.DropDatabase, *parser.AlterDatabase,
+		*parser.CreateSchema, *parser.DropSchema, *parser.AlterSchemaRename, *parser.SetSchema,
 		*parser.CreateRole, *parser.DropRole, *parser.GrantRevoke, *parser.AlterOwner, *parser.ReassignOwned, *parser.DropOwned,
 		*parser.AlterDefaultPrivileges, *parser.Truncate, *parser.CommentOn, *parser.Analyze,
 		*parser.CreatePolicy, *parser.AlterPolicy, *parser.DropPolicy, *parser.CreateExtension, *parser.DropExtension,

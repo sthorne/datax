@@ -179,14 +179,24 @@ func init() {
 		return rows, nil
 	})
 
-	// pg_namespace: public, pg_catalog, information_schema.
+	// pg_namespace: public, pg_catalog, information_schema, and the
+	// current database's own schemas.
 	pg("pg_namespace", []catalog.Column{col("oid", types.Int), col("nspname", types.String), col("nspowner", types.Int), col("nspacl", types.String)},
 		func(ctx context.Context, env *Env) ([]Row, error) {
-			return []Row{
+			rows := []Row{
 				{i64(OIDPgCatalog), str(PgCatalog), i64(10), null()},
 				publicNamespaceRow(env),
 				{i64(OIDInformationSchema), str(InformationSchema), i64(10), null()},
-			}, nil
+			}
+			for _, sd := range env.Schemas {
+				o := aclName(catalog.OwnerOf(sd.Owner))
+				acl := ObjectACL(sd.Owner, "UC", sd.Privileges, sd.GrantOptions)
+				if acl.Null {
+					acl = str("{" + o + "=UC/" + o + "}")
+				}
+				rows = append(rows, Row{i64(SchemaOID(sd.ID)), str(sd.Name), i64(RoleOID(catalog.OwnerOf(sd.Owner))), acl})
+			}
+			return rows, nil
 		})
 
 	// pg_class: tables ('r') and their indexes ('i'), in the current
@@ -212,7 +222,7 @@ func init() {
 			// large-object tables, ...) are system catalogs: pg_catalog's,
 			// as PostgreSQL's are, so pg_dump and psql's \dt leave them
 			// out (they are still read by their bare names).
-			ns := int64(OIDPublic)
+			ns := SchemaOID(t.SchemaID)
 			if catalog.IsSystemTableID(t.ID) {
 				ns = OIDPgCatalog
 			}
@@ -233,7 +243,7 @@ func init() {
 				}
 			}
 			if t.IsView() {
-				rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(OIDPublic), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(0), i64(0), i64(0),
+				rows = append(rows, Row{i64(TableOID(t)), str(t.Name), i64(SchemaOID(t.SchemaID)), i64(0), i64(RoleOID(catalog.OwnerOf(t.Owner))), i64(0), i64(0), i64(0),
 					i64(0), types.NewFloat(-1), i64(0), boolean(false), boolean(false), str("p"), str("v"), i64(int64(len(t.VisibleColumns()))),
 					i64(0), boolean(true), boolean(false), boolean(false), boolean(false), boolean(false), boolean(true), str("n"), boolean(false), i64(0), ObjectACL(t.Owner, "arwdDxt", t.Privileges, t.GrantOptions), null(), null(), null(), str(ViewDef(t.ViewQuery)), textOrNull(t.Comment)})
 				continue
@@ -751,7 +761,7 @@ func init() {
 			var rows []Row
 			for _, t := range env.currentTables() {
 				if t.IsView() {
-					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), str(t.ViewQuery)})
+					rows = append(rows, Row{str(env.schemaName(t.SchemaID)), str(t.Name), str(catalog.OwnerOf(t.Owner)), str(t.ViewQuery)})
 				}
 			}
 			return rows, nil
@@ -876,7 +886,7 @@ func init() {
 		}
 		for _, t := range env.currentTables() {
 			if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
-				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(OIDPublic), str("p"), boolean(false), boolean(false), boolean(true),
+				rows = append(rows, Row{i64(IndexOID(t, 1)), str(t.Name + "_pkey"), i64(SchemaOID(t.SchemaID)), str("p"), boolean(false), boolean(false), boolean(true),
 					i64(TableOID(t)), i64(0), i64(IndexOID(t, 1)), i64(0), str(intArray(attnums(t, visiblePK(t)))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(PrimaryKeyDef(t)), textOrNull(t.PKComment)})
 			}
 			for i := range t.Indexes {
@@ -888,7 +898,7 @@ func init() {
 				if idx.Primary {
 					contype = "p"
 				}
-				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(OIDPublic), str(contype), boolean(false), boolean(false), boolean(true),
+				rows = append(rows, Row{i64(IndexOID(t, idx.ID)), str(idx.Name), i64(SchemaOID(t.SchemaID)), str(contype), boolean(false), boolean(false), boolean(true),
 					i64(TableOID(t)), i64(0), i64(IndexOID(t, idx.ID)), i64(0), str(intArray(attnums(t, idx.ColumnIDs))), null(), null(), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(UniqueDef(t, idx)), textOrNull(idx.ConstraintComment)})
 			}
 			for i := range t.Constraints {
@@ -896,7 +906,7 @@ func init() {
 				def := ConstraintDef(t, c, env.tableByID)
 				switch c.Kind {
 				case catalog.ConstraintCheck:
-					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("c"), boolean(false), boolean(false), boolean(c.Validated),
+					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(SchemaOID(t.SchemaID)), str("c"), boolean(false), boolean(false), boolean(c.Validated),
 						i64(TableOID(t)), i64(0), i64(0), i64(0), str(intArray(attnums(t, c.Columns))), null(), str(c.Expr), i64(0), str(" "), str(" "), str(" "), boolean(true), i64(0), boolean(false), str(def), textOrNull(c.Comment)})
 				case catalog.ConstraintForeign:
 					ref := t
@@ -907,7 +917,7 @@ func init() {
 					if ref != nil {
 						confkey = str(intArray(attnums(ref, c.RefColumns)))
 					}
-					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(OIDPublic), str("f"), boolean(false), boolean(false), boolean(c.Validated),
+					rows = append(rows, Row{i64(ConstraintOID(t, c)), str(c.Name), i64(SchemaOID(t.SchemaID)), str("f"), boolean(false), boolean(false), boolean(c.Validated),
 						i64(TableOID(t)), i64(0), i64(0), confrelid, str(intArray(attnums(t, c.Columns))), confkey, null(), i64(0), str(fkAction(c.OnUpdate)), str(fkAction(c.OnDelete)), str("s"), boolean(true), i64(0), boolean(false), str(def), textOrNull(c.Comment)})
 				}
 			}
@@ -1103,7 +1113,7 @@ func init() {
 		func(ctx context.Context, env *Env) ([]Row, error) {
 			var rows []Row
 			for _, t := range env.currentTables() {
-				rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(catalog.OwnerOf(t.Owner)), null(), boolean(len(t.Indexes) > 0 || hasVisiblePK(t)), boolean(false), boolean(false), boolean(t.RowSecurity)})
+				rows = append(rows, Row{str(env.schemaName(t.SchemaID)), str(t.Name), str(catalog.OwnerOf(t.Owner)), null(), boolean(len(t.Indexes) > 0 || hasVisiblePK(t)), boolean(false), boolean(false), boolean(t.RowSecurity)})
 			}
 			return rows, nil
 		})
@@ -1113,10 +1123,10 @@ func init() {
 			for _, t := range env.currentTables() {
 				if hasVisiblePK(t) { // a hidden rowid alone is no key PostgreSQL would show (issue #354)
 					pkIdx := &catalog.IndexDescriptor{Name: t.Name + "_pkey", Unique: true, ColumnIDs: visiblePK(t)}
-					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(pkIdx.Name), null(), str(IndexDef(t, pkIdx))})
+					rows = append(rows, Row{str(env.schemaName(t.SchemaID)), str(t.Name), str(pkIdx.Name), null(), str(IndexDef(t, pkIdx))})
 				}
 				for i := range t.Indexes {
-					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(t.Indexes[i].Name), null(), str(IndexDef(t, &t.Indexes[i]))})
+					rows = append(rows, Row{str(env.schemaName(t.SchemaID)), str(t.Name), str(t.Indexes[i].Name), null(), str(IndexDef(t, &t.Indexes[i]))})
 				}
 			}
 			return rows, nil
@@ -1167,7 +1177,7 @@ func init() {
 					if len(p.Roles) > 0 {
 						roles = p.Roles
 					}
-					rows = append(rows, Row{str(catalog.PublicSchema), str(t.Name), str(p.Name), str(kind),
+					rows = append(rows, Row{str(env.schemaName(t.SchemaID)), str(t.Name), str(p.Name), str(kind),
 						str("{" + strings.Join(roles, ",") + "}"), str(strings.ToUpper(p.Command)), textOrNull(p.Using), textOrNull(p.Check)})
 				}
 			}
@@ -1184,7 +1194,7 @@ func init() {
 					live = st.RowCount
 					analyzed = types.NewTimestamp(st.CollectedAt)
 				}
-				rows = append(rows, Row{i64(TableOID(t)), str(catalog.PublicSchema), str(t.Name), i64(live), i64(0), analyzed})
+				rows = append(rows, Row{i64(TableOID(t)), str(env.schemaName(t.SchemaID)), str(t.Name), i64(live), i64(0), analyzed})
 			}
 			return rows, nil
 		})
@@ -1196,7 +1206,7 @@ func init() {
 			var rows []Row
 			for _, t := range env.currentTables() {
 				for i, id := range visiblePK(t) {
-					rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), boolean(false), str(catalog.PublicSchema), str(t.Name + "_pkey"), i64(int64(i + 1)), str(columnName(t, id))})
+					rows = append(rows, Row{str(env.Database), str(env.schemaName(t.SchemaID)), str(t.Name), boolean(false), str(env.schemaName(t.SchemaID)), str(t.Name + "_pkey"), i64(int64(i + 1)), str(columnName(t, id))})
 				}
 				for _, idx := range t.Indexes {
 					for i, id := range idx.ColumnIDs {
@@ -1204,7 +1214,7 @@ func init() {
 						if idx.IsExprKey(i) {
 							name = idx.Exprs[i]
 						}
-						rows = append(rows, Row{str(env.Database), str(catalog.PublicSchema), str(t.Name), boolean(!idx.Unique), str(catalog.PublicSchema), str(idx.Name), i64(int64(i + 1)), str(name)})
+						rows = append(rows, Row{str(env.Database), str(env.schemaName(t.SchemaID)), str(t.Name), boolean(!idx.Unique), str(env.schemaName(t.SchemaID)), str(idx.Name), i64(int64(i + 1)), str(name)})
 					}
 				}
 			}

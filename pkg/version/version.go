@@ -393,6 +393,15 @@ const (
 	// one over its plain columns — entries for rows the predicate
 	// excludes, none computed for an expression — so the DDL that
 	// declares one is refused until finalize.
+	//
+	// V22 also introduces schemas (gap PG-D-001,
+	// pkg/sql/catalog/schema.go): schema descriptors and names under
+	// /system/schemadesc and /system/schemans, and the table descriptor
+	// field schema_id, omitempty, whose table is filed under a name
+	// entry holding NUL bytes. A v21 node can reach no such entry by
+	// name, but would list such a table as a public one, so CREATE
+	// SCHEMA is refused until finalize; with no schema, every name
+	// resolves as before.
 	V22 Version = 22
 
 	// Current is the newest cluster version this binary can run.
