@@ -1931,6 +1931,13 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Row expiry no longer stalls with a short interval.** Each table in
+  a pass had a budget of one interval; with a short `RowTTLInterval` a
+  query that needs a moment longer (the first read after a restart
+  waits on a lease proposal) was cut off in every pass, so the table
+  never lost an expired row, and nothing reported it. A table now gets
+  at least 5 seconds. `TestRowTTLSurvivesRestartAndBackup` failed 4 of
+  5 runs under `-race` because of it.
 - **`pg_get_userbyid`** returns the owning role instead of always
   `root`.
 - **Subqueries in a join's `ON` condition are evaluated** (#379). Before,

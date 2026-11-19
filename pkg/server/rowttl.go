@@ -58,6 +58,12 @@ const (
 	defaultRowTTLInterval   = 30 * time.Second
 	defaultRowTTLBatchSize  = 100
 	defaultRowTTLBatchPause = 20 * time.Millisecond
+	// minRowTTLTableBudget is the least time one table gets in a pass.
+	// The budget is otherwise the interval, and with a short interval a
+	// query that needs a moment more (the first read after a restart
+	// waits on a lease proposal) would be cut off in every pass, and
+	// the table never expire a row.
+	minRowTTLTableBudget = 5 * time.Second
 )
 
 func (n *Node) rowTTLLoop(ctx context.Context) {
@@ -109,6 +115,7 @@ func (n *Node) RunRowTTLOnce(ctx context.Context) []RowTTLPass {
 	if budget <= 0 {
 		budget = defaultRowTTLInterval
 	}
+	budget = max(budget, minRowTTLTableBudget)
 	var out []RowTTLPass
 	var worst time.Duration
 	for _, t := range tables {
