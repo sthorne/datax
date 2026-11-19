@@ -1108,6 +1108,17 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **A client can no longer call another session's per-row closure.**
+  A `set_config` whose arguments read the row (pg_dump's
+  `set_config(name, ...) FROM pg_settings`) runs through a closure the
+  session registers in a registry every session shares, under an id
+  the query names through an internal function. That function was
+  callable from SQL (`SELECT "datax:row_session_func"(n, ...)`) and
+  the ids were sequential, so while one session ran such a statement,
+  another could run its closure: `SET` a setting in the first
+  session, with that session's privileges. Any call naming a function
+  whose name holds a `:` (the internal hooks all do) is now `42883`
+  at parse time, and the ids are random.
 - **The toolchain moves to go1.26.11.** GO-2026-6859 (an HTTP/1 server
   crash from a `MaxBytesReader` header race in `net/http`) is reachable
   through the console's HTTP server and is fixed in go1.26.11, so the
@@ -1920,6 +1931,13 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Row expiry no longer stalls with a short interval.** Each table in
+  a pass had a budget of one interval; with a short `RowTTLInterval` a
+  query that needs a moment longer (the first read after a restart
+  waits on a lease proposal) was cut off in every pass, so the table
+  never lost an expired row, and nothing reported it. A table now gets
+  at least 5 seconds. `TestRowTTLSurvivesRestartAndBackup` failed 4 of
+  5 runs under `-race` because of it.
 - **`pg_get_userbyid`** returns the owning role instead of always
   `root`.
 - **Subqueries in a join's `ON` condition are evaluated** (#379). Before,

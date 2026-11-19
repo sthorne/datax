@@ -205,8 +205,8 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-P-001 | **User-defined functions** (`CREATE FUNCTION ... LANGUAGE sql / plpgsql`, `SECURITY DEFINER`, `RETURNS TABLE`, `SETOF`), `pg_proc` entries for them, `\df` | `42601 syntax error: invalid parameter at position 56` (the lexer does not know dollar quoting, PG-P-005, so the body is read as a parameter) | application code | P1 | XL | V | — |
-| PG-P-002 | **Triggers** (`CREATE TRIGGER`, row and statement, `BEFORE` / `AFTER` / `INSTEAD OF`, transition tables) — `updated_at` and audit triggers, many schema generators | `42601 expected TABLE, found "trigger"` | application code; the `datax_audit` table for auditing | P1 | XL | V | — |
+| PG-P-001 | **User-defined functions** (`CREATE FUNCTION ... LANGUAGE sql / plpgsql`, `SECURITY DEFINER`, `RETURNS TABLE`, `SETOF`), `pg_proc` entries for them, `\df`. Design: docs/design/functions-and-triggers.md | `42601 expected TABLE, found "function"` | application code | P1 | XL | V | — |
+| PG-P-002 | **Triggers** (`CREATE TRIGGER`, row and statement, `BEFORE` / `AFTER` / `INSTEAD OF`, transition tables) — `updated_at` and audit triggers, many schema generators. Design: docs/design/functions-and-triggers.md | `42601 expected TABLE, found "trigger"` | application code; the `datax_audit` table for auditing | P1 | XL | V | — |
 | PG-P-003 | **PL/pgSQL** and `DO` blocks (migration scripts use `DO $$ BEGIN IF NOT EXISTS ... END $$` for idempotent DDL) | `42601 invalid parameter at position 3` | `IF NOT EXISTS` forms (widely supported here) | P2 | XL | V | — |
 | PG-P-004 | Procedures and `CALL` | `42601 invalid parameter at position 38`; `42601 unsupported statement "call"` | — | P2 | L | V | — |
 | PG-P-006 | Event triggers | `42601 expected TABLE, found "event"` (`\dy` lists none) | — | P3 | L | V | — |
@@ -216,7 +216,7 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-X-001 | **`READ COMMITTED` and `REPEATABLE READ`**: every transaction is serializable and can fail with `40001`; `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` is accepted and `SHOW transaction_isolation` says `serializable`; `default_transaction_isolation` is not a setting | silently different (stronger isolation, retries needed); `42704 unrecognized configuration parameter "default_transaction_isolation"` | a retry loop around every transaction | P1 | XL | V | — |
+| PG-X-001 | **`READ COMMITTED` and `REPEATABLE READ`**: every transaction is serializable and can fail with `40001`; `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` is accepted and `SHOW transaction_isolation` says `serializable`; `default_transaction_isolation` accepts every level but `SHOW` reports `serializable`. Design: docs/design/read-committed.md | silently different (stronger isolation, retries needed) | a retry loop around every transaction | P1 | XL | V | — |
 | PG-X-004 | `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`, `FOR UPDATE OF table` | `42601 expected UPDATE, found "share" / "no"`; `42601 unexpected "of"` | `FOR UPDATE` | P2 | M | V | — |
 | PG-X-005 | `LOCK TABLE` | `42601 unsupported statement "lock"` | — | P2 | M | V | — |
 | PG-X-006 | Statements refused inside a transaction block: `COPY FROM`, `CREATE INDEX`, `ANALYZE`, row-expiry options, `AS OF SYSTEM TIME` | `25001` | run outside `BEGIN` | P2 | L | V | — |
@@ -420,7 +420,7 @@ AES-256-GCM) and per-row commit-time bands for time-series retention.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| CR-TX-001 | `READ COMMITTED` isolation (GA in v24.1) — see PG-X-001 | serializable only | retries | P1 | XL | K, V | — |
+| CR-TX-001 | `READ COMMITTED` isolation (GA in v24.1) — see PG-X-001 (design: docs/design/read-committed.md) | serializable only | retries | P1 | XL | K, V | — |
 | CR-TX-002 | `SELECT ... FOR SHARE` with shared, replicated locks (v23.2+; durable under read committed) — see PG-X-004 | `42601 expected UPDATE, found "share"` | `FOR UPDATE` | P2 | M | K, V | — |
 | CR-TX-003 | User-defined functions (SQL and PL/pgSQL), stored procedures, triggers (v24.3+) — see PG-P-001 to PG-P-004 | `42601` | — | P2 | XL | K, V | — |
 | CR-TX-004 | Transaction priorities (`BEGIN PRIORITY HIGH`, `SET TRANSACTION PRIORITY`) | `42601 unexpected "priority"` | — | P3 | S | K, V | — |
@@ -619,6 +619,9 @@ requirements (PG-D-031) are P4, out of this list.
 5. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
 6. **PG-D-035** sequences and enum types in schemas other than
    `public`, so schema-per-tenant applications can use `SERIAL`.
-7. **PG-X-001 / CR-CDC-001** read committed and changefeeds: the large
-   structural gaps left (schemas, PG-D-001, are closed); each is XL and
-   wants a design first.
+7. **PG-P-001 / PG-P-002 / PG-X-001 / CR-CDC-001** functions, triggers,
+   read committed and changefeeds: the large structural gaps left
+   (schemas, PG-D-001, are closed); each is XL. Functions and triggers
+   (docs/design/functions-and-triggers.md) and read committed
+   (docs/design/read-committed.md) have designs awaiting the owner's
+   answers to their open questions; changefeeds want one.
