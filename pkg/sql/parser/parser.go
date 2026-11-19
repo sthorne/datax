@@ -7763,6 +7763,13 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 			if registered && bi.Session {
 				registered = false // the session's own: arity from scalarFuncs
 			}
+			// The executor's internal calls carry a ':' in their name
+			// (the per-row session hook among them); written by a client
+			// they would reach another session's closures, so such a
+			// name is never a function here.
+			if strings.Contains(t.text, ":") {
+				return Expr{}, &SyntaxError{Msg: "function " + t.text + " does not exist", Pos: t.pos, Code: "42883"}
+			}
 			p.i += 2
 			e := Expr{Func: t.text}
 			if fe, ok, err := p.parseSQLFuncForm(t.text); err != nil {

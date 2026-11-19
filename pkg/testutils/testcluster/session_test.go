@@ -294,6 +294,19 @@ func TestCurrentSettingAndPgSettings(t *testing.T) {
 		return h
 	}
 
+	// The executor's internal per-row hooks share one registry across
+	// sessions; a client naming one gets 42883, never another
+	// session's closure (or the unrecognized-setting stand-in).
+	t.Run("internal hooks", func(t *testing.T) {
+		h := setup(t)
+		h.refused(`SELECT "datax:row_session_func"(1, 'x')`, sql.CodeUndefinedFunction, `function datax:row_session_func does not exist`)
+		h.refused(`SELECT n FROM names WHERE "datax:row_session_func"(2) IS NULL`, sql.CodeUndefinedFunction, `does not exist`)
+		h.refused(`SELECT "current_setting:unrecognized"('nosuch')`, sql.CodeUndefinedFunction, `does not exist`)
+		// The per-row path itself still works.
+		h.want(`SELECT set_config(name, 'hooked', false) FROM pg_settings WHERE name = 'application_name'`, "hooked")
+		h.want(`SHOW application_name`, "hooked")
+	})
+
 	t.Run("constant", func(t *testing.T) {
 		h := setup(t)
 		h.refused(`SELECT current_setting('nosuch')`, sql.CodeUndefinedObject, `unrecognized configuration parameter "nosuch"`)

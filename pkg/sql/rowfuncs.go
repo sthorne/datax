@@ -2,9 +2,10 @@ package sql
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"strconv"
 	"sync"
-	"sync/atomic"
 
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -21,23 +22,38 @@ import (
 //	FROM pg_settings WHERE name = 'restrict_nonsystem_relation_kind'
 //
 // whose set_config takes its name from each row. evalFunc has no
-// session, so the closure carries it. A query that names the function
-// itself gets an id no closure has, which is an error.
+// session, so the closure carries it. The registry is shared by every
+// session, so a client must never reach it: the parser refuses any
+// call whose name holds a ':' (42883), and ids are random rather than
+// sequential, so one session cannot guess another's.
 const rowSessionFunc = "datax:row_session_func"
 
-var (
-	rowFuncSeq atomic.Int64
-	rowFuncs   sync.Map // int64 -> func([]types.Datum) (types.Datum, error)
-)
+var rowFuncs sync.Map // int64 -> func([]types.Datum) (types.Datum, error)
+
+// storeRowFunc stores fn under an unused random positive id.
+func storeRowFunc(fn func([]types.Datum) (types.Datum, error)) int64 {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(err) // crypto/rand.Read does not fail on supported platforms
+		}
+		id := int64(binary.LittleEndian.Uint64(b[:]) &^ (1 << 63))
+		if id == 0 {
+			continue
+		}
+		if _, taken := rowFuncs.LoadOrStore(id, fn); !taken {
+			return id
+		}
+	}
+}
 
 // registerRowFunc registers fn for this session and returns the call
 // that runs it per row with args. The registration lasts until the
 // session's next statement (a streamed result outlives Execute) or its
 // Close.
 func (s *Session) registerRowFunc(fn func([]types.Datum) (types.Datum, error), args []parser.Expr) parser.Expr {
-	id := rowFuncSeq.Add(1)
 	var mu sync.Mutex
-	rowFuncs.Store(id, func(a []types.Datum) (types.Datum, error) {
+	id := storeRowFunc(func(a []types.Datum) (types.Datum, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		return fn(a)
