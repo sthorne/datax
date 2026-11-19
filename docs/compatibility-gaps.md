@@ -49,7 +49,7 @@ Open gaps by area and priority.
 | [PG: Query language](#query-language) | 0 | 10 | 12 | 0 | 22 |
 | [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
 | [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
-| [PG: DDL](#ddl) | 2 | 13 | 7 | 1 | 23 |
+| [PG: DDL](#ddl) | 1 | 14 | 8 | 1 | 24 |
 | [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 0 | 12 |
 | [PG: Security](#security) | 0 | 5 | 5 | 0 | 10 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **5** | **68** | **80** | **1** | **154** |
+| **PostgreSQL total** | **4** | **69** | **81** | **1** | **155** |
 | **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
-| **All** | **7** | **92** | **99** | **1** | **199** |
+| **All** | **6** | **93** | **100** | **1** | **200** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -176,8 +176,9 @@ which do exist: see PG-F-022.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| PG-D-001 | **Schemas**: `CREATE SCHEMA`, `DROP SCHEMA`, objects in schemas other than `public`, `ALTER TABLE ... SET SCHEMA`; `search_path` is accepted and echoed by `SHOW` but ignored; a schema-qualified name is read as a database (`app.x` → database `app`) | `42601 expected TABLE, found "schema"`; `3D000 database "app" does not exist`; `42601 expected "(", found "schema"` | databases in place of schemas | P1 | XL | V | — |
-| PG-D-009 | **Temporary tables** (`CREATE TEMP TABLE`, `ON COMMIT DROP`) and `UNLOGGED` tables | `42601 expected TABLE, found "temp" / "unlogged"` | ordinary tables with session-unique names | P1 | L | V | — |
+| PG-D-035 | **Sequences and enum types in schemas other than `public`**: `CREATE SEQUENCE s.x`, `CREATE TYPE s.x`, `SERIAL` / identity columns in a table outside `public`, `ALTER SEQUENCE ... SET SCHEMA`, and `SET SCHEMA` of a table that owns a sequence (schema-per-tenant ORMs need these) | `0A000` | `DEFAULT nextval('public.seq')`; keep types in `public` | P1 | M | V | — |
+| PG-D-034 | **Temporary table leftovers**: `SERIAL` / identity columns on a temp table (no temp sequences); temporary views (a view over a temp table is refused, PostgreSQL makes it temporary); `WITH (...)` / `SET (...)` on a temp table; `CREATE TEMP TABLE ... AS` inside a transaction block (`25001`, as all CTAS); `ON COMMIT DELETE ROWS` deletes row by row and skips PostgreSQL's ON COMMIT / foreign-key combination check; `GLOBAL` raises no deprecation warning; `DROP OWNED` skips temp tables and `REASSIGN OWNED` also reassigns other sessions' temp tables; a node cut off for longer than `DeadNodeThreshold` can have its live sessions' temp tables swept (those sessions then get `42P01`) | `0A000`; `25001`; silently different | ordinary tables with session-unique names | P2 | M | V | — |
+| PG-D-036 | **Schema leftovers**: temp tables are listed in `public`, not a per-session `pg_temp_N`; `CREATE SCHEMA ... CREATE TABLE ...` schema elements; `ALTER DEFAULT PRIVILEGES IN SCHEMA` for schemas other than `public`; renaming a schema, or moving a relation, that a view reads is refused (`2BP01`); `RESTORE TABLE` of a table outside `public`; pg_dump round-trips of databases with schemas are untested; `public` without `USAGE` is `42501` rather than skipped; a real table shadows a `pg_catalog` name; `s.t.c` binds by table name, so same-named tables from two schemas in one query need aliases, and same-named views from two schemas in one statement are `0A000`; an empty `search_path` still resolves through `public` (for pg_dump restores); the two-part `db.t` fallback is deprecated; a view rewritten by a pre-v22 binary in a mixed-version cluster loses its creation-time bindings | `2BP01`; `0A000`; `42501`; silently different | qualify names; alias tables | P3 | M | V | — |
 | PG-D-010 | Generated columns `GENERATED ALWAYS AS (expr) STORED` (and 18's `VIRTUAL`) | `42601 expected IDENTITY, found "("` | compute in the application | P2 | M | V | — |
 | PG-D-011 | `DEFERRABLE` / `INITIALLY DEFERRED` constraints and `SET CONSTRAINTS` | `42601 expected ")", found "deferrable"`; `42601 expected = or TO after SET constraints` | order the writes | P2 | M | V | — |
 | PG-D-012 | `ADD PRIMARY KEY`, dropping or changing the primary key | `42601 ADD PRIMARY KEY is not supported: the primary key is fixed at CREATE TABLE` | recreate the table | P2 | L | V | — |
@@ -188,7 +189,7 @@ which do exist: see PG-F-022.
 | PG-D-018 | Materialized views (`CREATE`, `REFRESH [CONCURRENTLY]`) | `42601 expected TABLE, found "materialized"` | a table refreshed by a job | P2 | L | V | — |
 | PG-D-019 | Views: updatable views, `WITH CHECK OPTION`, `CREATE RECURSIVE VIEW`, `ALTER VIEW ... RENAME` and other forms, `security_invoker`; renaming a column a view reads | `42809 cannot modify view "vup": views are read-only`; `42601 unexpected "with"`; `42601 ALTER VIEW supports only OWNER TO`; `2BP01 cannot rename column v: view "vup" depends on table "u"` | `CREATE OR REPLACE VIEW`; write the base table | P2 | M | V | — |
 | PG-D-020 | Declarative partitioning (`PARTITION BY RANGE / LIST / HASH`, `ATTACH` / `DETACH PARTITION`) | `42601 unexpected "partition" after statement` | ranges split automatically; `SPLIT AT` | P2 | XL | V | — |
-| PG-D-021 | `ALTER TABLE` forms: `ENABLE` / `DISABLE TRIGGER` (Rails fixtures use `DISABLE TRIGGER ALL`), `SET LOGGED` / `UNLOGGED`, `REPLICA IDENTITY`, `ALTER COLUMN SET STATISTICS` / `STORAGE` / `COMPRESSION`, `CLUSTER ON`, `INHERIT`, `OF type` | `42601 expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found ...` | — | P2 | M | V | — |
+| PG-D-021 | `ALTER TABLE` forms: `ENABLE` / `DISABLE TRIGGER` (Rails fixtures use `DISABLE TRIGGER ALL`), `REPLICA IDENTITY`, `ALTER COLUMN SET STATISTICS` / `STORAGE` / `COMPRESSION`, `CLUSTER ON`, `INHERIT`, `OF type` | `42601 expected ADD, DROP, RENAME, ALTER COLUMN, VALIDATE CONSTRAINT, SET, RESET, PURGE, ROTATE ENCRYPTION KEY, SPLIT AT or UNSPLIT, found ...` | — | P2 | M | V | — |
 | PG-D-033 | `ALTER DATABASE ... SET param FROM CURRENT`; `pg_db_role_setting` / `\drds` do not show database defaults; `LC_COLLATE` is reported, not applied | `42601`; silently different | — | P3 | S | D | — |
 | PG-D-023 | Inheritance (`INHERITS`) | `42601 expected identifier, found ")"` | — | P3 | L | V | — |
 | PG-D-024 | Tablespaces (`TABLESPACE` clause, `CREATE TABLESPACE`) | `42601 unexpected "tablespace" after statement` | omit; placement is per database | P3 | S | V | — |
@@ -516,6 +517,8 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| Schemas: `CREATE` / `DROP` / `ALTER SCHEMA`, objects in any schema, `SET SCHEMA`, `search_path`, schema privileges, schemas in the catalogs (was PG-D-001; leftovers are PG-D-035 and PG-D-036) | PR (this branch) |
+| Temporary tables with `ON COMMIT`, and `UNLOGGED` tables (accepted, durable) (was PG-D-009; leftovers are PG-D-034) | PR (this branch) |
 | Aggregates in a `SELECT` without `FROM` (was PG-Q-008; leftovers are PG-Q-034) | PR (this branch) |
 | Quantified comparisons `< <= > >= = <>` and `LIKE` with `ANY` / `SOME` / `ALL` over subqueries and arrays, PostgreSQL's NULL rules (was PG-Q-013) | PR (this branch) |
 | `VALUES` column types resolved across rows; multi-row `LATERAL (VALUES ...)`; `TABLE t` (was PG-Q-015) | PR (this branch) |
@@ -614,6 +617,8 @@ requirements (PG-D-031) are P4, out of this list.
 3. **PG-D-030 / PG-D-029** index leftovers.
 4. **PG-Q-033** a hash join, for large joins without a usable equality.
 5. **PG-O-013** the pg_dump leftovers (#370, #371; tabled).
-6. **PG-D-001 / PG-X-001 / CR-CDC-001** schemas, read committed and
-   changefeeds: the large structural gaps that decide whether bigger
-   applications can move at all; each is XL and wants a design first.
+6. **PG-D-035** sequences and enum types in schemas other than
+   `public`, so schema-per-tenant applications can use `SERIAL`.
+7. **PG-X-001 / CR-CDC-001** read committed and changefeeds: the large
+   structural gaps left (schemas, PG-D-001, are closed); each is XL and
+   wants a design first.

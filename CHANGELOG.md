@@ -11,6 +11,45 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Schemas** (was PG-D-001; docs/user/sql.md, "Schemas"; design in
+  docs/design/schemas.md):
+  - `CREATE SCHEMA [IF NOT EXISTS] [name] [AUTHORIZATION role]`,
+    `DROP SCHEMA ... [CASCADE | RESTRICT]`, `ALTER SCHEMA ... RENAME TO`
+    / `OWNER TO`, and `ALTER TABLE / VIEW ... SET SCHEMA`.
+  - Tables and views in any schema. `search_path` (default
+    `"$user", public`) is honoured for resolution and creation, as are
+    `current_schema()` and `current_schemas()`. A schema on the path that
+    the role has no `USAGE` on is skipped, as in PostgreSQL.
+  - `GRANT` / `REVOKE USAGE` and `CREATE ON SCHEMA`, and
+    `... ON ALL TABLES IN SCHEMA s`. A new schema grants nothing to
+    PUBLIC; `public` keeps its current rules.
+  - Views bind their relations when they are created. A table created
+    later in a schema earlier on the view's path does not change what
+    the view reads.
+  - `pg_namespace`, `pg_class.relnamespace`, `information_schema` and
+    psql's `\dn` and `\dt` report the real schemas. Cluster backups
+    carry schemas.
+  - Existing tables resolve exactly as before, and nothing on disk
+    changes. `CREATE SCHEMA`, and restoring a backup that holds schemas,
+    need cluster protocol version v22.
+  - Leftovers are PG-D-035 (sequences and enum types outside `public`)
+    and PG-D-036.
+- **Temporary tables** (was PG-D-009):
+  - `CREATE [GLOBAL | LOCAL] TEMP[ORARY] TABLE` with
+    `ON COMMIT PRESERVE ROWS | DELETE ROWS | DROP`,
+    `CREATE TEMP TABLE ... AS`, indexes, and `pg_temp.t`.
+  - A temporary table is private to its session: other sessions get
+    `42P01` by every name and see no catalog rows for it.
+  - It is dropped when its session ends, on `DISCARD TEMP` / `ALL`, or
+    by a background sweep when its node crashed or restarted. A session
+    whose temporary table the sweep dropped gets `42P01` for the name
+    until it runs `DROP TABLE` or `DISCARD TEMP`; it never reaches an
+    ordinary table of that name.
+  - Leftovers are PG-D-034.
+- **`UNLOGGED` tables**: `CREATE UNLOGGED TABLE` and
+  `ALTER TABLE ... SET LOGGED | UNLOGGED` are accepted. Unlogged tables
+  stay fully durable; only `pg_class.relpersistence` reports `u`.
+  Temporary and unlogged tables need cluster protocol version v22.
 - **PostgreSQL compatibility: the small P2 gaps, and `information_schema`**
   (docs/compatibility-gaps.md; leftovers are new P3 rows there).
   - **Queries.**
@@ -1547,6 +1586,19 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **Two-part names with schemas.** `x.t` now means table `t` in schema
+  `x` of the current database when that schema exists. Only when it does
+  not, and a database `x` exists, does it mean `x.public.t`, as before.
+  This fallback is deprecated: write `x.public.t`.
+  - A name matching neither is now `42P01` (`3F000` for `CREATE`)
+    instead of `3D000`.
+  - `db.s.t` with another database and a schema other than `public` is
+    `0A000`, as in PostgreSQL.
+  - `public.t` names the permanent table even when a temporary `t`
+    shadows it.
+- **The default `search_path` is `"$user", public`**; `SHOW search_path`
+  used to print `public`. Names resolve as before unless a schema named
+  after the role exists.
 - **Behaviour now matching PostgreSQL** (the compatibility batch
   above). Clients that depended on the old behaviour see these changes:
   - **`information_schema.columns.data_type`** no longer includes a
@@ -1868,6 +1920,8 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`pg_get_userbyid`** returns the owning role instead of always
+  `root`.
 - **Subqueries in a join's `ON` condition are evaluated** (#379). Before,
   they were silently skipped:
   - `b.id IN (SELECT ...)` in `ON` never matched, so the join returned no
