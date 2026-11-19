@@ -358,7 +358,7 @@ the CockroachDB row points to it.
 
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
-| CR-CDC-001 | Changefeeds: `CREATE CHANGEFEED FOR TABLE ... INTO 'kafka://' \| 'webhook-https://' \| 's3://' \| 'gs://' \| 'gcpubsub://' \| ...` with `resolved`, `updated`, `initial_scan`, `diff`, formats (JSON, Avro), enriched envelopes; CDC queries (`CREATE CHANGEFEED ... AS SELECT`); sinkless `EXPERIMENTAL CHANGEFEED FOR` | `42601 expected TABLE, found "changefeed"`; `42601 unsupported statement "experimental"` | `LISTEN`/`NOTIFY` from the application (at most once, not durable); polling with `AS OF SYSTEM TIME` and an `updated_at` column | P1 | XL | K, V | — |
+| CR-CDC-001 | Changefeeds: `CREATE CHANGEFEED FOR TABLE ... INTO 'kafka://' \| 'webhook-https://' \| 's3://' \| 'gs://' \| 'gcpubsub://' \| ...` with `resolved`, `updated`, `initial_scan`, `diff`, formats (JSON, Avro), enriched envelopes; CDC queries (`CREATE CHANGEFEED ... AS SELECT`); sinkless `EXPERIMENTAL CHANGEFEED FOR`. Design: docs/design/changefeeds.md | `42601 expected TABLE, found "changefeed"`; `42601 unsupported statement "experimental"` | `LISTEN`/`NOTIFY` from the application (at most once, not durable); polling with `AS OF SYSTEM TIME` and an `updated_at` column | P1 | XL | K, V | — |
 | CR-CDC-002 | `SHOW CHANGEFEED JOBS`, changefeed metrics, protected timestamps for a lagging feed | `42704 unrecognized configuration parameter "changefeed_jobs"` | — | P3 | M | K, V | — |
 
 ### Multi-region and placement
@@ -621,6 +621,7 @@ requirements (PG-D-031) are P4, out of this list.
 6. **PG-P-001 / PG-P-002 / PG-X-001 / CR-CDC-001** functions, triggers,
    read committed and changefeeds: the large structural gaps left
    (schemas, PG-D-001, are closed); each is XL. Functions and triggers
-   (docs/design/functions-and-triggers.md) and read committed
-   (docs/design/read-committed.md) have designs awaiting the owner's
-   answers to their open questions; changefeeds want one.
+   (docs/design/functions-and-triggers.md), read committed
+   (docs/design/read-committed.md) and changefeeds
+   (docs/design/changefeeds.md) have designs awaiting the owner's
+   answers to their open questions.
