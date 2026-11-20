@@ -1975,6 +1975,15 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **The temporary-table sweep no longer drops a live node's tables.**
+  A node judged another node dead from its in-memory copy of the
+  registry, which lags the rows by up to a liveness beat (3s), while a
+  live node's own row is up to a beat old. With a dead-node threshold
+  near a beat, a live node's sessions could lose their temporary tables
+  to another node's sweep. The sweep now reads the registry rows fresh
+  before judging another node (and judges none if it cannot), and never
+  on less than two beats. The default threshold (30s) left a margin, so
+  only short thresholds, or a node already lagging, were exposed.
 - **Row expiry no longer stalls with a short interval.** Each table in
   a pass had a budget of one interval; with a short `RowTTLInterval` a
   query that needs a moment longer (the first read after a restart

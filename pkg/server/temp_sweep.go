@@ -18,9 +18,10 @@ import (
 //   - of this node, those of an earlier instance (the node restarted)
 //     and those of a session of this instance that has ended (its own
 //     drop failed);
-//   - of another node, those of a node whose liveness record is older
-//     than the dead-node threshold (the node is gone, or cut off for so
-//     long that its sessions could not have used them).
+//   - of another node, those of a node whose liveness record, read
+//     fresh, is older than the dead-node threshold, and never less than
+//     two liveness beats (the node is gone, or cut off for so long that
+//     its sessions could not have used them).
 //
 // A dropped table's rows go the way of any dropped table's: the reclaim
 // job clears its span once its history window has passed.
@@ -69,6 +70,12 @@ func (n *Node) SweepTempTablesOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	reg := srv.TempTables()
+	// Another node's tables are judged on fresh registry rows, against a
+	// threshold of at least two beats: a live node's row is up to a beat
+	// old, and the in-memory copy up to a beat older again. A drop cannot
+	// be undone, so without fresh rows no other node is judged at all.
+	fresh := n.refreshRegistry(ctx) == nil
+	threshold := max(n.deadNodeThreshold(), 2*livenessBeat)
 	now := n.clock.Now().WallTime
 	return sql.SweepOrphanTempTables(ctx, n.db, cat, func(sid string) bool {
 		node, instance, ok := sql.ParseTempSession(sid)
@@ -78,7 +85,10 @@ func (n *Node) SweepTempTablesOnce(ctx context.Context) (int, error) {
 		if node == reg.Node() {
 			return instance != reg.Instance() || !reg.Live(sid)
 		}
+		if !fresh {
+			return false
+		}
 		nd, known := n.registry.Get(base.NodeID(node))
-		return known && now-nd.LivenessTime > int64(n.deadNodeThreshold())
+		return known && now-nd.LivenessTime > int64(threshold)
 	})
 }
