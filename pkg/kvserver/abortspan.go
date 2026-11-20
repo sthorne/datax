@@ -36,6 +36,16 @@ import (
 // so a read that did not see the intent ran after the batch committed,
 // and so does the check that follows it.
 //
+// Only a transaction that has written can have an entry, so only its
+// requests are checked (mayHaveWritten): the coordinator bumps the
+// transaction's Sequence before every request that can lay an intent,
+// and never lowers it, so a transaction whose batch carries Sequence 0
+// has laid no intent anywhere, and nothing of it can have been removed.
+// That keeps the lookup off a read-only transaction's reads, nearly all
+// of a read-mostly workload. The test depends only on the batch, not on
+// any replica state, so every replica decides alike, and splits, merges,
+// snapshots and restarts cannot make it wrong.
+//
 // Entries are keyed by range and transaction (keys.AbortSpanKey): the
 // check is one point lookup whatever the request reads. They are
 // replicated state: streamed with the range's snapshots, copied to both
@@ -206,7 +216,7 @@ func (r *Replica) updateAbortSpan(b *storage.Batch, req *kvpb.ResolveIntentReque
 // not checked: they never read past a removed write, and the coordinator
 // needs them to learn of the abort and clean up.
 func abortSpanChecked(ba *kvpb.BatchRequest) bool {
-	if ba.Header.Txn == nil || ba.Header.StaleRead {
+	if ba.Header.Txn == nil || ba.Header.StaleRead || !mayHaveWritten(&ba.Header.Txn.TxnMeta) {
 		return false
 	}
 	for _, u := range ba.Requests {
@@ -216,6 +226,23 @@ func abortSpanChecked(ba *kvpb.BatchRequest) bool {
 		}
 	}
 	return false
+}
+
+// mayHaveWritten reports whether a batch of the transaction can come
+// after one of its intents was laid, and so after a pusher removed it.
+// Every coordinator path that sends a request able to lay an intent (a
+// Put, Delete or Increment, a locking Get or Scan, a write batch, a
+// parallel commit) bumps Sequence first and copies the transaction into
+// the batch after, and Sequence only grows (a restart and a savepoint
+// rollback keep it), so a batch with Sequence 0 comes from a transaction
+// that has laid no intent: a read-only one. A batch sent concurrently
+// with the first write may still carry 0, but it is not ordered after
+// that write and need not see it. The anchor key is set on the same
+// paths and counts too, so a transaction built by hand with only a Key
+// is still checked. A transaction whose first write is in this very
+// batch is checked needlessly, and finds nothing.
+func mayHaveWritten(m *enginepb.TxnMeta) bool {
+	return m.Sequence != 0 || len(m.Key) != 0
 }
 
 // checkAbortSpan fails the batch with a TxnAbortedError when its
