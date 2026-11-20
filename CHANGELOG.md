@@ -1975,6 +1975,18 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **An untyped parameter or quoted literal in arithmetic with a number
+  takes the number's type** (#381). `c.x = a.id + $1` failed with
+  `XX000 cannot use FLOAT8 value as INT8` when `$1` arrived in text
+  format (pgx exec or simple mode, or any text-format client): always
+  inside a correlated subquery, in `WHERE` or a join's `ON`, and in a
+  plain `x = 1 + $1`, because the value was read as a float. It is now
+  read as the other operand's type, and is `22P02` when it does not
+  parse, as in PostgreSQL. Comparisons no longer answer `XX000` on a
+  type mismatch: an integer compared with a `float8` compares
+  numerically, unparseable text is `22P02`, other mismatches are
+  `42883`, and an outer column compared with a text parameter
+  (`outer.id < $1`) works.
 - **The temporary-table sweep no longer drops a live node's tables.**
   A node judged another node dead from its in-memory copy of the
   registry, which lags the rows by up to a liveness beat (3s), while a
