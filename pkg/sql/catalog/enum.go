@@ -67,11 +67,11 @@ func CreateType(ctx context.Context, txn *kvclient.Txn, d *TypeDescriptor) error
 	} else if taken {
 		return &ErrTypeExists{Name: d.Name}
 	}
-	id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+	id, err := allocateDescID(ctx, txn)
 	if err != nil {
 		return err
 	}
-	d.ID = uint64(id)
+	d.ID = id
 	if err := UpdateType(ctx, txn, d); err != nil {
 		return err
 	}

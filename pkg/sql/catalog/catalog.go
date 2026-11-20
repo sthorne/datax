@@ -1602,7 +1602,25 @@ func lookupUncached(ctx context.Context, txn *kvclient.Txn, dbID uint64, name st
 		// (temp.go), whatever entry points at it.
 		return nil, &ErrTableNotFound{Name: name}
 	}
+	if !d.ownsEntry(id, dbID, name) {
+		// The entry leads to another table's descriptor (issue #390):
+		// planning against it would report the named table's columns
+		// missing, or worse, act on the other table. Say what is wrong.
+		return nil, fmt.Errorf("namespace entry for %q points at descriptor %d, which is table %q of database %d", displayName(name), id, d.Name, d.DatabaseID)
+	}
 	return &d, nil
+}
+
+// ownsEntry reports whether d, read as descriptor id, is the table the
+// name entry name of database dbID was written for: the descriptor is
+// stored under its own ID, and names the entry and the database. A
+// table from before the v6 catalog (database ID 0, filed in the flat
+// namespace) belongs to whatever database it is found through.
+func (d *TableDescriptor) ownsEntry(id, dbID uint64, name string) bool {
+	if d.ID != id || d.namespaceName() != name {
+		return false
+	}
+	return d.DatabaseID == 0 || dbID == 0 || d.DatabaseID == dbID
 }
 
 // ReadTable reads a table descriptor by ID, uncached (nil, nil when
@@ -1664,11 +1682,11 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 		return err
 	}
 	if d.ID == 0 {
-		id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+		id, err := allocateDescID(ctx, txn)
 		if err != nil {
 			return err
 		}
-		d.ID = uint64(id)
+		d.ID = id
 	} else if !IsSystemTableID(d.ID) {
 		return fmt.Errorf("table %q: only system tables carry a preset ID", d.Name)
 	}
