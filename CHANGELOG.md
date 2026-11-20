@@ -1975,6 +1975,14 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Rate-based health problems no longer miss a burst between two
+  reads.** Health is sampled when it is read; a read longer ago than
+  the rate window (five minutes by default) was dropped as the
+  baseline, leaving the sample just taken, so every increase since read
+  as zero and `auth-failures`, `auth-throttled` and the other rate
+  checks never raised for a cluster polled less often than the window.
+  The baseline is now the newest read at least a window old, and the
+  rate is taken over the time since it.
 - **Catalog queries with correlated subqueries are several times
   faster.** A correlated subquery over `pg_class`, `pg_attribute` and
   the other virtual catalogs gathered the whole catalog again for every

@@ -3,6 +3,7 @@ package server
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // A problem's history (issue #207): a run of the checks records a
@@ -125,5 +126,48 @@ func TestProblemIdentityIsCheckNodeAndRange(t *testing.T) {
 	}
 	if s := clearedSummary(cleared[0], 3); !strings.HasPrefix(s, "mixed-binaries cleared after ") {
 		t.Fatalf("a problem without a node or range names only its check: %q", s)
+	}
+}
+
+// TestRateOverKeepsABaselinePastTheWindow: health is sampled only when
+// read, so a rate must count what happened since the last read even
+// when that read is older than the window. Dropping it left the sample
+// just taken as the baseline, and a burst between two reads a window
+// apart read as zero (TestAuthFailuresProblemRaisesAndClears failed
+// that way when thirty guesses took longer than the test's window).
+func TestRateOverKeepsABaselinePastTheWindow(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	const window = 6 * time.Second
+	ss, d := rateOver(nil, 0, t0, window)
+	if d != 0 || len(ss) != 1 {
+		t.Fatalf("first sample: increase %v, %d samples", d, len(ss))
+	}
+	// Thirty more, read ten seconds later: past the window.
+	ss, d = rateOver(ss, 30, t0.Add(10*time.Second), window)
+	if d != 30 || !ss[0].at.Equal(t0) {
+		t.Fatalf("a read past the window: increase %v from %v, want 30 from %v", d, ss[0].at, t0)
+	}
+	// Read again a second later with no change: the baseline is still
+	// the newest sample a window old, so the increase holds, over 11s.
+	ss, d = rateOver(ss, 30, t0.Add(11*time.Second), window)
+	if d != 30 || !ss[0].at.Equal(t0) {
+		t.Fatalf("a second read: increase %v from %v", d, ss[0].at)
+	}
+	// Once a read inside the burst's aftermath is a window old, the
+	// increase is zero and a problem built on it clears.
+	ss, d = rateOver(ss, 30, t0.Add(17*time.Second), window)
+	if d != 0 {
+		t.Fatalf("a window after the burst: increase %v from %v, want 0", d, ss[0].at)
+	}
+	if len(ss) > 3 {
+		t.Fatalf("%d samples kept, want the baseline and the newer ones only", len(ss))
+	}
+	// Frequent reads keep the baseline about a window back.
+	ss, _ = nil, 0
+	for s := 0; s <= 20; s++ {
+		ss, d = rateOver(ss, float64(s), t0.Add(time.Duration(s)*time.Second), window)
+	}
+	if d != 6 || !ss[0].at.Equal(t0.Add(14*time.Second)) {
+		t.Fatalf("frequent reads: increase %v from %v, want 6 from +14s", d, ss[0].at)
 	}
 }

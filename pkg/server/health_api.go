@@ -212,15 +212,20 @@ func (n *Node) rateWindow() time.Duration {
 	return defaultRateWindow
 }
 
-// rateOver appends v and returns the increase over the window: samples
-// older than it are dropped, and the increase is measured from the
-// oldest that survives — which, once nothing has been sampled inside
-// the window, is the sample just taken, so the increase is zero and a
-// problem built on it clears.
+// rateOver appends v and returns the increase since the baseline: the
+// newest sample at least a window old, or the oldest one if none is.
+// Older samples are dropped. Callers divide by the time since the
+// baseline (ss[0].at), so a rate stays honest however rarely the
+// checks run: health is sampled only when read, and a baseline dropped
+// for being past the window (the last read was longer ago than it)
+// would hide every increase since — a burst between two reads a window
+// apart was never reported. Once the count stops rising, the increase
+// from a baseline inside the window, or from the last read, is zero
+// and a problem built on it clears.
 func rateOver(ss []sample, v float64, now time.Time, window time.Duration) ([]sample, float64) {
 	ss = append(ss, sample{at: now, v: v})
 	i := 0
-	for i < len(ss)-1 && now.Sub(ss[i].at) > window {
+	for i < len(ss)-2 && now.Sub(ss[i+1].at) >= window {
 		i++
 	}
 	ss = ss[i:]
