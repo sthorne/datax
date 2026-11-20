@@ -454,9 +454,9 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cmpType == types.Enum {
 			cmpType = rhs.Fam // an enum compares with a label by text
 		}
-		rhs, cerr := rhs.Coerce(cmpType)
+		rhs, cerr := coerceCmpValue(cmp.Op, rhs, cmpType)
 		if cerr != nil {
-			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, cerr)
+			return false, cerr
 		}
 		c, err := lhs.Compare(rhs)
 		if err != nil {

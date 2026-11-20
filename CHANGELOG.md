@@ -1975,6 +1975,33 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Rate-based health problems no longer miss a burst between two
+  reads.** Health is sampled when it is read; a read longer ago than
+  the rate window (five minutes by default) was dropped as the
+  baseline, leaving the sample just taken, so every increase since read
+  as zero and `auth-failures`, `auth-throttled` and the other rate
+  checks never raised for a cluster polled less often than the window.
+  The baseline is now the newest read at least a window old, and the
+  rate is taken over the time since it.
+- **Catalog queries with correlated subqueries are several times
+  faster.** A correlated subquery over `pg_class`, `pg_attribute` and
+  the other virtual catalogs gathered the whole catalog again for every
+  outer row; pg_dump's catalog queries are full of them, so a dump of a
+  small database took about 3 s (and a pg_dump test under the race
+  detector overran its four-minute budget). A statement now gathers
+  each virtual table once: the same dump takes under a second.
+- **An untyped parameter or quoted literal in arithmetic with a number
+  takes the number's type** (#381). `c.x = a.id + $1` failed with
+  `XX000 cannot use FLOAT8 value as INT8` when `$1` arrived in text
+  format (pgx exec or simple mode, or any text-format client): always
+  inside a correlated subquery, in `WHERE` or a join's `ON`, and in a
+  plain `x = 1 + $1`, because the value was read as a float. It is now
+  read as the other operand's type, and is `22P02` when it does not
+  parse, as in PostgreSQL. Comparisons no longer answer `XX000` on a
+  type mismatch: an integer compared with a `float8` compares
+  numerically, unparseable text is `22P02`, other mismatches are
+  `42883`, and an outer column compared with a text parameter
+  (`outer.id < $1`) works.
 - **The temporary-table sweep no longer drops a live node's tables.**
   A node judged another node dead from its in-memory copy of the
   registry, which lags the rows by up to a liveness beat (3s), while a
