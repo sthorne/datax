@@ -1059,7 +1059,8 @@ func constOp(b bool) string {
 }
 
 // compareDatums applies a scalar comparison with SQL NULL semantics
-// (NULL never matches).
+// (NULL never matches). Values of types that do not compare are 42883,
+// as in PostgreSQL, never XX000.
 func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
 	if (l.Null || r.Null) && !quantDecides(op, l, r) {
 		return false, nil
@@ -1067,9 +1068,18 @@ func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
 	if !plainCmpOp(op) {
 		return applyCmpOp(op, l, r)
 	}
+	if r.Fam == types.String && l.Fam != types.String && l.Fam != types.Enum && !l.Fam.IsArray() {
+		// An untyped value (a text-format parameter, a quoted literal)
+		// takes the outer column's type, as it would against the
+		// column itself: outer.id < $1.
+		var err error
+		if r, err = coerceCmpValue(op, r, l.Fam); err != nil {
+			return false, err
+		}
+	}
 	c, err := l.Compare(r)
 	if err != nil {
-		return false, err
+		return false, newErrf(CodeUndefinedFunction, "operator does not exist: %s %s %s", pgTypeName(l.Fam), op, pgTypeName(r.Fam))
 	}
 	switch op {
 	case "=":

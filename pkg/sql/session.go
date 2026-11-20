@@ -1679,6 +1679,14 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			}
 		}
 		if !handled {
+			switch e.BinOp {
+			case "+", "-", "*", "/", "%":
+				lhsExpr := e
+				lhsExpr.BinOp, lhsExpr.Right, lhsExpr.Cast = "", nil, ""
+				if base, rhs, err = unknownArithOperands(lhsExpr, *e.Right, base, rhs); err != nil {
+					return types.Datum{}, err
+				}
+			}
 			if base, err = applyArithIn(base, e.BinOp, rhs, e.Zone); err != nil {
 				return types.Datum{}, err
 			}
@@ -1696,6 +1704,68 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		return d, builtinErr(err)
 	}
 	return base, nil
+}
+
+// coerceCmpValue converts the value a column of family fam is compared
+// with to fam. Numbers of different types compare as they are (Compare
+// cross-compares them: an INT8 column equals 2.0, never 2.5). A value
+// that cannot be read as fam is a proper error, never XX000: text that
+// does not parse is 22P02, any other type 42883 (no such operator), as
+// in PostgreSQL.
+func coerceCmpValue(op string, v types.Datum, fam types.Family) (types.Datum, error) {
+	c, err := v.Coerce(fam)
+	if err == nil {
+		return c, nil
+	}
+	numeric := func(f types.Family) bool { return f == types.Int || f == types.Float || f == types.Decimal }
+	if numeric(v.Fam) && numeric(fam) {
+		return v, nil
+	}
+	if v.Fam == types.String {
+		return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "invalid input syntax for type %s: %q", pgTypeName(fam), v.S)
+	}
+	return types.Datum{}, newErrf(CodeUndefinedFunction, "operator does not exist: %s %s %s", pgTypeName(fam), op, pgTypeName(v.Fam))
+}
+
+// untypedOperand reports whether operand e is a value of unknown type
+// in PostgreSQL's sense: a bare parameter (its value bound in text
+// format arrives as a string) or a quoted literal, with no cast, call,
+// path or nested arithmetic around it.
+func untypedOperand(e parser.Expr, d types.Datum) bool {
+	if d.Null || d.Fam != types.String {
+		return false
+	}
+	if e.BinOp != "" || e.Cast != "" || e.Func != "" || len(e.Path) > 0 || e.Left != nil || e.Case != nil || e.Sub != nil || e.Cmp != nil || e.Agg != nil {
+		return false
+	}
+	return e.Param > 0 || (e.Lit != nil && e.Lit.Fam == types.String)
+}
+
+// unknownArithOperands resolves an untyped operand of arithmetic with a
+// number to the number's type, as PostgreSQL resolves an unknown
+// operand from the other one (int8 + '1' is int8 + int8): a text-format
+// parameter or a quoted literal beside a BIGINT is read as a BIGINT,
+// not as a float. A value that does not read as that type is 22P02, as
+// in PostgreSQL. Other operands pass through unchanged.
+func unknownArithOperands(le, re parser.Expr, l, r types.Datum) (types.Datum, types.Datum, error) {
+	numeric := func(d types.Datum) bool {
+		return !d.Null && (d.Fam == types.Int || d.Fam == types.Float || d.Fam == types.Decimal)
+	}
+	resolve := func(d types.Datum, fam types.Family) (types.Datum, error) {
+		c, err := types.NewString(strings.TrimSpace(d.S)).Coerce(fam)
+		if err != nil {
+			return types.Datum{}, newErrf(CodeInvalidTextRepresentation, "invalid input syntax for type %s: %q", pgTypeName(fam), d.S)
+		}
+		return c, nil
+	}
+	var err error
+	switch {
+	case untypedOperand(le, l) && numeric(r):
+		l, err = resolve(l, r.Fam)
+	case untypedOperand(re, r) && numeric(l):
+		r, err = resolve(r, l.Fam)
+	}
+	return l, r, err
 }
 
 // applyArithIn evaluates l op r under the session's TimeZone (nil:
@@ -2131,8 +2201,8 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 					rhs = v
 				}
 			}
-		} else if rhs, err = rhs.Coerce(cmpType); err != nil {
-			return false, newErrf(CodeInternal, "WHERE %s: %v", cmp.Column, err)
+		} else if rhs, err = coerceCmpValue(cmp.Op, rhs, cmpType); err != nil {
+			return false, err
 		}
 		c, err := lhs.Compare(rhs)
 		if err != nil {
@@ -2841,9 +2911,9 @@ func matchesIn(cmp parser.Comparison, cmpType types.Family, lhs types.Datum, des
 			}
 			continue
 		}
-		d, cerr := d.Coerce(cmpType)
+		d, cerr := coerceCmpValue("=", d, cmpType)
 		if cerr != nil {
-			return false, newErrf(CodeInternal, "IN %s: %v", cmp.Column, cerr)
+			return false, cerr
 		}
 		if c, err := lhs.Compare(d); err == nil && c == 0 {
 			matched = true

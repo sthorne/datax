@@ -87,6 +87,13 @@ func TestParamTypeInference(t *testing.T) {
 		{`SELECT id FROM sr WHERE sid = $1 OR w = $1`, []types.Family{I}, ""},
 		{`SELECT count(*) FROM gr AS g JOIN cl AS c ON c.cid = g.cid WHERE g.at = $1 OR c.name = $1`, nil, "42P08"},
 		{`INSERT INTO cl (cid, name) VALUES ($1, $1)`, nil, "42P08"},
+		// Issue #381: arithmetic with an outer column of a correlated
+		// subquery, the parameter on either side, the subquery in WHERE
+		// or a join's ON.
+		{`SELECT g.gid FROM gr AS g WHERE EXISTS (SELECT 1 FROM sr WHERE sr.sid = g.cid + $1)`, []types.Family{I}, ""},
+		{`SELECT g.gid FROM gr AS g WHERE EXISTS (SELECT 1 FROM sr WHERE sr.sid = $1 + g.cid)`, []types.Family{I}, ""},
+		{`SELECT g.gid FROM gr AS g WHERE EXISTS (SELECT 1 FROM sr WHERE g.cid + $1 = sr.sid)`, []types.Family{I}, ""},
+		{`SELECT g.gid FROM gr AS g JOIN cl AS c ON c.cid = g.cid AND EXISTS (SELECT 1 FROM sr WHERE sr.sid = g.cid + $1)`, []types.Family{I}, ""},
 		// Unknown tables fail as they will at execution.
 		{`SELECT x FROM nope WHERE x = $1`, nil, "42P01"},
 	} {
@@ -116,5 +123,50 @@ func TestParamTypeInference(t *testing.T) {
 		if strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Errorf("%s: %v, want %v", tc.sql, got, want)
 		}
+	}
+}
+
+// TestUnknownArithOperand (issue #381): a text-format parameter or a
+// quoted literal beside a number in arithmetic reads as the number's
+// type (bigint + '1' is bigint), not as a float; one that does not read
+// is 22P02. A comparison against a column or an outer value converts
+// the same way, and numbers of different types compare as numbers.
+func TestUnknownArithOperand(t *testing.T) {
+	one := types.NewInt(1)
+	params := []types.Datum{types.NewString("2")}
+	for _, tc := range []struct {
+		e    parser.Expr
+		want types.Datum
+	}{
+		{parser.Expr{Lit: &one, BinOp: "+", Right: &parser.Expr{Param: 1}}, types.NewInt(3)},
+		{parser.Expr{Param: 1, BinOp: "*", Right: &parser.Expr{Lit: &one}}, types.NewInt(2)},
+	} {
+		got, err := evalExpr(tc.e, nil, nil, params)
+		if err != nil || got.Fam != tc.want.Fam || got.I != tc.want.I {
+			t.Errorf("%+v: %v (%s), %v; want %v", tc.e, got, got.Fam, err, tc.want)
+		}
+	}
+	// || is concatenation, not arithmetic: 'n' || 1 stays text.
+	n := types.NewString("n")
+	if got, err := evalExpr(parser.Expr{Lit: &n, BinOp: "||", Right: &parser.Expr{Lit: &one}}, nil, nil, nil); err != nil || got.Fam != types.String || got.S != "n1" {
+		t.Errorf("'n' || 1: %v, %v", got, err)
+	}
+	for _, s := range []string{"1.5", "abc"} {
+		_, err := evalExpr(parser.Expr{Lit: &one, BinOp: "+", Right: &parser.Expr{Param: 1}}, nil, nil, []types.Datum{types.NewString(s)})
+		if serr := ToSQLError(err); serr == nil || serr.Code != CodeInvalidTextRepresentation {
+			t.Errorf("1 + %q: %v, want 22P02", s, err)
+		}
+	}
+	if ok, err := compareDatums(types.NewInt(2), "<", types.NewString("3")); err != nil || !ok {
+		t.Errorf("2 < '3': %v, %v", ok, err)
+	}
+	if _, err := compareDatums(types.NewInt(2), "<", types.NewString("x")); ToSQLError(err) == nil || ToSQLError(err).Code != CodeInvalidTextRepresentation {
+		t.Errorf("2 < 'x': %v, want 22P02", err)
+	}
+	if _, err := compareDatums(types.NewInt(2), "=", types.NewBool(true)); ToSQLError(err) == nil || ToSQLError(err).Code != CodeUndefinedFunction {
+		t.Errorf("2 = true: %v, want 42883", err)
+	}
+	if d, err := coerceCmpValue("=", types.NewFloat(2.5), types.Int); err != nil || d.Fam != types.Float {
+		t.Errorf("int8 column = 2.5: %v, %v", d, err)
 	}
 }
