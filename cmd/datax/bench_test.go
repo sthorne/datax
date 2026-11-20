@@ -252,3 +252,60 @@ func TestSealedModeFlag(t *testing.T) {
 		t.Fatal("--sealed no longer stands alone")
 	}
 }
+
+// TestBenchKVBatchesPerOp: a record carries the KV batches routed per
+// operation, from its counter deltas, and compare flags an increase as a
+// regression — the deterministic signal of an extra round trip per
+// statement that throughput on a noisy machine hides.
+func TestBenchKVBatchesPerOp(t *testing.T) {
+	if got := kvBatchesPerOp(map[string]float64{kvBatchSeries: 2500}, 1000); got != 2.5 {
+		t.Fatalf("kvBatchesPerOp: %v, want 2.5", got)
+	}
+	if got := kvBatchesPerOp(map[string]float64{kvBatchSeries: 2500}, 0); got != 0 {
+		t.Fatalf("kvBatchesPerOp with no ops: %v, want 0", got)
+	}
+	if got := kvBatchesPerOp(nil, 10); got != 0 {
+		t.Fatalf("kvBatchesPerOp with no deltas: %v, want 0", got)
+	}
+	// A record written before the field derives it from its deltas.
+	old := &benchResult{Ops: 400, Metrics: map[string]float64{kvBatchSeries: 400}}
+	if got := old.kvBatches(); got != 1 {
+		t.Fatalf("derived kv batches/op: %v, want 1", got)
+	}
+
+	dir := t.TempDir()
+	write := func(sub string, r *benchResult) string {
+		t.Helper()
+		if err := writeJSON(filepath.Join(dir, sub, r.Name+".json"), r); err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(dir, sub)
+	}
+	// Same throughput and latency; one more batch per point read.
+	before := write("before", &benchResult{Name: "kv-95-5", Ops: 1000, OpsPerSec: 100, P50us: 500, KVBatchesPerOp: 1.0})
+	after := write("after", &benchResult{Name: "kv-95-5", Ops: 1000, OpsPerSec: 100, P50us: 500, KVBatchesPerOp: 2.0})
+	same := write("same", &benchResult{Name: "kv-95-5", Ops: 1000, OpsPerSec: 100, P50us: 500, KVBatchesPerOp: 1.01})
+	fewer := write("fewer", &benchResult{Name: "kv-95-5", Ops: 1000, OpsPerSec: 100, P50us: 500, KVBatchesPerOp: 0.5})
+
+	var err error
+	out := captureStdout(t, func() { err = runBenchCompare([]string{"--fail-on-regression", before, after}) })
+	if err == nil {
+		t.Fatalf("doubling kv batches/op did not fail --fail-on-regression:\n%s", out)
+	}
+	if !strings.Contains(out, "kv batches/op") || !strings.Contains(out, "+100.0% !!") {
+		t.Fatalf("compare did not flag the kv batches/op increase as a regression:\n%s", out)
+	}
+	for _, c := range []struct{ name, path string }{{"within threshold", same}, {"a decrease", fewer}} {
+		out = captureStdout(t, func() { err = runBenchCompare([]string{"--fail-on-regression", before, c.path}) })
+		if err != nil || strings.Contains(out, "% !!") {
+			t.Fatalf("%s in kv batches/op was flagged as a regression (%v):\n%s", c.name, err, out)
+		}
+	}
+	// An old record without the field is compared through its deltas.
+	legacy := write("legacy", &benchResult{Name: "kv-95-5", Ops: 1000, OpsPerSec: 100, P50us: 500,
+		Metrics: map[string]float64{kvBatchSeries: 1000}})
+	out = captureStdout(t, func() { err = runBenchCompare([]string{"--fail-on-regression", legacy, after}) })
+	if err == nil || !strings.Contains(out, "+100.0% !!") {
+		t.Fatalf("a legacy record's derived kv batches/op was not compared (%v):\n%s", err, out)
+	}
+}

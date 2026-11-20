@@ -56,7 +56,7 @@ jobs:
           shopt -s nullglob
           for f in bench-results/nightly/*/*.json; do
             printf '%s: ' "$f"
-            jq -r '"\(.ops_per_sec) ops/s p50 \(.p50_us)us p99 \(.p99_us)us retries \(.retries) errors \(.errors)"
+            jq -r '"\(.ops_per_sec) ops/s p50 \(.p50_us)us p99 \(.p99_us)us retries \(.retries) errors \(.errors) kv batches/op \(.kv_batches_per_op // "n/a")"
               + ((.error_samples // {}) | to_entries | sort_by(-.value) | .[:1]
                  | map(" (most frequent, \(.value) times: \(.key))") | join(""))' "$f"
           done
