@@ -56,13 +56,151 @@ func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, e parser
 	case len(res.Columns) != 1:
 		return types.Datum{}, newErrf(CodeSyntaxError, "subquery must return only one column")
 	}
+	// The value carries the subquery's column type, NULL included, so the
+	// expression around it types (and describes) as planning did.
+	fam := res.Columns[col].Type
 	switch len(res.Rows) {
 	case 0:
-		return types.DNull, nil
+		return types.Datum{Null: true, Fam: fam}, nil
 	case 1:
-		return res.Rows[0][col], nil
+		return conformTo(res.Rows[0][col], fam), nil
 	}
 	return types.Datum{}, newErrf(CodeCardinality, "more than one row returned by a subquery used as an expression")
+}
+
+// scalarSubColumn is the column a scalar subquery's value is described
+// as: the subquery's one output column, as PlanColumns describes it
+// (PostgreSQL types a scalar sublink by its select item). ok is false
+// when the subquery does not describe on its own as one typed column.
+func (s *Session) scalarSubColumn(ctx context.Context, sub *parser.Select) (ResultColumn, bool) {
+	cols, serr := s.PlanColumns(ctx, sub)
+	if serr != nil {
+		// A correlated subquery names the enclosing row in its WHERE
+		// (or HAVING, ORDER BY), which does not describe on its own;
+		// those clauses never change the output's type.
+		cols, serr = s.PlanColumns(ctx, outputShape(sub))
+	}
+	if serr != nil || len(cols) != 1 || cols[0].Type == types.Unknown {
+		return ResultColumn{}, false
+	}
+	return cols[0], true
+}
+
+// outputShape is a copy of sel (and of each set-operation member)
+// without the clauses that filter or order its rows, which are all a
+// correlated subquery's references to an enclosing row usually sit in:
+// it describes the same columns.
+func outputShape(sel *parser.Select) *parser.Select {
+	c := *sel
+	c.Where, c.Having, c.OrderBy, c.DistinctOn = nil, nil, nil, nil
+	if c.Union != nil {
+		c.Union = outputShape(c.Union)
+	}
+	return &c
+}
+
+// bareScalarSub reports whether e is a scalar subquery and nothing else
+// ((SELECT ...) as a select item, not an operand, cast or argument).
+func bareScalarSub(e parser.Expr) bool {
+	return e.Sub != nil && e.SubCol == 0 && e.Lit == nil && e.Param == 0 && e.Column == "" &&
+		e.Func == "" && e.BinOp == "" && e.Left == nil && e.Right == nil && e.Case == nil &&
+		e.Cmp == nil && e.Cast == "" && len(e.Path) == 0 && e.Window == nil && e.Agg == nil
+}
+
+// typeScalarSubItems gives every select item of t that is a bare scalar
+// subquery its subquery's column type (width, modifier and the like
+// included), keeping the item's name, and conforms rows' values to it.
+// Describe (planColumns) and execution (execSelect) both run it, so the
+// RowDescription and the values agree whichever path produced them. A
+// select list with * (whose expansion moves positions) or a set
+// operation (typed by unifying its members) is left as it is.
+func (s *Session) typeScalarSubItems(ctx context.Context, t *parser.Select, cols []ResultColumn, rows [][]types.Datum) {
+	if t == nil || t.Union != nil || len(cols) != len(t.Exprs) {
+		return
+	}
+	for _, se := range t.Exprs {
+		if se.Star {
+			return
+		}
+	}
+	for i, se := range t.Exprs {
+		if se.Agg != "" || se.Window != nil || !bareScalarSub(se.Expr) {
+			continue
+		}
+		col, ok := s.scalarSubColumn(ctx, se.Expr.Sub)
+		if !ok {
+			continue
+		}
+		col.Name = cols[i].Name
+		cols[i] = col
+		for _, r := range rows {
+			if i < len(r) {
+				r[i] = conformTo(r[i], col.Type)
+			}
+		}
+	}
+}
+
+// typeSubqueryOperands returns e with every scalar subquery that
+// describes (scalarSubColumn) replaced by a NULL of its type, for
+// typing the expression around it without evaluating anything; a
+// condition carrying one ([NOT] EXISTS, IN (SELECT ...)) stands as a
+// boolean NULL. ok is false when a subquery remains (one that does not
+// describe, or one inside a CASE or ARRAY(SELECT ...)).
+func (s *Session) typeSubqueryOperands(ctx context.Context, e parser.Expr) (parser.Expr, bool) {
+	ok := true
+	var walk func(e parser.Expr) parser.Expr
+	walk = func(e parser.Expr) parser.Expr {
+		out := e
+		if e.Cmp != nil && e.Lit == nil && e.Sub == nil && e.Column == "" && e.Func == "" && e.Left == nil {
+			// A condition ([NOT] EXISTS, IN (SELECT ...)) is a boolean,
+			// whatever its subqueries read.
+			null := types.Datum{Null: true, Fam: types.Bool}
+			out.Cmp, out.Lit = nil, &null
+			if e.Right != nil {
+				r := walk(*e.Right)
+				out.Right = &r
+			}
+			return out
+		}
+		if e.Cmp != nil || e.Case != nil || e.Func == "array" {
+			// CASE arms and ARRAY(SELECT ...) keep their subqueries.
+			if exprHasSubquery(e) {
+				ok = false
+			}
+			return e
+		}
+		if e.Sub != nil {
+			if e.SubCol != 0 {
+				ok = false
+				return e
+			}
+			col, cok := s.scalarSubColumn(ctx, e.Sub)
+			if !cok {
+				ok = false
+				return e
+			}
+			null := types.Datum{Null: true, Fam: col.Type}
+			out.Sub, out.Lit = nil, &null
+		}
+		if e.Left != nil {
+			l := walk(*e.Left)
+			out.Left = &l
+		}
+		if e.Right != nil {
+			r := walk(*e.Right)
+			out.Right = &r
+		}
+		if len(e.Args) > 0 {
+			out.Args = make([]parser.Expr, len(e.Args))
+			for i, a := range e.Args {
+				out.Args[i] = walk(a)
+			}
+		}
+		return out
+	}
+	out := walk(e)
+	return out, ok
 }
 
 // resolveValueExpr splices the parts of a value expression that must be

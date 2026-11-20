@@ -1416,7 +1416,16 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 			return
 		}
 		if pt.stmt.cols != nil {
-			c.backend.Send(rowDescription(pt.stmt.cols))
+			// A portal's description carries the result formats its Bind
+			// chose, which its rows are sent in (PostgreSQL's
+			// SendRowDescriptionMessage with the portal's formats).
+			rd := rowDescription(pt.stmt.cols)
+			for i := range rd.Fields {
+				if i < len(pt.resFormats) {
+					rd.Fields[i].Format = pt.resFormats[i]
+				}
+			}
+			c.backend.Send(rd)
 		} else {
 			c.backend.Send(&pgproto3.NoData{})
 		}

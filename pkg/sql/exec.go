@@ -2384,6 +2384,21 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 		c.With = nil
 		t = &c
 	}
+	res, err := s.execSelectBody(ctx, txn, t, orig, top, params)
+	if err != nil || res == nil {
+		return res, err
+	}
+	// A scalar subquery item is typed as Describe types it (its own
+	// output column), whichever path produced the rows; the WITH list is
+	// still bound, so a subquery reading it describes as planning did.
+	s.typeScalarSubItems(ctx, t, res.Columns, res.Rows)
+	return res, nil
+}
+
+// execSelectBody is execSelect once the WITH list is bound: orig is the
+// statement as prepared (the plan cache's key), top whether it may
+// stream.
+func (s *Session) execSelectBody(ctx context.Context, txn *kvclient.Txn, t, orig *parser.Select, top bool, params []types.Datum) (*Result, error) {
 	if t.Derived != nil && len(t.Joins) > 0 {
 		// A joined derived table runs as a relation named by its alias.
 		inner, err := s.execSubSelect(ctx, txn, t.Derived, params)
@@ -2835,8 +2850,9 @@ func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			if err != nil {
 				return nil, err
 			}
+			d, typed := cp.typed(d)
 			out[projAt[i]] = d
-			if !d.Null {
+			if !typed && !d.Null {
 				res.Columns[projAt[i]].Type = d.Fam
 			}
 		}

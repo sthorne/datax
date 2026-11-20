@@ -128,6 +128,18 @@ func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]Res
 		defer restore()
 		stmt = stmtWithout(stmt)
 	}
+	cols, serr := s.planBoundColumns(ctx, stmt)
+	if sel, ok := stmt.(*parser.Select); ok && serr == nil {
+		// A scalar subquery item is described as its own output column
+		// (execSelect types it the same), while the WITH list is bound.
+		s.typeScalarSubItems(ctx, sel, cols, nil)
+	}
+	return cols, serr
+}
+
+// planBoundColumns is planColumns once the statement's WITH list is
+// bound.
+func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) ([]ResultColumn, *Error) {
 	switch t := stmt.(type) {
 	case *parser.Select:
 		if hasDerivedJoin(t) {
@@ -305,8 +317,8 @@ func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]Res
 				return nil, ToSQLError(jerr)
 			}
 			// Subqueries in the select list are evaluated per row at
-			// execution (text on the wire): describe them as such.
-			t = maskSubqueryExprs(t)
+			// execution: describe them by their columns' types.
+			t = s.maskSubqueryExprs(ctx, t)
 			if hasAggregates(t.Exprs) || len(t.GroupBy) > 0 {
 				jdesc, _, sel, gerr := groupedJoinQuery(sides, t)
 				if gerr != nil {
@@ -343,7 +355,7 @@ func (s *Session) planColumns(ctx context.Context, stmt parser.Statement) ([]Res
 			}
 			return cols, nil
 		}
-		proj, perr := resolveProjection(desc, maskSubqueryExprs(t).Exprs)
+		proj, perr := resolveProjection(desc, s.maskSubqueryExprs(ctx, t).Exprs)
 		if perr != nil {
 			return nil, ToSQLError(perr)
 		}
@@ -452,8 +464,12 @@ func (s *Session) planJoinSides(ctx context.Context, baseDesc *catalog.TableDesc
 
 // maskSubqueryExprs returns t with every select-list expression that
 // carries a subquery replaced by a NULL placeholder (the original is
-// untouched), for describing a statement without evaluating it.
-func maskSubqueryExprs(t *parser.Select) *parser.Select {
+// untouched), for describing a statement without evaluating it. Each
+// scalar subquery stands as a NULL of its own column's type, so the
+// expression around it (or the bare subquery) types as execution
+// types it; an expression with another kind of subquery is masked
+// whole, as text.
+func (s *Session) maskSubqueryExprs(ctx context.Context, t *parser.Select) *parser.Select {
 	var out *parser.Select
 	for i, se := range t.Exprs {
 		if se.Star || !exprHasSubquery(se.Expr) {
@@ -463,6 +479,10 @@ func maskSubqueryExprs(t *parser.Select) *parser.Select {
 			c := *t
 			c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
 			out = &c
+		}
+		if typed, ok := s.typeSubqueryOperands(ctx, se.Expr); ok {
+			out.Exprs[i].Expr = typed
+			continue
 		}
 		null := types.DNull
 		out.Exprs[i].Expr = parser.Expr{Lit: &null}
