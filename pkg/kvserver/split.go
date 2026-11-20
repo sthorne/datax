@@ -186,6 +186,19 @@ func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (
 	return nil, lastErr
 }
 
+// applyGuardsOK reports whether a proposal may carry ApplyGuards
+// (cluster version v23, issue #389). A v22 replica drops the flag and
+// would apply what the guards refuse, so the replicas of a range would
+// diverge. The node's cluster-version mirror is consulted only here, by
+// the proposer: never at apply, where replicas must decide alike
+// whatever version each has heard of.
+func (s *Store) applyGuardsOK() bool {
+	if s.cfg.ClusterVersion == nil {
+		return true
+	}
+	return s.cfg.ClusterVersion() >= version.V23
+}
+
 // stickyBitsOK reports whether a descriptor may carry a sticky bit and a
 // descriptor-update trigger may be proposed (cluster version v20): an
 // older replica would drop the one and ignore the other.
@@ -366,10 +379,14 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	// refuses where one without accepts; that divergence is the lesser
 	// harm, the alternative being a range overwritten on the stores that
 	// hold both.
-	if why := r.store.rangeIDInUse(trig.Right.RangeID, trig.Right.StartKey); why != "" {
-		metrics.RangeIDCollisions.Inc()
-		return fmt.Errorf("%s: cannot split at %s: the new range's ID %s %s; the split is retried with another ID",
-			r.rangeID, trig.Right.StartKey, trig.Right.RangeID, why)
+	// Only with the command's ApplyGuards (cluster version v23): a v22
+	// replica would apply the split.
+	if trig.applyGuards {
+		if why := r.store.rangeIDInUse(trig.Right.RangeID, trig.Right.StartKey); why != "" {
+			metrics.RangeIDCollisions.Inc()
+			return fmt.Errorf("%s: cannot split at %s: the new range's ID %s %s; the split is retried with another ID",
+				r.rangeID, trig.Right.StartKey, trig.Right.RangeID, why)
+		}
 	}
 	if err := PutRangeDescriptor(b, trig.Left); err != nil {
 		return err

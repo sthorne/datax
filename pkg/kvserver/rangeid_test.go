@@ -20,6 +20,7 @@ import (
 	"github.com/sthorne/datax/pkg/storage"
 	"github.com/sthorne/datax/pkg/util/hlc"
 	"github.com/sthorne/datax/pkg/util/stop"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // Range ID allocation (issue #389). Every split draws its new range's ID
@@ -444,6 +445,7 @@ func TestWriteQueuedBehindSplitIsReRouted(t *testing.T) {
 // wrong Raft group.
 func TestStaleWriteRefusedAtApply(t *testing.T) {
 	env := startClearTestStore(t)
+	env.cv.Store(int64(version.V23))
 	ctx := context.Background()
 	outside, _ := keys.TableDataSpan(clearTestTable + 1)
 	outside = append(outside.Clone(), 'k')
@@ -509,7 +511,7 @@ func TestSplitRefusesRangeIDInUse(t *testing.T) {
 	b := env.store.cfg.Engine.NewBatch()
 	defer func() { _ = b.Close() }()
 	collisions := testutil.ToFloat64(metrics.RangeIDCollisions)
-	if err := env.r.stageSplit(b, &splitTrigger{Left: left, Right: right}); err == nil {
+	if err := env.r.stageSplit(b, &splitTrigger{Left: left, Right: right, applyGuards: true}); err == nil {
 		t.Fatalf("a split giving the new range %s's ID applied", other.rangeID)
 	}
 	if testutil.ToFloat64(metrics.RangeIDCollisions) != collisions+1 {
@@ -519,7 +521,7 @@ func TestSplitRefusesRangeIDInUse(t *testing.T) {
 		t.Fatalf("%s is now %v", other.rangeID, d)
 	}
 	right.RangeID = 12
-	if err := env.r.stageSplit(b, &splitTrigger{Left: left, Right: right}); err != nil {
+	if err := env.r.stageSplit(b, &splitTrigger{Left: left, Right: right, applyGuards: true}); err != nil {
 		t.Fatalf("the split with a free ID: %v", err)
 	}
 	// A replica of the right-hand range itself (seeded before this
@@ -590,11 +592,89 @@ func TestMergeRefusesRightRangeWithWrongStart(t *testing.T) {
 	merged.Generation++
 	b := env.store.cfg.Engine.NewBatch()
 	defer func() { _ = b.Close() }()
-	trig := &mergeTrigger{Left: env.r.Desc(), Right: claimed, Merged: merged, RightAppliedIndex: far.AppliedIndex()}
+	trig := &mergeTrigger{Left: env.r.Desc(), Right: claimed, Merged: merged, RightAppliedIndex: far.AppliedIndex(), applyGuards: true}
 	if err := env.r.stageMerge(ctx, b, trig); err == nil {
 		t.Fatal("a merge absorbed a range that does not start where this one ends")
 	}
 	if rep, ok := env.store.GetReplica(far.rangeID); !ok || rep != far {
 		t.Fatalf("%s was detached", far.rangeID)
+	}
+}
+
+// TestApplyGuardsFollowTheClusterVersion: the apply-time refusals change
+// what a replica does below Raft, so they travel with the command
+// (raftCommand.ApplyGuards), set by the proposer only at cluster version
+// v23. Below it a command carries no guards, and every replica — a v22
+// binary's included — applies a stale write as before; the leader's
+// re-check under latches still applies, being evaluation only. The flag
+// survives the raft log's encoding.
+func TestApplyGuardsFollowTheClusterVersion(t *testing.T) {
+	env := startClearTestStore(t) // at v22
+	ctx := context.Background()
+	outside, _ := keys.TableDataSpan(clearTestTable + 1)
+	outside = append(outside.Clone(), 'k')
+	if env.store.applyGuardsOK() {
+		t.Fatal("a v22 store proposes with apply guards")
+	}
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: env.r.rangeID, Timestamp: env.clock.Now()}}
+	ba.Add(&kvpb.IncrementRequest{RequestHeader: kvpb.RequestHeader{Key: outside}, By: 1})
+	if _, kerr := env.r.proposeCmd(ctx, ba, cmdTriggers{}); kerr != nil {
+		t.Fatalf("below v23 the write was refused at apply: %v", kerr)
+	}
+	env.cv.Store(int64(version.V23))
+	if !env.store.applyGuardsOK() {
+		t.Fatal("a v23 store proposes without apply guards")
+	}
+	ba = &kvpb.BatchRequest{Header: kvpb.BatchHeader{RangeID: env.r.rangeID, Timestamp: env.clock.Now()}}
+	ba.Add(&kvpb.IncrementRequest{RequestHeader: kvpb.RequestHeader{Key: outside}, By: 1})
+	if _, kerr := env.r.proposeCmd(ctx, ba, cmdTriggers{}); kerr == nil || kerr.RangeKeyMismatch == nil {
+		t.Fatalf("at v23 the write applied (%v)", kerr)
+	}
+	if v, err := storage.MVCCGet(env.store.cfg.Engine, outside, maxTimestamp, storage.MVCCGetOptions{}); err != nil || string(v) != "1" {
+		t.Fatalf("counter is %q (%v), want 1: only the unguarded write applied", v, err)
+	}
+
+	for _, guards := range []bool{false, true} {
+		data, err := encodeRaftCommand(&raftCommand{ID: "x", ApplyGuards: guards})
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := decodeRaftCommand(data)
+		if err != nil || back.ApplyGuards != guards {
+			t.Fatalf("ApplyGuards=%v lost on the wire: %+v (%v)", guards, back, err)
+		}
+	}
+}
+
+// TestSplitIDGuardOnlyWithApplyGuards: a split trigger whose new ID
+// names another range on the store applies when its command carries no
+// guards (a v22 replica would apply it) and is refused when it does.
+func TestSplitIDGuardOnlyWithApplyGuards(t *testing.T) {
+	env := startClearTestStore(t)
+	rStart, rEnd := keys.TableDataSpan(clearTestTable + 1)
+	other, err := env.store.CreateReplica(kvpb.RangeDescriptor{
+		RangeID: 11, StartKey: rStart, EndKey: rEnd, NextReplicaID: 2, Generation: 1,
+		Replicas: env.r.Desc().Replicas,
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desc := env.r.Desc()
+	left, right := desc, desc
+	left.EndKey = env.key("m")
+	left.Generation = desc.Generation + 1
+	right.RangeID = other.rangeID
+	right.StartKey = env.key("m")
+	right.Generation = desc.Generation + 1
+	for _, guards := range []bool{true, false} {
+		b := env.store.cfg.Engine.NewBatch()
+		err := env.r.stageSplit(b, &splitTrigger{Left: left, Right: right, applyGuards: guards})
+		_ = b.Close()
+		if guards && err == nil {
+			t.Fatal("with apply guards the split applied")
+		}
+		if !guards && err != nil {
+			t.Fatalf("without apply guards the split was refused: %v", err)
+		}
 	}
 }

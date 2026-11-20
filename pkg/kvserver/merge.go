@@ -78,6 +78,9 @@ type mergeTrigger struct {
 	RightAppliedIndex uint64        `json:"right_applied"`
 	RightSizeBytes    int64         `json:"right_size,omitempty"`
 	RightGCThreshold  hlc.Timestamp `json:"right_gc,omitempty"`
+	// applyGuards is its command's ApplyGuards, copied at apply. It is
+	// not part of the trigger's encoding.
+	applyGuards bool
 }
 
 // RunRangeMergeOnce merges adjacent underfull ranges: for every range this
@@ -685,7 +688,9 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 	// detach and tombstone a range nobody merged while the real RHS's
 	// span was claimed twice. Refused before the wait below, which would
 	// otherwise wait on the wrong replica's applied index.
-	if rd := rhs.Desc(); !rd.StartKey.Equal(trig.Right.StartKey) || !trig.Right.StartKey.Equal(trig.Left.EndKey) {
+	// Only with the command's ApplyGuards (cluster version v23): a v22
+	// replica would go on.
+	if rd := rhs.Desc(); trig.applyGuards && (!rd.StartKey.Equal(trig.Right.StartKey) || !trig.Right.StartKey.Equal(trig.Left.EndKey)) {
 		metrics.DescriptorChangeRefusals.WithLabelValues("merge").Inc()
 		return kvpb.NewErrorf("%s: merge refused: the trigger's right-hand range %s starts at %s and this range ends at %s, but the local replica of %s is [%s, %s); retried by housekeeping",
 			r.rangeID, trig.Right.RangeID, trig.Right.StartKey, trig.Left.EndKey, trig.Right.RangeID, rd.StartKey, rd.EndKey)

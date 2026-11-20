@@ -1339,6 +1339,15 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v23 turns on range-safety checks at apply** (issue #389). Before
+  finalize, a node on the new binary already re-checks that a write
+  still belongs to its range once it holds its latches, and a split draws
+  a new range ID if the one it drew is in use. Three checks run on every
+  replica only after finalize. A replica refuses a write ordered after a
+  split or merge that moved its key, a split whose new range ID is
+  already in use on the store, and a merge of the wrong right-hand range.
+  An older binary would apply what these refuse, so they wait for
+  finalize.
 - **v21 starts the audit table.** Until it is finalized audit records
   are in the node logs only, as before; from finalize on every node also
   writes them to `datax_audit` (see [Security → Audit

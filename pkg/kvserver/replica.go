@@ -26,10 +26,15 @@ import (
 // write batch. The proposing replica matches the ID back to a waiting
 // caller at application time.
 type raftCommand struct {
-	ID    string            `json:"id"`
-	Batch kvpb.BatchRequest `json:"batch"`
-	Split *splitTrigger     `json:"split,omitempty"`
-	Merge *mergeTrigger     `json:"merge,omitempty"`
+	ID string `json:"id"`
+	// ApplyGuards turns on the apply-time refusals of issue #389 (see
+	// Store.applyGuardsOK). Set by the proposer, so every replica
+	// decides alike whatever binary it runs. Proposed only at cluster
+	// version v23.
+	ApplyGuards bool              `json:"apply_guards,omitempty"`
+	Batch       kvpb.BatchRequest `json:"batch"`
+	Split       *splitTrigger     `json:"split,omitempty"`
+	Merge       *mergeTrigger     `json:"merge,omitempty"`
 	// Descriptor replaces the range descriptor in place (the sticky bit;
 	// see descriptorTrigger). Proposed only at cluster version v20.
 	Descriptor *descriptorTrigger `json:"descriptor,omitempty"`
@@ -81,6 +86,9 @@ type splitTrigger struct {
 	// the parent served at or below it covered the RHS span too, so no
 	// post-split RHS write may land beneath it.
 	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
+	// applyGuards is its command's ApplyGuards, copied at apply. It is
+	// not part of the trigger's encoding.
+	applyGuards bool
 }
 
 type proposalResult struct {
@@ -999,7 +1007,7 @@ func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 // checksum probe).
 func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cmdTriggers) (*kvpb.BatchResponse, *kvpb.Error) {
 	cmd := raftCommand{
-		ID: uuid.NewString(), Batch: *ba,
+		ID: uuid.NewString(), Batch: *ba, ApplyGuards: r.store.applyGuardsOK(),
 		Split: trig.split, Merge: trig.merge, Descriptor: trig.descriptor, ClosedTS: trig.closedTS,
 		Load: trig.load, Checksum: trig.checksum,
 	}

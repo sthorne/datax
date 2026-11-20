@@ -254,7 +254,17 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64) (*kvpb.BatchResponse, *kvpb.Error, error) {
 	eng := r.store.cfg.Engine
 	b := eng.NewBatch()
-	resp, aerr := r.evalWriteBatch(b, &cmd.Batch)
+	var resp *kvpb.BatchResponse
+	var aerr *kvpb.Error
+	// Only the range that owns a key at this log position may write it
+	// (issue #389), when the proposer asked for the check: see
+	// raftCommand.ApplyGuards.
+	if cmd.ApplyGuards {
+		aerr = r.checkAppliedWriteBounds(&cmd.Batch)
+	}
+	if aerr == nil {
+		resp, aerr = r.evalWriteBatch(b, &cmd.Batch)
+	}
 	if aerr != nil {
 		_ = b.Close()
 		b = eng.NewBatch()
@@ -310,6 +320,7 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		}
 	}
 	if aerr == nil && cmd.Split != nil {
+		cmd.Split.applyGuards = cmd.ApplyGuards
 		if err := r.stageSplit(b, cmd.Split); err != nil {
 			log.Warnf("%s: split application refused: %v", r.rangeID, err)
 			_ = b.Close()
@@ -326,6 +337,7 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		}
 	}
 	if aerr == nil && cmd.Merge != nil {
+		cmd.Merge.applyGuards = cmd.ApplyGuards
 		if err := r.stageMerge(ctx, b, cmd.Merge); err != nil {
 			_ = b.Close()
 			if errors.Is(err, errApplyAborted) {
@@ -391,7 +403,8 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 // descriptor and the freeze are replicated state, changed only by
 // entries of this log, so every replica refuses the same commands. The
 // refusal carries a RangeKeyMismatch: nothing was written and the client
-// routes to the owner and resends.
+// routes to the owner and resends. Run only for a command that carries
+// ApplyGuards (cluster version v23): a v22 replica would apply it.
 func (r *Replica) checkAppliedWriteBounds(ba *kvpb.BatchRequest) *kvpb.Error {
 	spans := mvccWriteSpans(ba)
 	if len(spans) == 0 {
@@ -425,11 +438,6 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 		txnMeta = &ba.Header.Txn.TxnMeta
 	}
 	ts := writeTimestamp(ba)
-
-	// Only the range that owns a key at this log position may write it.
-	if err := r.checkAppliedWriteBounds(ba); err != nil {
-		return nil, err
-	}
 
 	// One-phase commit: the whole transaction in one proposal — writes land
 	// as committed values, no record, no intents. Detected from batch

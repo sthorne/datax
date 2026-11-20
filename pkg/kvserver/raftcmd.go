@@ -37,8 +37,9 @@ const raftCommandVersionProto = 0x01
 // encodeRaftCommand serializes a command for proposal.
 func encodeRaftCommand(cmd *raftCommand) ([]byte, error) {
 	pb := &rpcpb.RaftCommand{
-		Id:    cmd.ID,
-		Batch: kvpb.BatchRequestToProto(&cmd.Batch),
+		Id:          cmd.ID,
+		Batch:       kvpb.BatchRequestToProto(&cmd.Batch),
+		ApplyGuards: cmd.ApplyGuards,
 	}
 	pb.ClosedTs = tsToProto(cmd.ClosedTS)
 	if cmd.Load != nil {
@@ -101,7 +102,7 @@ func decodeRaftCommand(data []byte) (*raftCommand, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := &raftCommand{ID: pb.Id, Batch: *batch, ClosedTS: tsFromProto(pb.ClosedTs)}
+	cmd := &raftCommand{ID: pb.Id, Batch: *batch, ClosedTS: tsFromProto(pb.ClosedTs), ApplyGuards: pb.ApplyGuards}
 	if pb.LoadHandoff != nil {
 		cmd.Load = &loadHandoff{QPS: pb.LoadHandoff.Qps, AtNanos: pb.LoadHandoff.AtNanos}
 	}
