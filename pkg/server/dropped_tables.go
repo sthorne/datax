@@ -167,6 +167,15 @@ func (n *Node) RunDroppedTableReclaimOnce(ctx context.Context) int {
 				continue
 			}
 		}
+		// Each reclaim splits the span out, clears it, and purges it — a
+		// forced memtable flush and a manual compaction — then the merge
+		// queue folds it back: work the engine pays in small L0 files. A
+		// store already shedding writes is left to dig out first; the
+		// tables wait for a later pass (issue #391).
+		if over, why := n.storageOverloaded(); over {
+			log.Infof("dropped-table reclaim: deferring %s (id %d) and the rest of this pass: storage overloaded: %s", rec.Label(), rec.ID, why)
+			break
+		}
 		opID := newOpID()
 		n.events.RecordStart("drop-reclaim", opID, "reclaiming dropped table %s (id %d)", rec.Label(), rec.ID)
 		if err := n.reclaimDroppedTable(ctx, rec); err != nil {

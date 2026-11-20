@@ -103,7 +103,8 @@ func (e *SnapshotTooOldError) Error() string { return e.Cause.Message }
 func (e *SnapshotTooOldError) Unwrap() error { return e.Cause }
 
 // IsRetryable reports whether err calls for a transaction restart: a
-// RetryableError, or a GC-threshold refusal that is not a historical
+// RetryableError, a write shed under storage backpressure, or a
+// GC-threshold refusal that is not a historical
 // read's SnapshotTooOldError. The transaction coordinator turns the
 // refusals of its own reads and writes into RetryableErrors, but a
 // refusal can reach a statement by other ways — a push or an intent
@@ -123,7 +124,11 @@ func IsRetryable(err error) bool {
 		return false
 	}
 	var kerr *kvpb.Error
-	return errors.As(err, &kerr) && kerr.IsBelowGCThreshold()
+	// A write shed under storage backpressure is retryable however it
+	// arrives: a non-transactional write's shed is not wrapped in a
+	// RetryableError, and it too must reach the client as 40001 rather
+	// than XX000 (issue #391).
+	return errors.As(err, &kerr) && (kerr.IsBelowGCThreshold() || kerr.StorageOverloaded != nil)
 }
 
 // Txn is a client transaction coordinator: it stamps requests with the
@@ -974,6 +979,12 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			case <-time.After(ambiguousResendDelay):
 			}
 			continue
+		case kerr.StorageOverloaded != nil:
+			// Shed under storage backpressure: sendToRange already backed
+			// off for the overload budget. A refresh would only resend the
+			// batch and wait the budget again (issue #391).
+			metrics.TxnRetries.Inc()
+			return nil, &RetryableError{Cause: kerr}
 		case kerr.IsRetryableTxnError():
 			// Timestamp conflict (WriteTooOld / tsCache push / uncertainty
 			// / commit equality): try to move the read timestamp forward by
@@ -1622,6 +1633,10 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 			}
 		case kerr.TxnAborted != nil:
 			return nil, true, &RetryableError{Cause: kerr}
+		case kerr.StorageOverloaded != nil:
+			// As in send: the overload budget is spent (issue #391).
+			metrics.TxnRetries.Inc()
+			return nil, true, &RetryableError{Cause: kerr}
 		case kerr.IsRetryableTxnError():
 			newTS := kerr.RetryTimestamp(t.db.clock.Now())
 			if refreshes < maxRefreshesPerOp && t.maybeRefresh(ctx, newTS) {
@@ -2059,7 +2074,10 @@ func (db *DB) RunTxn(ctx context.Context, name string, fn func(ctx context.Conte
 		if attempt >= 3 {
 			log.Debugf("txn %s: attempt %d failed, retrying: %v", name, attempt, err)
 		}
-		if !IsRetryable(err) || ctx.Err() != nil || attempt >= 20 {
+		// A write shed under storage backpressure is not restarted: the
+		// shed batch already waited out the overload budget, and twenty
+		// more budgets is the hang issue #391 reported.
+		if !IsRetryable(err) || IsStorageOverloaded(err) || ctx.Err() != nil || attempt >= 20 {
 			_ = txn.Rollback(ctx)
 			return err
 		}

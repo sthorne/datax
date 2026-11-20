@@ -59,6 +59,12 @@ func (c *rangeCache) Insert(descs ...kvpb.RangeDescriptor) {
 					// Cached one is at least as fresh; keep it, skip insert.
 					d.RangeID = 0
 					filtered = append(filtered, cur)
+				} else if cur.RangeID != d.RangeID {
+					// A range the new descriptor covers is gone (merged
+					// away, or reshaped): its leader hint goes with it,
+					// or the hints of every range a node ever saw would
+					// stay (issue #391).
+					delete(c.hints, cur.RangeID)
 				}
 				continue
 			}
@@ -106,4 +112,11 @@ func (c *rangeCache) SetHint(rangeID base.RangeID, node base.NodeID) {
 	} else {
 		c.hints[rangeID] = node
 	}
+}
+
+// sizes reports the cached descriptors and leader hints.
+func (c *rangeCache) sizes() (descs, hints int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.descs), len(c.hints)
 }

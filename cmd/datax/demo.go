@@ -29,8 +29,12 @@ func runDemo(args []string) error {
 	baseHTTP := fs.Int("http-port", 0, "first observability HTTP port (0 = disabled; node i listens on port+i-1)")
 	verbose := fs.Bool("v", false, "verbose logging")
 	mergeThr := fs.Int64("merge-size-threshold", 0, "size in bytes below which a range and its right neighbor are merged back together (0 = default 16 MiB, negative = disabled)")
+	gcTTL := fs.Duration("gc-ttl", 0, "how long MVCC history, and the rows of dropped tables, are kept before they are reclaimed (0 = default 25h). A demo is in memory: a test suite that creates and drops databases over and over holds everything it dropped in memory for this long, so give such a cluster a short window, e.g. 5m")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *gcTTL != 0 && *gcTTL < time.Second {
+		return fmt.Errorf("--gc-ttl must be at least 1s (or 0 for the default)")
 	}
 	if *nodes < 1 || *nodes > 9 {
 		return fmt.Errorf("--nodes must be between 1 and 9")
@@ -54,6 +58,7 @@ func runDemo(args []string) error {
 			Locality:              loc,
 			UpreplicationInterval: time.Second,
 			MergeSizeThreshold:    *mergeThr,
+			GCTTL:                 *gcTTL,
 		}
 		if *baseHTTP > 0 {
 			cfg.HTTPListen = fmt.Sprintf("127.0.0.1:%d", *baseHTTP+i)

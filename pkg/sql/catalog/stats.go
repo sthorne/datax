@@ -131,3 +131,19 @@ func (a *Accessor) pruneStats() {
 		}
 	}
 }
+
+// TestingMemoryStats reports the sizes of the accessor's caches (issue
+// #391).
+func (a *Accessor) TestingMemoryStats() map[string]int {
+	out := map[string]int{}
+	a.mu.Lock()
+	out["catalog.descs"] = len(a.cache)
+	out["catalog.dbs"] = len(a.dbs)
+	out["catalog.flights"] = len(a.flights)
+	out["catalog.adopting"] = len(a.adopting)
+	a.mu.Unlock()
+	a.statsMu.Lock()
+	out["catalog.stats"] = len(a.statsCache)
+	a.statsMu.Unlock()
+	return out
+}

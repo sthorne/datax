@@ -1438,9 +1438,16 @@ This can lose recently committed writes on the dead replicas — hence
 
 When the LSM falls behind (L0 too deep, memtables full), nodes shed
 table-data writes with a retryable storage-overload error rather than
-letting the engine hard-stall; clients see higher latency, not failures
-(the built-in retry loop absorbs it). Three limits feed the same shed
-path, told apart by `datax_storage_backpressure_cause_total`:
+letting the engine hard-stall. A short burst is absorbed: the gateway
+retries a shed write with jittered backoff (10ms doubling to 1s) for up
+to 5 seconds, and the client sees latency. Overload that lasts longer
+fails the statement with SQLSTATE `40001` ("restart transaction: ...
+storage overloaded, write shed: ..."), and so does a statement whose own
+deadline (`statement_timeout`) would pass during the next backoff — it
+fails before the deadline, not at it. Retry such a statement as any
+other `40001`, with backoff; the statement is not retried again inside
+the server, since that would only multiply the wait. Three limits feed
+the same shed path, told apart by `datax_storage_backpressure_cause_total`:
 
 - **`cause=leader`** — the leaseholder's own engine crossed its
   profile's L0/memtable thresholds (or Pebble is mid-stall).
@@ -1454,6 +1461,11 @@ path, told apart by `datax_storage_backpressure_cause_total`:
   (unbounded lag ends in catch-up snapshots, or one more failure away
   from quorum loss). The error names the node; check that node's
   storage tiles.
+
+Dropped tables are not reclaimed while the node is shedding writes:
+the reclaim of each one forces a memtable flush and a compaction, more
+small L0 files for an engine whose L0 is the problem. They are taken up
+again once it recovers.
 
 Sustained backpressure means a disk can't take the write rate: switch
 heavy loaders to the `ingest`

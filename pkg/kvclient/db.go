@@ -6,6 +6,7 @@ package kvclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"strconv"
@@ -121,6 +122,11 @@ type DB struct {
 	// attemptTimeout bounds one attempt at one replica (perAttemptTimeout;
 	// tests shorten it).
 	attemptTimeout time.Duration
+	// overloadBudget bounds how long one batch keeps backing off and
+	// resending a write a leader shed under storage backpressure before
+	// it hands the shed back to the caller (defaultOverloadBudget; see
+	// SetOverloadRetryBudget). Nanoseconds; read atomically.
+	overloadBudget atomic.Int64
 	// waits wakes transactions blocked on another transaction's intents
 	// when that transaction finishes (see conflictwait.go).
 	waits txnWaits
@@ -212,6 +218,7 @@ type localSender struct {
 
 func NewDB(local LocalStore, transport *rpc.Transport, clock *hlc.Clock) *DB {
 	db := &DB{transport: transport, clock: clock, cache: newRangeCache(), frozenWait: defaultFrozenRangeWait, attemptTimeout: perAttemptTimeout}
+	db.overloadBudget.Store(int64(defaultOverloadBudget))
 	if local != nil {
 		db.local = &localSender{store: local}
 	}
@@ -1055,7 +1062,7 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 		if kerr == nil {
 			return br, false, nil
 		}
-		if header.Txn == nil && kerr.IsRetryableTxnError() {
+		if header.Txn == nil && kerr.IsRetryableTxnError() && kerr.StorageOverloaded == nil {
 			// Non-transactional batches have no reads to protect: refresh
 			// the timestamp above the server's floor and try again.
 			header.Timestamp = db.clock.Now().Forward(kerr.RetryTimestamp(header.Timestamp))
@@ -1097,6 +1104,46 @@ func (db *DB) sendPartial(ctx context.Context, header *kvpb.BatchHeader, reqs []
 	}
 }
 
+// defaultOverloadBudget is how long a batch rides out storage
+// backpressure before its statement fails with the retryable shed
+// (issue #391). A burst shorter than this is absorbed as latency;
+// sustained overload ends the statement with 40001 while the client
+// still has time to act on it — before, the batch backed off until its
+// context ended, and a statement over the wire, whose context carries
+// no client deadline, waited for good.
+const defaultOverloadBudget = 5 * time.Second
+
+// overloadDeadlineMargin is the time a shed batch leaves before its
+// caller's deadline when it gives up on account of it: enough for the
+// statement to roll back and the error to reach the client while the
+// deadline has not yet passed.
+const overloadDeadlineMargin = 250 * time.Millisecond
+
+// SetOverloadRetryBudget sets how long one batch keeps retrying a write
+// shed under storage backpressure before it returns the shed (zero
+// restores the default; a negative budget returns the first shed at
+// once).
+func (db *DB) SetOverloadRetryBudget(d time.Duration) {
+	if d == 0 {
+		d = defaultOverloadBudget
+	}
+	db.overloadBudget.Store(int64(d))
+}
+
+// IsStorageOverloaded reports whether err is a write shed under storage
+// backpressure. It is retryable (40001), but the retry loops that
+// restart a statement on their own do not restart for it: the batch
+// already rode out the overload for its whole budget, and a restart
+// would only multiply the wait the budget bounds.
+func IsStorageOverloaded(err error) bool {
+	var re *RetryableError
+	if errors.As(err, &re) && re.Cause != nil {
+		return re.Cause.StorageOverloaded != nil
+	}
+	var kerr *kvpb.Error
+	return errors.As(err, &kerr) && kerr.StorageOverloaded != nil
+}
+
 // overloadBackoff is the jittered exponential delay before retrying a
 // write the leader shed under storage backpressure: 10ms doubling to a 1s
 // cap, ±50% jitter.
@@ -1106,6 +1153,14 @@ func overloadBackoff(n int) time.Duration {
 		d = time.Second
 	}
 	return d/2 + time.Duration(rand.Int64N(int64(d)))
+}
+
+// overloadGaveUp is the shed a batch hands back once it stops retrying:
+// the leader's error, with how long it was tried, and its typed fields.
+func overloadGaveUp(kerr *kvpb.Error, tries int, waited time.Duration) *kvpb.Error {
+	e := *kerr
+	e.Message = fmt.Sprintf("%s (shed %d times over %s)", kerr.Message, tries, waited.Round(time.Millisecond))
+	return &e
 }
 
 // MaxWriteBatchBytes bounds the keys and values one write batch may
@@ -1152,6 +1207,7 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 	}
 	var lastErr *kvpb.Error
 	overloads := 0
+	var overloadedSince time.Time
 	readTimeouts := 0 // read attempts that ran out their own deadline and were sent again
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -1180,11 +1236,28 @@ func (db *DB) sendToRange(ctx context.Context, ba *kvpb.BatchRequest, desc kvpb.
 				// safe — but retry with jittered exponential backoff: a hot
 				// retry loop is exactly the load an overloaded store cannot
 				// absorb.
+				//
+				// The wait is bounded (issue #391): by the overload budget,
+				// and by the caller's deadline — a backoff that would end
+				// past it (less a margin to unwind in) returns the shed now,
+				// so the statement fails with a retryable error rather than
+				// a timeout.
 				lastErr = kerr
+				if overloads == 0 {
+					overloadedSince = time.Now()
+				}
+				delay := overloadBackoff(overloads)
+				budget := time.Duration(db.overloadBudget.Load())
+				if waited := time.Since(overloadedSince); waited+delay > budget {
+					return nil, overloadGaveUp(kerr, overloads+1, waited)
+				}
+				if dl, ok := ctx.Deadline(); ok && time.Until(dl) <= delay+overloadDeadlineMargin {
+					return nil, overloadGaveUp(kerr, overloads+1, time.Since(overloadedSince))
+				}
 				select {
 				case <-ctx.Done():
 					return nil, kerr
-				case <-time.After(overloadBackoff(overloads)):
+				case <-time.After(delay):
 				}
 				overloads++
 				break // restart from the leader hint
@@ -1529,6 +1602,17 @@ func (db *DB) AdminMerge(ctx context.Context, key keys.Key) (*kvpb.AdminMergeRes
 	return resp, nil
 }
 
+// NoteMerge updates the routing cache for a merge this node's store
+// drove itself (the merge queue): the merged descriptor replaces the
+// two it came from. Without it the cache kept the absorbed range's
+// descriptor and leader hint until a request happened to land on its
+// span, so a node that split and merged ranges by the thousand — the
+// reclaim of every dropped table does both — held them all (issue #391).
+func (db *DB) NoteMerge(merged, absorbed kvpb.RangeDescriptor) {
+	db.cache.Evict(absorbed.RangeID)
+	db.cache.Insert(merged)
+}
+
 // AdminSplit splits the range containing key at key — an ordinary split,
 // which the merge queue undoes when both halves are small. A key that is
 // already a range boundary is success (Left is then empty).
@@ -1592,4 +1676,14 @@ func ParseCounter(raw []byte) (int64, error) {
 		return 0, nil
 	}
 	return strconv.ParseInt(string(raw), 10, 64)
+}
+
+// TestingMemoryStats reports the sizes of the client's routing caches
+// (issue #391).
+func (db *DB) TestingMemoryStats() map[string]int {
+	descs, hints := db.cache.sizes()
+	db.skipPushes.Lock()
+	skips := len(db.skipPushes.last)
+	db.skipPushes.Unlock()
+	return map[string]int{"kv.rangecache.descs": descs, "kv.rangecache.hints": hints, "kv.skippushes": skips}
 }

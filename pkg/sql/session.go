@@ -1501,7 +1501,7 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 			return res, nil
 		}
 		_ = txn.Rollback(ctx)
-		if !kvclient.IsRetryable(err) || ctx.Err() != nil || attempt >= 20 {
+		if !kvclient.IsRetryable(err) || kvclient.IsStorageOverloaded(err) || ctx.Err() != nil || attempt >= 20 {
 			return nil, ToSQLError(err)
 		}
 		next := s.db.NewTxn("sql-implicit")
