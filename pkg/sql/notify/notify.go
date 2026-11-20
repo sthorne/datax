@@ -18,6 +18,13 @@
 //     the notification to a peer (normally well under a millisecond):
 //     the notification dies with it, and listeners elsewhere are not
 //     told.
+//   - A notification committed on another node shortly before a
+//     session's LISTEN can arrive after it, and is delivered to it.
+//     PostgreSQL would not deliver it. Filtering on commit timestamps
+//     would be exact only with clocks the nodes do not share: a node
+//     whose clock lags would drop a notification committed after the
+//     LISTEN, which breaks the promise above. An extra notification is
+//     harmless where a notification means "look now".
 //   - Order: every node sees one node's notifications in the order that
 //     node published them (the order its sessions' commits returned).
 //     Notifications from different nodes are not ordered against each

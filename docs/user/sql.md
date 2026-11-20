@@ -2096,6 +2096,13 @@ What is guaranteed, and what is not:
   moment never sees it, on datax as on PostgreSQL. Treat a notification
   as "look now", and on every (re)connect run `LISTEN` and then read the
   state the notifications describe.
+- **One that commits on another node just before a `LISTEN` may still
+  be delivered to it.** Notifications travel between nodes in the
+  background, so one committed elsewhere moments before the `LISTEN`
+  (normally within a few milliseconds) can arrive after it, and the
+  session receives it. PostgreSQL would not deliver it. A client that
+  treats notifications as "look now" is unaffected: it reads the state
+  after its `LISTEN` anyway.
 - **A session that stays connected receives every notification once**,
   from every node, or it is disconnected — it is not left connected
   having missed one. Two things end a listening session with a FATAL

@@ -500,8 +500,10 @@ syntax error or `0A000` feature not supported):
   not get to this one (`57P01`) — so a client that is still connected
   has missed nothing, with one exception: a node that crashes can take
   with it the notifications of the transactions it committed in its
-  last instant. Notifications from one node arrive in that node's
-  commit order; notifications from different nodes are not ordered
+  last instant. A notification committed on another node just before
+  a session's `LISTEN` (normally within a few milliseconds) may still
+  be delivered to it, where PostgreSQL would not deliver it.
+  Notifications from one node arrive in that node's commit order; notifications from different nodes are not ordered
   against each other (PostgreSQL has one order for the whole server).
   `pg_notify` is evaluated once per statement and its arguments cannot
   name columns. There is no `pg_listening_channels()` or
