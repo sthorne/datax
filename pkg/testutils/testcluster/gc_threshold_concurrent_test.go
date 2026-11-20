@@ -110,8 +110,44 @@ func TestPurgeUnderConcurrentTxnsSQLState(t *testing.T) {
 		}
 		t.Fatalf("%d transactions failed other than with 40001:\n%s", len(bad), joinLines(bad))
 	}
-	if committed.Load() == 0 {
-		t.Fatal("no transaction committed")
+
+	// The workers read the whole table that the others write to, so
+	// almost all of them restart on each other's writes even without a
+	// purge, and whether any commits in the time allowed is luck (none
+	// did in one run in three under the race detector). That a retry
+	// succeeds is shown here instead, with the others stopped: a purge
+	// moves the threshold above an open transaction, its next statement
+	// is 40001, and the retry at a new timestamp commits. Both
+	// connections are new: a purge the run's deadline cancelled closed
+	// admin's.
+	conn, purger := pgConn(t, ctx, tc, 0), pgConn(t, ctx, tc, 0)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s int64
+	if err := tx.QueryRow(ctx, `SELECT sum(v) FROM pt`).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := purger.Exec(ctx, `ALTER TABLE pt PURGE`); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	_, err = tx.Exec(ctx, `UPDATE pt SET v = v + 1 WHERE id = 1`)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if code := sqlState(err); code != sql.CodeSerializationFailure {
+		t.Fatalf("a transaction the purge passed: %s: %v, want 40001", code, err)
+	}
+	_ = tx.Rollback(ctx)
+	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT sum(v) FROM pt`).Scan(&s); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE pt SET v = v + 1 WHERE id = 1`)
+		return err
+	}); err != nil {
+		t.Fatalf("the retry: %v", err)
 	}
 }
 
