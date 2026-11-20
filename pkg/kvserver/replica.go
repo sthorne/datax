@@ -26,10 +26,15 @@ import (
 // write batch. The proposing replica matches the ID back to a waiting
 // caller at application time.
 type raftCommand struct {
-	ID    string            `json:"id"`
-	Batch kvpb.BatchRequest `json:"batch"`
-	Split *splitTrigger     `json:"split,omitempty"`
-	Merge *mergeTrigger     `json:"merge,omitempty"`
+	ID string `json:"id"`
+	// ApplyGuards turns on the apply-time refusals of issue #389 (see
+	// Store.applyGuardsOK). Set by the proposer, so every replica
+	// decides alike whatever binary it runs. Proposed only at cluster
+	// version v23.
+	ApplyGuards bool              `json:"apply_guards,omitempty"`
+	Batch       kvpb.BatchRequest `json:"batch"`
+	Split       *splitTrigger     `json:"split,omitempty"`
+	Merge       *mergeTrigger     `json:"merge,omitempty"`
 	// Descriptor replaces the range descriptor in place (the sticky bit;
 	// see descriptorTrigger). Proposed only at cluster version v20.
 	Descriptor *descriptorTrigger `json:"descriptor,omitempty"`
@@ -81,6 +86,9 @@ type splitTrigger struct {
 	// the parent served at or below it covered the RHS span too, so no
 	// post-split RHS write may land beneath it.
 	ClosedTS hlc.Timestamp `json:"closed_ts,omitempty"`
+	// applyGuards is its command's ApplyGuards, copied at apply. It is
+	// not part of the trigger's encoding.
+	applyGuards bool
 }
 
 type proposalResult struct {
@@ -999,7 +1007,7 @@ func (r *Replica) propose(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 // checksum probe).
 func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cmdTriggers) (*kvpb.BatchResponse, *kvpb.Error) {
 	cmd := raftCommand{
-		ID: uuid.NewString(), Batch: *ba,
+		ID: uuid.NewString(), Batch: *ba, ApplyGuards: r.store.applyGuardsOK(),
 		Split: trig.split, Merge: trig.merge, Descriptor: trig.descriptor, ClosedTS: trig.closedTS,
 		Load: trig.load, Checksum: trig.checksum,
 	}
@@ -1319,6 +1327,9 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if len(spans) > 0 {
 		r.load.record(spans[0].Start)
 	}
+	if k := r.store.cfg.TestingKnobs.BeforeLatch; k != nil {
+		k(ba)
+	}
 	guard, gerr := r.latches.Acquire(ctx, spans, mode)
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
@@ -1333,6 +1344,19 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	}
 	if k := r.store.cfg.TestingKnobs.AfterLatch; k != nil {
 		k(ba)
+	}
+	// The bounds were checked before the latches were taken, and a split
+	// or merge that held them in between has since changed the range: a
+	// split holds the whole-range latch until it has applied here, so a
+	// batch that queued behind it can find its key handed to the new
+	// right-hand range. Served here it would bypass that range's latches
+	// and timestamp cache and apply through a second Raft group, in
+	// parallel with the owner's (issue #389: two Increments of the range
+	// ID counter, one through each group, read the same value and two
+	// splits were given the same range ID). Check again, now that
+	// nothing can move the bounds until the latches are released.
+	if err := r.checkKeyBounds(ba); err != nil {
+		return nil, err
 	}
 	// Reads at or below the GC threshold could miss reclaimed versions:
 	// reject them outright — the data is gone at that timestamp; whether

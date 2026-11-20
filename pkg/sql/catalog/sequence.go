@@ -143,11 +143,11 @@ func CreateSequence(ctx context.Context, txn *kvclient.Txn, d *SequenceDescripto
 	} else if existing != nil {
 		return &ErrTableExists{Name: d.Name}
 	}
-	id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+	id, err := allocateDescID(ctx, txn)
 	if err != nil {
 		return err
 	}
-	d.ID = uint64(id)
+	d.ID = id
 	raw, err := json.Marshal(d)
 	if err != nil {
 		return err

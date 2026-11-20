@@ -1952,7 +1952,12 @@ for {
 ```
 
 Single statements outside `BEGIN` are transactions too, retried
-automatically by the server. Other transaction tools:
+automatically by the server — DDL included, so autocommit `CREATE`,
+`ALTER` and `DROP` statements (a migration tool's) do not fail with
+`40001` when two of them change the catalog at once. The server re-runs
+such a statement, with backoff, until it succeeds, its
+`statement_timeout` is about to run out, or it has retried for 30
+seconds. Other transaction tools:
 
 ```sql
 SAVEPOINT sp;  ROLLBACK TO SAVEPOINT sp;  RELEASE SAVEPOINT sp;

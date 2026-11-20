@@ -601,6 +601,14 @@ message RaftCommand {
   // only in its sticky bit and generation (cluster version v20; an older
   // replica would ignore it, so it is never proposed before finalize).
   DescriptorUpdateTrigger descriptor_update = 8;
+  // apply_guards turns on the apply-time refusals of issue #389. With it,
+  // a replica refuses a write to a key outside its range, or any write
+  // while the range is frozen for a merge. It refuses a split whose new
+  // range ID names another range on the store, and a merge whose
+  // right-hand replica does not start where this range ends. Proposed
+  // only at cluster version v23: a v22 replica would drop the field and
+  // apply what a v23 replica refuses.
+  bool apply_guards = 9;
 }
 
 message DescriptorUpdateTrigger {

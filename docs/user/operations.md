@@ -570,7 +570,10 @@ bytes still under retired data keys — 0 attests re-encryption is
 complete),
 `datax_auto_splits_total` / `datax_load_splits_total` /
 `datax_range_merges_total`, `datax_range_merges_deferred_total`,
-`datax_range_merges_unwound_total`, `datax_gc_runs_total`,
+`datax_range_merges_unwound_total`,
+`datax_range_id_collisions_total` (splits that drew a range ID already in
+use and were given another; it should stay at 0, and any count is a bug
+to report), `datax_gc_runs_total`,
 `datax_raft_scheduler_latency_seconds` (how long replicas wait for a raft
 worker — a growing tail means the store's raft workers are saturated),
 `datax_raft_log_syncs_total` / `datax_raft_readies_per_sync` (one synced
@@ -1336,6 +1339,15 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v23 turns on range-safety checks at apply** (issue #389). Before
+  finalize, a node on the new binary already re-checks that a write
+  still belongs to its range once it holds its latches, and a split draws
+  a new range ID if the one it drew is in use. Three checks run on every
+  replica only after finalize. A replica refuses a write ordered after a
+  split or merge that moved its key, a split whose new range ID is
+  already in use on the store, and a merge of the wrong right-hand range.
+  An older binary would apply what these refuse, so they wait for
+  finalize.
 - **v21 starts the audit table.** Until it is finalized audit records
   are in the node logs only, as before; from finalize on every node also
   writes them to `datax_audit` (see [Security → Audit
@@ -1426,9 +1438,16 @@ This can lose recently committed writes on the dead replicas — hence
 
 When the LSM falls behind (L0 too deep, memtables full), nodes shed
 table-data writes with a retryable storage-overload error rather than
-letting the engine hard-stall; clients see higher latency, not failures
-(the built-in retry loop absorbs it). Three limits feed the same shed
-path, told apart by `datax_storage_backpressure_cause_total`:
+letting the engine hard-stall. A short burst is absorbed: the gateway
+retries a shed write with jittered backoff (10ms doubling to 1s) for up
+to 5 seconds, and the client sees latency. Overload that lasts longer
+fails the statement with SQLSTATE `40001` ("restart transaction: ...
+storage overloaded, write shed: ..."), and so does a statement whose own
+deadline (`statement_timeout`) would pass during the next backoff — it
+fails before the deadline, not at it. Retry such a statement as any
+other `40001`, with backoff; the statement is not retried again inside
+the server, since that would only multiply the wait. Three limits feed
+the same shed path, told apart by `datax_storage_backpressure_cause_total`:
 
 - **`cause=leader`** — the leaseholder's own engine crossed its
   profile's L0/memtable thresholds (or Pebble is mid-stall).
@@ -1442,6 +1461,11 @@ path, told apart by `datax_storage_backpressure_cause_total`:
   (unbounded lag ends in catch-up snapshots, or one more failure away
   from quorum loss). The error names the node; check that node's
   storage tiles.
+
+Dropped tables are not reclaimed while the node is shedding writes:
+the reclaim of each one forces a memtable flush and a compaction, more
+small L0 files for an engine whose L0 is the problem. They are taken up
+again once it recovers.
 
 Sustained backpressure means a disk can't take the write rate: switch
 heavy loaders to the `ingest`

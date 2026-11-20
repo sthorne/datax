@@ -1167,6 +1167,7 @@ type corrProj struct {
 	nodes map[*parser.Select]*scopeNode // analysis of each (covered) subquery
 	refs  []string                      // bind-level names across all subqueries (the memo key)
 	bind  *scopeNode                    // any node: all share the bound scope
+	fam   types.Family                  // the expression's type (Unknown: typed by its values)
 }
 
 // exprSubqueries lists the subqueries an expression carries, anywhere
@@ -1351,8 +1352,9 @@ func mapExprSubqueries(e parser.Expr, f func(*parser.Select) (*parser.Select, er
 
 // splitCorrelatedProj finds the output expressions of a plain
 // single-table select whose subqueries reference the select's own row,
-// and returns a clone with each replaced by a NULL placeholder (typed
-// after evaluation).
+// and returns a clone with each replaced by a NULL placeholder (of the
+// expression's type when its subqueries describe, else typed after
+// evaluation).
 func (s *Session) splitCorrelatedProj(ctx context.Context, txn *kvclient.Txn, t *parser.Select, outer scopeLevel) ([]corrProj, *parser.Select, error) {
 	var projs []corrProj
 	var clone *parser.Select
@@ -1390,7 +1392,21 @@ func (s *Session) splitCorrelatedProj(ctx context.Context, txn *kvclient.Txn, t 
 			c.Exprs = append([]parser.SelectExpr(nil), t.Exprs...)
 			clone = &c
 		}
+		// The placeholder carries the expression's type when its scalar
+		// subqueries describe (as maskSubqueryExprs types it for
+		// Describe); the values are conformed to it.
 		null := types.DNull
+		if typed, ok := s.typeSubqueryOperands(ctx, se.Expr); ok {
+			cp.fam = exprFamily(typed, func(n string) (types.Family, bool) {
+				q, name := "", n
+				if j := strings.LastIndexByte(n, '.'); j >= 0 {
+					q, name = n[:j], n[j+1:]
+				}
+				c, ok := outer.col(q, name)
+				return c.Type, ok
+			})
+			null.Fam = cp.fam
+		}
 		clone.Exprs[i].Expr = parser.Expr{Lit: &null}
 		projs = append(projs, cp)
 	}
@@ -1398,6 +1414,16 @@ func (s *Session) splitCorrelatedProj(ctx context.Context, txn *kvclient.Txn, t 
 		return nil, t, nil
 	}
 	return projs, clone, nil
+}
+
+// typed conforms a correlated output value to the expression's type,
+// when it is known; ok is false when it is not (the column is typed by
+// the values).
+func (cp *corrProj) typed(d types.Datum) (types.Datum, bool) {
+	if cp.fam == types.Unknown {
+		return d, false
+	}
+	return conformTo(d, cp.fam), true
 }
 
 // evalCorrProj evaluates one correlated output expression against a

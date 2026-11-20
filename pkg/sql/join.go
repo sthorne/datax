@@ -1006,8 +1006,9 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 			if err != nil {
 				return nil, err
 			}
+			d, typed := jc.projs[i].typed(d)
 			out[projAt[i]] = d
-			if !d.Null {
+			if !typed && !d.Null {
 				res.Columns[projAt[i]].Type = d.Fam
 			}
 		}

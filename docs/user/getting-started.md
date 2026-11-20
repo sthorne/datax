@@ -35,7 +35,12 @@ Press Ctrl-C to shut down (in-memory data is discarded).
 
 Useful flags: `-nodes N` (1–9), `-http-port 8080` to also serve the
 [observability dashboard](operations.md) per node (node *i* listens on
-`port+i-1`), `-pg-port` / `-rpc-port` to move the port ranges.
+`port+i-1`), `-pg-port` / `-rpc-port` to move the port ranges, and
+`-gc-ttl` for the history window (default 25h). Dropped tables and
+databases keep their rows for that window before they are reclaimed, and
+a demo keeps everything in memory, so a test suite that creates and
+drops a database per test should run its demo with a short one, e.g.
+`./datax demo -nodes 1 -gc-ttl 5m`.
 
 Demo data is in-memory only — everything is discarded on Ctrl-C. For a
 persistent cluster see [Deployment](deployment.md).

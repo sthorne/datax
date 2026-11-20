@@ -254,7 +254,17 @@ func (r *Replica) stageAppliedIndex(b *storage.Batch, idx uint64) error {
 func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64) (*kvpb.BatchResponse, *kvpb.Error, error) {
 	eng := r.store.cfg.Engine
 	b := eng.NewBatch()
-	resp, aerr := r.evalWriteBatch(b, &cmd.Batch)
+	var resp *kvpb.BatchResponse
+	var aerr *kvpb.Error
+	// Only the range that owns a key at this log position may write it
+	// (issue #389), when the proposer asked for the check: see
+	// raftCommand.ApplyGuards.
+	if cmd.ApplyGuards {
+		aerr = r.checkAppliedWriteBounds(&cmd.Batch)
+	}
+	if aerr == nil {
+		resp, aerr = r.evalWriteBatch(b, &cmd.Batch)
+	}
 	if aerr != nil {
 		_ = b.Close()
 		b = eng.NewBatch()
@@ -310,6 +320,7 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		}
 	}
 	if aerr == nil && cmd.Split != nil {
+		cmd.Split.applyGuards = cmd.ApplyGuards
 		if err := r.stageSplit(b, cmd.Split); err != nil {
 			log.Warnf("%s: split application refused: %v", r.rangeID, err)
 			_ = b.Close()
@@ -326,6 +337,7 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		}
 	}
 	if aerr == nil && cmd.Merge != nil {
+		cmd.Merge.applyGuards = cmd.ApplyGuards
 		if err := r.stageMerge(ctx, b, cmd.Merge); err != nil {
 			_ = b.Close()
 			if errors.Is(err, errApplyAborted) {
@@ -375,6 +387,47 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		r.startChecksum(cmd.Checksum.ID, idx)
 	}
 	return resp, aerr, nil
+}
+
+// checkAppliedWriteBounds refuses, at apply, a batch that writes a key
+// this range does not own at this log position, or that writes at all
+// while the range is frozen for a merge. The leader checks both before
+// proposing, under latches that a split, a merge's freeze and its
+// absorption hold until they apply; but a proposal can still be ordered
+// after one of those — one made by a leader that has since lost the
+// lease, or forwarded to a new one. Applied, it would write a key now
+// owned by another range through a second Raft group: on a store that
+// holds both, the two groups apply in parallel with nothing serializing
+// them, and an Increment of a counter (the range ID counter, issue #389)
+// read the same value through each and handed it out twice. The
+// descriptor and the freeze are replicated state, changed only by
+// entries of this log, so every replica refuses the same commands. The
+// refusal carries a RangeKeyMismatch: nothing was written and the client
+// routes to the owner and resends. Run only for a command that carries
+// ApplyGuards (cluster version v23): a v22 replica would apply it.
+func (r *Replica) checkAppliedWriteBounds(ba *kvpb.BatchRequest) *kvpb.Error {
+	spans := mvccWriteSpans(ba)
+	if len(spans) == 0 {
+		return nil
+	}
+	if r.isFrozen() {
+		return r.frozenError(spans[0].Start, "%s: write refused at apply: range is frozen for a merge (the freeze applied after the write was proposed)", r.rangeID)
+	}
+	desc := r.Desc()
+	for _, sp := range spans {
+		end := sp.End
+		if !desc.ContainsKey(sp.Start) || (len(end) > 0 && desc.EndKey.Compare(end) < 0) {
+			if len(end) == 0 {
+				end = sp.Start
+			}
+			metrics.DescriptorChangeRefusals.WithLabelValues("write").Inc()
+			e := kvpb.NewErrorf("%s: write to [%s, %s] refused at apply: outside range [%s, %s) (the range changed after the write was proposed)",
+				r.rangeID, sp.Start, end, desc.StartKey, desc.EndKey)
+			e.RangeKeyMismatch = &kvpb.RangeKeyMismatchError{RequestKey: sp.Start, ActualDescriptors: []kvpb.RangeDescriptor{desc}}
+			return e
+		}
+	}
+	return nil
 }
 
 // evalWriteBatch executes the batch's requests against the engine batch.

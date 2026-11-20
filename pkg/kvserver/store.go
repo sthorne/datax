@@ -149,6 +149,10 @@ type StoreConfig struct {
 
 // TestingKnobs are test-only hooks; all nil in production.
 type TestingKnobs struct {
+	// BeforeLatch runs after a batch's key bounds are checked and before
+	// it waits for its latches — lets a test change the range (a split)
+	// in that window (issue #389).
+	BeforeLatch func(ba *kvpb.BatchRequest)
 	// AfterLatch runs after a batch acquires its latches, before it is
 	// evaluated — lets tests hold a latch open deliberately.
 	AfterLatch func(ba *kvpb.BatchRequest)
@@ -655,3 +659,24 @@ func (s *Store) HandleRaftMessage(ctx context.Context, rangeID base.RangeID, m r
 }
 
 func containsKey(d kvpb.RangeDescriptor, k keys.Key) bool { return d.ContainsKey(k) }
+
+// TestingMemoryStats reports the sizes of the store's per-range maps
+// (issue #391): what a test checks returns to its baseline once ranges
+// are merged away.
+func (s *Store) TestingMemoryStats() map[string]int {
+	out := map[string]int{}
+	s.mu.Lock()
+	out["store.replicas"] = len(s.mu.replicas)
+	s.mu.Unlock()
+	s.side.Lock()
+	out["store.side.woken"] = len(s.side.woken)
+	for _, m := range s.side.reg {
+		out["store.side.reg"] += len(m)
+	}
+	s.side.Unlock()
+	s.sched.mu.Lock()
+	out["store.sched.state"] = len(s.sched.mu.state)
+	out["store.sched.apply"] = len(s.sched.mu.apply)
+	s.sched.mu.Unlock()
+	return out
+}

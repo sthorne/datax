@@ -120,7 +120,12 @@ rejects **user table-data writes** with a retryable
 "storage overloaded" error (`StorageOverloadedError` + 40001-class
 retry); `pkg/kvclient` retries them with jittered exponential backoff
 (10ms → 1s), so an overloaded store sees its load thin out instead of a
-hot retry storm.
+hot retry storm. The retries are bounded (issue #391): after 5s of
+sheds (`server.Config.OverloadRetryBudget`), or as soon as the next
+backoff would pass the caller's deadline, the shed goes back to the
+statement as 40001. The coordinator neither refreshes nor restarts
+for it, and the implicit-statement retry loops do not run the statement
+again: the budget already covered the wait.
 
 Two further gates ride the same shed path (the per-cause counter says
 which fired):

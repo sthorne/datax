@@ -3,8 +3,10 @@ package kvserver
 import (
 	"context"
 	"encoding/json"
-	"github.com/google/uuid"
+	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/sthorne/datax/pkg/base"
 	"github.com/sthorne/datax/pkg/keys"
@@ -112,6 +114,17 @@ func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (
 			}
 			newID = base.RangeID(ibr.Responses[0].Increment.NewValue)
 		}
+		// A fresh ID names nothing on this store. One that does means the
+		// counter handed it out before (issue #389): a split under it would
+		// overwrite the other range's descriptor and leave one of the two
+		// spans with no replica serving it. Draw another.
+		if why := r.store.rangeIDInUse(newID, nil); why != "" {
+			metrics.RangeIDCollisions.Inc()
+			log.Errorf("%s: split at %s drew range ID %s, which %s; drawing another", r.rangeID, splitKey, newID, why)
+			lastErr = kvpb.NewErrorf("%s: split at %s drew range ID %s, which %s", r.rangeID, splitKey, newID, why)
+			newID = 0
+			continue
+		}
 
 		// The left half keeps the parent's sticky bit — it describes the
 		// start boundary, which does not move. The right half's start
@@ -151,6 +164,13 @@ func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (
 				lastErr = kerr
 				continue
 			}
+			if why := r.store.rangeIDInUse(newID, right.StartKey); why != "" {
+				// Refused at apply because the ID turned out to be taken
+				// (stageSplit): nothing was split. Draw another ID.
+				lastErr = kerr
+				newID = 0
+				continue
+			}
 			return nil, kerr
 		}
 
@@ -164,6 +184,19 @@ func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (
 		return &kvpb.AdminSplitResponse{Left: left, Right: right}, nil
 	}
 	return nil, lastErr
+}
+
+// applyGuardsOK reports whether a proposal may carry ApplyGuards
+// (cluster version v23, issue #389). A v22 replica drops the flag and
+// would apply what the guards refuse, so the replicas of a range would
+// diverge. The node's cluster-version mirror is consulted only here, by
+// the proposer: never at apply, where replicas must decide alike
+// whatever version each has heard of.
+func (s *Store) applyGuardsOK() bool {
+	if s.cfg.ClusterVersion == nil {
+		return true
+	}
+	return s.cfg.ClusterVersion() >= version.V23
 }
 
 // stickyBitsOK reports whether a descriptor may carry a sticky bit and a
@@ -331,6 +364,30 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 		metrics.DescriptorChangeRefusals.WithLabelValues("split").Inc()
 		return r.descriptorChangedError("split", trig.Left.Generation-1, cur)
 	}
+	// The right-hand range's ID must not name another range on this
+	// store. Applied, the split would overwrite that range's descriptor
+	// and replica state with the new one's while the store kept serving
+	// the old replica under the ID — the new span, and after a restart
+	// the old one, served by no replica (issue #389: every connection
+	// then failed with "no replica covering key"). adminSplit draws IDs
+	// that name nothing here, so this refuses only a split proposed with
+	// a duplicate the counter handed out; adminSplit then draws again.
+	// A replica of the right-hand range itself may already be here (a
+	// snapshot seeded it before this replica applied the split): that is
+	// the same range, recognized by its start key, which no split or
+	// merge ever moves. A store holding a replica of the other range
+	// refuses where one without accepts; that divergence is the lesser
+	// harm, the alternative being a range overwritten on the stores that
+	// hold both.
+	// Only with the command's ApplyGuards (cluster version v23): a v22
+	// replica would apply the split.
+	if trig.applyGuards {
+		if why := r.store.rangeIDInUse(trig.Right.RangeID, trig.Right.StartKey); why != "" {
+			metrics.RangeIDCollisions.Inc()
+			return fmt.Errorf("%s: cannot split at %s: the new range's ID %s %s; the split is retried with another ID",
+				r.rangeID, trig.Right.StartKey, trig.Right.RangeID, why)
+		}
+	}
 	if err := PutRangeDescriptor(b, trig.Left); err != nil {
 		return err
 	}
@@ -372,6 +429,36 @@ func (r *Replica) stageSplit(b *storage.Batch, trig *splitTrigger) error {
 	})
 }
 
+// rangeIDInUse reports why id cannot name a new range starting at start
+// on this store, or "" if it can: a replica or a persisted descriptor of
+// another range uses it. With start nil (an ID just drawn, before any
+// split was proposed under it) any use counts, a tombstone included: a
+// fresh ID names nothing anywhere. With start set (the split is being
+// applied) a range starting there is the right-hand range itself, and a
+// tombstone does not count — the store may have removed its replica of
+// the right-hand range before this replica of the parent caught up.
+func (s *Store) rangeIDInUse(id base.RangeID, start keys.Key) string {
+	other := func(d kvpb.RangeDescriptor) bool { return start == nil || !d.StartKey.Equal(start) }
+	if rep, ok := s.GetReplica(id); ok {
+		if d := rep.Desc(); other(d) {
+			return fmt.Sprintf("names the replica of [%s, %s) on n%d", d.StartKey, d.EndKey, s.cfg.NodeID)
+		}
+	}
+	if d, ok, err := loadRangeDescriptor(s.cfg.Engine, id); err != nil {
+		return fmt.Sprintf("could not be checked on n%d: %v", s.cfg.NodeID, err)
+	} else if ok && other(d) {
+		return fmt.Sprintf("names the stored descriptor of [%s, %s) on n%d", d.StartKey, d.EndKey, s.cfg.NodeID)
+	}
+	if start == nil {
+		if raw, err := s.cfg.Engine.Get(keys.RangeTombstoneKey(id)); err != nil {
+			return fmt.Sprintf("could not be checked on n%d: %v", s.cfg.NodeID, err)
+		} else if raw != nil {
+			return fmt.Sprintf("names a range removed from n%d (%s)", s.cfg.NodeID, raw)
+		}
+	}
+	return ""
+}
+
 // staleDescriptorChange reports whether a descriptor change (split, merge
 // or replica change) that produced generation produced was built from a
 // descriptor other than the one the replica holds now, at current. Every
@@ -411,6 +498,12 @@ func (r *Replica) finishSplit(trig *splitTrigger) {
 	rhs, err := r.store.startReplica(trig.Right, rep.ReplicaID, false)
 	if err != nil {
 		log.Errorf("%s: starting RHS replica after split: %v", trig.Right.RangeID, err)
+		return
+	}
+	if d := rhs.Desc(); !d.StartKey.Equal(trig.Right.StartKey) {
+		// stageSplit refuses a split whose ID names another range here,
+		// so this cannot happen; never treat that range as the new one.
+		log.Errorf("%s: after split at %s the store's replica under the new ID is [%s, %s), another range", trig.Right.RangeID, trig.Right.StartKey, d.StartKey, d.EndKey)
 		return
 	}
 	// The parent served reads on the RHS span up to this moment, and only

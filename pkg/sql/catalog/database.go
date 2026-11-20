@@ -265,11 +265,11 @@ func (a *Accessor) CreateDatabase(ctx context.Context, txn *kvclient.Txn, d *Dat
 	if existing != nil {
 		return &ErrDatabaseExists{Name: d.Name}
 	}
-	id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+	id, err := allocateDescID(ctx, txn)
 	if err != nil {
 		return err
 	}
-	d.ID = uint64(id)
+	d.ID = id
 	if err := a.putDatabase(ctx, txn, d); err != nil {
 		return err
 	}

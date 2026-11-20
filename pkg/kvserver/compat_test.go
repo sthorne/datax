@@ -35,6 +35,10 @@ const (
 	// version v22, issue #316): range 9, [a, q), at 200.3, generation 12.
 	goldenRaftCommandClearRange = "010a05636d642d3212210a090a0508c801100318091214c201110a060a0161120171120508c8011003180c"
 
+	// goldenRaftCommandApplyGuards carries the apply-guards flag (cluster
+	// version v23, issue #389): range 9, an Increment of c by 1.
+	goldenRaftCommandApplyGuards = "010a07636d642d333839120f0a021809120922070a030a016310014801"
+
 	// goldenRaftCommandAbortSpan carries the abort span's two fields
 	// (cluster version v22, issue #320): range 9 at 300.1, a poisoning
 	// ABORTED resolution of key a, and a GC of [a, q) with an abort-span
@@ -114,6 +118,30 @@ func TestRaftCommandDecodesGoldenClearRange(t *testing.T) {
 	}
 	if hex.EncodeToString(raw) != goldenRaftCommandClearRange {
 		t.Fatalf("encoding changed:\n got %x\nwant %s", raw, goldenRaftCommandClearRange)
+	}
+}
+
+func TestRaftCommandDecodesGoldenApplyGuards(t *testing.T) {
+	data, err := hex.DecodeString(goldenRaftCommandApplyGuards)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := decodeRaftCommand(data)
+	if err != nil {
+		t.Fatalf("golden guarded command no longer decodes: %v", err)
+	}
+	if cmd.ID != "cmd-389" || !cmd.ApplyGuards || cmd.Batch.Header.RangeID != 9 || len(cmd.Batch.Requests) != 1 {
+		t.Fatalf("decoded %+v", cmd)
+	}
+	if inc := cmd.Batch.Requests[0].Increment; inc == nil || string(inc.Key) != "c" || inc.By != 1 {
+		t.Fatalf("increment: %+v", inc)
+	}
+	raw, err := encodeRaftCommand(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(raw) != goldenRaftCommandApplyGuards {
+		t.Fatalf("encoding changed:\n got %x\nwant %s", raw, goldenRaftCommandApplyGuards)
 	}
 }
 

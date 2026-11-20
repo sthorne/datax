@@ -236,11 +236,11 @@ func (a *Accessor) CreateSchema(ctx context.Context, txn *kvclient.Txn, d *Schem
 	if existing != nil {
 		return &ErrSchemaExists{Name: d.Name}
 	}
-	id, err := txn.Increment(ctx, keys.DescIDGenKey(), 1)
+	id, err := allocateDescID(ctx, txn)
 	if err != nil {
 		return err
 	}
-	d.ID = uint64(id)
+	d.ID = id
 	d.Version = 1
 	if err := putSchema(ctx, txn, d); err != nil {
 		return err

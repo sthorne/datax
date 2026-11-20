@@ -124,9 +124,18 @@ type Error struct {
 	// none).
 	Detail string
 	Hint   string
+	// cause is the error a 40001 was made from (ToSQLError), kept so
+	// that a retry loop the error passes through on its way out — RunTxn,
+	// an implicit statement's — still recognizes it as retryable: a
+	// statement that turned the conflict into its SQL error inside the
+	// loop must not stop the loop from re-running it (issue #392).
+	cause error
 }
 
 func (e *Error) Error() string { return e.Msg }
+
+// Unwrap returns the error e was made from, if ToSQLError kept it.
+func (e *Error) Unwrap() error { return e.cause }
 
 func newErrf(code, format string, args ...any) *Error {
 	return &Error{Code: code, Msg: fmt.Sprintf(format, args...)}
@@ -158,7 +167,7 @@ func ToSQLError(err error) *Error {
 	if kvclient.IsRetryable(err) {
 		// Every GC-threshold refusal but a historical read's is one
 		// (issue #374): the timestamp was the cluster's.
-		return &Error{Code: CodeSerializationFailure, Msg: restartMessage(err)}
+		return &Error{Code: CodeSerializationFailure, Msg: restartMessage(err), cause: err}
 	}
 	var stoo *kvclient.SnapshotTooOldError
 	if errors.As(err, &stoo) {

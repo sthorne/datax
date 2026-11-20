@@ -403,9 +403,25 @@ const (
 	// SCHEMA is refused until finalize; with no schema, every name
 	// resolves as before.
 	V22 Version = 22
+	// V23 turns on the apply-time guards of issue #389. A range's
+	// replicas refuse three things at apply:
+	//   - a write to a key the range no longer owns at that log position,
+	//     or any write while it is frozen for a merge;
+	//   - a split whose new range ID already names another range on the
+	//     store;
+	//   - a merge whose right-hand replica does not start where the
+	//     left-hand range ends.
+	// A refusal at apply is safe only when every replica makes it. A v22
+	// binary applies all three, and many releases speak v22, so the
+	// guards travel with each command as kvpb RaftCommand.apply_guards.
+	// A proposer sets the flag only once the cluster has finalized v23
+	// (rule 4). Below v23 the leader still re-checks a write's bounds
+	// once it holds its latches, and a split still draws another ID
+	// when the one it drew is in use. Both are evaluation, not apply.
+	V23 Version = 23
 
 	// Current is the newest cluster version this binary can run.
-	Current = V22
+	Current = V23
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

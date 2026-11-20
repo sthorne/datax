@@ -256,6 +256,10 @@ type Config struct {
 	// before the janitor reclaims it (0 = the GC TTL, matching the
 	// deepest admissible historical read).
 	ReshardRetireFor time.Duration
+	// OverloadRetryBudget is how long a write shed under storage
+	// backpressure is retried before its statement fails with 40001
+	// (0 = default 5s; kvclient.DB.SetOverloadRetryBudget).
+	OverloadRetryBudget time.Duration
 	// DroppedTableReclaimInterval is how often the node leading range 1
 	// looks for dropped tables whose history window has passed and clears
 	// their spans (0 = default 1m; negative disables it, and a dropped
@@ -875,6 +879,7 @@ func (n *Node) start() error {
 	})
 	n.db = kvclient.NewDB(n.store, n.trans, n.clock)
 	n.db.EnableMetaLookup()
+	n.db.SetOverloadRetryBudget(n.cfg.OverloadRetryBudget)
 	// Version-gated request shapes key off the node's cluster-version
 	// mirror (refreshed by the heartbeat loop and at finalize).
 	n.db.SetVersionGate(func() version.Version {
@@ -911,15 +916,7 @@ func (n *Node) start() error {
 	// The testing knob is consulted first — the advertised verdict must
 	// match the one this node's own gate would apply.
 	n.trans.SetHealthProvider(func() *rpcpb.StorageHealth {
-		var (
-			over bool
-			why  string
-		)
-		if k := n.cfg.TestingKnobs.OverrideOverloaded; k != nil {
-			over, why = k()
-		} else if n.engine != nil {
-			over, _, why = n.engine.OverloadedCause()
-		}
+		over, why := n.storageOverloaded()
 		// No wall_time: receivers stamp the verdict with their own receipt
 		// time, so clocks need not agree.
 		h := &rpcpb.StorageHealth{Overloaded: over, Reason: why}
@@ -1439,4 +1436,18 @@ func (n *Node) ensureDatabaseCatalog(ctx context.Context) {
 		}
 		return
 	}
+}
+
+// storageOverloaded is this node's own storage-health verdict: the
+// engine's soft backpressure gate, or the testing knob that stands in
+// for it.
+func (n *Node) storageOverloaded() (bool, string) {
+	if k := n.cfg.TestingKnobs.OverrideOverloaded; k != nil {
+		return k()
+	}
+	if n.engine != nil {
+		over, _, why := n.engine.OverloadedCause()
+		return over, why
+	}
+	return false, ""
 }

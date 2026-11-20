@@ -1432,7 +1432,7 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.executeStreamingSelect(ctx, sel, params)
 	}
 	var res *Result
-	err := s.db.RunTxn(ctx, "sql-implicit", func(ctx context.Context, txn *kvclient.Txn) error {
+	err := s.runImplicit(ctx, stmt, func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
 		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		s.keyLeaseAfterCommit = false
@@ -1501,7 +1501,7 @@ func (s *Session) executeStreamingSelect(ctx context.Context, sel *parser.Select
 			return res, nil
 		}
 		_ = txn.Rollback(ctx)
-		if !kvclient.IsRetryable(err) || ctx.Err() != nil || attempt >= 20 {
+		if !kvclient.IsRetryable(err) || kvclient.IsStorageOverloaded(err) || ctx.Err() != nil || attempt >= 20 {
 			return nil, ToSQLError(err)
 		}
 		next := s.db.NewTxn("sql-implicit")

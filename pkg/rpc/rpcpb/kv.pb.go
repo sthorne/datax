@@ -5336,8 +5336,16 @@ type RaftCommand struct {
 	// only in its sticky bit and generation (cluster version v20; an older
 	// replica would ignore it, so it is never proposed before finalize).
 	DescriptorUpdate *DescriptorUpdateTrigger `protobuf:"bytes,8,opt,name=descriptor_update,json=descriptorUpdate,proto3" json:"descriptor_update,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// apply_guards turns on the apply-time refusals of issue #389. With it,
+	// a replica refuses a write to a key outside its range, or any write
+	// while the range is frozen for a merge. It refuses a split whose new
+	// range ID names another range on the store, and a merge whose
+	// right-hand replica does not start where this range ends. Proposed
+	// only at cluster version v23: a v22 replica would drop the field and
+	// apply what a v23 replica refuses.
+	ApplyGuards   bool `protobuf:"varint,9,opt,name=apply_guards,json=applyGuards,proto3" json:"apply_guards,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RaftCommand) Reset() {
@@ -5424,6 +5432,13 @@ func (x *RaftCommand) GetDescriptorUpdate() *DescriptorUpdateTrigger {
 		return x.DescriptorUpdate
 	}
 	return nil
+}
+
+func (x *RaftCommand) GetApplyGuards() bool {
+	if x != nil {
+		return x.ApplyGuards
+	}
+	return false
 }
 
 type DescriptorUpdateTrigger struct {
@@ -6090,7 +6105,7 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\x12below_gc_threshold\x18\x0e \x01(\v2\x1f.datax.v1.BelowGCThresholdErrorR\x10belowGcThreshold\"k\n" +
 	"\rBatchEnvelope\x123\n" +
 	"\bresponse\x18\x01 \x01(\v2\x17.datax.v1.BatchResponseR\bresponse\x12%\n" +
-	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\x94\x03\n" +
+	"\x05error\x18\x02 \x01(\v2\x0f.datax.v1.ErrorR\x05error\"\xb7\x03\n" +
 	"\vRaftCommand\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12,\n" +
 	"\x05batch\x18\x02 \x01(\v2\x16.datax.v1.BatchRequestR\x05batch\x12,\n" +
@@ -6099,7 +6114,8 @@ const file_datax_v1_kv_proto_rawDesc = "" +
 	"\tclosed_ts\x18\x05 \x01(\v2\r.datax.v1.HlcR\bclosedTs\x128\n" +
 	"\fload_handoff\x18\x06 \x01(\v2\x15.datax.v1.LoadHandoffR\vloadHandoff\x125\n" +
 	"\bchecksum\x18\a \x01(\v2\x19.datax.v1.ChecksumTriggerR\bchecksum\x12N\n" +
-	"\x11descriptor_update\x18\b \x01(\v2!.datax.v1.DescriptorUpdateTriggerR\x10descriptorUpdate\"H\n" +
+	"\x11descriptor_update\x18\b \x01(\v2!.datax.v1.DescriptorUpdateTriggerR\x10descriptorUpdate\x12!\n" +
+	"\fapply_guards\x18\t \x01(\bR\vapplyGuards\"H\n" +
 	"\x17DescriptorUpdateTrigger\x12-\n" +
 	"\x04desc\x18\x01 \x01(\v2\x19.datax.v1.RangeDescriptorR\x04desc\":\n" +
 	"\vLoadHandoff\x12\x10\n" +
