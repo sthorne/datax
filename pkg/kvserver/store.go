@@ -149,6 +149,10 @@ type StoreConfig struct {
 
 // TestingKnobs are test-only hooks; all nil in production.
 type TestingKnobs struct {
+	// BeforeLatch runs after a batch's key bounds are checked and before
+	// it waits for its latches — lets a test change the range (a split)
+	// in that window (issue #389).
+	BeforeLatch func(ba *kvpb.BatchRequest)
 	// AfterLatch runs after a batch acquires its latches, before it is
 	// evaluated — lets tests hold a latch open deliberately.
 	AfterLatch func(ba *kvpb.BatchRequest)

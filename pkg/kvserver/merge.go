@@ -677,6 +677,19 @@ func (r *Replica) stageMerge(ctx context.Context, b *storage.Batch, trig *mergeT
 		// and this log position is the first time it can be deleted.
 		log.Fatalf("%s: merge apply: local RHS replica %s missing", r.rangeID, trig.Right.RangeID)
 	}
+	// The replica found under the RHS's ID must be the RHS: the range
+	// that starts where this one ends, as the trigger says. A range's
+	// start key never moves (a split keeps its left half's, a merge its
+	// own), so a replica under that ID starting elsewhere is another range
+	// that was given the same ID (issue #389), and absorbing it would
+	// detach and tombstone a range nobody merged while the real RHS's
+	// span was claimed twice. Refused before the wait below, which would
+	// otherwise wait on the wrong replica's applied index.
+	if rd := rhs.Desc(); !rd.StartKey.Equal(trig.Right.StartKey) || !trig.Right.StartKey.Equal(trig.Left.EndKey) {
+		metrics.DescriptorChangeRefusals.WithLabelValues("merge").Inc()
+		return kvpb.NewErrorf("%s: merge refused: the trigger's right-hand range %s starts at %s and this range ends at %s, but the local replica of %s is [%s, %s); retried by housekeeping",
+			r.rangeID, trig.Right.RangeID, trig.Right.StartKey, trig.Left.EndKey, trig.Right.RangeID, rd.StartKey, rd.EndKey)
+	}
 	// The RHS's engine content is identical on every node once it reaches
 	// the subsume index (its final command). The driver confirmed every
 	// RHS replica had applied it before proposing the merge (adminMerge),

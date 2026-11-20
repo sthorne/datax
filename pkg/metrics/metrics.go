@@ -111,8 +111,12 @@ var (
 	})
 	DescriptorChangeRefusals = promauto.With(Registry).NewCounterVec(prometheus.CounterOpts{
 		Name: "datax_descriptor_change_refused_total",
-		Help: "Splits, merges and replica changes refused at apply because the range changed under them between being built and being applied (issue #200); each is retried by its caller. A range under sustained churn can starve here, which this counter is the only sign of.",
+		Help: "Splits, merges and replica changes refused at apply because the range changed under them between being built and being applied (issue #200); each is retried by its caller. op=write counts writes refused at apply because a split or merge ordered before them moved their key out of the range, or froze it (issue #389); the client re-routes them. A range under sustained churn can starve here, which this counter is the only sign of.",
 	}, []string{"op"})
+	RangeIDCollisions = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_range_id_collisions_total",
+		Help: "Splits that drew a range ID already naming another range on this store, and either drew another before proposing or were refused at apply and retried with another (issue #389). Range IDs are unique, so any count here is a bug worth reporting; the check is what keeps it from overwriting a range.",
+	})
 	RaftSchedulerLatency = promauto.With(Registry).NewHistogram(prometheus.HistogramOpts{
 		Name:    "datax_raft_scheduler_latency_seconds",
 		Help:    "Time a replica waited in the store's raft scheduler queue before a worker picked it up.",
