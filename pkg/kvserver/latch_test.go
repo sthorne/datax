@@ -246,3 +246,38 @@ func BenchmarkLatchAcquirePoints(b *testing.B) {
 		g.Release()
 	}
 }
+
+// TestLatchWideBatchesInterleaved: a pushed bulk INSERT refreshes its
+// uniqueness probes as one batch of point Refresh requests; that batch,
+// and the wide write batches of other workers whose keys fall between its
+// keys, latch only their own keys, so neither waits for the other.
+func TestLatchWideBatchesInterleaved(t *testing.T) {
+	key := func(i int) keys.Key { return append(keys.TableDataPrefix(433), fmt.Sprintf("%06d", i)...) }
+	refresh, write := &kvpb.BatchRequest{}, &kvpb.BatchRequest{}
+	for i := 0; i < 1000; i++ {
+		refresh.Add(&kvpb.RefreshRequest{RequestHeader: kvpb.RequestHeader{Key: key(2 * i)}})
+		write.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: key(2*i + 1)}, Value: []byte("v")})
+	}
+	m := newLatchManager()
+	rs, rm, err := latchSpans(refresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sp := range rs {
+		if sp.End != nil {
+			t.Fatalf("a point refresh latched the span %s-%s", sp.Start, sp.End)
+		}
+	}
+	g1 := mustAcquire(t, m, rs, rm)
+	defer g1.Release()
+	ws, wm, err := latchSpans(write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2 := mustAcquire(t, m, ws, wm)
+	defer g2.Release()
+	// One of the refreshed keys written: that write waits.
+	ch := acquireBlocks(t, m, []latchSpan{{Start: key(500)}}, latchExclusive)
+	g1.Release()
+	(<-ch).Release()
+}
