@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
-	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/parser"
 )
 
@@ -33,12 +32,7 @@ const (
 // storage shed under overload — re-running the whole statement is the
 // load the store asked to be spared.
 func implicitRetryable(err error) bool {
-	var kerr *kvpb.Error
-	if errors.As(err, &kerr) && kerr.StorageOverloaded != nil {
-		return false
-	}
-	var re *kvclient.RetryableError
-	if errors.As(err, &re) && re.Cause != nil && re.Cause.StorageOverloaded != nil {
+	if kvclient.IsStorageOverloaded(err) {
 		return false
 	}
 	if kvclient.IsRetryable(err) {
