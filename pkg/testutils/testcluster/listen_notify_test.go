@@ -380,6 +380,11 @@ func TestListenNotify(t *testing.T) {
 	// the client sent nothing after the LISTEN.
 	t.Run("pushed while idle", func(t *testing.T) {
 		for _, node := range []int{0, 2} {
+			// A channel per node: the pg_notify at the end of node 1's
+			// round is sent to node 3 asynchronously, and may reach it
+			// after node 3's LISTEN (see postgres-differences.md), which
+			// on a shared channel it would then be delivered to.
+			ch := fmt.Sprintf("idle%d", node+1)
 			nc, err := net.Dial("tcp", tc.Nodes[node].SQLAddr())
 			if err != nil {
 				t.Fatal(err)
@@ -408,7 +413,7 @@ func TestListenNotify(t *testing.T) {
 				}
 			}
 			untilReady()
-			fe.Send(&pgproto3.Query{String: "LISTEN idle"})
+			fe.Send(&pgproto3.Query{String: "LISTEN " + ch})
 			if err := fe.Flush(); err != nil {
 				t.Fatal(err)
 			}
@@ -419,20 +424,20 @@ func TestListenNotify(t *testing.T) {
 				// Spaced out, so each arrives on a connection that has
 				// already been pushed to and gone back to waiting.
 				time.Sleep(50 * time.Millisecond)
-				mustExec(t, ctx, notifier, `NOTIFY idle, '`+fmt.Sprint(i)+`'`)
+				mustExec(t, ctx, notifier, `NOTIFY `+ch+`, '`+fmt.Sprint(i)+`'`)
 				msg, err := fe.Receive()
 				if err != nil {
 					t.Fatalf("node %d: nothing pushed to an idle listener: %v", node+1, err)
 				}
 				n, ok := msg.(*pgproto3.NotificationResponse)
-				if !ok || n.Channel != "idle" || n.Payload != fmt.Sprint(i) {
-					t.Fatalf("node %d: got %#v, want notification %d on idle", node+1, msg, i)
+				if !ok || n.Channel != ch || n.Payload != fmt.Sprint(i) {
+					t.Fatalf("node %d: got %#v, want notification %d on %s", node+1, msg, i, ch)
 				}
 			}
 			// The connection still serves statements afterwards, and a
 			// notification that arrives during one precedes its
 			// ReadyForQuery rather than interrupting its answer.
-			fe.Send(&pgproto3.Query{String: "SELECT pg_notify('idle', 'mine'), 1"})
+			fe.Send(&pgproto3.Query{String: "SELECT pg_notify('" + ch + "', 'mine'), 1"})
 			if err := fe.Flush(); err != nil {
 				t.Fatal(err)
 			}
