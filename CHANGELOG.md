@@ -11,6 +11,14 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax demo --gc-ttl`** sets the history window of a demo cluster,
+  so an in-memory cluster that runs create-and-drop test suites need not
+  hold 25 hours of dropped tables in memory (#391).
+- **Cluster version v23.** Once the upgrade to it is finalized, a
+  replica refuses at apply a write outside its range or into a range
+  frozen for a merge, a split that would reuse a range ID, and a merge
+  whose right-hand range does not start where the left ends (#389).
+  The new metric `datax_range_id_collisions_total` should stay at 0.
 - **Schemas** (was PG-D-001; docs/user/sql.md, "Schemas"; design in
   docs/design/schemas.md):
   - `CREATE SCHEMA [IF NOT EXISTS] [name] [AUTHORIZATION role]`,
@@ -1975,6 +1983,41 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Two range splits could be given the same range ID** when the range
+  holding the ID counter was split or merged at the same moment, which
+  heavy DDL load does (#389). A write queued behind a split was applied
+  by the half that no longer owned its key, so two increments of the
+  counter read the same value; one range then overwrote the other, a
+  span was left with no replica, and every new connection failed with
+  `no replica covering key /system/dbns/...` until a restart. The same
+  race could hand out a descriptor ID or a sequence value twice. A
+  write's key is now checked against the range once its latches are
+  held, and a split draws another ID if the one it got is in use.
+- **A statement could see another table's columns** (`42703 column
+  ... does not exist` right after `CREATE TABLE` made it) when a
+  descriptor ID was handed out twice and the second table overwrote the
+  first's descriptor (#390). New objects skip an ID already in use, and
+  a name entry that leads to another object's descriptor is reported as
+  catalog damage (`XX000`) instead of used.
+- **Autocommit DDL no longer fails with `40001`** when it conflicts with
+  another catalog change (#392): the error a DDL statement made of the
+  conflict had lost its link to the retryable cause, so the implicit
+  retry gave up at once. Implicit statements are now re-run with backoff
+  until they succeed, their `statement_timeout` nears, or 30 seconds
+  pass; only an explicit transaction block still returns `40001`.
+- **Writes shed under storage backpressure fail promptly with `40001`**
+  instead of waiting past the client's deadline (#391): a shed write is
+  retried for at most 5 seconds, or until just before the statement's
+  deadline, and a shed non-transactional write is `40001` rather than
+  `XX000`. A node no longer keeps routing-cache entries for ranges its
+  merge queue merged away, and the dropped-table reclaim waits while the
+  node is shedding writes.
+- **A scalar subquery in a select list with a FROM is described with
+  its own type** (#388), for example `count(*)` as `int8` rather than
+  `text`, in Describe and the simple protocol alike, with its values,
+  NULL included, sent in that type; `EXISTS` and `IN (SELECT ...)` are
+  `boolean`. Describing a portal reports the result formats its Bind
+  chose, so pgx's describe modes read binary columns correctly.
 - **Rate-based health problems no longer miss a burst between two
   reads.** Health is sampled when it is read; a read longer ago than
   the rate window (five minutes by default) was dropped as the
