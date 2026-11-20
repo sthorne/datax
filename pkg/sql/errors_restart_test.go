@@ -63,3 +63,34 @@ func TestToSQLErrorBelowGCThreshold(t *testing.T) {
 		t.Errorf("a restart after the refusal reads at %s, want above the threshold %s", got, thr)
 	}
 }
+
+// TestImplicitRetryable (issue #392): an implicit statement is re-run on
+// a retryable error even once a statement has made it into its 40001
+// (*Error) inside the retry loop, and never on a storage-overload shed.
+func TestImplicitRetryable(t *testing.T) {
+	abort := &kvclient.RetryableError{Cause: &kvpb.Error{Message: "aborted", TxnAborted: &kvpb.TxnAbortedError{}}}
+	shed := &kvpb.Error{Message: "shed", TxnRetry: &kvpb.TxnRetryError{}, StorageOverloaded: &kvpb.StorageOverloadedError{}}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"retryable", abort, true},
+		{"as its 40001", ToSQLError(abort), true},
+		{"wrapped 40001", fmt.Errorf("create: %w", ToSQLError(abort)), true},
+		{"40001 without its cause", &Error{Code: CodeSerializationFailure, Msg: "restart transaction"}, true},
+		{"other SQL error", newErrf(CodeDuplicateTable, "relation %q already exists", "t"), false},
+		{"storage overloaded", shed, false},
+		{"storage overloaded, retryable", &kvclient.RetryableError{Cause: shed}, false},
+		{"storage overloaded, as its 40001", ToSQLError(&kvclient.RetryableError{Cause: shed}), false},
+	} {
+		if got := implicitRetryable(tc.err); got != tc.want {
+			t.Errorf("%s: implicitRetryable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// A retry loop that only knows kvclient's errors (RunTxn) still sees
+	// a 40001 the statement made inside it as retryable.
+	if !kvclient.IsRetryable(ToSQLError(abort)) {
+		t.Errorf("kvclient.IsRetryable(ToSQLError(retryable)) = false")
+	}
+}
