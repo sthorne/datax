@@ -13,6 +13,9 @@ import (
 // use).
 type whereMemo struct {
 	jsonb []jsonbMemoEntry
+	// env is the environment a computed conjunct is evaluated in, held
+	// here so that passing it boxes nothing per row.
+	env tableEnv
 }
 
 type jsonbMemoEntry struct {
@@ -66,18 +69,12 @@ func rowIndependent(e parser.Expr) bool {
 
 // scanNeededCols returns the columns a streaming scan's filter and
 // projection read, as a membership test, or nil (decode every column)
-// when there is nothing to skip or it cannot be told simply: a
-// projected expression, or a conjunct other than a column compared with
-// constants.
+// when there is nothing to skip or it cannot be told: an expression
+// with a subquery, a window or aggregate call, DEFAULT, or a name that
+// is no column of the table (evaluating it fails as it always has).
 func scanNeededCols(desc *catalog.TableDescriptor, proj []projCol, where []parser.Comparison) func(catalog.ColumnID) bool {
 	need := make(map[catalog.ColumnID]bool, len(proj)+len(where))
-	for _, p := range proj {
-		if p.expr != nil {
-			return nil
-		}
-		need[p.col.ID] = true
-	}
-	if !whereColumnIDs(desc, where, need) {
+	if !projReadCols(desc, proj, need) || !whereReadCols(desc, where, need) {
 		return nil
 	}
 	for i := range desc.Columns {
@@ -88,33 +85,92 @@ func scanNeededCols(desc *catalog.TableDescriptor, proj []projCol, where []parse
 	return nil
 }
 
-// whereColumnIDs adds the columns of a conjunction of column-versus-
-// constant conjuncts to need; false when some conjunct is not one.
-func whereColumnIDs(desc *catalog.TableDescriptor, where []parser.Comparison, need map[catalog.ColumnID]bool) bool {
-	for _, c := range where {
-		switch {
-		case c.Op == "TRUE" || c.Op == "FALSE":
-			continue
-		case c.Op == "OR":
-			for _, d := range c.Or {
-				if !whereColumnIDs(desc, d, need) {
-					return false
-				}
-			}
-			continue
-		case c.Expr != nil || c.Sub != nil || c.Column == "":
+// projReadCols adds the columns a select list reads to need; false when
+// that cannot be told.
+func projReadCols(desc *catalog.TableDescriptor, proj []projCol, need map[catalog.ColumnID]bool) bool {
+	for _, p := range proj {
+		if p.expr == nil {
+			need[p.col.ID] = true
+		} else if !exprReadCols(desc, p.expr, need) {
 			return false
 		}
-		col, ok := desc.Col(c.Column)
-		if !ok || !constExpr(c.Value) {
+	}
+	return true
+}
+
+// whereReadCols adds the columns a conjunction reads to need: every
+// column a conjunct names, on either side, in its value list, inside
+// an OR, a CASE or a function's arguments. False when that cannot be
+// told (see exprReadCols), or for a subquery not yet spliced.
+func whereReadCols(desc *catalog.TableDescriptor, where []parser.Comparison, need map[catalog.ColumnID]bool) bool {
+	for i := range where {
+		c := &where[i]
+		if c.Sub != nil {
 			return false
 		}
-		for _, v := range c.Values {
-			if !constExpr(v) {
+		for _, d := range c.Or {
+			if !whereReadCols(desc, d, need) {
 				return false
 			}
 		}
+		if c.Column != "" {
+			col, ok := desc.Col(c.Column)
+			if !ok {
+				return false
+			}
+			need[col.ID] = true
+		}
+		if !exprReadCols(desc, c.Expr, need) || !exprReadCols(desc, &c.Value, need) {
+			return false
+		}
+		for j := range c.Values {
+			if !exprReadCols(desc, &c.Values[j], need) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// exprReadCols adds the columns an expression reads to need (evaluation
+// reads a column only where an Expr or a Comparison names it). False
+// when that cannot be told: a subquery, a window or aggregate call,
+// DEFAULT, or a name that is no column of desc.
+func exprReadCols(desc *catalog.TableDescriptor, e *parser.Expr, need map[catalog.ColumnID]bool) bool {
+	if e == nil {
+		return true
+	}
+	if e.Sub != nil || e.Window != nil || e.Agg != nil || e.IsDefault {
+		return false
+	}
+	if e.Column != "" {
+		col, ok := desc.Col(e.Column)
+		if !ok {
+			return false
+		}
 		need[col.ID] = true
+	}
+	for i := range e.Args {
+		if !exprReadCols(desc, &e.Args[i], need) {
+			return false
+		}
+	}
+	if !exprReadCols(desc, e.Left, need) || !exprReadCols(desc, e.Right, need) {
+		return false
+	}
+	if e.Cmp != nil && !whereReadCols(desc, []parser.Comparison{*e.Cmp}, need) {
+		return false
+	}
+	if ce := e.Case; ce != nil {
+		if !exprReadCols(desc, ce.Operand, need) || !exprReadCols(desc, ce.Else, need) {
+			return false
+		}
+		for i := range ce.Whens {
+			w := &ce.Whens[i]
+			if !exprReadCols(desc, w.Value, need) || !whereReadCols(desc, w.Cond, need) || !exprReadCols(desc, &w.Result, need) {
+				return false
+			}
+		}
 	}
 	return true
 }

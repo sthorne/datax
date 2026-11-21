@@ -1645,8 +1645,17 @@ func (t tableEnv) col(name string) (types.Datum, error) {
 // historical signature, kept for its many call sites; join evaluation
 // passes a joinEnv to evalExprEnv directly.
 func evalExpr(e parser.Expr, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (types.Datum, error) {
+	if constExpr(e) {
+		// A literal or parameter reads no column: evaluated without
+		// boxing an environment for it, which would allocate on every
+		// row of a filter comparing a column with a constant.
+		return evalExprEnv(e, noColumnsEnv, params)
+	}
 	return evalExprEnv(e, tableEnv{desc: desc, row: row}, params)
 }
+
+// noColumnsEnv is the environment of an expression that reads no column.
+var noColumnsEnv exprEnv = tableEnv{}
 
 func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
 	var base types.Datum
@@ -2117,7 +2126,15 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 		if cmp.Expr != nil {
 			// Computed left-hand side: evaluate both sides and compare raw
 			// (Compare lifts numerics; no column type to coerce toward).
-			ok, err := condsHold([]parser.Comparison{cmp}, tableEnv{desc: desc, row: row}, params)
+			// A scan's memo lends the environment, so a row boxes none.
+			var env exprEnv
+			if memo != nil {
+				memo.env = tableEnv{desc: desc, row: row}
+				env = &memo.env
+			} else {
+				env = tableEnv{desc: desc, row: row}
+			}
+			ok, err := condsHold(where[i:i+1], env, params)
 			if err != nil {
 				return false, err
 			}

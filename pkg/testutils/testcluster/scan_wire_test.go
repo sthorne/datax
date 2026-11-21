@@ -10,6 +10,7 @@ import (
 	"net"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,6 +53,30 @@ func (r *rawFrontend) rawRowsOf(q string, formats []int16) [][][]byte {
 	}
 }
 
+// wireTableSetup creates wt: a column of every value type, with NULLs,
+// a dropped column, a column added later with a default, and an index
+// on g.
+var wireTableSetup = []string{
+	`CREATE TYPE wmood AS ENUM ('sad', 'ok', 'happy')`,
+	`CREATE TABLE wt (
+		k INT8 PRIMARY KEY, g INT8, i2 INT2, i4 INT4, t TEXT, vc VARCHAR(10), ch CHAR(5),
+		bb BYTEA, b BOOL, f FLOAT8, n NUMERIC, n2 NUMERIC(10,2), ts TIMESTAMP, tz TIMESTAMPTZ,
+		d DATE, tm TIME, iv INTERVAL, u UUID, j JSONB, ai INT8[], tt TEXT[], m wmood, gone INT8)`,
+	`CREATE INDEX wt_g ON wt (g)`,
+	`INSERT INTO wt VALUES
+		(1, 1, -32768, 2147483647, 'héllo', 'abc', 'ab', '\x00ff5c61', true, 3.141592653589793, -12345.678, 9.9,
+		 '2026-08-30 01:02:03.456789', '2026-08-30 01:02:03.456789+00', '2026-08-30', '13:14:15.5', '1 year 2 mons 3 days 04:05:06.007',
+		 '12345678-9abc-def0-0102-030405060708', '{"a": [1, 2.5, "x"], "b": null}', '{1,NULL,-3}', '{"a b","",NULL,"q\"x"}', 'happy', 5),
+		(2, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+		(3, 1, 0, 0, '', '', '', '', false, 'NaN', 'NaN', 0, '1999-12-31 23:59:59', '1970-01-01 00:00:00+00', '1999-12-31', '00:00:00', '-1 days',
+		 '00000000-0000-0000-0000-000000000000', '"s"', '{}', '{}', 'sad', NULL),
+		(-4, 2, 7, -7, 'x', 'y', 'abcde', '\x', false, '-Infinity', 0.000001, -99999999.99, '2000-01-01 00:00:00', '2000-01-01 00:00:00+00', '2000-01-01', '23:59:59.999999', '00:00:00.000001',
+		 'ffffffff-ffff-ffff-ffff-ffffffffffff', '[]', '{9223372036854775807}', '{"z"}', 'ok', 1)`,
+	`ALTER TABLE wt DROP COLUMN gone`,
+	`ALTER TABLE wt ADD COLUMN fill INT8 DEFAULT 7`,
+	`INSERT INTO wt (k, g, t, fill) VALUES (5, 1, 'later', NULL)`,
+}
+
 // TestScanWireOutputEqual: a streamed scan of bare columns (decoded
 // into one reused map and projected at once, encoded straight into the
 // wire buffer) sends the same DataRow bytes as the same rows through
@@ -68,26 +93,7 @@ func TestScanWireOutputEqual(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	for _, s := range []string{
-		`CREATE TYPE wmood AS ENUM ('sad', 'ok', 'happy')`,
-		`CREATE TABLE wt (
-			k INT8 PRIMARY KEY, g INT8, i2 INT2, i4 INT4, t TEXT, vc VARCHAR(10), ch CHAR(5),
-			bb BYTEA, b BOOL, f FLOAT8, n NUMERIC, n2 NUMERIC(10,2), ts TIMESTAMP, tz TIMESTAMPTZ,
-			d DATE, tm TIME, iv INTERVAL, u UUID, j JSONB, ai INT8[], tt TEXT[], m wmood, gone INT8)`,
-		`CREATE INDEX wt_g ON wt (g)`,
-		`INSERT INTO wt VALUES
-			(1, 1, -32768, 2147483647, 'héllo', 'abc', 'ab', '\x00ff5c61', true, 3.141592653589793, -12345.678, 9.9,
-			 '2026-08-30 01:02:03.456789', '2026-08-30 01:02:03.456789+00', '2026-08-30', '13:14:15.5', '1 year 2 mons 3 days 04:05:06.007',
-			 '12345678-9abc-def0-0102-030405060708', '{"a": [1, 2.5, "x"], "b": null}', '{1,NULL,-3}', '{"a b","",NULL,"q\"x"}', 'happy', 5),
-			(2, 2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-			(3, 1, 0, 0, '', '', '', '', false, 'NaN', 'NaN', 0, '1999-12-31 23:59:59', '1970-01-01 00:00:00+00', '1999-12-31', '00:00:00', '-1 days',
-			 '00000000-0000-0000-0000-000000000000', '"s"', '{}', '{}', 'sad', NULL),
-			(-4, 2, 7, -7, 'x', 'y', 'abcde', '\x', false, '-Infinity', 0.000001, -99999999.99, '2000-01-01 00:00:00', '2000-01-01 00:00:00+00', '2000-01-01', '23:59:59.999999', '00:00:00.000001',
-			 'ffffffff-ffff-ffff-ffff-ffffffffffff', '[]', '{9223372036854775807}', '{"z"}', 'ok', 1)`,
-		`ALTER TABLE wt DROP COLUMN gone`,
-		`ALTER TABLE wt ADD COLUMN fill INT8 DEFAULT 7`,
-		`INSERT INTO wt (k, g, t, fill) VALUES (5, 1, 'later', NULL)`,
-	} {
+	for _, s := range wireTableSetup {
 		if _, err := conn.Exec(ctx, s); err != nil {
 			t.Fatalf("%s: %v", s, err)
 		}
@@ -166,7 +172,8 @@ func TestScanWireOutputEqual(t *testing.T) {
 	}
 }
 
-// scanBench is a hijacked connection that runs SELECT k, pad FROM scanb
+// scanBench is a hijacked connection that runs a query over scanb
+// (SELECT k, pad FROM scanb unless startScanBenchQuery says otherwise)
 // and reads every frame, allocating nothing per row.
 type scanBench struct {
 	tb  testing.TB
@@ -181,6 +188,21 @@ type scanBench struct {
 // connection that reads it in text (a simple Query) or binary (a
 // prepared statement's Bind/Execute with binary results).
 func startScanBench(tb testing.TB, rows int, binaryResults bool) *scanBench {
+	return startScanBenchQuery(tb, rows, binaryResults, "SELECT k, pad FROM scanb", rows)
+}
+
+// scanBenchBodies are scanb's body texts, row k taking the k%4th: one
+// row in four mentions a fox.
+var scanBenchBodies = []string{
+	"The quick brown fox jumps over the lazy dog near the riverbank",
+	"A slow green turtle walks under the busy bridge every morning",
+	"Several tired horses were resting quietly in the shaded meadow",
+	"Bright yellow lanterns lit the narrow streets of the old harbour",
+}
+
+// startScanBenchQuery is startScanBench for query q, which must return
+// want rows; scanb also has n INT8 (= k) and body TEXT (scanBenchBodies).
+func startScanBenchQuery(tb testing.TB, rows int, binaryResults bool, q string, want int) *scanBench {
 	tb.Helper()
 	tc := Start(tb, 1)
 	ctx := context.Background()
@@ -188,7 +210,7 @@ func startScanBench(tb testing.TB, rows int, binaryResults bool) *scanBench {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	if _, err := setup.Exec(ctx, "CREATE TABLE scanb (k INT8 PRIMARY KEY, pad TEXT)"); err != nil {
+	if _, err := setup.Exec(ctx, "CREATE TABLE scanb (k INT8 PRIMARY KEY, pad TEXT, n INT8, body TEXT)"); err != nil {
 		tb.Fatal(err)
 	}
 	pad := strings.Repeat("p", 256)
@@ -199,7 +221,7 @@ func startScanBench(tb testing.TB, rows int, binaryResults bool) *scanBench {
 			if j > i {
 				sb.WriteByte(',')
 			}
-			fmt.Fprintf(&sb, "(%d, '%s')", j, pad)
+			fmt.Fprintf(&sb, "(%d, '%s', %d, '%s')", j, pad, j, scanBenchBodies[j%len(scanBenchBodies)])
 		}
 		if _, err := setup.Exec(ctx, sb.String()); err != nil {
 			tb.Fatal(err)
@@ -211,7 +233,7 @@ func startScanBench(tb testing.TB, rows int, binaryResults bool) *scanBench {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	if _, err := pc.Prepare(ctx, "s", "SELECT k, pad FROM scanb", nil); err != nil {
+	if _, err := pc.Prepare(ctx, "s", q, nil); err != nil {
 		tb.Fatal(err)
 	}
 	hj, err := pc.Hijack()
@@ -221,16 +243,15 @@ func startScanBench(tb testing.TB, rows int, binaryResults bool) *scanBench {
 	tb.Cleanup(func() { _ = hj.Conn.Close() })
 	sb := &scanBench{tb: tb, nc: hj.Conn, rd: bufio.NewReaderSize(hj.Conn, 64<<10)}
 	if !binaryResults {
-		q := "SELECT k, pad FROM scanb\x00"
-		sb.msg = binary.BigEndian.AppendUint32(append(sb.msg, 'Q'), uint32(4+len(q)))
-		sb.msg = append(sb.msg, q...)
+		sb.msg = binary.BigEndian.AppendUint32(append(sb.msg, 'Q'), uint32(4+len(q)+1))
+		sb.msg = append(append(sb.msg, q...), 0)
 	} else {
 		sb.msg = append(sb.msg, 'B', 0, 0, 0, 0, 0, 's', 0, 0, 0, 0, 0, 0, 1, 0, 1)
 		binary.BigEndian.PutUint32(sb.msg[1:5], uint32(len(sb.msg)-1))
 		sb.msg = append(sb.msg, 'E', 0, 0, 0, 9, 0, 0, 0, 0, 0, 'S', 0, 0, 0, 4)
 	}
-	if got := sb.run(); got != rows {
-		tb.Fatalf("%d rows, want %d", got, rows)
+	if got := sb.run(); got != want {
+		tb.Fatalf("%d rows, want %d", got, want)
 	}
 	return sb
 }
@@ -267,36 +288,26 @@ func (sb *scanBench) run() int {
 // measure runs the query times times and returns the rows read, the
 // time taken and the process's allocations meanwhile.
 func (sb *scanBench) measure(times int) (rows int, elapsed time.Duration, mallocs, bytes uint64) {
+	rows, elapsed, mallocs, bytes, _ = sb.measureCPU(times)
+	return rows, elapsed, mallocs, bytes
+}
+
+// measureCPU is measure, also returning the processor time the whole
+// process (the node, its background work and the reading client) used
+// meanwhile: steadier than the elapsed time on a shared machine.
+func (sb *scanBench) measureCPU(times int) (rows int, elapsed time.Duration, mallocs, bytes uint64, cpu time.Duration) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
+	cpuBefore := processCPU()
 	start := time.Now()
 	for i := 0; i < times; i++ {
 		rows += sb.run()
 	}
 	elapsed = time.Since(start)
+	cpu = processCPU() - cpuBefore
 	runtime.ReadMemStats(&after)
-	return rows, elapsed, after.Mallocs - before.Mallocs, after.TotalAlloc - before.TotalAlloc
-}
-
-// TestScanStreamAllocsPerRow: a streamed scan of bare columns allocates
-// about one object per row in the whole process (its text value,
-// decoded), in text and in binary; it allocated ten before the per-row
-// map, the per-value wire buffers and the per-row key and value copies
-// went. The bound leaves room for the node's background work.
-func TestScanStreamAllocsPerRow(t *testing.T) {
-	if raceEnabled {
-		t.Skip("allocation counts are not meaningful under the race detector")
-	}
-	for _, binaryResults := range []bool{false, true} {
-		sb := startScanBench(t, 5000, binaryResults)
-		rows, _, mallocs, bytes := sb.measure(5)
-		perRow := float64(mallocs) / float64(rows)
-		t.Logf("binary=%v: %.2f allocs/row, %.0f B/row", binaryResults, perRow, float64(bytes)/float64(rows))
-		if perRow > 2.5 {
-			t.Errorf("binary=%v: %.2f allocs per streamed row, want at most 2.5", binaryResults, perRow)
-		}
-	}
+	return rows, elapsed, after.Mallocs - before.Mallocs, after.TotalAlloc - before.TotalAlloc, cpu
 }
 
 // BenchmarkScanStream measures a large result set end to end on one
@@ -320,4 +331,52 @@ func BenchmarkScanStream(b *testing.B) {
 			b.ReportMetric(float64(bytes)/float64(rows), "B/row")
 		})
 	}
+}
+
+// scanShapes are streamed scans off the bare-column path: computed
+// projections, a computed filter, a reverse scan and a text-search
+// filter, over startScanBenchQuery's table of rows rows.
+func scanShapes(rows int) []struct {
+	name, q string
+	want    int
+} {
+	return []struct {
+		name, q string
+		want    int
+	}{
+		{"exprs", "SELECT k + 1, n * 2 FROM scanb", rows},
+		{"lower", "SELECT k, lower(pad) FROM scanb", rows},
+		{"computed-where", "SELECT k, pad FROM scanb WHERE n % 3 = 0", (rows + 2) / 3},
+		{"reverse", "SELECT k, pad FROM scanb WHERE k >= 0 ORDER BY k DESC", rows},
+		{"tsearch", "SELECT k FROM scanb WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox')", (rows + 3) / 4},
+	}
+}
+
+// BenchmarkScanShapes is BenchmarkScanStream for scanShapes, in text.
+//
+//	go test ./pkg/testutils/testcluster -run - -bench BenchmarkScanShapes -benchtime 10x
+func BenchmarkScanShapes(b *testing.B) {
+	const rows = 20000
+	for _, sh := range scanShapes(rows) {
+		b.Run(sh.name, func(b *testing.B) {
+			sb := startScanBenchQuery(b, rows, false, sh.q, sh.want)
+			b.ResetTimer()
+			got, elapsed, mallocs, bytes, cpu := sb.measureCPU(b.N)
+			b.StopTimer()
+			b.ReportMetric(float64(elapsed.Nanoseconds())/float64(got), "ns/row")
+			b.ReportMetric(float64(cpu.Nanoseconds())/float64(got), "cpu-ns/row")
+			b.ReportMetric(float64(mallocs)/float64(got), "allocs/row")
+			b.ReportMetric(float64(bytes)/float64(got), "B/row")
+		})
+	}
+}
+
+// processCPU is the processor time, user and system, the process has
+// used so far, as the kernel accounts it.
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }

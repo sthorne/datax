@@ -2490,6 +2490,26 @@ func decodeOpenedRowInto(desc *catalog.TableDescriptor, key keys.Key, value []by
 	return nil
 }
 
+// decodeOpenedColsInto decodes into row the columns need reports of a
+// value already opened, stamped for display as decodeOpenedRowInto
+// stamps them: the rest of a row a scan decoded the filter's columns
+// of first (decodeOpenedRowInto, under another need) and kept. need
+// must not report a primary-key column, which comes from the key.
+func decodeOpenedColsInto(desc *catalog.TableDescriptor, value []byte, need func(catalog.ColumnID) bool, row rowenc.RowSink) error {
+	if err := rowenc.DecodeValueInto(desc, value, need, row); err != nil {
+		return err
+	}
+	for i := range desc.Columns {
+		col := &desc.Columns[i]
+		if (col.Precision > 0 || col.Char || col.NoTZ || col.Type.IsArray()) && need(col.ID) {
+			if d, ok := row.GetCol(col.ID); ok && !d.Null {
+				row.SetCol(col.ID, stampDisplay(col, d))
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
 	// Only the statement's own select may stream; every select run
 	// underneath (WITH members, derived tables, set members, subqueries)
