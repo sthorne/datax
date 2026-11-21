@@ -1017,7 +1017,7 @@ func rewriteRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, d *
 	if err := putRowValue(ctx, b, d, wb, newKey, updated); err != nil {
 		return nil, err
 	}
-	return newKey, addIndexEntries(ctx, txn, d, updated, wb, map[string]bool{}, nil)
+	return newKey, addIndexEntries(ctx, txn, d, updated, wb, map[string]bool{}, nil, nil)
 }
 
 // ---- DDL ------------------------------------------------------------

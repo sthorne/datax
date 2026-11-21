@@ -198,6 +198,12 @@ func (r *Replica) evalOnePhase(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb.B
 	br := &kvpb.BatchResponse{Txn: ba.Header.Txn, Timestamp: ba.Header.Timestamp}
 	// Every intent conflict is reported together (see evalWriteBatch).
 	var conflicts intentCollector
+	var getter *storage.Getter // the conditional puts' reads, through one iterator
+	defer func() {
+		if getter != nil {
+			getter.Close()
+		}
+	}()
 	for i := range ba.Requests {
 		var ru kvpb.ResponseUnion
 		switch req := ba.Requests[i].GetInner().(type) {
@@ -209,6 +215,20 @@ func (r *Replica) evalOnePhase(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb.B
 				return nil, kvpb.NewError(err)
 			}
 			ru.Put = &kvpb.PutResponse{}
+		case *kvpb.CPutRequest:
+			if getter == nil {
+				getter = storage.NewGetter(b)
+			}
+			if err := storage.MVCCConditionalPutCommitted(b, getter, req.Key, ts, req.Value); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
+				if cerr := conflicts.err(); cerr != nil {
+					return nil, kvpb.NewError(cerr) // see evalWriteBatch
+				}
+				return nil, kvpb.NewError(err)
+			}
+			ru.CPut = &kvpb.CPutResponse{}
 		case *kvpb.DeleteRequest:
 			if err := storage.MVCCDeleteCommitted(b, req.Key, ts); err != nil {
 				if conflicts.collect(err) {

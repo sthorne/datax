@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,6 +185,13 @@ func (db *DB) Purge(ctx context.Context, start, end keys.Key) (*kvpb.PurgeReport
 // forward scan when it sees one (pkg/version rule 4).
 func (db *DB) ReverseScansOK() bool {
 	return db.ClusterVersion() >= version.V3
+}
+
+// CPutsOK reports whether conditional puts (kvpb.CPutRequest) may be
+// SENT: they were introduced under cluster version v24, and an older node
+// refuses a batch that carries one (pkg/version rule 4).
+func (db *DB) CPutsOK() bool {
+	return db.ClusterVersion() >= version.V24
 }
 
 // ClusterVersion reports the finalized cluster version the gate observes
@@ -417,6 +426,9 @@ func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 			continue // descriptors refreshed; re-group from request i
 		}
 		if kerr != nil {
+			if kerr.ConditionFailed != nil && i == 0 {
+				kerr.ConditionFailed.NoneApplied = true // the first part sent failed
+			}
 			return nil, kerr
 		}
 		if out.Responses == nil && j == len(ba.Requests) {
@@ -624,6 +636,12 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 				continue
 			}
 			if kerr != nil {
+				if kerr.ConditionFailed != nil {
+					kerr = db.earlierConditionFailure(ctx, header, groups, ai, kerr)
+					if kerr.ConditionFailed != nil {
+						kerr.ConditionFailed.NoneApplied = true // the other parts were not sent
+					}
+				}
 				return nil, kerr
 			}
 			groups = append(groups[:ai:ai], groups[ai+1:]...)
@@ -636,6 +654,11 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 			retry    []rangeGroup
 			firstErr *kvpb.Error
 			lastRe   *kvpb.Error
+			// The failed conditional put earliest in the batch, kept
+			// apart: it is reported only when no group failed otherwise
+			// (see conditionFailedAt).
+			condErr *kvpb.Error
+			condAt  int
 		)
 		sem := make(chan struct{}, maxParallelSubBatches)
 		for _, g := range groups {
@@ -652,6 +675,10 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 					retry = append(retry, g)
 					lastRe = kerr
 					trace.note(g.desc, kerr)
+				case kerr != nil && kerr.ConditionFailed != nil:
+					if at := conditionFailedAt(g, kerr); condErr == nil || at < condAt {
+						condErr, condAt = kerr, at
+					}
 				case kerr != nil && firstErr == nil:
 					firstErr = kerr
 				}
@@ -660,6 +687,9 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 		wg.Wait()
 		if firstErr != nil {
 			return nil, firstErr
+		}
+		if condErr != nil {
+			return nil, condErr
 		}
 		if len(retry) == 0 {
 			break
@@ -673,6 +703,71 @@ func (db *DB) sendParallel(ctx context.Context, ba *kvpb.BatchRequest, groups []
 		}
 	}
 	return out, nil
+}
+
+// conditionFailedAt is the position, in the whole batch, of the
+// conditional put of g whose failure kerr reports. A batch's failed
+// conditional puts report the one earliest in the batch, as reads of
+// every key in order would have found it: each range reports its own
+// earliest, and among those the earliest wins — but only when no range
+// failed otherwise. A range that failed with a conflict (an intent to
+// push, a timestamp to refresh) has not checked its keys, one of which
+// may fail earlier; its error goes back to be settled and the batch is
+// sent again.
+func conditionFailedAt(g rangeGroup, kerr *kvpb.Error) int {
+	for k := range g.reqs {
+		if c := g.reqs[k].CPut; c != nil && c.Key.Equal(kerr.ConditionFailed.Key) {
+			return g.indices[k]
+		}
+	}
+	return math.MaxInt
+}
+
+// earlierConditionFailure is the failure a batch reports when the part
+// sent first, alone, because it creates the transaction record — groups[ai]
+// — failed a conditional put (kerr): the other parts were never sent, and
+// a conditional put of theirs earlier in the batch may fail too, which is
+// the one to report (see conditionFailedAt). Their keys are read instead,
+// at the transaction's timestamp (nothing of the batch applied), and the
+// first holding a value becomes the failure. Only a failing batch pays for
+// the reads.
+func (db *DB) earlierConditionFailure(ctx context.Context, header kvpb.BatchHeader, groups []rangeGroup, ai int, kerr *kvpb.Error) *kvpb.Error {
+	at := conditionFailedAt(groups[ai], kerr)
+	type probe struct {
+		at  int
+		key keys.Key
+	}
+	var probes []probe
+	for gi, g := range groups {
+		if gi == ai {
+			continue
+		}
+		for k := range g.reqs {
+			if c := g.reqs[k].CPut; c != nil && g.indices[k] < at {
+				probes = append(probes, probe{g.indices[k], c.Key})
+			}
+		}
+	}
+	if len(probes) == 0 {
+		return kerr
+	}
+	sort.Slice(probes, func(i, j int) bool { return probes[i].at < probes[j].at })
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: header.Txn}}
+	for _, p := range probes {
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: p.key}})
+	}
+	br, gerr := db.send(ctx, ba)
+	if gerr != nil {
+		return gerr // a conflict: settled by the sender, which sends the batch again
+	}
+	for i, p := range probes {
+		if br.Responses[i].Get != nil && br.Responses[i].Get.Value != nil {
+			e := kvpb.NewErrorf("conditional put: key %s already has a value", p.key)
+			e.ConditionFailed = &kvpb.ConditionFailedError{Key: p.key}
+			return e
+		}
+	}
+	return kerr
 }
 
 // descForKey resolves the descriptor covering an addressed key, consulting
@@ -1185,6 +1280,9 @@ func writeBatchBytes(ba *kvpb.BatchRequest) int64 {
 	var n int64
 	for i := range ba.Requests {
 		if p := ba.Requests[i].Put; p != nil {
+			n += int64(len(p.Key) + len(p.Value))
+		}
+		if p := ba.Requests[i].CPut; p != nil {
 			n += int64(len(p.Key) + len(p.Value))
 		}
 	}

@@ -221,7 +221,7 @@ func abortSpanChecked(ba *kvpb.BatchRequest) bool {
 	}
 	for _, u := range ba.Requests {
 		switch {
-		case u.Get != nil, u.Scan != nil, u.Put != nil, u.Delete != nil, u.Increment != nil, u.Refresh != nil:
+		case u.Get != nil, u.Scan != nil, u.Put != nil, u.CPut != nil, u.Delete != nil, u.Increment != nil, u.Refresh != nil:
 			return true
 		}
 	}

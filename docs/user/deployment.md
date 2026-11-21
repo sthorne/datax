@@ -129,7 +129,7 @@ cache sized from the machine's memory (25 % capped at 8 GiB for
 `balanced`, 10 % capped at 2 GiB for `ingest`; `--cache-size 2GiB`
 overrides it — watch `datax_storage_block_cache_hits_total` against
 `_misses_total` to size it), bloom filters on every level (a point read
-for a key that is not there — the uniqueness probe on every `INSERT`,
+for a key that is not there — the uniqueness check on every `INSERT`,
 the intent lookup before every write — skips the levels that cannot hold
 it), the newest sstable format the bundled Pebble supports, and an
 open-file budget of half the process's descriptor limit (1000 to
@@ -342,7 +342,7 @@ format (`store_format`).
 
 Upgrading to v15 is "finalize, then restart", like v13: a store at v15
 opens with prefix bloom filters — Pebble's filters answer point reads
-by user key, so a read of a key that is not there (the uniqueness probe
+by user key, so a read of a key that is not there (the uniqueness check
 of every `INSERT`, the intent lookup before every write) skips the
 sstables that hold nothing of it — and the switch is a property of how
 the store is opened, so each node picks it up at its next restart after

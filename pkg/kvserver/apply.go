@@ -481,6 +481,22 @@ func (r *Replica) evalWriteBatch(b *storage.Batch, ba *kvpb.BatchRequest) (*kvpb
 				return nil, kvpb.NewError(err)
 			}
 			ru.Put = &kvpb.PutResponse{}
+		case *kvpb.CPutRequest:
+			// A failed condition is final for the batch, unless a request
+			// before it ran into an intent: that key may yet resolve to a
+			// value, and the earliest failing key is the one the client
+			// reports (as a read of every key would have found it), so the
+			// conflict goes back to be pushed and the batch re-sent.
+			if err := storage.MVCCConditionalPut(b, getter, req.Key, readTimestamp(ba), req.Value, txnMeta); err != nil {
+				if conflicts.collect(err) {
+					continue
+				}
+				if cerr := conflicts.err(); cerr != nil {
+					return nil, kvpb.NewError(cerr)
+				}
+				return nil, kvpb.NewError(err)
+			}
+			ru.CPut = &kvpb.CPutResponse{}
 		case *kvpb.DeleteRequest:
 			if err := storage.MVCCDelete(b, req.Key, ts, txnMeta); err != nil {
 				if conflicts.collect(err) {
@@ -850,6 +866,8 @@ func commandSizeDelta(ba *kvpb.BatchRequest) int64 {
 	for _, u := range ba.Requests {
 		switch req := u.GetInner().(type) {
 		case *kvpb.PutRequest:
+			delta += int64(len(req.Key)+len(req.Value)) + mvccVersionOverhead
+		case *kvpb.CPutRequest:
 			delta += int64(len(req.Key)+len(req.Value)) + mvccVersionOverhead
 		case *kvpb.DeleteRequest:
 			delta += int64(len(req.Key)) + mvccVersionOverhead // tombstones occupy space until GC

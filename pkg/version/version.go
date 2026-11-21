@@ -419,9 +419,20 @@ const (
 	// once it holds its latches, and a split still draws another ID
 	// when the one it drew is in use. Both are evaluation, not apply.
 	V23 Version = 23
+	// V24 introduces the conditional put (kvpb.CPutRequest): a write
+	// that succeeds only if its key has no live value, failing with a
+	// ConditionFailedError otherwise. An INSERT checks its primary key,
+	// and its unique index keys, with the write itself, in one batch,
+	// instead of reading every key first. A v23 node does not know the
+	// request and refuses a batch carrying it, so until finalize every
+	// INSERT reads its keys and then writes with plain puts, as before
+	// (rule 4). The decision is the sender's, by what it puts in the
+	// batch; a replica evaluates a conditional put it is sent whatever
+	// cluster version it has heard of.
+	V24 Version = 24
 
 	// Current is the newest cluster version this binary can run.
-	Current = V23
+	Current = V24
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

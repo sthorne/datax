@@ -39,6 +39,20 @@ type Error struct {
 	// BelowGCThreshold: the batch's timestamp is at or below the range's
 	// GC threshold (issue #313).
 	BelowGCThreshold *BelowGCThresholdError `json:"below_gc_threshold,omitempty"`
+	// ConditionFailed: a CPutRequest found a live value at its key.
+	ConditionFailed *ConditionFailedError `json:"condition_failed,omitempty"`
+}
+
+// ConditionFailedError: a conditional put (CPutRequest) found a live
+// value at Key, visible at the batch's read timestamp, and wrote
+// nothing. It is final, not a conflict to retry: the transaction's
+// snapshot holds the value.
+type ConditionFailedError struct {
+	Key keys.Key `json:"key"`
+	// NoneApplied is set by the gateway, and never crosses the wire, when
+	// it knows that no part of the batch applied: the part that failed
+	// was the only one sent.
+	NoneApplied bool `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Message }
@@ -175,6 +189,7 @@ func NewError(err error) *Error {
 		wie *storage.WriteIntentError
 		wto *storage.WriteTooOldError
 		ue  *storage.UncertaintyError
+		cfe *storage.ConditionFailedError
 	)
 	switch {
 	case errors.As(err, &wie):
@@ -183,6 +198,8 @@ func NewError(err error) *Error {
 		e.WriteTooOld = &WriteTooOldError{Timestamp: wto.Timestamp, ActualTimestamp: wto.ActualTimestamp}
 	case errors.As(err, &ue):
 		e.Uncertainty = &UncertaintyError{ReadTimestamp: ue.ReadTimestamp, ExistingTimestamp: ue.ExistingTimestamp}
+	case errors.As(err, &cfe):
+		e.ConditionFailed = &ConditionFailedError{Key: cfe.Key}
 	}
 	return e
 }

@@ -989,8 +989,11 @@ func sameEntryKey(old []rowenc.IndexEntry, k keys.Key) bool {
 // intent makes the conflict visible); seen catches duplicates within one
 // statement whose writes are still buffered. A nil seen says the caller
 // has checked the row's unique keys itself (an UPDATE that moves rows
-// checks the statement's keys together, checkUpdateKeys).
-func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb batchWriter, seen map[string]bool, ps *probeSet) error {
+// checks the statement's keys together, checkUpdateKeys). With a
+// cputPlan (an INSERT, writing to a kvclient.WriteBatch) a unique
+// index's entry is written with a conditional put that checks it,
+// instead of being read first.
+func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, wb batchWriter, seen map[string]bool, ps *probeSet, cp *cputPlan) error {
 	shadowRow, serr := reshardShadowRow(desc, row)
 	if serr != nil {
 		return newErrf(CodeInternal, "re-shard shadow row: %v", serr)
@@ -1007,20 +1010,26 @@ func addIndexEntries(ctx context.Context, txn *kvclient.Txn, desc *catalog.Table
 			}
 			continue
 		}
+		checked := false // the entry's write checks it (cputPlan)
 		if idx.Unique && seen != nil {
 			key := entries[0].Key
 			if seen[string(key)] {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
-			if existing, err := ps.get(ctx, txn, key); err != nil {
+			if cw, ok := wb.(*kvclient.WriteBatch); ok && cp != nil && len(entries) == 1 {
+				cw.CPut(key, entries[0].Value, cp.indexErr(i))
+				checked = true
+			} else if existing, err := ps.get(ctx, txn, key); err != nil {
 				return err
 			} else if existing != nil {
 				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", idx.Name)
 			}
 			seen[string(key)] = true
 		}
-		for _, e := range entries {
-			wb.Put(e.Key, e.Value)
+		if !checked {
+			for _, e := range entries {
+				wb.Put(e.Key, e.Value)
+			}
 		}
 		mirror, err := reshardMirrorEntries(desc, i, shadowRow)
 		if err != nil {

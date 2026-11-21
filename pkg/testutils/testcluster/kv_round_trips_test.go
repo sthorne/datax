@@ -149,6 +149,7 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 		}
 	}
 
+	multiRow := int64(200000)
 	one := func(f func(i int) []any) func(i int) [][]any {
 		return func(i int) [][]any { return [][]any{f(i)} }
 	}
@@ -171,9 +172,22 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			name:  "point INSERT, autocommit",
 			stmts: []string{`INSERT INTO rt VALUES ($1, 0, 'new')`},
 			args:  one(func(i int) []any { return []any{int64(100000 + i)} }),
-			// The primary key's existence check, then the row and its
-			// index entry committed in one batch.
-			batches: 2, requests: 4, onePhase: true,
+			// The row, written on the condition that its primary key is
+			// free, and its index entry, committed in one batch: the
+			// uniqueness check travels with the write.
+			batches: 1, requests: 3, onePhase: true,
+		},
+		{
+			name:  "three-row INSERT, autocommit",
+			stmts: []string{`INSERT INTO rt VALUES ($1, 0, 'm'), ($2, 0, 'm'), ($3, 0, 'm')`},
+			args: one(func(int) []any {
+				// Fresh keys on every execution, over both protocols.
+				multiRow += 3
+				return []any{multiRow, multiRow + 1, multiRow + 2}
+			}),
+			// Three conditional puts of rows and three index entries,
+			// committed in one batch: no reads of the keys first.
+			batches: 1, requests: 7, onePhase: true,
 		},
 		{
 			name:  "DELETE by primary key",
