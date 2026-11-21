@@ -846,6 +846,9 @@ const scanTargetBytes = 8 << 20
 
 func scanResponse(res storage.ScanResult) *kvpb.ScanResponse {
 	out := &kvpb.ScanResponse{Resume: res.Resume}
+	if len(res.KVs) > 0 {
+		out.Rows = make([]kvpb.KeyValue, 0, len(res.KVs))
+	}
 	for _, kv := range res.KVs {
 		out.Rows = append(out.Rows, kvpb.KeyValue{Key: kv.Key, Value: kv.Value})
 	}

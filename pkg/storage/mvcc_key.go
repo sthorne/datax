@@ -69,6 +69,20 @@ func DecodeMVCCKey(enc []byte) (keys.Key, hlc.Timestamp, error) {
 	if err != nil {
 		return nil, hlc.Timestamp{}, err
 	}
+	return finishMVCCKey(enc, rest, user)
+}
+
+// decodeMVCCKeyAppend is DecodeMVCCKey appending the user key to dst, so
+// a scan decodes every row's key into one reused buffer.
+func decodeMVCCKeyAppend(dst, enc []byte) (keys.Key, hlc.Timestamp, error) {
+	rest, user, err := encoding.DecodeBytesAppend(dst, enc)
+	if err != nil {
+		return nil, hlc.Timestamp{}, err
+	}
+	return finishMVCCKey(enc, rest, user)
+}
+
+func finishMVCCKey(enc, rest, user []byte) (keys.Key, hlc.Timestamp, error) {
 	switch len(rest) {
 	case 0:
 		return user, hlc.Timestamp{}, nil

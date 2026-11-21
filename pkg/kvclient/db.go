@@ -902,6 +902,16 @@ func routingBackoff(ctx context.Context, regroups int) *kvpb.Error {
 	}
 }
 
+// appendScanRows stitches one range's rows onto those already read: the
+// first range's are taken as they are, not copied (the common scan, of
+// one range, then copies nothing).
+func appendScanRows(out, rows []kvpb.KeyValue) []kvpb.KeyValue {
+	if len(out) == 0 && len(rows) > 0 {
+		return rows
+	}
+	return append(out, rows...)
+}
+
 // sendScan executes a scan, stitching across range boundaries.
 func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.ScanRequest) (*kvpb.ScanResponse, *kvpb.Error) {
 	if req.Reverse {
@@ -946,7 +956,7 @@ func (db *DB) sendScan(ctx context.Context, header kvpb.BatchHeader, req *kvpb.S
 			return nil, kerr
 		}
 		sr := br.Responses[0].Scan
-		out.Rows = append(out.Rows, sr.Rows...)
+		out.Rows = appendScanRows(out.Rows, sr.Rows)
 		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
@@ -1021,7 +1031,7 @@ func (db *DB) sendReverseScan(ctx context.Context, header kvpb.BatchHeader, req 
 			return nil, kerr
 		}
 		sr := br.Responses[0].Scan
-		out.Rows = append(out.Rows, sr.Rows...)
+		out.Rows = appendScanRows(out.Rows, sr.Rows)
 		out.Skipped = append(out.Skipped, sr.Skipped...)
 		if req.MaxRows > 0 {
 			remaining -= int64(len(sr.Rows))
