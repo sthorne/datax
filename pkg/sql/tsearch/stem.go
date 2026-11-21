@@ -1,6 +1,6 @@
 package tsearch
 
-import "strings"
+import "bytes"
 
 // The Snowball English stemmer ("Porter2"), written from the published
 // definition of the algorithm: prelude, regions R1 and R2, the two
@@ -27,6 +27,13 @@ var stemStopAfter1a = map[string]bool{
 	"proceed": true, "exceed": true, "succeed": true,
 }
 
+// The lengths of the words in the two lists, which spare most words
+// the map lookups.
+const (
+	maxExceptionLen   = 6
+	minStopAfter1aLen = 6
+)
+
 type stemmer struct {
 	b      []byte
 	p1, p2 int
@@ -41,7 +48,17 @@ func isVowel(c byte) bool {
 }
 
 func (s *stemmer) ends(suffix string) bool {
-	return len(s.b) >= len(suffix) && string(s.b[len(s.b)-len(suffix):]) == suffix
+	n, m := len(s.b), len(suffix)
+	if n < m {
+		return false
+	}
+	// From the last byte back: most suffixes fail on it.
+	for k := 1; k <= m; k++ {
+		if s.b[n-k] != suffix[m-k] {
+			return false
+		}
+	}
+	return true
 }
 
 // inR1 and inR2 report whether a suffix of n bytes lies inside the
@@ -49,9 +66,20 @@ func (s *stemmer) ends(suffix string) bool {
 func (s *stemmer) inR1(n int) bool { return len(s.b)-n >= s.p1 }
 func (s *stemmer) inR2(n int) bool { return len(s.b)-n >= s.p2 }
 
-// replace swaps the last n bytes for repl.
+// replace swaps the last n bytes for repl, which is never longer: the
+// word shrinks in place. (Reslicing rather than appending also keeps
+// the bytes on their caller's stack.)
 func (s *stemmer) replace(n int, repl string) {
-	s.b = append(s.b[:len(s.b)-n], repl...)
+	k := len(s.b) - n
+	s.b = s.b[:k+len(repl)]
+	copy(s.b[k:], repl)
+}
+
+// addE appends an e where step 1b has just removed a longer suffix.
+func (s *stemmer) addE() {
+	n := len(s.b)
+	s.b = s.b[:n+1]
+	s.b[n] = 'e'
 }
 
 // hasVowel reports whether b[:end] contains a vowel.
@@ -90,9 +118,9 @@ func (s *stemmer) markRegions() {
 	s.p1, s.p2 = n, n
 	i := 0
 	switch {
-	case strings.HasPrefix(string(b), "gener"), strings.HasPrefix(string(b), "arsen"):
+	case bytes.HasPrefix(b, []byte("gener")), bytes.HasPrefix(b, []byte("arsen")):
 		i = 5
-	case strings.HasPrefix(string(b), "commun"):
+	case bytes.HasPrefix(b, []byte("commun")):
 		i = 6
 	default:
 		for i < n && !isVowel(b[i]) {
@@ -123,9 +151,12 @@ func (s *stemmer) markRegions() {
 // none). The steps choose their suffix first and test its region
 // second: a longer suffix outside the region does not give way to a
 // shorter one inside it.
-func (s *stemmer) longest(suffixes ...string) string {
+func (s *stemmer) longest(set *suffixSet) string {
+	if len(s.b) == 0 {
+		return ""
+	}
 	best := ""
-	for _, suf := range suffixes {
+	for _, suf := range set.byLast[s.b[len(s.b)-1]] {
 		if len(suf) > len(best) && s.ends(suf) {
 			best = suf
 		}
@@ -133,14 +164,39 @@ func (s *stemmer) longest(suffixes ...string) string {
 	return best
 }
 
+// suffixSet is a step's suffixes, grouped by their last byte: a word
+// is compared only with the suffixes that end as it does.
+type suffixSet struct {
+	byLast [256][]string
+}
+
+func newSuffixSet(suffixes ...string) *suffixSet {
+	set := &suffixSet{}
+	for _, suf := range suffixes {
+		c := suf[len(suf)-1]
+		set.byLast[c] = append(set.byLast[c], suf)
+	}
+	return set
+}
+
+var (
+	step0Set  = newSuffixSet("'s'", "'s", "'")
+	step1aSet = newSuffixSet("sses", "ied", "ies", "us", "ss", "s")
+	step1bSet = newSuffixSet("eedly", "ingly", "edly", "eed", "ing", "ed")
+	step2Set  = newSuffixSet(step2Suffixes...)
+	step3Set  = newSuffixSet("ational", "tional", "alize", "icate", "iciti", "ical", "ful", "ness", "ative")
+	step4Set  = newSuffixSet("al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent",
+		"ism", "ate", "iti", "ous", "ive", "ize", "ion")
+)
+
 func (s *stemmer) step0() {
-	if suf := s.longest("'s'", "'s", "'"); suf != "" {
+	if suf := s.longest(step0Set); suf != "" {
 		s.replace(len(suf), "")
 	}
 }
 
 func (s *stemmer) step1a() {
-	switch suf := s.longest("sses", "ied", "ies", "us", "ss", "s"); suf {
+	switch suf := s.longest(step1aSet); suf {
 	case "sses":
 		s.replace(2, "")
 	case "ied", "ies":
@@ -170,7 +226,7 @@ func isDouble(a, b byte) bool {
 }
 
 func (s *stemmer) step1b() {
-	suf := s.longest("eedly", "ingly", "edly", "eed", "ing", "ed")
+	suf := s.longest(step1bSet)
 	switch suf {
 	case "":
 		return
@@ -187,11 +243,11 @@ func (s *stemmer) step1b() {
 	n := len(s.b)
 	switch {
 	case s.ends("at"), s.ends("bl"), s.ends("iz"):
-		s.b = append(s.b, 'e')
+		s.addE()
 	case n >= 2 && isDouble(s.b[n-2], s.b[n-1]):
 		s.b = s.b[:n-1]
 	case s.isShort():
-		s.b = append(s.b, 'e')
+		s.addE()
 	}
 }
 
@@ -224,7 +280,7 @@ func isValidLi(c byte) bool {
 }
 
 func (s *stemmer) step2() {
-	suf := s.longest(step2Suffixes...)
+	suf := s.longest(step2Set)
 	if suf == "" || !s.inR1(len(suf)) {
 		return
 	}
@@ -244,7 +300,7 @@ func (s *stemmer) step2() {
 }
 
 func (s *stemmer) step3() {
-	suf := s.longest("ational", "tional", "alize", "icate", "iciti", "ical", "ful", "ness", "ative")
+	suf := s.longest(step3Set)
 	if suf == "" || !s.inR1(len(suf)) {
 		return
 	}
@@ -267,8 +323,7 @@ func (s *stemmer) step3() {
 }
 
 func (s *stemmer) step4() {
-	suf := s.longest("al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent",
-		"ism", "ate", "iti", "ous", "ive", "ize", "ion")
+	suf := s.longest(step4Set)
 	if suf == "" || !s.inR2(len(suf)) {
 		return
 	}
@@ -300,25 +355,55 @@ func (s *stemmer) step5() {
 
 // Stem returns the Snowball English stem of a lower-case word.
 func Stem(word string) string {
-	if len(word) <= 2 {
+	if !stemmable(word) {
 		return word
-	}
-	for i := 0; i < len(word); i++ {
-		if c := word[i]; (c < 'a' || c > 'z') && c != '\'' {
-			return word
-		}
 	}
 	if stem, ok := stemExceptions[word]; ok {
 		return stem
 	}
-	s := &stemmer{b: []byte(word)}
+	return string(stemBytes([]byte(word)))
+}
+
+// stemmable: the word is long enough to have a suffix and made only of
+// ASCII lower-case letters and apostrophes.
+func stemmable[S string | []byte](word S) bool {
+	if len(word) <= 2 {
+		return false
+	}
+	for i := 0; i < len(word); i++ {
+		if c := word[i]; (c < 'a' || c > 'z') && c != '\'' {
+			return false
+		}
+	}
+	return true
+}
+
+// stemInPlace is Stem over bytes: it overwrites word and returns its
+// stem, a prefix of word (or of word[1:]) — a stem is never longer than
+// its word.
+func stemInPlace(word []byte) []byte {
+	if !stemmable(word) {
+		return word
+	}
+	if len(word) <= maxExceptionLen {
+		if stem, ok := stemExceptions[string(word)]; ok {
+			return append(word[:0], stem...)
+		}
+	}
+	return stemBytes(word)
+}
+
+// stemBytes runs the algorithm on a stemmable word that is not an
+// exception, in place.
+func stemBytes(word []byte) []byte {
+	s := stemmer{b: word}
 	// Prelude: a leading apostrophe goes; y is a consonant (written Y)
 	// at the start of the word and after a vowel.
 	if s.b[0] == '\'' {
 		s.b = s.b[1:]
 	}
 	if len(s.b) <= 2 {
-		return string(s.b)
+		return s.b
 	}
 	if s.b[0] == 'y' {
 		s.b[0] = 'Y'
@@ -331,7 +416,7 @@ func Stem(word string) string {
 	s.markRegions()
 	s.step0()
 	s.step1a()
-	if !stemStopAfter1a[string(s.b)] {
+	if len(s.b) < minStopAfter1aLen || !stemStopAfter1a[string(s.b)] {
 		s.step1b()
 		s.step1c()
 		s.step2()
@@ -344,5 +429,5 @@ func Stem(word string) string {
 			s.b[i] = 'y'
 		}
 	}
-	return string(s.b)
+	return s.b
 }

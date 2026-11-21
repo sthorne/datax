@@ -2099,7 +2099,14 @@ func sizePretty(n int64) string {
 
 // matchesWhere evaluates the conjunction against a full row.
 func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
-	for _, cmp := range where {
+	return matchesWhereMemo(where, desc, row, params, nil)
+}
+
+// matchesWhereMemo is matchesWhere for a caller that applies the same
+// conjunction to many rows of one statement: memo (nil for none) keeps
+// what the conjuncts compute once, such as a compiled jsonb @> operand.
+func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum, memo *whereMemo) (bool, error) {
+	for i, cmp := range where {
 		// Constant conjuncts (evaluated EXISTS subqueries) bind no column.
 		if cmp.Op == "TRUE" {
 			continue
@@ -2127,7 +2134,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 						return false, newErrf(CodeInternal, "an IN or EXISTS subquery inside OR was not resolved before execution")
 					}
 				}
-				ok, err := matchesWhere(disjunct, desc, row, params)
+				ok, err := matchesWhereMemo(disjunct, desc, row, params, memo)
 				if err != nil {
 					return false, err
 				}
@@ -2191,6 +2198,28 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			continue
 		}
 		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			if memo != nil && cmpType == types.Jsonb && !lhs.Fam.IsArray() && rowIndependent(cmp.Value) {
+				// A constant right operand: evaluated, coerced and
+				// compiled once for the statement.
+				if lhs.Null {
+					return false, nil // NULL operands: UNKNOWN either way
+				}
+				pat, null, err := memo.jsonbPattern(&where[i], desc, row, params)
+				if err != nil {
+					return false, err
+				}
+				if null {
+					return false, nil
+				}
+				ok, cerr := jsonbContainsPattern(lhs, pat)
+				if cerr != nil {
+					return false, cerr
+				}
+				if ok != (cmp.Op == "@>") {
+					return false, nil
+				}
+				continue
+			}
 			rhs, err := evalExpr(cmp.Value, desc, row, params)
 			if err != nil {
 				return false, err
@@ -2310,6 +2339,52 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 	return types.DNull, nil
 }
 
+// tsVectorMatchCall reports whether a conjunct is `to_tsvector(config,
+// text) @@ query` (or NOT @@): a vector made only to be matched, which
+// tsMatchFused matches without making.
+func tsVectorMatchCall(cmp *parser.Comparison) bool {
+	if cmp.Op != "@@" && cmp.Op != "NOT @@" || cmp.Expr == nil {
+		return false
+	}
+	e := cmp.Expr
+	return e.Func == "to_tsvector" && len(e.Args) == 2 && e.BinOp == "" && e.Left == nil && e.Cast == "" &&
+		len(e.Path) == 0 && e.Case == nil && e.Cmp == nil && e.Sub == nil && e.Agg == nil && e.Window == nil
+}
+
+// tsMatchFused evaluates a tsVectorMatchCall conjunct as the generic
+// road would — to_tsvector's arguments, its own refusals, the right
+// side, then the match — but reads the text straight into the query
+// (builtins.TSDoc) instead of building, rendering and re-parsing its
+// vector for every row. null is a NULL operand on either side; evalErr
+// is an error evaluating an operand, matchErr one from @@ itself, which
+// callers treat as they treat applyCmpOpEsc's.
+func tsMatchFused(cmp *parser.Comparison, env exprEnv, params []types.Datum) (match, null bool, evalErr, matchErr error) {
+	var args [2]types.Datum
+	for i, a := range cmp.Expr.Args {
+		d, err := evalExprEnv(a, env, params)
+		if err != nil {
+			return false, false, err, nil
+		}
+		args[i] = d
+	}
+	doc, lnull, err := builtins.PrepareTSVectorMatch(args[:])
+	if err != nil {
+		return false, false, builtinErr(err), nil
+	}
+	rhs, err := evalExprEnv(cmp.Value, env, params)
+	if err != nil {
+		return false, false, err, nil
+	}
+	if lnull || rhs.Null {
+		return false, true, nil, nil
+	}
+	ok, err := doc.Match(rhs)
+	if err != nil {
+		return false, false, nil, builtinErr(err)
+	}
+	return ok == (cmp.Op == "@@"), false, nil, nil
+}
+
 // condsHold evaluates WHERE-shaped conjuncts against an expression
 // environment (CASE WHEN conditions): comparisons, IS NULL, IN lists, OR.
 func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool, error) {
@@ -2332,6 +2407,16 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 				}
 			}
 			if !any {
+				return false, nil
+			}
+			continue
+		}
+		if tsVectorMatchCall(&cmp) {
+			ok, null, evalErr, matchErr := tsMatchFused(&cmp, env, params)
+			if evalErr != nil {
+				return false, evalErr
+			}
+			if null || matchErr != nil || !ok {
 				return false, nil
 			}
 			continue
@@ -2426,6 +2511,16 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 			unknown = unknown || null
 		}
 		return false, unknown, nil
+	}
+	if tsVectorMatchCall(&cmp) {
+		ok, null, evalErr, matchErr := tsMatchFused(&cmp, env, params)
+		if evalErr != nil {
+			return false, false, evalErr
+		}
+		if matchErr != nil {
+			return false, false, matchErr
+		}
+		return ok, null, nil
 	}
 	var lhs types.Datum
 	var err error

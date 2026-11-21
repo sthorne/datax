@@ -171,15 +171,7 @@ func (st *RowStream) pull(ctx context.Context) ([]types.Datum, bool, error) {
 		st.rpos++
 		return r, true, nil
 	}
-	fr, ok, err := st.iter.next(ctx)
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	out, err := st.iter.project(fr)
-	if err != nil {
-		return nil, false, err
-	}
-	return out, true, nil
+	return st.iter.nextRow(ctx)
 }
 
 // finish ends a drained stream: the implicit transaction commits.
@@ -307,6 +299,15 @@ type scanIter struct {
 	where  []parser.Comparison
 	params []types.Datum
 	proj   []projCol
+	// memo keeps what the filter computes once per statement.
+	memo whereMemo
+	// need, when set, is the set of columns the filter and projection
+	// read: the only ones decoded.
+	need func(catalog.ColumnID) bool
+	// spare is the row map of the last row the filter rejected, cleared
+	// for the next row to decode into (a scan that is not plain; a plain
+	// one decodes every row into scratch or dense).
+	spare map[catalog.ColumnID]types.Datum
 
 	spans   []keySpan // spans still to scan (per shard bucket when fanned)
 	cur     keySpan   // the span in progress
@@ -319,6 +320,20 @@ type scanIter struct {
 
 	buf  []fetchedRow
 	bpos int
+	// plain marks a select list of bare columns (no expression): a
+	// plain scan projects each row as soon as it is decoded and matched,
+	// into out (bpos then indexes out), so it decodes every row into one
+	// reused row instead of a map per row, and allocates the projected
+	// rows a chunk at a time. A select list with an expression keeps
+	// the map per row and projects lazily (an expression is evaluated
+	// only for the rows the client pulls).
+	plain bool
+	// scratch (when there is a filter, which reads a map) or dense is
+	// the row a plain scan decodes each row into.
+	scratch map[catalog.ColumnID]types.Datum
+	dense   *denseRow
+	out     [][]types.Datum
+	slab    []types.Datum
 	// pageSize is the next page's row count (doubling to streamPageMax).
 	pageSize int64
 	// index marks an index scan: pages of entries whose primary rows are
@@ -326,7 +341,42 @@ type scanIter struct {
 	index bool
 }
 
-// next yields the next matching row.
+// nextRow yields the next matching row, projected through the select
+// list.
+func (it *scanIter) nextRow(ctx context.Context) ([]types.Datum, bool, error) {
+	if !it.plain {
+		fr, ok, err := it.next(ctx)
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		out, err := it.project(fr)
+		if err != nil {
+			return nil, false, err
+		}
+		return out, true, nil
+	}
+	for {
+		if it.fetchLimit > 0 && it.yielded >= it.fetchLimit {
+			return nil, false, nil
+		}
+		if it.bpos < len(it.out) {
+			r := it.out[it.bpos]
+			it.out[it.bpos] = nil
+			it.bpos++
+			it.yielded++
+			return r, true, nil
+		}
+		more, err := it.fill(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		if !more {
+			return nil, false, nil
+		}
+	}
+}
+
+// next yields the next matching row (a scan that is not plain).
 func (it *scanIter) next(ctx context.Context) (fetchedRow, bool, error) {
 	for {
 		if it.fetchLimit > 0 && it.yielded >= it.fetchLimit {
@@ -351,8 +401,8 @@ func (it *scanIter) next(ctx context.Context) (fetchedRow, bool, error) {
 
 // fill fetches the next page into buf; false when every span is done.
 func (it *scanIter) fill(ctx context.Context) (bool, error) {
-	it.buf, it.bpos = it.buf[:0], 0
-	for len(it.buf) == 0 {
+	it.buf, it.out, it.bpos = it.buf[:0], it.out[:0], 0
+	for len(it.buf) == 0 && len(it.out) == 0 {
 		if !it.active {
 			if len(it.spans) == 0 {
 				return false, nil
@@ -396,22 +446,151 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 			}
 			continue
 		}
-		for _, kv := range kvs {
-			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, kv.Key, kv.Value)
-			if err != nil {
+		for i, kv := range kvs {
+			if err := it.accept(ctx, kv.Key, kv.Value, len(kvs)-i); err != nil {
 				return false, err
-			}
-			match, err := matchesWhere(it.where, it.desc, row, it.params)
-			if err != nil {
-				return false, err
-			}
-			if match {
-				it.buf = append(it.buf, fetchedRow{key: kv.Key, row: row})
 			}
 		}
 	}
 	return true, nil
 }
+
+// keep buffers a row the filter matched; a rejected row's map is
+// cleared and decoded into next (the filter holds on to nothing of it).
+func (it *scanIter) keep(fr fetchedRow, match bool) {
+	if match {
+		it.buf = append(it.buf, fr)
+		it.spare = nil
+		return
+	}
+	clear(fr.row)
+	it.spare = fr.row
+}
+
+// accept decodes one fetched row and, when it matches the filter,
+// buffers it: projected into out on a plain scan, as its map otherwise.
+// left is how many rows of the page remain, this one included (it
+// sizes the next chunk of projected rows).
+func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left int) error {
+	if !it.plain {
+		row, err := decodeRowInto(ctx, it.s.rowSealer(), it.desc, key, raw, it.need, it.spare)
+		if err != nil {
+			return err
+		}
+		match, err := matchesWhereMemo(it.where, it.desc, row, it.params, &it.memo)
+		if err != nil {
+			return err
+		}
+		it.keep(fetchedRow{key: key, row: row}, match)
+		return nil
+	}
+	var row rowenc.RowSink
+	switch {
+	case it.dense != nil:
+		it.dense.reset()
+		row = it.dense
+	case it.scratch != nil:
+		clear(it.scratch)
+		row = rowenc.MapRow(it.scratch)
+	default:
+		// No filter to evaluate (it reads a map): the row by column
+		// position, when the column IDs index one.
+		if len(it.where) == 0 {
+			it.dense = newDenseRow(it.desc)
+		}
+		if it.dense != nil {
+			row = it.dense
+		} else {
+			it.scratch = make(map[catalog.ColumnID]types.Datum, len(it.desc.Columns))
+			row = rowenc.MapRow(it.scratch)
+		}
+	}
+	if err := decodeFullRowInto(ctx, it.s.rowSealer(), it.desc, key, raw, it.need, row); err != nil {
+		return err
+	}
+	if it.scratch != nil {
+		match, err := matchesWhereMemo(it.where, it.desc, it.scratch, it.params, &it.memo)
+		if err != nil || !match {
+			return err
+		}
+	}
+	n := len(it.proj)
+	if len(it.slab) < n {
+		// A chunk of projected rows at a time: one allocation for many
+		// rows, never more than the page can still fill. Each row is
+		// capped at its own length, so an append to one never runs into
+		// the next.
+		it.slab = make([]types.Datum, n*min(left, plainChunkRows))
+	}
+	out := it.slab[:n:n]
+	it.slab = it.slab[n:]
+	for i := range it.proj {
+		d, ok := row.GetCol(it.proj[i].col.ID)
+		if !ok {
+			d = types.DNull
+		}
+		out[i] = d
+	}
+	it.out = append(it.out, out)
+	return nil
+}
+
+// denseRow is a decoded row held by column position (the descriptor's
+// order) instead of in a map: a plain scan with no filter reuses one,
+// and emptying it between rows clears a flag per column.
+type denseRow struct {
+	pos  []int32 // column ID → position + 1 (0: no such column)
+	vals []types.Datum
+	has  []bool
+}
+
+// denseRowMaxID bounds the column IDs a denseRow indexes directly; a
+// table with a larger one decodes into a map.
+const denseRowMaxID = 1 << 12
+
+// newDenseRow returns a denseRow for desc's columns, or nil when their
+// IDs are too sparse to index.
+func newDenseRow(desc *catalog.TableDescriptor) *denseRow {
+	maxID := catalog.ColumnID(0)
+	for i := range desc.Columns {
+		id := desc.Columns[i].ID
+		if id < 0 || id >= denseRowMaxID {
+			return nil
+		}
+		maxID = max(maxID, id)
+	}
+	r := &denseRow{pos: make([]int32, maxID+1), vals: make([]types.Datum, len(desc.Columns)), has: make([]bool, len(desc.Columns))}
+	for i := range desc.Columns {
+		if r.pos[desc.Columns[i].ID] == 0 {
+			r.pos[desc.Columns[i].ID] = int32(i) + 1
+		}
+	}
+	return r
+}
+
+func (r *denseRow) reset() { clear(r.has) }
+
+// SetCol stores d as column id's value; a column the table does not
+// have is not kept (a map would keep it, but no reader asks for one).
+func (r *denseRow) SetCol(id catalog.ColumnID, d types.Datum) {
+	if id < 0 || int(id) >= len(r.pos) || r.pos[id] == 0 {
+		return
+	}
+	i := r.pos[id] - 1
+	r.vals[i], r.has[i] = d, true
+}
+
+// GetCol returns column id's value, if the row has one.
+func (r *denseRow) GetCol(id catalog.ColumnID) (types.Datum, bool) {
+	if id < 0 || int(id) >= len(r.pos) || r.pos[id] == 0 || !r.has[r.pos[id]-1] {
+		return types.Datum{}, false
+	}
+	return r.vals[r.pos[id]-1], true
+}
+
+// plainChunkRows is how many projected rows a plain scan allocates at a
+// time.
+const plainChunkRows = 128
 
 // fillIndexPage fetches the primary rows behind a page of index entries
 // (in batches, issue #103) and filters them into buf.
@@ -430,16 +609,8 @@ func (it *scanIter) fillIndexPage(ctx context.Context, kvs []kvpb.KeyValue) erro
 			if raw == nil {
 				return false, newErrf(CodeInternal, "index %q entry points at a missing row", it.plan.idx.Name)
 			}
-			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, pk, raw)
-			if err != nil {
+			if err := it.accept(ctx, pk, raw, len(raws)-i); err != nil {
 				return false, err
-			}
-			match, err := matchesWhere(it.where, it.desc, row, it.params)
-			if err != nil {
-				return false, err
-			}
-			if match {
-				it.buf = append(it.buf, fetchedRow{key: pk, row: row})
 			}
 		}
 		return true, nil
@@ -484,7 +655,13 @@ func (s *Session) streamable(top bool, desc *catalog.TableDescriptor, plan acces
 
 // newScanStream builds the streaming result for a scan-shaped select.
 func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, t *parser.Select, proj []projCol, where []parser.Comparison, params []types.Datum, fetchLimit int64) (*Result, error) {
-	it := &scanIter{s: s, txn: txn, desc: desc, plan: plan, where: where, params: params, proj: proj, reverse: plan.reverse, fetchLimit: fetchLimit}
+	it := &scanIter{s: s, txn: txn, desc: desc, plan: plan, where: where, params: params, proj: proj, reverse: plan.reverse, fetchLimit: fetchLimit, plain: true}
+	for _, p := range proj {
+		if p.expr != nil {
+			it.plain = false
+		}
+	}
+	it.need = scanNeededCols(desc, proj, where)
 	switch plan.kind {
 	case planIndexScan:
 		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)

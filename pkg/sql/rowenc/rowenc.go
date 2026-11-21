@@ -223,23 +223,38 @@ func decodeKeyDatum(rest []byte, fam types.Family) ([]byte, types.Datum, error) 
 
 // DecodePK decodes the PK datums from a primary row key.
 func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error) {
-	prefix := PrimaryKeyPrefixFor(desc)
+	out := make([]types.Datum, 0, len(desc.PrimaryKey))
+	err := decodePK(desc, key, func(_ catalog.ColumnID, d types.Datum) { out = append(out, d) })
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DecodePKTo decodes the PK datums from a primary row key into row, as
+// DecodePK and a SetCol of each value would, without allocating.
+func DecodePKTo(desc *catalog.TableDescriptor, key keys.Key, row RowSink) error {
+	return decodePK(desc, key, row.SetCol)
+}
+
+func decodePK(desc *catalog.TableDescriptor, key keys.Key, emit func(catalog.ColumnID, types.Datum)) error {
+	var pbuf [32]byte
+	prefix := keys.AppendTableIndexPrefix(pbuf[:0], desc.ID, desc.LivePrimaryIndex())
 	if !bytes.HasPrefix(key, prefix) {
-		return nil, fmt.Errorf("key not in table %d's primary index", desc.ID)
+		return fmt.Errorf("key not in table %d's primary index", desc.ID)
 	}
 	rest := []byte(key[len(prefix):])
-	out := make([]types.Datum, 0, len(desc.PrimaryKey))
 	for _, colID := range desc.PrimaryKey {
 		col, _ := desc.ColByID(colID)
 		var err error
 		var d types.Datum
 		rest, d, err = decodeKeyDatum(rest, col.Type)
 		if err != nil {
-			return nil, fmt.Errorf("decoding pk column %q: %w", col.Name, err)
+			return fmt.Errorf("decoding pk column %q: %w", col.Name, err)
 		}
-		out = append(out, d)
+		emit(colID, d)
 	}
-	return out, nil
+	return nil
 }
 
 // LeadingPKColumn returns the leading primary-key column of a row key of
@@ -416,41 +431,83 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 // NULL). Columns the descriptor does not know are skipped — dropped
 // columns' bytes, or columns added by a newer descriptor.
 func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnID]types.Datum, error) {
+	return DecodeValueCols(desc, raw, nil)
+}
+
+// DecodeValueCols is DecodeValue that decodes only the columns need
+// reports (every column when need is nil): the others are stepped over,
+// and read as absent.
+func DecodeValueCols(desc *catalog.TableDescriptor, raw []byte, need func(catalog.ColumnID) bool) (map[catalog.ColumnID]types.Datum, error) {
+	out := make(map[catalog.ColumnID]types.Datum)
+	if err := DecodeValueInto(desc, raw, need, MapRow(out)); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// A RowSink holds the columns of a decoded row by column ID: a
+// colID → datum map (MapRow), or a scan's own reused row. A column it
+// does not hold reads as absent (missing = NULL).
+type RowSink interface {
+	SetCol(id catalog.ColumnID, d types.Datum)
+	GetCol(id catalog.ColumnID) (types.Datum, bool)
+}
+
+// MapRow is the colID → datum map as a RowSink.
+type MapRow map[catalog.ColumnID]types.Datum
+
+// SetCol stores d as column id's value.
+func (m MapRow) SetCol(id catalog.ColumnID, d types.Datum) { m[id] = d }
+
+// GetCol returns column id's value, if the row has one.
+func (m MapRow) GetCol(id catalog.ColumnID) (types.Datum, bool) {
+	d, ok := m[id]
+	return d, ok
+}
+
+// DecodeValueInto is DecodeValueCols into a row the caller provides (and
+// empties between rows), so a scan reuses one row for every row it
+// decodes: only the columns need reports are decoded (every column when
+// need is nil), the others are stepped over without allocating and read
+// as absent. On error out holds whatever was decoded before it.
+func DecodeValueInto(desc *catalog.TableDescriptor, raw []byte, need func(catalog.ColumnID) bool, out RowSink) error {
 	if len(raw) == 0 {
-		return nil, fmt.Errorf("corrupt row value: empty")
+		return fmt.Errorf("corrupt row value: empty")
 	}
 	if raw[0] == SealedValueMarker {
-		return nil, fmt.Errorf("row value is sealed: it must be opened under its table's key before it is decoded")
+		return fmt.Errorf("row value is sealed: it must be opened under its table's key before it is decoded")
 	}
 	if raw[0] != valueVersion {
-		return nil, fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])
+		return fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])
 	}
 	rest := raw[1:]
-	out := make(map[catalog.ColumnID]types.Datum)
 	for len(rest) > 0 {
 		var id uint64
 		var err error
 		rest, id, err = encoding.DecodeUvarint(rest)
 		if err != nil {
-			return nil, fmt.Errorf("corrupt row value: %w", err)
+			return fmt.Errorf("corrupt row value: %w", err)
 		}
 		if len(rest) == 0 {
-			return nil, fmt.Errorf("corrupt row value: truncated at column %d", id)
+			return fmt.Errorf("corrupt row value: truncated at column %d", id)
 		}
 		tag := rest[0]
 		rest = rest[1:]
 
 		colID := catalog.ColumnID(id)
 		col, known := desc.ColByID(colID)
+		if known && need != nil && !need(colID) {
+			known = false
+		}
 
 		switch tag {
 		case tagNull:
 			if known {
-				out[colID] = types.DNull
+				out.SetCol(colID, types.DNull)
 			}
 		case tagInt, tagTimestamp, tagDate, tagTime:
 			if len(rest) < 8 {
-				return nil, fmt.Errorf("corrupt row value: short int payload")
+				return fmt.Errorf("corrupt row value: short int payload")
 			}
 			v := int64(binary.BigEndian.Uint64(rest[:8]))
 			rest = rest[8:]
@@ -464,22 +521,22 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 				want = types.Time
 			}
 			if known && col.Type == want {
-				out[colID] = types.Datum{Fam: want, I: v}
+				out.SetCol(colID, types.Datum{Fam: want, I: v})
 			}
 		case tagArray:
 			var elemN, n uint64
 			var err error
 			if rest, elemN, err = encoding.DecodeUvarint(rest); err != nil {
-				return nil, fmt.Errorf("corrupt row value: %w", err)
+				return fmt.Errorf("corrupt row value: %w", err)
 			}
 			if rest, n, err = encoding.DecodeUvarint(rest); err != nil {
-				return nil, fmt.Errorf("corrupt row value: %w", err)
+				return fmt.Errorf("corrupt row value: %w", err)
 			}
 			elem := types.Family(elemN)
 			elems := make([]types.Datum, 0, n)
 			for j := uint64(0); j < n; j++ {
 				if len(rest) == 0 {
-					return nil, fmt.Errorf("corrupt row value: short array payload")
+					return fmt.Errorf("corrupt row value: short array payload")
 				}
 				flag := rest[0]
 				rest = rest[1:]
@@ -489,33 +546,33 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 				}
 				var d types.Datum
 				if rest, d, err = decodeKeyDatum(rest, elem); err != nil {
-					return nil, fmt.Errorf("corrupt row value: array element: %w", err)
+					return fmt.Errorf("corrupt row value: array element: %w", err)
 				}
 				elems = append(elems, d)
 			}
 			if known && col.Type == types.ArrayOf(elem) {
-				out[colID] = types.NewArray(elem, elems)
+				out.SetCol(colID, types.NewArray(elem, elems))
 			}
 		case tagEnum:
 			var ord, n uint64
 			var err error
 			if rest, ord, err = encoding.DecodeUvarint(rest); err != nil {
-				return nil, fmt.Errorf("corrupt row value: %w", err)
+				return fmt.Errorf("corrupt row value: %w", err)
 			}
 			if rest, n, err = encoding.DecodeUvarint(rest); err != nil {
-				return nil, fmt.Errorf("corrupt row value: %w", err)
+				return fmt.Errorf("corrupt row value: %w", err)
 			}
 			if uint64(len(rest)) < n {
-				return nil, fmt.Errorf("corrupt row value: short enum payload")
+				return fmt.Errorf("corrupt row value: short enum payload")
 			}
-			label := string(rest[:n])
+			label := rest[:n]
 			rest = rest[n:]
 			if known && col.Type == types.Enum {
-				out[colID] = types.NewEnum(int64(ord), label)
+				out.SetCol(colID, types.NewEnum(int64(ord), string(label)))
 			}
 		case tagInterval:
 			if len(rest) < 24 {
-				return nil, fmt.Errorf("corrupt row value: short interval payload")
+				return fmt.Errorf("corrupt row value: short interval payload")
 			}
 			iv := types.Interval{
 				Months: int64(binary.BigEndian.Uint64(rest[:8])),
@@ -524,64 +581,64 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			}
 			rest = rest[24:]
 			if known && col.Type == types.IntervalFam {
-				out[colID] = types.NewInterval(iv)
+				out.SetCol(colID, types.NewInterval(iv))
 			}
 		case tagFloat:
 			if len(rest) < 8 {
-				return nil, fmt.Errorf("corrupt row value: short float payload")
+				return fmt.Errorf("corrupt row value: short float payload")
 			}
 			v := math.Float64frombits(binary.BigEndian.Uint64(rest[:8]))
 			rest = rest[8:]
 			if known && col.Type == types.Float {
-				out[colID] = types.NewFloat(v)
+				out.SetCol(colID, types.NewFloat(v))
 			}
 		case tagString, tagBytes, tagDecimal, tagJsonb, tagTsvector, tagTsquery, tagVector:
 			var n uint64
 			var err error
 			rest, n, err = encoding.DecodeUvarint(rest)
 			if err != nil || uint64(len(rest)) < n {
-				return nil, fmt.Errorf("corrupt row value: bad string payload")
+				return fmt.Errorf("corrupt row value: bad string payload")
 			}
-			v := string(rest[:n])
+			v := rest[:n]
 			rest = rest[n:]
-			want := types.String
+			fam := types.String
 			switch tag {
 			case tagBytes:
-				want = types.Bytes
+				fam = types.Bytes
 			case tagDecimal:
-				want = types.Decimal
+				fam = types.Decimal
 			case tagJsonb:
-				want = types.Jsonb
+				fam = types.Jsonb
 			case tagTsvector:
-				want = types.Tsvector
+				fam = types.Tsvector
 			case tagTsquery:
-				want = types.Tsquery
+				fam = types.Tsquery
 			case tagVector:
-				want = types.Vector
+				fam = types.Vector
 			}
-			if known && col.Type == want {
-				out[colID] = types.Datum{Fam: want, S: v}
+			if known && col.Type == fam {
+				out.SetCol(colID, types.Datum{Fam: fam, S: string(v)})
 			}
 		case tagUUID:
 			if len(rest) < 16 {
-				return nil, fmt.Errorf("corrupt row value: short uuid payload")
+				return fmt.Errorf("corrupt row value: short uuid payload")
 			}
-			v := string(rest[:16])
+			v := rest[:16]
 			rest = rest[16:]
 			if known && col.Type == types.Uuid {
-				out[colID] = types.Datum{Fam: types.Uuid, S: v}
+				out.SetCol(colID, types.Datum{Fam: types.Uuid, S: string(v)})
 			}
 		case tagBool:
 			if len(rest) < 1 {
-				return nil, fmt.Errorf("corrupt row value: short bool payload")
+				return fmt.Errorf("corrupt row value: short bool payload")
 			}
 			v := rest[0] != 0
 			rest = rest[1:]
 			if known && col.Type == types.Bool {
-				out[colID] = types.NewBool(v)
+				out.SetCol(colID, types.NewBool(v))
 			}
 		default:
-			return nil, fmt.Errorf("corrupt row value: unknown tag 0x%02x for column %d", tag, id)
+			return fmt.Errorf("corrupt row value: unknown tag 0x%02x for column %d", tag, id)
 		}
 	}
 	// Fill-on-read: a fill-default column absent from the value predates
@@ -591,11 +648,143 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 		if !col.FillDefault || col.Default == nil {
 			continue
 		}
-		if _, ok := out[col.ID]; !ok {
-			out[col.ID] = *col.Default
+		if _, ok := out.GetCol(col.ID); !ok {
+			out.SetCol(col.ID, *col.Default)
 		}
 	}
-	return out, nil
+	return nil
+}
+
+// VectorColumn finds a VECTOR column's stored elements in an opened row
+// value (EncodeValue's form) without decoding the rest of the row: the
+// returned bytes alias raw. ok is false whenever DecodeValue would not
+// produce a non-NULL vector datum from those very bytes — the column is
+// NULL, absent (fill-on-read, or a row that predates it), stored under
+// another tag, not a vector column of desc, or the value does not parse
+// — and the caller then decodes the whole row, which reports or
+// resolves whatever the case is exactly as it always has.
+func VectorColumn(desc *catalog.TableDescriptor, raw []byte, id catalog.ColumnID) (stored []byte, ok bool) {
+	if col, known := desc.ColByID(id); !known || col.Type != types.Vector {
+		return nil, false
+	}
+	if len(raw) == 0 || raw[0] != valueVersion {
+		return nil, false
+	}
+	rest := raw[1:]
+	for len(rest) > 0 {
+		var cid uint64
+		var err error
+		if rest, cid, err = encoding.DecodeUvarint(rest); err != nil || len(rest) == 0 {
+			return nil, false
+		}
+		tag := rest[0]
+		rest = rest[1:]
+		if catalog.ColumnID(cid) == id {
+			if tag != tagVector {
+				return nil, false
+			}
+			var n uint64
+			if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+				return nil, false
+			}
+			// A column appears once in a value; DecodeValue would keep
+			// the last occurrence, so a value that repeats it is left to
+			// DecodeValue too.
+			stored = rest[:n]
+			if after, ok := skipValueColumns(rest[n:], id); !ok || after {
+				return nil, false
+			}
+			return stored, true
+		}
+		if rest, ok = skipValuePayload(tag, rest); !ok {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// skipValueColumns walks the rest of a value; found reports whether
+// column id appears in it again, ok whether it parsed.
+func skipValueColumns(rest []byte, id catalog.ColumnID) (found, ok bool) {
+	for len(rest) > 0 {
+		var cid uint64
+		var err error
+		if rest, cid, err = encoding.DecodeUvarint(rest); err != nil || len(rest) == 0 {
+			return false, false
+		}
+		if catalog.ColumnID(cid) == id {
+			return true, true
+		}
+		tag := rest[0]
+		if rest, ok = skipValuePayload(tag, rest[1:]); !ok {
+			return false, false
+		}
+	}
+	return false, true
+}
+
+// skipValuePayload steps over one column payload of the given tag, as
+// DecodeValue reads it.
+func skipValuePayload(tag byte, rest []byte) ([]byte, bool) {
+	fixed := func(n int) ([]byte, bool) {
+		if len(rest) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	}
+	switch tag {
+	case tagNull:
+		return rest, true
+	case tagInt, tagTimestamp, tagDate, tagTime, tagFloat:
+		return fixed(8)
+	case tagInterval:
+		return fixed(24)
+	case tagUUID:
+		return fixed(16)
+	case tagBool:
+		return fixed(1)
+	case tagString, tagBytes, tagDecimal, tagJsonb, tagTsvector, tagTsquery, tagVector:
+		var n uint64
+		var err error
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	case tagEnum:
+		var n uint64
+		var err error
+		if rest, _, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	case tagArray:
+		var elemN, n uint64
+		var err error
+		if rest, elemN, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		for j := uint64(0); j < n; j++ {
+			if len(rest) == 0 {
+				return nil, false
+			}
+			flag := rest[0]
+			rest = rest[1:]
+			if flag == 0 {
+				continue
+			}
+			if rest, _, err = decodeKeyDatum(rest, types.Family(elemN)); err != nil {
+				return nil, false
+			}
+		}
+		return rest, true
+	}
+	return nil, false
 }
 
 // ---------------------------------------------------------------------------

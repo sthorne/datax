@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sthorne/datax/pkg/sql/jsonbcontain"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
 	"github.com/sthorne/datax/pkg/util/decimal"
@@ -121,8 +122,33 @@ func pathResultType(path []parser.PathStep) types.Family {
 //     asymmetry with jsonb '=', which compares normalized text
 //     (documented).
 //
-// Both inputs are jsonb datums (normalized text).
+// Both inputs are jsonb datums (normalized text). The containment walks
+// left's text without decoding it (package jsonbcontain); a left that
+// is not well-formed falls back to jsonbContainsTree.
 func jsonbContains(left, right types.Datum) (bool, error) {
+	p, err := jsonbcontain.Compile(right.S)
+	if err != nil {
+		return false, newErrf(CodeInternal, "malformed stored jsonb: %v", err)
+	}
+	return jsonbContainsPattern(left, p)
+}
+
+// jsonbContainsPattern is left @> a compiled right operand.
+func jsonbContainsPattern(left types.Datum, p *jsonbcontain.Pattern) (bool, error) {
+	if ok, decided := p.ContainedIn(left.S); decided {
+		return ok, nil
+	}
+	var l any
+	if err := decodeJSONNumber(left.S, &l); err != nil {
+		return false, newErrf(CodeInternal, "malformed stored jsonb: %v", err)
+	}
+	return jsonContains(l, p.Value(), true), nil
+}
+
+// jsonbContainsTree is jsonbContains by decoding both sides into Go
+// values and comparing the trees: the reference the text walk is tested
+// against.
+func jsonbContainsTree(left, right types.Datum) (bool, error) {
 	var l, r any
 	if err := decodeJSONNumber(left.S, &l); err != nil {
 		return false, newErrf(CodeInternal, "malformed stored jsonb: %v", err)

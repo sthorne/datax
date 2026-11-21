@@ -1,6 +1,7 @@
 package tsearch
 
 import (
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -137,5 +138,48 @@ func BenchmarkStem(b *testing.B) {
 	words := strings.Fields(stemPairs)
 	for i := 0; i < b.N; i++ {
 		Stem(words[i%len(words)])
+	}
+}
+
+// TestStemListLengths: the length bounds that guard the two word lists
+// cover every word in them.
+func TestStemListLengths(t *testing.T) {
+	for w := range stemExceptions {
+		if len(w) > maxExceptionLen {
+			t.Errorf("exception %q is longer than maxExceptionLen", w)
+		}
+	}
+	for w := range stemStopAfter1a {
+		if len(w) < minStopAfter1aLen {
+			t.Errorf("%q is shorter than minStopAfter1aLen", w)
+		}
+	}
+}
+
+// TestStemKeepsFirstByte: the stem of a word without apostrophes (all
+// a token can be) is never empty and starts as the word does, which
+// Matcher relies on to leave alone the tokens no term starts like.
+func TestStemKeepsFirstByte(t *testing.T) {
+	r := rand.New(rand.NewSource(4))
+	words := strings.Fields(stemSample)
+	pairs := strings.Fields(stemPairs)
+	for i := 0; i < len(pairs); i += 2 {
+		words = append(words, pairs[i])
+	}
+	for w := range stemExceptions {
+		words = append(words, w)
+	}
+	const letters = "abcdefghijklmnopqrstuvwxyzaeiouyyss"
+	for i := 0; i < 200000; i++ {
+		var b strings.Builder
+		for k := 1 + r.Intn(14); k >= 0; k-- {
+			b.WriteByte(letters[r.Intn(len(letters))])
+		}
+		words = append(words, b.String())
+	}
+	for _, w := range words {
+		if s := Stem(w); s == "" || s[0] != w[0] {
+			t.Fatalf("Stem(%q) = %q", w, s)
+		}
 	}
 }

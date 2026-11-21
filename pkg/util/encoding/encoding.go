@@ -136,13 +136,39 @@ func DecodeBytes(b []byte) (rest []byte, data []byte, err error) {
 	// One pass finds the terminator and counts escaped NULs, so the
 	// decoded bytes are allocated once at their exact size (issue #163);
 	// the common key without a NUL is then a single copy.
-	end, escapes := -1, 0
+	end, escapes, err := bytesEnd(b)
+	if err != nil {
+		return nil, nil, err
+	}
+	data = make([]byte, end-escapes)
+	unescapeBytes(data, b[:end], escapes)
+	return b[end+2:], data, nil
+}
+
+// DecodeBytesAppend is DecodeBytes appending the decoded bytes to dst
+// (data is dst extended by them), so a caller decoding many values
+// reuses one buffer.
+func DecodeBytesAppend(dst, b []byte) (rest []byte, data []byte, err error) {
+	end, escapes, err := bytesEnd(b)
+	if err != nil {
+		return nil, nil, err
+	}
+	n := len(dst)
+	dst = slices.Grow(dst, end-escapes)[:n+end-escapes]
+	unescapeBytes(dst[n:], b[:end], escapes)
+	return b[end+2:], dst, nil
+}
+
+// bytesEnd finds the terminator of an encoded byte string (its offset
+// in b) and counts the escaped NULs before it.
+func bytesEnd(b []byte) (end, escapes int, err error) {
+	end = -1
 	for i := 0; i < len(b) && end < 0; i++ {
 		if b[i] != escape {
 			continue
 		}
 		if i+1 >= len(b) {
-			return nil, nil, fmt.Errorf("decode bytes: truncated escape")
+			return 0, 0, fmt.Errorf("decode bytes: truncated escape")
 		}
 		switch b[i+1] {
 		case escapedNul:
@@ -151,24 +177,29 @@ func DecodeBytes(b []byte) (rest []byte, data []byte, err error) {
 		case terminator:
 			end = i
 		default:
-			return nil, nil, fmt.Errorf("decode bytes: invalid escape 0x00 0x%02x", b[i+1])
+			return 0, 0, fmt.Errorf("decode bytes: invalid escape 0x00 0x%02x", b[i+1])
 		}
 	}
 	if end < 0 {
-		return nil, nil, fmt.Errorf("decode bytes: missing terminator")
+		return 0, 0, fmt.Errorf("decode bytes: missing terminator")
 	}
-	data = make([]byte, end-escapes)
+	return end, escapes, nil
+}
+
+// unescapeBytes writes the bytes enc (an encoded string up to its
+// terminator, holding escapes escaped NULs) decode to into data, which
+// is exactly that long.
+func unescapeBytes(data, enc []byte, escapes int) {
 	if escapes == 0 {
-		copy(data, b[:end])
-		return b[end+2:], data, nil
+		copy(data, enc)
+		return
 	}
-	for i, j := 0, 0; i < end; i, j = i+1, j+1 {
-		data[j] = b[i] // an escaped NUL decodes to its first byte, 0x00
-		if b[i] == escape {
+	for i, j := 0, 0; i < len(enc); i, j = i+1, j+1 {
+		data[j] = enc[i] // an escaped NUL decodes to its first byte, 0x00
+		if enc[i] == escape {
 			i++
 		}
 	}
-	return b[end+2:], data, nil
 }
 
 func EncodeString(b []byte, s string) []byte {

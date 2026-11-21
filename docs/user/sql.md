@@ -1473,8 +1473,9 @@ that hold the rows, in the index's order (`EXPLAIN ANALYZE` reports
 `index join: N primary rows fetched in B batches`), so a lookup matching
 a thousand entries is four round trips, not a thousand. The same
 batching covers a statement's other point reads: `INSERT` reads all its
-uniqueness probes and foreign-key parents at once, `UPDATE` the entries
-it moves, `SELECT ... FOR UPDATE` locks its rows in one batch.
+foreign-key parents at once (its uniqueness checks travel in its write
+batch as conditional puts, from cluster version v24; before it, they
+are read with the parents), `UPDATE` the entries it moves, `SELECT ... FOR UPDATE` locks its rows in one batch.
 
 **Streaming.** A `SELECT` that reads one table without sorting in
 memory, aggregating, joining, `DISTINCT` or a window function streams

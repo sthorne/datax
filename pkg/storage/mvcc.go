@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -513,6 +514,65 @@ func MVCCLock(b *Batch, key keys.Key, readTS hlc.Timestamp, value []byte, txn *e
 	return mvccWrite(b, key, readTS.Next(), value, value == nil, txn)
 }
 
+// latestTimestamp reads the newest version of a key, whatever its
+// timestamp.
+var latestTimestamp = hlc.Timestamp{WallTime: math.MaxInt64, Logical: math.MaxInt32}
+
+// MVCCConditionalPut writes value to key only if the key has no live
+// value — never written, or deleted — and otherwise fails with
+// ConditionFailedError, writing nothing. With a transaction it is a
+// locking read followed by a put: the key is read at readTS as the
+// transaction sees it (its own writes included, a foreign intent at or
+// below readTS a WriteIntentError); then, the key absent, the intent is
+// laid exactly as MVCCLock lays one, so a committed version ABOVE readTS
+// fails it with WriteTooOldError (the snapshot is stale — which also
+// covers every version an uncertainty interval would have caught) and a
+// foreign intent anywhere fails it with WriteIntentError. Without a
+// transaction it checks the latest value and writes over it, like any
+// non-transactional write. g, when non-nil, serves the read (over b).
+func MVCCConditionalPut(b *Batch, g *Getter, key keys.Key, readTS hlc.Timestamp, value []byte, txn *enginepb.TxnMeta) error {
+	at, opts := readTS, MVCCGetOptions{Txn: txn}
+	if txn == nil {
+		at = latestTimestamp
+	}
+	cur, err := conditionalRead(b, g, key, at, opts)
+	if err != nil {
+		return err
+	}
+	if cur != nil {
+		return &ConditionFailedError{Key: key.Clone()}
+	}
+	if txn == nil {
+		return mvccWrite(b, key, readTS, value, false, nil)
+	}
+	// readTS.Next(): mvccWrite's conflict check then refuses versions
+	// strictly above readTS (see MVCCLock); the intent itself lands at
+	// the transaction's write timestamp.
+	return mvccWrite(b, key, readTS.Next(), value, false, txn)
+}
+
+// MVCCConditionalPutCommitted is MVCCConditionalPut for a one-phase
+// commit: the key is read at ts (any intent at or below it conflicts)
+// and, absent, written as a committed version at ts with
+// MVCCPutCommitted's conflict rules.
+func MVCCConditionalPutCommitted(b *Batch, g *Getter, key keys.Key, ts hlc.Timestamp, value []byte) error {
+	cur, err := conditionalRead(b, g, key, ts, MVCCGetOptions{})
+	if err != nil {
+		return err
+	}
+	if cur != nil {
+		return &ConditionFailedError{Key: key.Clone()}
+	}
+	return mvccWriteCommitted(b, key, ts, value, false)
+}
+
+func conditionalRead(b *Batch, g *Getter, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]byte, error) {
+	if g != nil {
+		return g.Get(key, ts, opts)
+	}
+	return MVCCGet(b, key, ts, opts)
+}
+
 // KeyValue is one row of a scan result.
 type KeyValue struct {
 	Key   keys.Key
@@ -545,6 +605,8 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 	var intents []Intent
 	var bytes int64
 	var prefix []byte // cur's metadata key, copied off the iterator per row
+	var keyBuf []byte // cur, decoded into one buffer reused for every row
+	var rowBuf scanArena
 	skippedBefore := 0
 	if opts.SkipLocked != nil {
 		skippedBefore = len(*opts.SkipLocked)
@@ -552,19 +614,30 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 
 	ok := it.SeekGE(lower)
 	for ok {
-		userKey, vts, err := DecodeMVCCKey(it.Key())
+		userKey, vts, err := decodeMVCCKeyAppend(keyBuf[:0], it.Key())
 		if err != nil {
 			return ScanResult{}, err
 		}
-		cur := keys.Key(userKey) // DecodeMVCCKey allocated it: ours to keep
+		keyBuf = userKey
+		cur := keys.Key(userKey) // borrowed: keyBuf is rewritten by the next row
 		prefix = appendMetaKeyOf(prefix[:0], it.Key(), vts)
-		value, found, err := mvccScanKey(it, cur, prefix, ts, opts, &intents)
+		data, found, err := mvccScanKey(it, cur, prefix, ts, opts, &intents)
 		if err != nil {
 			return ScanResult{}, err
 		}
 		if found && len(intents) == 0 {
-			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
-			bytes += int64(len(cur) + len(value))
+			// The row's key and value, copied off keyBuf and the
+			// iterator (whose memory Pebble reuses) into the scan's
+			// own buffer.
+			kv := rowBuf.alloc(len(cur) + len(data))
+			n := copy(kv, cur)
+			copy(kv[n:], data)
+			row := KeyValue{Key: keys.Key(kv[:n:n])}
+			if len(data) > 0 {
+				row.Value = kv[n:]
+			}
+			res.KVs = append(res.KVs, row)
+			bytes += int64(len(cur) + len(data))
 			if max > 0 && int64(len(res.KVs)) == max || opts.TargetBytes > 0 && bytes >= opts.TargetBytes {
 				res.Resume = cur.Next()
 				return res, nil
@@ -581,6 +654,29 @@ func MVCCScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64, opts M
 		return ScanResult{}, &WriteIntentError{Intents: intents}
 	}
 	return res, nil
+}
+
+// scanArena hands a scan the memory its rows' keys and values are
+// copied into, carved from chunks of scanArenaChunk bytes, so a scan
+// allocates once per chunk rather than once per row. Each piece is
+// capped at its own length (an append to a key never runs into its
+// value or the next row), and a row larger than a quarter chunk gets an
+// allocation of its own, so what one kept row can hold alive is
+// bounded by a chunk.
+type scanArena struct{ free []byte }
+
+const scanArenaChunk = 16 << 10
+
+func (a *scanArena) alloc(n int) []byte {
+	if n > scanArenaChunk/4 {
+		return make([]byte, n)
+	}
+	if len(a.free) < n {
+		a.free = make([]byte, scanArenaChunk)
+	}
+	b := a.free[:n:n]
+	a.free = a.free[n:]
+	return b
 }
 
 // maxStepsBeforeSeek bounds how many engine keys a scan walks with Next
@@ -675,11 +771,12 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 		if !stepToKeyStart(it, curStart) {
 			break // unreachable: an engine key of cur was just observed
 		}
-		value, found, err := mvccScanKey(it, cur, curStart, ts, opts, &intents)
+		data, found, err := mvccScanKey(it, cur, curStart, ts, opts, &intents)
 		if err != nil {
 			return ScanResult{}, err
 		}
 		if found && len(intents) == 0 {
+			value := append([]byte(nil), data...)
 			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
 			bytes += int64(len(cur) + len(value))
 			if max > 0 && int64(len(res.KVs)) == max || opts.TargetBytes > 0 && bytes >= opts.TargetBytes {
@@ -745,7 +842,9 @@ func stepBeforeKey(it Iterator, prefix []byte) bool {
 // keys or just past them, so callers step on from there (stepPastKey). A
 // blocking foreign intent is appended to *intents and reported as
 // not-found (the scan stops returning rows and ultimately surfaces a
-// WriteIntentError).
+// WriteIntentError). The value returned is the iterator's: it is valid
+// until the iterator moves, so the caller copies it before stepping on.
+// cur may be borrowed too: what is kept of it (an intent) is a copy.
 func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opts MVCCGetOptions, intents *[]Intent) ([]byte, bool, error) {
 	vts := versionOf(it.Key(), prefix)
 
@@ -764,7 +863,7 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 				skipAt = meta.Timestamp
 			}
 		case opts.SkipLocked != nil:
-			*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur, Txn: meta.Txn})
+			*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur.Clone(), Txn: meta.Txn})
 			return nil, false, nil
 		case opts.Inconsistent:
 			skipAt = meta.Timestamp // read beneath the intent
@@ -773,7 +872,7 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 			// beneath it (see MVCCGet).
 			skipAt = meta.Timestamp
 		default:
-			*intents = append(*intents, Intent{Key: cur, Txn: meta.Txn})
+			*intents = append(*intents, Intent{Key: cur.Clone(), Txn: meta.Txn})
 			if len(*intents) >= maxIntentsPerError {
 				return nil, false, &WriteIntentError{Intents: *intents}
 			}
@@ -798,7 +897,7 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 					return nil, false, err
 				}
 				if !tombstone {
-					value, found = append([]byte(nil), data...), true
+					value, found = data, true
 				}
 			}
 		}
@@ -819,7 +918,7 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 				if uvts.LessEq(opts.UncertaintyLimit) && !(!skipAt.IsEmpty() && uvts.Equal(skipAt)) {
 					if ts.Less(uvts) {
 						if opts.SkipLocked != nil {
-							*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur})
+							*opts.SkipLocked = append(*opts.SkipLocked, Intent{Key: cur.Clone()})
 							return nil, false, nil
 						}
 						return nil, false, &UncertaintyError{ReadTimestamp: ts, ExistingTimestamp: uvts}
@@ -851,7 +950,7 @@ func mvccScanKey(it Iterator, cur keys.Key, prefix []byte, ts hlc.Timestamp, opt
 				return nil, false, err
 			}
 			if !tombstone {
-				value, found = append([]byte(nil), data...), true
+				value, found = data, true
 			}
 			break
 		}

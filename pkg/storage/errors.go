@@ -46,3 +46,13 @@ type UncertaintyError struct {
 func (e *UncertaintyError) Error() string {
 	return fmt.Sprintf("read at %s within uncertainty interval of value at %s", e.ReadTimestamp, e.ExistingTimestamp)
 }
+
+// ConditionFailedError: a conditional put found a live value at Key, so
+// it wrote nothing.
+type ConditionFailedError struct {
+	Key keys.Key
+}
+
+func (e *ConditionFailedError) Error() string {
+	return fmt.Sprintf("conditional put: key %s already has a value", e.Key)
+}

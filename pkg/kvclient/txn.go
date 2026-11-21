@@ -89,6 +89,32 @@ func batchCommits(ba *kvpb.BatchRequest) bool {
 	return false
 }
 
+// onlyCPutConflicts reports whether every intent ba ran into lies on a
+// key one of its conditional puts writes. Such a conflict is the read the
+// conditional put replaces (an INSERT's uniqueness check), and a read
+// waits for a live owner rather than aborting it: pushing with the power
+// to abort would let an INSERT kill, by priority alone, a transaction
+// that merely holds an uncommitted row with the same key, where the read
+// it stands for would have waited for that transaction to finish.
+func onlyCPutConflicts(ba *kvpb.BatchRequest, intents []storage.Intent) bool {
+	if len(intents) == 0 {
+		return false
+	}
+	for _, in := range intents {
+		found := false
+		for i := range ba.Requests {
+			if c := ba.Requests[i].CPut; c != nil && c.Key.Equal(in.Key) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // SnapshotTooOldError is a historical transaction's read refused by a
 // range whose GC threshold has passed the transaction's timestamp. The
 // timestamp is the client's (AS OF SYSTEM TIME, an imported snapshot),
@@ -954,7 +980,7 @@ func (t *Txn) sendWith(ctx context.Context, ba *kvpb.BatchRequest, isWrite bool,
 			// Watch for the owners finishing before pushing them, so a
 			// finish between the push and the wait still wakes us.
 			watch := t.db.waits.watch(kerr.WriteIntent.Intents)
-			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite && !opts.noWait)
+			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, isWrite && !opts.noWait && !onlyCPutConflicts(ba, kerr.WriteIntent.Intents))
 			if err != nil {
 				watch.release()
 				t.publishWait(ctx, nil)
@@ -1625,6 +1651,10 @@ func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 	if err != nil {
 		t.markFinished()
 		t.wakeWaiters()
+		var kerr *kvpb.Error
+		if errors.As(err, &kerr) {
+			err = t.conditionFailure(wb, kerr)
+		}
 		return true, err
 	}
 	et := br.Responses[len(br.Responses)-1].EndTxn
@@ -1688,7 +1718,7 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		switch {
 		case kerr.WriteIntent != nil:
 			watch := t.db.waits.watch(kerr.WriteIntent.Intents)
-			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, true)
+			live, err := t.pushIntents(ctx, kerr.WriteIntent.Intents, !onlyCPutConflicts(ba, kerr.WriteIntent.Intents))
 			if err != nil {
 				watch.release()
 				return nil, true, err
@@ -1810,6 +1840,10 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// be RECOVERED AS COMMITTED, contradicting the error we return.
 		t.abortFailedCommit(ctx)
 		if wbErr != nil {
+			var kerr *kvpb.Error
+			if errors.As(wbErr, &kerr) {
+				return t.conditionFailure(wb, kerr)
+			}
 			return wbErr
 		}
 		return etErr

@@ -1339,6 +1339,15 @@ Rules of the road:
   [Deployment → Store layout](deployment.md#storage-profiles)). Until
   that restart the node keeps running on one engine. A migrated store
   refuses a v12 binary.
+- **v24 makes an `INSERT` check uniqueness in its write.** Once it is
+  finalized, a plain `INSERT` (no `ON CONFLICT`, not an `UPSERT`)
+  writes each row's primary key, and each unique index entry, with a
+  conditional put that fails if the key already holds a value, so the
+  check and the write are one KV batch: an autocommit single-row
+  `INSERT` is one one-phase commit instead of a read and then a commit.
+  Errors are the same as before. Until finalize a node on the new
+  binary reads the keys first, as before: an older node does not know
+  the conditional put.
 - **v23 turns on range-safety checks at apply** (issue #389). Before
   finalize, a node on the new binary already re-checks that a write
   still belongs to its range once it holds its latches, and a split draws
@@ -1558,7 +1567,8 @@ Rules of thumb, from measured single-node numbers (NVMe, 100-row batches):
   50 µs / rows-per-commit), so batch inserts of 100+ rows are within
   15% of the ceiling and single-row commits reach a third of it.
 - **Through SQL an INSERT costs more than its KV write** — parsing,
-  encoding, the uniqueness probe (one read round trip per statement) and
+  encoding, the uniqueness check (from v24 a conditional put in the
+  write batch itself; before it, one read round trip per statement) and
   the timestamp cache's bookkeeping — so a single range ingests roughly
   **40k rows/s** of 100-row batched INSERTs on one node, and the SQL
   layer's CPU, not the range, is what saturates first (`datax bench

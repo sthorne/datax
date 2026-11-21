@@ -9,6 +9,8 @@ import (
 type Config struct {
 	Name string
 	stop map[string]struct{}
+	// stem is Stem for english, nil for simple; lexemeBytes calls
+	// stemInPlace, its form over bytes, directly.
 	stem func(string) string
 }
 
@@ -63,9 +65,59 @@ func (c *Config) Lexeme(t Token) (lexeme string, ok bool) {
 	return c.stem(t.Text), true
 }
 
+// lexemeBytes is Lexeme over the token a tokenizer holds: the lexeme
+// is written over text (a stem is never longer than its word) and
+// returned; ok is false for a stop word. Nothing is allocated.
+func (c *Config) lexemeBytes(kind TokenKind, text []byte) (lexeme []byte, ok bool) {
+	if c.stem == nil || kind != TokWord || !allLetters(text) {
+		return text, true
+	}
+	if _, stop := c.stop[string(text)]; stop {
+		return nil, false
+	}
+	return stemInPlace(text), true
+}
+
+// lexemes walks a text's lexemes in order, as ToVector keeps them.
+// Stop words and over-long words are skipped but, as in PostgreSQL,
+// still count as positions.
+type lexemes struct {
+	cfg *Config
+	t   tokenizer
+	n   int // tokens read
+	// only, when set, skips the tokens whose (lower-cased) first byte it
+	// does not hold, before any normalizing: a lexeme starts with its
+	// token's first byte (see Matcher.first), so a caller that wants
+	// only lexemes starting with certain bytes is spared the stop-word
+	// lookup and the stemming of every other token.
+	only *[256]bool
+}
+
+func newLexemes(cfg *Config, text string) lexemes {
+	return lexemes{cfg: cfg, t: tokenizer{s: text}}
+}
+
+// next returns the next lexeme and its position; ok is false at the
+// end of the text. The lexeme is written to buf (appended to buf[:0]),
+// so a caller that keeps buf on its stack walks without allocating.
+func (w *lexemes) next(buf []byte) (lexeme []byte, pos int, ok bool) {
+	for w.t.next() {
+		w.n++
+		text := w.t.lower(buf[:0])
+		if w.only != nil && !w.only[text[0]] {
+			continue
+		}
+		lex, keep := w.cfg.lexemeBytes(w.t.kind, text)
+		if keep && len(lex) <= MaxLexemeLen {
+			return lex, min(w.n, MaxPos), true
+		}
+	}
+	return nil, 0, false
+}
+
 // allLetters: no digit in the token. A word with a digit in it is a
 // part number or an identifier, not English.
-func allLetters(s string) bool {
+func allLetters[S string | []byte](s S) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= '0' && s[i] <= '9' {
 			return false

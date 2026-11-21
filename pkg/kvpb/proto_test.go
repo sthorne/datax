@@ -68,6 +68,7 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	}}
 	ba.Add(&GetRequest{RequestHeader: h("g")})
 	ba.Add(&PutRequest{RequestHeader: h("p"), Value: []byte("v")})
+	ba.Add(&CPutRequest{RequestHeader: h("cp"), Value: []byte("cv")})
 	ba.Add(&DeleteRequest{RequestHeader: h("d")})
 	ba.Add(&IncrementRequest{RequestHeader: h("i"), By: -4})
 	ba.Add(&ScanRequest{RequestHeader: hr("a", "b"), MaxRows: 10})
@@ -116,6 +117,7 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Get: &GetResponse{Value: []byte("v")}},
 		{Get: &GetResponse{}}, // not found: nil Value must survive
 		{Put: &PutResponse{}},
+		{CPut: &CPutResponse{}},
 		{Delete: &DeleteResponse{}},
 		{Increment: &IncrementResponse{NewValue: 9}},
 		{Scan: &ScanResponse{Rows: []KeyValue{{Key: keys.Key("k"), Value: []byte("v")}}, Resume: keys.Key("r")}},
@@ -157,6 +159,7 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{Message: "rt", TxnRetry: &TxnRetryError{RetryTimestamp: mkts(3)}},
 		{Message: "nf", TxnNotFound: &TxnNotFoundError{}},
 		{Message: "amb", Ambiguous: &AmbiguousResultError{}},
+		{Message: "cf", ConditionFailed: &ConditionFailedError{Key: keys.Key("k")}},
 	}
 	for _, kerr := range errs {
 		data, err := MarshalBatchEnvelope(br, kerr)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -780,6 +781,205 @@ func TestVectorExactKNN(t *testing.T) {
 	if _, serr := trySQL(ctx, s, wq); serr == nil || serr.Code != sql.CodeOutOfMemory {
 		t.Fatalf("a full sort under the same limit: %v", serr)
 	}
+}
+
+// resultBits renders a result for exact comparison: floats by their
+// bits, so a distance off by one ulp, or -0 against 0, is a difference.
+func resultBits(res *sql.Result) string {
+	var b strings.Builder
+	for _, row := range res.Rows {
+		for _, d := range row {
+			switch {
+			case d.Null:
+				b.WriteString("NULL")
+			case d.Fam == types.Float:
+				fmt.Fprintf(&b, "f%016x", math.Float64bits(d.F))
+			case d.Fam == types.Int:
+				fmt.Fprintf(&b, "%d", d.I)
+			default:
+				fmt.Fprintf(&b, "%v", d)
+			}
+			b.WriteByte(' ')
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// TestVectorStoredDistanceMatchesGeneral holds the scan paths that rank
+// rows by distance straight off the stored bytes — the exact top-k scan
+// and ivfflat candidate ranking — to the general evaluation they replace
+// (sql.TestingNoStoredDistance), result for result and bit for bit: on
+// vectors of small integers, where many distinct rows lie at exactly the
+// same distance and the tie-breaking is all that orders them, with
+// copies, NULLs and a zero vector (a NaN cosine distance), for the
+// three operators, both operand orders, parameters, filters and OFFSET;
+// with a dimension mismatch failing the same way; and with ivfflat
+// returning the same rows, so its recall is unchanged.
+func TestVectorStoredDistanceMatchesGeneral(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s)
+	defer sql.TestingNoStoredDistance.Store(false)
+
+	const n, dims = 1500, 6
+	r := rand.New(rand.NewSource(7))
+	small := func() []float32 {
+		v := make([]float32, dims)
+		for j := range v {
+			v[j] = float32(r.Intn(5) - 2)
+		}
+		return v
+	}
+	rows := make([]vecRow, n)
+	for i := range rows {
+		rows[i] = vecRow{id: int64(i), grp: int64(i % 5), v: small()}
+		switch {
+		case i%11 == 10:
+			rows[i].v = rows[i-7].v // an exact copy
+		case i%89 == 0:
+			rows[i].v = nil
+		case i%400 == 5:
+			rows[i].v = make([]float32, dims) // the zero vector
+		case i%13 == 0:
+			for j := range rows[i].v { // fractional values too
+				rows[i].v[j] += float32(r.NormFloat64()) / 3
+			}
+		}
+	}
+	execVec(t, ctx, s, fmt.Sprintf(`CREATE TABLE sd (id INT8 PRIMARY KEY, grp INT8, v vector(%d))`, dims))
+	insertVecRows(t, ctx, s, "sd", rows)
+	for _, at := range []int{300, 1000} {
+		execVec(t, ctx, s, fmt.Sprintf(`ALTER TABLE sd SPLIT AT VALUES (%d)`, at))
+	}
+
+	// both runs a query with the stored-distance paths on and off and
+	// requires the same outcome, rows or error.
+	both := func(q string, params ...types.Datum) string {
+		t.Helper()
+		run := func(general bool) (string, *sql.Error) {
+			sql.TestingNoStoredDistance.Store(general)
+			defer sql.TestingNoStoredDistance.Store(false)
+			res, serr := trySQL(ctx, s, q, params...)
+			if serr != nil {
+				return "", serr
+			}
+			return resultBits(res), nil
+		}
+		got, gerr := run(false)
+		want, werr := run(true)
+		if (gerr == nil) != (werr == nil) || (gerr != nil && (gerr.Code != werr.Code || gerr.Msg != werr.Msg)) {
+			t.Fatalf("%s:\n stored-distance error %v\n general error %v", q, gerr, werr)
+		}
+		if got != want {
+			t.Fatalf("%s:\n stored distance:\n%s\n general:\n%s", q, got, want)
+		}
+		return got
+	}
+
+	queries := [][]float32{small(), small(), make([]float32, dims), {0.5, -1.25, 2, 0, 1, -0.75}}
+	ties := 0
+	for _, op := range []string{"<->", "<=>", "<#>"} {
+		for qi, q := range queries {
+			lit := vecLit(q)
+			for _, k := range []int{1, 10, 40, n + 5} {
+				both(fmt.Sprintf(`SELECT id, v %s %s FROM sd ORDER BY v %s %s LIMIT %d`, op, lit, op, lit, k))
+			}
+			both(fmt.Sprintf(`SELECT id FROM sd ORDER BY %s %s v LIMIT 10 OFFSET 7`, lit, op))
+			both(fmt.Sprintf(`SELECT id, v %s $1 AS d FROM sd ORDER BY d LIMIT 25`, op), types.NewString(vector.Format(q)))
+			both(fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s $1 LIMIT 25`, op), types.NewVector(q))
+			both(fmt.Sprintf(`SELECT id FROM sd WHERE id %% 3 = 1 ORDER BY v %s %s LIMIT 15`, op, lit))
+			both(fmt.Sprintf(`SELECT id FROM sd WHERE v IS NOT NULL AND id >= 200 ORDER BY v %s %s LIMIT 15`, op, lit))
+			both(fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s %s DESC LIMIT 12`, op, lit))
+			both(fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s %s NULLS FIRST LIMIT 12`, op, lit))
+			// And the answer is the true one: ties in primary-key order,
+			// NaN after every number, NULLs last.
+			got := idsInOrder(t, ctx, s, fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s %s LIMIT 40`, op, lit))
+			if want := refKNN(rows, op, q, 40, nil); fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Fatalf("%s q%d: got %v\nwant %v", op, qi, got, want)
+			}
+			res := execVec(t, ctx, s, fmt.Sprintf(`SELECT v %s %s AS d FROM sd ORDER BY d LIMIT 40`, op, lit))
+			for i := 1; i < len(res.Rows); i++ {
+				if res.Rows[i][0].F == res.Rows[i-1][0].F {
+					ties++
+				}
+			}
+		}
+	}
+	if ties < 50 {
+		t.Fatalf("only %d tied neighbours among the answers: the data does not exercise tie-breaking", ties)
+	}
+	// The exact scan decodes only the rows that make the heap: what it
+	// allocates per row scanned is the store's copy of the row, not a
+	// decoded row and an evaluated sort key (about eight allocations a
+	// row before).
+	knn := fmt.Sprintf(`SELECT id FROM sd ORDER BY v <-> %s LIMIT 10`, vecLit(queries[3]))
+	if perRow := testing.AllocsPerRun(5, func() { execVec(t, ctx, s, knn) }) / n; perRow > 4 {
+		t.Fatalf("the exact k-NN scan allocates %.1f times per row", perRow)
+	}
+
+	// A dimension mismatch fails as before, wherever the odd row sits.
+	execVec(t, ctx, s, `CREATE TABLE sdm (id INT8 PRIMARY KEY, v vector)`)
+	execVec(t, ctx, s, `INSERT INTO sdm VALUES (1, '[1,2,3]'), (2, '[1,2,4]'), (3, '[1,2]'), (4, NULL), (5, '[0,0,1]')`)
+	for _, q := range []string{
+		`SELECT id FROM sdm ORDER BY v <-> '[1,1,1]' LIMIT 2`,
+		`SELECT id FROM sdm ORDER BY '[1,1,1]' <=> v LIMIT 2`,
+		`SELECT id FROM sdm WHERE id > 1 ORDER BY v <#> '[1,1,1]' LIMIT 2`,
+	} {
+		both(q)
+		if _, serr := trySQL(ctx, s, q); serr == nil || serr.Code != "22000" || serr.Msg != "different vector dimensions 2 and 3" {
+			t.Fatalf("%s: %v", q, serr)
+		}
+	}
+	// Rows before and after the odd one are fine on their own.
+	if got := both(`SELECT id FROM sdm WHERE id <> 3 ORDER BY v <-> '[1,1,1]' LIMIT 3`); got != "5 \n1 \n2 \n" {
+		t.Fatalf("without the odd row: %q", got)
+	}
+
+	// ivfflat: the same candidates, ranked the same, so the same answer
+	// at every probes setting — with and without a filter (the bounded
+	// heap and the full ranking) — and recall@10 as it was.
+	execVec(t, ctx, s, `CREATE INDEX sd_ivf ON sd USING ivfflat (v vector_l2_ops) WITH (lists = 16)`)
+	execVec(t, ctx, s, `CREATE INDEX sd_ivf_ip ON sd USING ivfflat (v vector_ip_ops) WITH (lists = 16)`)
+	execVec(t, ctx, s, `CREATE INDEX sd_ivf_cos ON sd USING ivfflat (v vector_cosine_ops) WITH (lists = 16)`)
+	for _, op := range []string{"<->", "<#>", "<=>"} {
+		var recallOn, recallOff float64
+		for _, probes := range []string{"1", "4", "16"} {
+			execVec(t, ctx, s, `SET ivfflat.probes = `+probes)
+			for _, q := range queries {
+				lit := vecLit(q)
+				query := fmt.Sprintf(`SELECT id, v %s %s FROM sd ORDER BY v %s %s LIMIT 10`, op, lit, op, lit)
+				if p := planOf(t, ctx, s, query); !strings.HasPrefix(p, "vector scan of index") {
+					t.Fatalf("%s: not served by the index: %s", query, p)
+				}
+				both(query)
+				both(fmt.Sprintf(`SELECT id FROM sd WHERE grp <> 2 ORDER BY v %s %s LIMIT 10 OFFSET 3`, op, lit))
+				exact := refKNN(rows, op, q, 10, nil)
+				if probes == "4" {
+					sql.TestingNoStoredDistance.Store(true)
+					idx, _ := indexedAndExact(t, ctx, s, fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s %s LIMIT 10`, op, lit))
+					sql.TestingNoStoredDistance.Store(false)
+					recallOff += recallOf(idx, exact)
+					idx, _ = indexedAndExact(t, ctx, s, fmt.Sprintf(`SELECT id FROM sd ORDER BY v %s %s LIMIT 10`, op, lit))
+					recallOn += recallOf(idx, exact)
+				}
+				if probes == "16" {
+					// Every list probed: the index's answer is the exact one.
+					execVec(t, ctx, s, `SET vector_index_scan = on`)
+					if got := idsInOrder(t, ctx, s, fmt.Sprintf(`SELECT id FROM sd WHERE v IS NOT NULL ORDER BY v %s %s LIMIT 10`, op, lit)); op != "<=>" && fmt.Sprint(got) != fmt.Sprint(exact) {
+						t.Fatalf("%s all lists: %v, want %v", op, got, exact)
+					}
+					execVec(t, ctx, s, `RESET vector_index_scan`)
+				}
+			}
+		}
+		if recallOn != recallOff {
+			t.Fatalf("%s: recall@10 %v with the stored-distance ranking, %v without", op, recallOn/float64(len(queries)), recallOff/float64(len(queries)))
+		}
+	}
+	execVec(t, ctx, s, `RESET ivfflat.probes`)
 }
 
 // vectorRecall measures recall@k of the index against the exact scan's
@@ -1598,6 +1798,8 @@ func BenchmarkVectorKNN(b *testing.B) {
 		rec, _ := vectorRecall(b, ctx, s, "bench_vec", "<->", byID, queries, exact, 10, probes)
 		b.Logf("probes = %s: recall@10 = %.3f", probes, rec)
 	}
+	// Watch allocs/op first (ns/op is noisy on a shared machine); the
+	// exact scan also reports its cost per row scanned.
 	for _, mode := range []struct{ name, set string }{
 		{"indexed-probes-1", `SET vector_index_scan = on; SET ivfflat.probes = 1`},
 		{"indexed-probes-auto", `SET vector_index_scan = on; RESET ivfflat.probes`},
@@ -1606,12 +1808,22 @@ func BenchmarkVectorKNN(b *testing.B) {
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			execVec(b, ctx, s, mode.set)
+			b.ReportAllocs()
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			mallocs := ms.Mallocs
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				q := queries[i%len(queries)]
 				if got := idsInOrder(b, ctx, s, `SELECT id FROM bench_vec ORDER BY v <-> `+vecLit(q)+` LIMIT 10`); len(got) != 10 {
 					b.Fatalf("%d rows", len(got))
 				}
+			}
+			b.StopTimer()
+			if mode.name == "exact" {
+				runtime.ReadMemStats(&ms)
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/n, "ns/vector")
+				b.ReportMetric(float64(ms.Mallocs-mallocs)/float64(b.N)/n, "allocs/vector")
 			}
 		})
 	}
