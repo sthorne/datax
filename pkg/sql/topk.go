@@ -115,6 +115,7 @@ func (s *Session) scanTopK(ctx context.Context, txn *kvclient.Txn, desc *catalog
 	}
 	noteIndexScan(desc, desc.LivePrimaryIndex())
 	h := &topKHeap{keyer: keyer}
+	memo := &whereMemo{}
 	var scanned, matched int64
 	cursor := keys.Key(start)
 	for {
@@ -127,7 +128,7 @@ func (s *Session) scanTopK(ctx context.Context, txn *kvclient.Txn, desc *catalog
 			if err != nil {
 				return nil, err
 			}
-			match, err := matchesWhere(where, desc, row, params)
+			match, err := matchesWhereMemo(where, desc, row, params, memo)
 			if err != nil {
 				return nil, err
 			}

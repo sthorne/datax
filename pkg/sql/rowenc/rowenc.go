@@ -242,6 +242,27 @@ func DecodePK(desc *catalog.TableDescriptor, key keys.Key) ([]types.Datum, error
 	return out, nil
 }
 
+// DecodePKInto is DecodePK storing each primary key column's value in
+// row by column ID.
+func DecodePKInto(desc *catalog.TableDescriptor, key keys.Key, row map[catalog.ColumnID]types.Datum) error {
+	prefix := PrimaryKeyPrefixFor(desc)
+	if !bytes.HasPrefix(key, prefix) {
+		return fmt.Errorf("key not in table %d's primary index", desc.ID)
+	}
+	rest := []byte(key[len(prefix):])
+	for _, colID := range desc.PrimaryKey {
+		col, _ := desc.ColByID(colID)
+		var err error
+		var d types.Datum
+		rest, d, err = decodeKeyDatum(rest, col.Type)
+		if err != nil {
+			return fmt.Errorf("decoding pk column %q: %w", col.Name, err)
+		}
+		row[colID] = d
+	}
+	return nil
+}
+
 // LeadingPKColumn returns the leading primary-key column of a row key of
 // desc at any of its indexes' prefixes (/t/<id>/<index>/...): the bytes
 // of its key encoding — what tells one value from another in KV — and the
@@ -416,6 +437,19 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 // NULL). Columns the descriptor does not know are skipped — dropped
 // columns' bytes, or columns added by a newer descriptor.
 func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnID]types.Datum, error) {
+	return DecodeValueCols(desc, raw, nil)
+}
+
+// DecodeValueCols is DecodeValue that decodes only the columns need
+// reports (every column when need is nil): the others are stepped over,
+// and read as absent.
+func DecodeValueCols(desc *catalog.TableDescriptor, raw []byte, need func(catalog.ColumnID) bool) (map[catalog.ColumnID]types.Datum, error) {
+	return DecodeValueInto(desc, raw, need, nil)
+}
+
+// DecodeValueInto is DecodeValueCols decoding into out, an empty map the
+// caller recycles (a new map when out is nil).
+func DecodeValueInto(desc *catalog.TableDescriptor, raw []byte, need func(catalog.ColumnID) bool, out map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("corrupt row value: empty")
 	}
@@ -426,7 +460,9 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 		return nil, fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])
 	}
 	rest := raw[1:]
-	out := make(map[catalog.ColumnID]types.Datum)
+	if out == nil {
+		out = make(map[catalog.ColumnID]types.Datum)
+	}
 	for len(rest) > 0 {
 		var id uint64
 		var err error
@@ -442,6 +478,9 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 
 		colID := catalog.ColumnID(id)
 		col, known := desc.ColByID(colID)
+		if known && need != nil && !need(colID) {
+			known = false
+		}
 
 		switch tag {
 		case tagNull:
@@ -508,10 +547,10 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if uint64(len(rest)) < n {
 				return nil, fmt.Errorf("corrupt row value: short enum payload")
 			}
-			label := string(rest[:n])
+			label := rest[:n]
 			rest = rest[n:]
 			if known && col.Type == types.Enum {
-				out[colID] = types.NewEnum(int64(ord), label)
+				out[colID] = types.NewEnum(int64(ord), string(label))
 			}
 		case tagInterval:
 			if len(rest) < 24 {
@@ -542,25 +581,25 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 			if err != nil || uint64(len(rest)) < n {
 				return nil, fmt.Errorf("corrupt row value: bad string payload")
 			}
-			v := string(rest[:n])
+			v := rest[:n]
 			rest = rest[n:]
-			want := types.String
+			fam := types.String
 			switch tag {
 			case tagBytes:
-				want = types.Bytes
+				fam = types.Bytes
 			case tagDecimal:
-				want = types.Decimal
+				fam = types.Decimal
 			case tagJsonb:
-				want = types.Jsonb
+				fam = types.Jsonb
 			case tagTsvector:
-				want = types.Tsvector
+				fam = types.Tsvector
 			case tagTsquery:
-				want = types.Tsquery
+				fam = types.Tsquery
 			case tagVector:
-				want = types.Vector
+				fam = types.Vector
 			}
-			if known && col.Type == want {
-				out[colID] = types.Datum{Fam: want, S: v}
+			if known && col.Type == fam {
+				out[colID] = types.Datum{Fam: fam, S: string(v)}
 			}
 		case tagUUID:
 			if len(rest) < 16 {

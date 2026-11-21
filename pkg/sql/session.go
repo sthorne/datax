@@ -2099,7 +2099,14 @@ func sizePretty(n int64) string {
 
 // matchesWhere evaluates the conjunction against a full row.
 func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum) (bool, error) {
-	for _, cmp := range where {
+	return matchesWhereMemo(where, desc, row, params, nil)
+}
+
+// matchesWhereMemo is matchesWhere for a caller that applies the same
+// conjunction to many rows of one statement: memo (nil for none) keeps
+// what the conjuncts compute once, such as a compiled jsonb @> operand.
+func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum, params []types.Datum, memo *whereMemo) (bool, error) {
+	for i, cmp := range where {
 		// Constant conjuncts (evaluated EXISTS subqueries) bind no column.
 		if cmp.Op == "TRUE" {
 			continue
@@ -2127,7 +2134,7 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 						return false, newErrf(CodeInternal, "an IN or EXISTS subquery inside OR was not resolved before execution")
 					}
 				}
-				ok, err := matchesWhere(disjunct, desc, row, params)
+				ok, err := matchesWhereMemo(disjunct, desc, row, params, memo)
 				if err != nil {
 					return false, err
 				}
@@ -2191,6 +2198,28 @@ func matchesWhere(where []parser.Comparison, desc *catalog.TableDescriptor, row 
 			continue
 		}
 		if cmp.Op == "@>" || cmp.Op == "NOT @>" {
+			if memo != nil && cmpType == types.Jsonb && !lhs.Fam.IsArray() && rowIndependent(cmp.Value) {
+				// A constant right operand: evaluated, coerced and
+				// compiled once for the statement.
+				if lhs.Null {
+					return false, nil // NULL operands: UNKNOWN either way
+				}
+				pat, null, err := memo.jsonbPattern(&where[i], desc, row, params)
+				if err != nil {
+					return false, err
+				}
+				if null {
+					return false, nil
+				}
+				ok, cerr := jsonbContainsPattern(lhs, pat)
+				if cerr != nil {
+					return false, cerr
+				}
+				if ok != (cmp.Op == "@>") {
+					return false, nil
+				}
+				continue
+			}
 			rhs, err := evalExpr(cmp.Value, desc, row, params)
 			if err != nil {
 				return false, err

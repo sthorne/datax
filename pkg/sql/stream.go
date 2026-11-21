@@ -307,6 +307,14 @@ type scanIter struct {
 	where  []parser.Comparison
 	params []types.Datum
 	proj   []projCol
+	// memo keeps what the filter computes once per statement.
+	memo whereMemo
+	// need, when set, is the set of columns the filter and projection
+	// read: the only ones decoded.
+	need func(catalog.ColumnID) bool
+	// spare is the row map of the last row the filter rejected, cleared
+	// for the next row to decode into.
+	spare map[catalog.ColumnID]types.Datum
 
 	spans   []keySpan // spans still to scan (per shard bucket when fanned)
 	cur     keySpan   // the span in progress
@@ -397,20 +405,30 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 			continue
 		}
 		for _, kv := range kvs {
-			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, kv.Key, kv.Value)
+			row, err := decodeRowInto(ctx, it.s.rowSealer(), it.desc, kv.Key, kv.Value, it.need, it.spare)
 			if err != nil {
 				return false, err
 			}
-			match, err := matchesWhere(it.where, it.desc, row, it.params)
+			match, err := matchesWhereMemo(it.where, it.desc, row, it.params, &it.memo)
 			if err != nil {
 				return false, err
 			}
-			if match {
-				it.buf = append(it.buf, fetchedRow{key: kv.Key, row: row})
-			}
+			it.keep(fetchedRow{key: kv.Key, row: row}, match)
 		}
 	}
 	return true, nil
+}
+
+// keep buffers a row the filter matched; a rejected row's map is
+// cleared and decoded into next (the filter holds on to nothing of it).
+func (it *scanIter) keep(fr fetchedRow, match bool) {
+	if match {
+		it.buf = append(it.buf, fr)
+		it.spare = nil
+		return
+	}
+	clear(fr.row)
+	it.spare = fr.row
 }
 
 // fillIndexPage fetches the primary rows behind a page of index entries
@@ -430,17 +448,15 @@ func (it *scanIter) fillIndexPage(ctx context.Context, kvs []kvpb.KeyValue) erro
 			if raw == nil {
 				return false, newErrf(CodeInternal, "index %q entry points at a missing row", it.plan.idx.Name)
 			}
-			row, err := decodeFullRow(ctx, it.s.rowSealer(), it.desc, pk, raw)
+			row, err := decodeRowInto(ctx, it.s.rowSealer(), it.desc, pk, raw, it.need, it.spare)
 			if err != nil {
 				return false, err
 			}
-			match, err := matchesWhere(it.where, it.desc, row, it.params)
+			match, err := matchesWhereMemo(it.where, it.desc, row, it.params, &it.memo)
 			if err != nil {
 				return false, err
 			}
-			if match {
-				it.buf = append(it.buf, fetchedRow{key: pk, row: row})
-			}
+			it.keep(fetchedRow{key: pk, row: row}, match)
 		}
 		return true, nil
 	})
@@ -485,6 +501,7 @@ func (s *Session) streamable(top bool, desc *catalog.TableDescriptor, plan acces
 // newScanStream builds the streaming result for a scan-shaped select.
 func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, t *parser.Select, proj []projCol, where []parser.Comparison, params []types.Datum, fetchLimit int64) (*Result, error) {
 	it := &scanIter{s: s, txn: txn, desc: desc, plan: plan, where: where, params: params, proj: proj, reverse: plan.reverse, fetchLimit: fetchLimit}
+	it.need = scanNeededCols(desc, proj, where)
 	switch plan.kind {
 	case planIndexScan:
 		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
