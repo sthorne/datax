@@ -1367,8 +1367,11 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	// and timestamp cache and apply through a second Raft group, in
 	// parallel with the owner's (issue #389: two Increments of the range
 	// ID counter, one through each group, read the same value and two
-	// splits were given the same range ID). Check again, now that
-	// nothing can move the bounds until the latches are released.
+	// splits were given the same range ID). Check again, now that the
+	// bounds can no longer move away from this batch's keys: a split may
+	// still shrink the range while a left-hand batch holds its latches
+	// (it latches only its right-hand side), but every key of such a
+	// batch stays in this range either way.
 	if err := r.checkKeyBounds(ba); err != nil {
 		return nil, err
 	}
