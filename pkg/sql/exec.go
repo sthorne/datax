@@ -1979,6 +1979,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 			met              bool
 		)
 		lo, hi := start, end
+		memo := &whereMemo{}
 		for {
 			kvs, err := spanScan(ctx, txn, lo, hi, scanLimit, plan.reverse)
 			if err != nil {
@@ -2016,7 +2017,7 @@ func (s *Session) executePlan(ctx context.Context, txn *kvclient.Txn, desc *cata
 					if err != nil {
 						return false, err
 					}
-					match, err := matchesWhere(where, desc, row, params)
+					match, err := matchesWhereMemo(where, desc, row, params, memo)
 					if err != nil {
 						return false, err
 					}
@@ -2149,6 +2150,7 @@ func (s *Session) fetchPKPoints(ctx context.Context, txn *kvclient.Txn, desc *ca
 	noteIndexScan(desc, desc.LivePrimaryIndex())
 	mark := txn.ReadMark()
 	var out []fetchedRow
+	memo := &whereMemo{}
 	err := fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
 		for i, raw := range raws {
 			if raw == nil {
@@ -2159,7 +2161,7 @@ func (s *Session) fetchPKPoints(ctx context.Context, txn *kvclient.Txn, desc *ca
 			if err != nil {
 				return false, err
 			}
-			match, err := matchesWhere(where, desc, row, params)
+			match, err := matchesWhereMemo(where, desc, row, params, memo)
 			if err != nil {
 				return false, err
 			}
@@ -2246,12 +2248,13 @@ func (s *Session) scanPrimarySpan(ctx context.Context, txn *kvclient.Txn, desc *
 	s.AddScanned(int64(len(kvs)))
 	noteIndexRows(desc, desc.LivePrimaryIndex(), len(kvs))
 	var out []fetchedRow
+	memo := &whereMemo{}
 	for i, kv := range kvs {
 		row, err := decodeFullRow(ctx, s.rowSealer(), desc, kv.Key, kv.Value)
 		if err != nil {
 			return nil, err
 		}
-		match, err := matchesWhere(where, desc, row, params)
+		match, err := matchesWhereMemo(where, desc, row, params, memo)
 		if err != nil {
 			return nil, err
 		}
@@ -2421,27 +2424,36 @@ func (s *Session) rowSealer() *rowseal.Boundary { return rowseal.For(s.cat) }
 // table is sealed — into every column, PK columns included. Every read
 // of a row value goes through here (or through openRowValue).
 func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
+	return decodeRowInto(ctx, b, desc, key, value, nil, nil)
+}
+
+// decodeRowInto is decodeFullRow decoding only the value columns need
+// reports (all of them when need is nil; the primary key columns always
+// are), into into: an empty map the caller recycles, or nil for a new
+// one.
+func decodeRowInto(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, into map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
 	value, err := b.OpenValue(ctx, desc, key, value)
 	if err != nil {
 		return nil, err
 	}
-	return decodeOpenedRow(desc, key, value)
+	return decodeOpenedRowInto(desc, key, value, need, into)
 }
 
 // decodeOpenedRow is decodeFullRow over a value already opened
 // (rowseal.Boundary.OpenValue): for a caller that reads the opened
 // value itself before deciding to decode the row.
 func decodeOpenedRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
-	row, err := rowenc.DecodeValue(desc, value)
+	return decodeOpenedRowInto(desc, key, value, nil, nil)
+}
+
+// decodeOpenedRowInto is decodeRowInto over a value already opened.
+func decodeOpenedRowInto(desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, into map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
+	row, err := rowenc.DecodeValueInto(desc, value, need, into)
 	if err != nil {
 		return nil, err
 	}
-	pkVals, err := rowenc.DecodePK(desc, key)
-	if err != nil {
+	if err := rowenc.DecodePKInto(desc, key, row); err != nil {
 		return nil, err
-	}
-	for i, id := range desc.PrimaryKey {
-		row[id] = pkVals[i]
 	}
 	// Stamp DECIMAL(p,s) columns with their declared display scale so
 	// projections render fixed-scale ("9.90"), CHAR(n) columns with their

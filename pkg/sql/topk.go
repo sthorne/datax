@@ -121,6 +121,7 @@ func (s *Session) scanTopK(ctx context.Context, txn *kvclient.Txn, desc *catalog
 	dist := topKDistanceOf(desc, order)
 	sealer := s.rowSealer()
 	var probe [1]types.Datum
+	memo := &whereMemo{}
 	var scanned, matched int64
 	cursor := keys.Key(start)
 	for {
@@ -162,7 +163,7 @@ func (s *Session) scanTopK(ctx context.Context, txn *kvclient.Txn, desc *catalog
 				}
 			}
 			if key == nil {
-				match, err := matchesWhere(where, desc, row, params)
+				match, err := matchesWhereMemo(where, desc, row, params, memo)
 				if err != nil {
 					return nil, err
 				}

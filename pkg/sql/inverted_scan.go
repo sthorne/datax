@@ -267,6 +267,7 @@ func (s *Session) executeInvertedScan(ctx context.Context, txn *kvclient.Txn, de
 	}
 	var out []fetchedRow
 	batches := 0
+	memo := &whereMemo{}
 	err = fetchPrimaryRows(ctx, txn, pks, func(first int, raws [][]byte) (bool, error) {
 		batches++
 		for i, raw := range raws {
@@ -281,7 +282,7 @@ func (s *Session) executeInvertedScan(ctx context.Context, txn *kvclient.Txn, de
 			if err != nil {
 				return false, err
 			}
-			match, err := matchesWhere(where, desc, row, params)
+			match, err := matchesWhereMemo(where, desc, row, params, memo)
 			if err != nil {
 				return false, err
 			}
