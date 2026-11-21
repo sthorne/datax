@@ -2344,20 +2344,27 @@ func (s *Session) rowSealer() *rowseal.Boundary { return rowseal.For(s.cat) }
 // table is sealed — into every column, PK columns included. Every read
 // of a row value goes through here (or through openRowValue).
 func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
+	row := make(map[catalog.ColumnID]types.Datum)
+	if err := decodeFullRowInto(ctx, b, desc, key, value, rowenc.MapRow(row)); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// decodeFullRowInto is decodeFullRow into an empty row the caller
+// provides: a scan that is done with each row before it decodes the
+// next reuses one row (emptying it between rows) rather than building
+// a map per row.
+func decodeFullRowInto(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte, row rowenc.RowSink) error {
 	value, err := b.OpenValue(ctx, desc, key, value)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	row, err := rowenc.DecodeValue(desc, value)
-	if err != nil {
-		return nil, err
+	if err := rowenc.DecodeValueInto(desc, value, row); err != nil {
+		return err
 	}
-	pkVals, err := rowenc.DecodePK(desc, key)
-	if err != nil {
-		return nil, err
-	}
-	for i, id := range desc.PrimaryKey {
-		row[id] = pkVals[i]
+	if err := rowenc.DecodePKTo(desc, key, row); err != nil {
+		return err
 	}
 	// Stamp DECIMAL(p,s) columns with their declared display scale so
 	// projections render fixed-scale ("9.90"), CHAR(n) columns with their
@@ -2368,12 +2375,12 @@ func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.Table
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
 		if col.Precision > 0 || col.Char || col.NoTZ || col.Type.IsArray() {
-			if d, ok := row[col.ID]; ok && !d.Null {
-				row[col.ID] = stampDisplay(col, d)
+			if d, ok := row.GetCol(col.ID); ok && !d.Null {
+				row.SetCol(col.ID, stampDisplay(col, d))
 			}
 		}
 	}
-	return row, nil
+	return nil
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {

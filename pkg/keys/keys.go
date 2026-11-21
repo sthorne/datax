@@ -821,8 +821,15 @@ func TableDataSpan(tableID uint64) (Key, Key) {
 // /t/<tableID>/<indexID>/. Primary rows are index 1 (see pkg/sql/rowenc).
 func TableIndexPrefix(tableID, indexID uint64) Key {
 	// One allocation, at the capacity the grow it replaces ended with.
-	k := append(make(Key, 0, 32), TablePrefix...)
-	return Key(encoding.EncodeUint64(encoding.EncodeUint64(k, tableID), indexID))
+	return AppendTableIndexPrefix(make(Key, 0, 32), tableID, indexID)
+}
+
+// AppendTableIndexPrefix appends TableIndexPrefix(tableID, indexID) to
+// b, so a caller with a buffer of its own (a stack array) builds it
+// without allocating.
+func AppendTableIndexPrefix(b []byte, tableID, indexID uint64) Key {
+	b = append(b, TablePrefix...)
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(b, tableID), indexID))
 }
 
 // TableAuxIndexID is the index ID no index ever has (primary rows are

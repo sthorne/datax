@@ -87,3 +87,39 @@ func TestDecodeBytesWithTrailingData(t *testing.T) {
 		t.Fatalf("got %q rest %x err %v", dec, rest, err)
 	}
 }
+
+// TestDecodeBytesAppend: DecodeBytesAppend decodes what DecodeBytes
+// does, after whatever dst already holds, with the same rest and the
+// same errors, NULs and escapes included.
+func TestDecodeBytesAppend(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	inputs := [][]byte{nil, {}, []byte("key"), {0}, {0, 0}, {0, 1, 0}, {0xff, 0, 0xff}}
+	for i := 0; i < 200; i++ {
+		b := make([]byte, rng.Intn(40))
+		for j := range b {
+			b[j] = byte(rng.Intn(4)) // NULs often
+		}
+		inputs = append(inputs, b)
+	}
+	var buf []byte
+	for _, in := range inputs {
+		enc := append(EncodeBytes(nil, in), 0xde, 0xad)
+		wantRest, want, werr := DecodeBytes(enc)
+		buf = append(buf[:0], "pre"...)
+		rest, got, err := DecodeBytesAppend(buf, enc)
+		if err != nil || werr != nil {
+			t.Fatalf("%x: %v / %v", in, err, werr)
+		}
+		if string(got[:3]) != "pre" || !bytes.Equal(got[3:], want) || !bytes.Equal(rest, wantRest) {
+			t.Fatalf("%x: got %x rest %x, want pre+%x rest %x", in, got, rest, want, wantRest)
+		}
+		buf = got
+	}
+	for _, bad := range [][]byte{{}, {'a'}, {0}, {0, 2}, {'a', 0, 0xfe}} {
+		_, _, werr := DecodeBytes(bad)
+		_, _, err := DecodeBytesAppend([]byte("x"), bad)
+		if err == nil || werr == nil || err.Error() != werr.Error() {
+			t.Errorf("%x: got %v, want %v", bad, err, werr)
+		}
+	}
+}
