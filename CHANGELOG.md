@@ -2007,6 +2007,20 @@ state or the internode protocol does, and an entry below says so.
     A transaction that has not written cannot have an entry, so the
     lookup now runs only when the batch's sequence or anchor key says it
     has written, which removes about 4 µs per read.
+  - The statement path had picked up allocations: a prepared point
+    SELECT made 159 server allocations, against 97 on 11-14, and a point
+    UPDATE 346, against 259. They are down to 97 and 272 before the
+    schema fix, which removes another 47 from the SELECT. The changes:
+    - The activity fingerprint is taken once per prepared statement.
+    - Wire messages and session resolution state are reused.
+    - The routing fallback caches its node list.
+    - A latch makes its release channel only when someone waits.
+    - A lease-holding leader with no read-index round in flight
+      confirms a read through its lease inline, the round's own first
+      step, instead of through a goroutine.
+- Executions of a prepared statement are recorded under one statement
+  shape, the one its text has in the simple protocol. They were split
+  between the qualified and the alias-stripped forms.
 - **Bulk INSERTs of 1,000 rows no longer push and refresh each other.**
   Each statement's uniqueness checks filled a timestamp-cache generation
   every few statements, and folding it into the floor pushed every
