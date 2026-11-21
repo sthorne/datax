@@ -994,6 +994,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.pendingDrops = append(s.pendingDrops, s.extraDrops...)
 		s.extraDDL, s.extraDrops = nil, nil
 		s.tempEndTxn()
+		committed := s.txn
 		err := s.txn.Commit(ctx)
 		s.tempTxnDone(err == nil)
 		s.loEndTxn(ctx, err == nil)
@@ -1016,7 +1017,11 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// its notifications go out, whatever the steps below report.
 		s.commitNotify()
 		// Schema changes are visible everywhere once COMMIT returns: drain
-		// lease adoption for every table this transaction altered.
+		// the schema sets of the databases whose schemas this transaction
+		// changed, and lease adoption for every table it altered.
+		if derr := s.cat.FinishSchemaChanges(ctx, committed); derr != nil {
+			return nil, ToSQLError(derr)
+		}
 		for _, name := range pending {
 			if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {
 				return nil, ToSQLError(derr)
@@ -1432,8 +1437,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.executeStreamingSelect(ctx, sel, params)
 	}
 	var res *Result
+	var committed *kvclient.Txn
 	err := s.runImplicit(ctx, stmt, func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
+		committed = txn
 		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
@@ -1459,6 +1466,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	s.extraDDL, s.extraDrops = nil, nil
 	if name := ddlTableName(stmt); name != "" {
 		names = append([]string{name}, names...)
+	}
+	if derr := s.cat.FinishSchemaChanges(ctx, committed); derr != nil {
+		return nil, ToSQLError(derr)
 	}
 	for _, name := range names {
 		if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {

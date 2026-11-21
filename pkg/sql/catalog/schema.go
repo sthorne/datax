@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,7 +246,10 @@ func (a *Accessor) CreateSchema(ctx context.Context, txn *kvclient.Txn, d *Schem
 	if err := putSchema(ctx, txn, d); err != nil {
 		return err
 	}
-	return txn.Put(ctx, keys.SchemaNamespaceKey(d.DatabaseID, d.Name), []byte(strconv.FormatUint(d.ID, 10)))
+	if err := txn.Put(ctx, keys.SchemaNamespaceKey(d.DatabaseID, d.Name), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
+		return err
+	}
+	return bumpSchemaGen(ctx, txn, d.DatabaseID)
 }
 
 func putSchema(ctx context.Context, txn *kvclient.Txn, d *SchemaDescriptor) error {
@@ -258,6 +262,9 @@ func putSchema(ctx context.Context, txn *kvclient.Txn, d *SchemaDescriptor) erro
 
 // UpdateSchema rewrites a schema descriptor (owner, privileges),
 // refusing one made from another version of it (a concurrent change).
+// The database's schema generation moves with it, so gateways caching
+// the schema set re-read it (a USAGE grant or revoke decides whether
+// the schema is searched).
 func (a *Accessor) UpdateSchema(ctx context.Context, txn *kvclient.Txn, d *SchemaDescriptor) error {
 	cur, err := ReadSchema(ctx, txn, d.ID)
 	if err != nil {
@@ -270,7 +277,10 @@ func (a *Accessor) UpdateSchema(ctx context.Context, txn *kvclient.Txn, d *Schem
 		return &kvclient.RetryableError{Cause: &kvpb.Error{Message: fmt.Sprintf("schema %q was changed by a concurrent statement", d.Name)}}
 	}
 	d.Version++
-	return putSchema(ctx, txn, d)
+	if err := putSchema(ctx, txn, d); err != nil {
+		return err
+	}
+	return bumpSchemaGen(ctx, txn, d.DatabaseID)
 }
 
 // RenameSchema moves a schema's name entry. Its tables are filed by
@@ -303,7 +313,10 @@ func (a *Accessor) DropSchema(ctx context.Context, txn *kvclient.Txn, d *SchemaD
 	if err := txn.Delete(ctx, keys.SchemaNamespaceKey(d.DatabaseID, d.Name)); err != nil {
 		return err
 	}
-	return txn.Delete(ctx, keys.SchemaDescKey(d.ID))
+	if err := txn.Delete(ctx, keys.SchemaDescKey(d.ID)); err != nil {
+		return err
+	}
+	return bumpSchemaGen(ctx, txn, d.DatabaseID)
 }
 
 // dropSchemasOf removes every schema of database dbID (DROP DATABASE,
@@ -324,7 +337,10 @@ func dropSchemasOf(ctx context.Context, txn *kvclient.Txn, dbID uint64) error {
 			return err
 		}
 	}
-	return nil
+	if len(rows) == 0 {
+		return nil
+	}
+	return bumpSchemaGen(ctx, txn, dbID)
 }
 
 // TablesInSchema returns the table and view descriptors of schema
@@ -458,12 +474,87 @@ func splitPathList(v string) []string {
 // UserPathEntry is the search_path entry that names the current role.
 const UserPathEntry = "$user"
 
+// schemaLookup looks up schemas of one database by name: from the
+// gateway's leased schema set when there is one to use (schemacache.go),
+// leased on first need, and otherwise in txn.
+type schemaLookup struct {
+	a      *Accessor // nil: always in txn
+	txn    *kvclient.Txn
+	dbID   uint64
+	set    *schemaSet
+	leased bool // set was asked for
+}
+
+// get returns the schema called name, or found false when there is no
+// such schema. Public always exists.
+func (l *schemaLookup) get(ctx context.Context, name string) (sd *SchemaDescriptor, found bool, err error) {
+	if name == PublicSchema {
+		return publicSchema(l.dbID), true, nil
+	}
+	if name == "" || IsSystemSchemaName(name) || IsReservedTableName(name) {
+		return nil, false, nil
+	}
+	if l.a != nil && !l.leased {
+		l.set, l.leased = l.a.schemaSnapshot(ctx, l.txn, l.dbID), true
+	}
+	if l.set != nil {
+		sd = l.set.byName[name]
+		return sd, sd != nil, nil
+	}
+	sd, err = LookupSchema(ctx, l.txn, l.dbID, name)
+	if err != nil {
+		var nf *ErrSchemaNotFound
+		if errors.As(err, &nf) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return sd, true, nil
+}
+
+// lookupSchemaErr is get with a missing schema as ErrSchemaNotFound.
+func (l *schemaLookup) lookupSchemaErr(ctx context.Context, name string) (*SchemaDescriptor, error) {
+	sd, found, err := l.get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, &ErrSchemaNotFound{Name: name}
+	}
+	return sd, nil
+}
+
+// schemas is the lookup of database dbID's schemas for a by-name lookup
+// of an existing object in txn: through the leased schema set when
+// cached is true, in txn otherwise.
+func (a *Accessor) schemas(txn *kvclient.Txn, dbID uint64, cached bool) *schemaLookup {
+	l := &schemaLookup{txn: txn, dbID: dbID}
+	if cached {
+		l.a = a
+	}
+	return l
+}
+
 // PathSchemas resolves the path of r (public alone for nil) to the
 // schemas of database dbID that exist, in order and without repeats:
 // "$user" names the current role's schema, a schema that does not exist
 // is skipped, and the system schemas (pg_catalog, pg_temp, ...) are
-// left out, being the session's to search.
+// left out, being the session's to search. It reads the schemas in txn;
+// Accessor.PathSchemas answers from the gateway's leased schema set.
 func PathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolution) ([]*SchemaDescriptor, error) {
+	return pathSchemas(ctx, &schemaLookup{txn: txn, dbID: dbID}, r)
+}
+
+// PathSchemas is catalog.PathSchemas through this gateway's leased
+// schema set, when it can answer for txn (schemacache.go): for a lookup
+// of existing objects, not for where one is created (ResolveTarget).
+// The descriptors returned may be shared and must not be modified.
+func (a *Accessor) PathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolution) ([]*SchemaDescriptor, error) {
+	return pathSchemas(ctx, a.schemas(txn, dbID, true), r)
+}
+
+func pathSchemas(ctx context.Context, l *schemaLookup, r *Resolution) ([]*SchemaDescriptor, error) {
+	txn := l.txn
 	path := []string{PublicSchema}
 	user := ""
 	var canUse func(context.Context, *kvclient.Txn, *SchemaDescriptor) (bool, error)
@@ -471,22 +562,21 @@ func PathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolut
 		path, user, canUse = r.Path, r.User, r.CanUse
 	}
 	var out []*SchemaDescriptor
-	seen := map[string]bool{}
+	var seen []string
 	for _, e := range path {
 		if e == UserPathEntry {
 			e = user
 		}
-		if e == "" || seen[e] || IsSystemSchemaName(e) {
+		if e == "" || slices.Contains(seen, e) || IsSystemSchemaName(e) {
 			continue
 		}
-		seen[e] = true
-		sd, err := LookupSchema(ctx, txn, dbID, e)
+		seen = append(seen, e)
+		sd, found, err := l.get(ctx, e)
 		if err != nil {
-			var nf *ErrSchemaNotFound
-			if errors.As(err, &nf) {
-				continue
-			}
 			return nil, err
+		}
+		if !found {
+			continue
 		}
 		if !sd.IsPublic() && canUse != nil {
 			ok, err := canUse(ctx, txn, sd)
@@ -561,7 +651,18 @@ func BareName(name string) string {
 // all in public must restore from a dump as it did before schemas.
 // Creation (ResolveTarget) and current_schema() do not fall back.
 func LookupPathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolution) ([]*SchemaDescriptor, error) {
-	schemas, err := PathSchemas(ctx, txn, dbID, r)
+	return lookupPathSchemas(ctx, &schemaLookup{txn: txn, dbID: dbID}, r)
+}
+
+// LookupPathSchemas is catalog.LookupPathSchemas through this gateway's
+// leased schema set, as Accessor.PathSchemas.
+func (a *Accessor) LookupPathSchemas(ctx context.Context, txn *kvclient.Txn, dbID uint64, r *Resolution) ([]*SchemaDescriptor, error) {
+	return lookupPathSchemas(ctx, a.schemas(txn, dbID, true), r)
+}
+
+func lookupPathSchemas(ctx context.Context, l *schemaLookup, r *Resolution) ([]*SchemaDescriptor, error) {
+	dbID := l.dbID
+	schemas, err := pathSchemas(ctx, l, r)
 	if err != nil || len(schemas) > 0 || r == nil {
 		return schemas, err
 	}
@@ -605,7 +706,7 @@ type Target struct {
 // extension kept for compatibility (docs/design/schemas.md) — a
 // database q, whose public schema is meant. ok is false when q names
 // neither.
-func (a *Accessor) resolveSchemaQualified(ctx context.Context, txn *kvclient.Txn, cur, q string) (db string, dbID uint64, sd *SchemaDescriptor, ok bool, err error) {
+func (a *Accessor) resolveSchemaQualified(ctx context.Context, txn *kvclient.Txn, cur, q string, cached bool) (db string, dbID uint64, sd *SchemaDescriptor, ok bool, err error) {
 	curID, err := a.databaseID(ctx, txn, cur)
 	if err != nil {
 		return "", 0, nil, false, err
@@ -614,13 +715,12 @@ func (a *Accessor) resolveSchemaQualified(ctx context.Context, txn *kvclient.Txn
 		return cur, curID, publicSchema(curID), true, nil
 	}
 	if !IsSystemSchemaName(q) {
-		sd, err = LookupSchema(ctx, txn, curID, q)
-		if err == nil {
-			return cur, curID, sd, true, nil
-		}
-		var nf *ErrSchemaNotFound
-		if !errors.As(err, &nf) {
+		sd, found, err := a.schemas(txn, curID, cached).get(ctx, q)
+		if err != nil {
 			return "", 0, nil, false, err
+		}
+		if found {
+			return cur, curID, sd, true, nil
 		}
 	}
 	dbID, err = a.databaseID(ctx, txn, q)
@@ -638,15 +738,17 @@ func (a *Accessor) resolveSchemaQualified(ctx context.Context, txn *kvclient.Txn
 // resolveSchemaQualified, three parts as database.schema, where the
 // database must be the current one unless the schema is public (the
 // datax extension: db.public.t reads another database's table). A
-// schema that does not exist is ErrSchemaNotFound.
-func (a *Accessor) resolveQualified(ctx context.Context, txn *kvclient.Txn, cur string, parts []string) (*Target, error) {
+// schema that does not exist is ErrSchemaNotFound. With cached true the
+// schema may come from the leased schema set (a lookup of an existing
+// object; the Target's descriptor is then shared, not to be modified).
+func (a *Accessor) resolveQualified(ctx context.Context, txn *kvclient.Txn, cur string, parts []string, cached bool) (*Target, error) {
 	full := strings.Join(parts, ".")
 	if cur == "" {
 		cur = DefaultDatabase
 	}
 	switch len(parts) {
 	case 2:
-		db, dbID, sd, ok, err := a.resolveSchemaQualified(ctx, txn, cur, parts[0])
+		db, dbID, sd, ok, err := a.resolveSchemaQualified(ctx, txn, cur, parts[0], cached)
 		if err != nil {
 			return nil, err
 		}
@@ -663,7 +765,7 @@ func (a *Accessor) resolveQualified(ctx context.Context, txn *kvclient.Txn, cur 
 		if err != nil {
 			return nil, err
 		}
-		sd, err := LookupSchema(ctx, txn, dbID, schema)
+		sd, err := a.schemas(txn, dbID, cached).lookupSchemaErr(ctx, schema)
 		if err != nil {
 			return nil, err
 		}
@@ -677,8 +779,16 @@ func (a *Accessor) resolveQualified(ctx context.Context, txn *kvclient.Txn, cur 
 // alone without one) in database db; for a qualified one the single
 // place its qualifiers name. A qualifier that names nothing yields no
 // candidate (the table does not exist); a three-part name into another
-// database's non-public schema is ErrCrossDatabase.
+// database's non-public schema is ErrCrossDatabase. Schemas are looked
+// up through the gateway's leased schema set where it can answer
+// (schemacache.go).
 func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name string) ([]nameCandidate, error) {
+	return a.resolveWith(ctx, txn, db, name, true)
+}
+
+// resolveWith is resolve, reading every schema in txn when cached is
+// false (LookupFresh, which must see the committed catalog).
+func (a *Accessor) resolveWith(ctx context.Context, txn *kvclient.Txn, db, name string, cached bool) ([]nameCandidate, error) {
 	if dbID, entry, ok := splitRelationName(name); ok {
 		_, _, inSchema := splitSchemaEntry(entry)
 		return []nameCandidate{{dbID: dbID, entry: entry, isDefault: !inSchema && a.isDefaultID(dbID)}}, nil
@@ -701,7 +811,7 @@ func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name stri
 			// lookup, exactly as before schemas existed.
 			return []nameCandidate{{db: db, dbID: dbID, entry: name, isDefault: isDefaultDatabase(db)}}, nil
 		}
-		schemas, err := LookupPathSchemas(ctx, txn, dbID, r)
+		schemas, err := lookupPathSchemas(ctx, a.schemas(txn, dbID, cached), r)
 		if err != nil {
 			return nil, err
 		}
@@ -714,7 +824,7 @@ func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name stri
 	if len(parts) == 2 && parts[0] == TempSchema {
 		return nil, nil // the session's temporary tables are its own to resolve
 	}
-	t, err := a.resolveQualified(ctx, txn, db, parts)
+	t, err := a.resolveQualified(ctx, txn, db, parts, cached)
 	if err != nil {
 		var snf *ErrSchemaNotFound
 		var tnf *ErrTableNotFound
@@ -729,7 +839,10 @@ func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name stri
 // ResolveTarget resolves where name lives or is to be created in
 // database db: a qualified name where its qualifiers say; an
 // unqualified one in the first schema of the search path in ctx that
-// exists (ErrNoCreationSchema when none does).
+// exists (ErrNoCreationSchema when none does). The schema is read in
+// txn, never from the leased schema set: what is created there records
+// its ID, so a DROP SCHEMA committing concurrently must conflict with
+// the creation.
 func (a *Accessor) ResolveTarget(ctx context.Context, txn *kvclient.Txn, db, name string) (*Target, error) {
 	if IsReservedTableName(name) {
 		return nil, fmt.Errorf("table name %q is reserved", name)
@@ -752,7 +865,7 @@ func (a *Accessor) ResolveTarget(ctx context.Context, txn *kvclient.Txn, db, nam
 		}
 		return &Target{Database: db, DBID: dbID, Schema: schemas[0], Name: name}, nil
 	}
-	return a.resolveQualified(ctx, txn, db, parts)
+	return a.resolveQualified(ctx, txn, db, parts, false)
 }
 
 // ListAllSchemas returns every schema of every database (ownership
