@@ -1,7 +1,9 @@
 package builtins
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -147,5 +149,36 @@ func TestTSMatch(t *testing.T) {
 	}
 	if CastFamily("tsvector", types.String) != types.Tsvector || CastFamily("tsquery", types.String) != types.Tsquery {
 		t.Error("cast families")
+	}
+}
+
+// TestTSMatcherCache: queries parsed once and shared stay correct when
+// many goroutines match at once, past the cache's limit (it starts
+// over), and a query that does not parse is an error every time.
+func TestTSMatcherCache(t *testing.T) {
+	v := types.Datum{Fam: types.Tsvector, S: "'cat':2 'fat':1"}
+	var wg sync.WaitGroup
+	errs := make(chan string, 8)
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 2*tsMatcherLimit; i++ {
+				q := types.Datum{Fam: types.Tsquery, S: fmt.Sprintf("'cat' & !'w%d'", (i+g)%(tsMatcherLimit+50))}
+				if ok, err := TSMatch(v, q); err != nil || !ok {
+					errs <- fmt.Sprintf("%s: %v, %v", q.S, ok, err)
+					return
+				}
+				if _, err := TSMatch(v, types.NewString("bad &")); err == nil {
+					errs <- "a query that does not parse matched"
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }

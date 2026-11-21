@@ -2310,6 +2310,52 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 	return types.DNull, nil
 }
 
+// tsVectorMatchCall reports whether a conjunct is `to_tsvector(config,
+// text) @@ query` (or NOT @@): a vector made only to be matched, which
+// tsMatchFused matches without making.
+func tsVectorMatchCall(cmp *parser.Comparison) bool {
+	if cmp.Op != "@@" && cmp.Op != "NOT @@" || cmp.Expr == nil {
+		return false
+	}
+	e := cmp.Expr
+	return e.Func == "to_tsvector" && len(e.Args) == 2 && e.BinOp == "" && e.Left == nil && e.Cast == "" &&
+		len(e.Path) == 0 && e.Case == nil && e.Cmp == nil && e.Sub == nil && e.Agg == nil && e.Window == nil
+}
+
+// tsMatchFused evaluates a tsVectorMatchCall conjunct as the generic
+// road would — to_tsvector's arguments, its own refusals, the right
+// side, then the match — but reads the text straight into the query
+// (builtins.TSDoc) instead of building, rendering and re-parsing its
+// vector for every row. null is a NULL operand on either side; evalErr
+// is an error evaluating an operand, matchErr one from @@ itself, which
+// callers treat as they treat applyCmpOpEsc's.
+func tsMatchFused(cmp *parser.Comparison, env exprEnv, params []types.Datum) (match, null bool, evalErr, matchErr error) {
+	var args [2]types.Datum
+	for i, a := range cmp.Expr.Args {
+		d, err := evalExprEnv(a, env, params)
+		if err != nil {
+			return false, false, err, nil
+		}
+		args[i] = d
+	}
+	doc, lnull, err := builtins.PrepareTSVectorMatch(args[:])
+	if err != nil {
+		return false, false, builtinErr(err), nil
+	}
+	rhs, err := evalExprEnv(cmp.Value, env, params)
+	if err != nil {
+		return false, false, err, nil
+	}
+	if lnull || rhs.Null {
+		return false, true, nil, nil
+	}
+	ok, err := doc.Match(rhs)
+	if err != nil {
+		return false, false, nil, builtinErr(err)
+	}
+	return ok == (cmp.Op == "@@"), false, nil, nil
+}
+
 // condsHold evaluates WHERE-shaped conjuncts against an expression
 // environment (CASE WHEN conditions): comparisons, IS NULL, IN lists, OR.
 func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bool, error) {
@@ -2332,6 +2378,16 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 				}
 			}
 			if !any {
+				return false, nil
+			}
+			continue
+		}
+		if tsVectorMatchCall(&cmp) {
+			ok, null, evalErr, matchErr := tsMatchFused(&cmp, env, params)
+			if evalErr != nil {
+				return false, evalErr
+			}
+			if null || matchErr != nil || !ok {
 				return false, nil
 			}
 			continue
@@ -2426,6 +2482,16 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 			unknown = unknown || null
 		}
 		return false, unknown, nil
+	}
+	if tsVectorMatchCall(&cmp) {
+		ok, null, evalErr, matchErr := tsMatchFused(&cmp, env, params)
+		if evalErr != nil {
+			return false, false, evalErr
+		}
+		if matchErr != nil {
+			return false, false, matchErr
+		}
+		return ok, null, nil
 	}
 	var lhs types.Datum
 	var err error
