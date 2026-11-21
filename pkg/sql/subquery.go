@@ -741,6 +741,9 @@ func (s *Session) resolveValueNode(ctx context.Context, txn *kvclient.Txn, e par
 		}
 		out.Args = args
 	}
+	if folded, ok := foldTSQueryCall(out, params); ok {
+		out = folded
+	}
 	if e.Agg != nil {
 		// An aggregate call inside an expression: its arguments and
 		// FILTER resolve like a select item's.
@@ -1922,6 +1925,38 @@ var splicedFuncs = map[string]bool{
 	// configuration when the call names none.
 	"to_tsvector": true, "to_tsquery": true, "plainto_tsquery": true, "phraseto_tsquery": true, "websearch_to_tsquery": true,
 	"ts_headline": true, "get_current_ts_config": true,
+}
+
+// foldTSQueryCall evaluates a call that makes a tsquery from constants
+// (to_tsquery('english', 'cat & hat'), with the session's default
+// configuration already supplied), once for the statement: the call is
+// a pure function of its arguments, and a filter would otherwise make
+// the same query again for every row. A call that fails is left to fail
+// where it always has, when a row evaluates it.
+func foldTSQueryCall(e parser.Expr, params []types.Datum) (parser.Expr, bool) {
+	switch e.Func {
+	case "to_tsquery", "plainto_tsquery", "phraseto_tsquery", "websearch_to_tsquery":
+	default:
+		return e, false
+	}
+	if len(e.Args) != 2 || e.Left != nil || e.Case != nil {
+		return e, false
+	}
+	for _, a := range e.Args {
+		constant := a.Lit != nil || a.Param > 0
+		if !constant || a.Column != "" || a.Func != "" || a.BinOp != "" || a.Left != nil || a.Cast != "" ||
+			len(a.Path) > 0 || a.Case != nil || a.Cmp != nil || a.Sub != nil || a.Agg != nil || a.Window != nil {
+			return e, false
+		}
+	}
+	call := e
+	call.BinOp, call.Left, call.Right, call.Cast, call.Path = "", nil, nil, "", nil
+	d, err := evalExpr(call, nil, nil, params)
+	if err != nil {
+		return e, false
+	}
+	e.Func, e.Args, e.Lit = "", nil, &d
+	return e, true
 }
 
 // regclassOID resolves a regclass literal: a number is the OID itself,

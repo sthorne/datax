@@ -1,7 +1,6 @@
 package tsearch
 
 import (
-	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -52,39 +51,118 @@ type Token struct {
 // "known", and a URL is its scheme, its host and the words of its path.
 func Tokenize(s string) []Token {
 	var out []Token
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if !isWordRune(r) || (r == utf8.RuneError && size == 1) {
+	t := tokenizer{s: s}
+	for t.next() {
+		out = append(out, Token{Text: string(t.lower(nil)), Kind: t.kind, Start: t.start, End: t.end})
+	}
+	return out
+}
+
+// tokenizer walks a text token by token without allocating; lower
+// writes the current token's text to a buffer the caller provides (and
+// may reuse). Tokenize is the same walk, collected.
+type tokenizer struct {
+	s string
+	i int
+	// The current token: its kind and its byte offsets in s.
+	kind       TokenKind
+	start, end int
+}
+
+// next advances to the next token; false at the end of the text.
+func (t *tokenizer) next() bool {
+	s := t.s
+	for i := t.i; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			// ASCII: a letter or a digit starts a token, anything else
+			// separates.
+			if !isASCIIAlnum(c) {
+				i++
+				continue
+			}
+		} else if r, size := utf8.DecodeRuneInString(s[i:]); !isWordRune(r) || (r == utf8.RuneError && size == 1) {
 			i += size
 			continue
 		}
+		if s[i] < utf8.RuneSelf {
+			// The common token: a run of ASCII letters and digits that
+			// ends the text or ends at an ASCII byte that cannot carry
+			// it on into an address, a host name or a fraction. Then it
+			// is a number or a word, and the scans below need not run.
+			j, digits := i, true
+			for j < len(s) && isASCIIAlnum(s[j]) {
+				digits = digits && s[j] <= '9'
+				j++
+			}
+			if j == len(s) || s[j] < utf8.RuneSelf && s[j] != '@' && s[j] != '.' && s[j] != '_' && s[j] != '+' && s[j] != '-' {
+				if digits {
+					t.set(TokNumber, i, j)
+				} else {
+					t.set(TokWord, i, j)
+				}
+				return true
+			}
+		}
 		if end := scanEmail(s, i); end > 0 {
-			out = append(out, Token{Text: strings.ToLower(s[i:end]), Kind: TokEmail, Start: i, End: end})
-			i = end
-			continue
+			t.set(TokEmail, i, end)
+			return true
 		}
 		if end := scanHost(s, i); end > 0 && !wordRuneAt(s, end) {
-			out = append(out, Token{Text: strings.ToLower(s[i:end]), Kind: TokHost, Start: i, End: end})
-			i = end
-			continue
+			t.set(TokHost, i, end)
+			return true
 		}
 		if end := scanNumber(s, i); end > 0 {
-			out = append(out, Token{Text: s[i:end], Kind: TokNumber, Start: i, End: end})
-			i = end
-			continue
+			t.set(TokNumber, i, end)
+			return true
 		}
 		j := i
 		for j < len(s) {
+			if c := s[j]; c < utf8.RuneSelf {
+				if !isASCIIAlnum(c) {
+					break
+				}
+				j++
+				continue
+			}
 			r, size := utf8.DecodeRuneInString(s[j:])
 			if !isWordRune(r) || (r == utf8.RuneError && size == 1) {
 				break
 			}
 			j += size
 		}
-		out = append(out, Token{Text: strings.ToLower(s[i:j]), Kind: TokWord, Start: i, End: j})
-		i = j
+		t.set(TokWord, i, j)
+		return true
 	}
-	return out
+	t.i = len(s)
+	return false
+}
+
+func (t *tokenizer) set(kind TokenKind, start, end int) {
+	t.kind, t.start, t.end, t.i = kind, start, end, end
+}
+
+// lower appends the current token's text to dst: lower-cased as
+// strings.ToLower lower-cases it (a token is valid UTF-8, so rune by
+// rune with unicode.ToLower), but a number as it is written.
+func (t *tokenizer) lower(dst []byte) []byte {
+	if t.kind == TokNumber {
+		return append(dst, t.s[t.start:t.end]...)
+	}
+	for k := t.start; k < t.end; {
+		c := t.s[k]
+		if c < utf8.RuneSelf {
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			dst = append(dst, c)
+			k++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(t.s[k:])
+		dst = utf8.AppendRune(dst, unicode.ToLower(r))
+		k += size
+	}
+	return dst
 }
 
 func isWordRune(r rune) bool {

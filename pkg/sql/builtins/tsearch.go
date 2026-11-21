@@ -3,6 +3,8 @@ package builtins
 import (
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sthorne/datax/pkg/sql/tsearch"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -66,6 +68,115 @@ func TSQueryArg(d types.Datum) (tsearch.Query, error) {
 	return q, nil
 }
 
+// tsMatchers caches the queries @@ has parsed, by their text: a filter
+// tests one query against every row, and the parse is the same each
+// time. Bounded like the regular-expression cache: past the limit it
+// starts over.
+var (
+	tsMatchers     sync.Map // string -> *tsearch.Matcher
+	tsMatcherCount atomic.Int64
+)
+
+const tsMatcherLimit = 256
+
+// tsMatcher parses a query once and prepares it for matching.
+func tsMatcher(text string) (*tsearch.Matcher, error) {
+	if m, ok := tsMatchers.Load(text); ok {
+		return m.(*tsearch.Matcher), nil
+	}
+	q, err := tsearch.ParseQuery(text)
+	if err != nil {
+		return nil, err
+	}
+	m := tsearch.NewMatcher(q)
+	if tsMatcherCount.Add(1) > tsMatcherLimit {
+		tsMatchers.Clear()
+		tsMatcherCount.Store(1)
+	}
+	tsMatchers.Store(text, m)
+	return m, nil
+}
+
+// TSMatcherArg is TSQueryArg prepared for matching, and parsed once
+// per distinct query text rather than once per row.
+func TSMatcherArg(d types.Datum) (*tsearch.Matcher, error) {
+	if d.Fam != types.Tsquery && d.Fam != types.String {
+		return nil, errf(CodeUndefined, "expected a tsquery, got %s", strings.ToLower(d.Fam.String()))
+	}
+	m, err := tsMatcher(d.S)
+	if err != nil {
+		return nil, errf("42601", "%v", err)
+	}
+	return m, nil
+}
+
+// toTSVectorBuiltin is to_tsvector, whose argument coercion
+// PrepareTSVectorMatch borrows.
+var toTSVectorBuiltin *Builtin
+
+// TSDoc is the left side of `to_tsvector(config, text) @@ query`, held
+// back so that the match can read the text itself instead of a vector
+// made of it (tsearch.Matcher.MatchText).
+type TSDoc struct {
+	cfg  *tsearch.Config
+	text string
+	// vec is the text's vector when it was made up front: for a text
+	// long enough that to_tsvector might refuse it, so that it refuses
+	// it here, where to_tsvector would have.
+	vec tsearch.Vector
+}
+
+// PrepareTSVectorMatch is the call to_tsvector(args...) on the left of
+// @@, up to what it would have refused: its arguments coerced (null is
+// true when one is NULL, and the call then NULL), the configuration
+// looked up, and the vector of a text too long to match without it.
+func PrepareTSVectorMatch(args []types.Datum) (doc TSDoc, null bool, err error) {
+	coerced := args
+	if len(args) != 2 || args[0].Null || args[1].Null || args[0].Fam != types.String || args[1].Fam != types.String {
+		// Anything but two texts (which coerce to themselves) is
+		// coerced as the call coerces it.
+		var null bool
+		var err error
+		if coerced, null, err = toTSVectorBuiltin.coerceArgs(args); err != nil || null {
+			return TSDoc{}, null, err
+		}
+	}
+	if len(coerced) != 2 {
+		return TSDoc{}, false, errf(CodeUndefined, "to_tsvector() on the left of @@ takes (config, text)")
+	}
+	cfg, err := tsConfig(coerced[0])
+	if err != nil {
+		return TSDoc{}, false, err
+	}
+	doc = TSDoc{cfg: cfg, text: coerced[1].S}
+	if !tsearch.MatchableText(doc.text) {
+		if doc.vec, err = tsearch.ToVector(cfg, doc.text); err != nil {
+			return TSDoc{}, false, errf("54000", "%v", err)
+		}
+	}
+	return doc, false, nil
+}
+
+// Match is TSMatch(to_tsvector(...), q) for the prepared left side,
+// with TSMatch's errors.
+func (d TSDoc) Match(q types.Datum) (bool, error) {
+	if q.Fam != types.Tsquery && q.Fam != types.String {
+		return false, errf(CodeUndefined, "operator does not exist: tsvector @@ %s", strings.ToLower(q.Fam.String()))
+	}
+	m, err := TSMatcherArg(q)
+	if err != nil {
+		return false, err
+	}
+	if d.vec != nil {
+		return tsearch.Match(d.vec, m.Query()), nil
+	}
+	ok, err := m.MatchText(d.cfg, d.text)
+	if err != nil {
+		return false, errf("54000", "%v", err)
+	}
+	return ok, nil
+}
+
 // TSMatch is the @@ operator. One side is a tsvector and the other a
 // tsquery, in either order; a text operand beside a typed one is read
 // as a literal of the other type. Text on the left of a tsquery is
@@ -87,11 +198,11 @@ func TSMatch(l, r types.Datum) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	q, err := TSQueryArg(r)
+	m, err := TSMatcherArg(r)
 	if err != nil {
 		return false, err
 	}
-	return tsearch.Match(v, q), nil
+	return tsearch.Match(v, m.Query()), nil
 }
 
 // ConcatTSVectors is tsvector || tsvector.
@@ -150,9 +261,12 @@ func rankArgs(name string, a []types.Datum) (w [4]float64, v tsearch.Vector, q t
 	if v, err = TSVectorArg(a[0]); err != nil {
 		return
 	}
-	if q, err = TSQueryArg(a[1]); err != nil {
-		return
+	// The query is parsed once per text, not once per row ranked.
+	m, err := TSMatcherArg(a[1])
+	if err != nil {
+		return w, nil, q, 0, err
 	}
+	q = m.Query()
 	if len(a) == 3 {
 		n, cerr := a[2].Coerce(types.Int)
 		if cerr != nil {
@@ -192,7 +306,7 @@ func init() {
 		cfg, err := tsConfig(a[0])
 		return cfg, a[1].S, err
 	}
-	register(&Builtin{Name: "to_tsvector", Args: []types.Family{text, text}, MinArgs: 1, Ret: types.Tsvector, Vol: Stable, Category: catTextSearch,
+	toTSVectorBuiltin = &Builtin{Name: "to_tsvector", Args: []types.Family{text, text}, MinArgs: 1, Ret: types.Tsvector, Vol: Stable, Category: catTextSearch,
 		Doc: "to_tsvector([config,] text): the text reduced to a tsvector — its lexemes under the configuration (simple or english; default_text_search_config when omitted), each with the positions it occurs at.",
 		Fn: func(a []types.Datum) (types.Datum, error) {
 			cfg, s, err := withConfig(a)
@@ -204,7 +318,8 @@ func init() {
 				return types.Datum{}, errf("54000", "%v", err)
 			}
 			return types.NewTsvector(v), nil
-		}})
+		}}
+	register(toTSVectorBuiltin)
 	register(&Builtin{Name: "to_tsquery", Args: []types.Family{text, text}, MinArgs: 1, Ret: types.Tsquery, Vol: Stable, Category: catTextSearch,
 		Doc: "to_tsquery([config,] text): a tsquery from its text form — words joined by & (and), | (or), ! (not) and <-> or <N> (followed by), with parentheses, word:* for a prefix and word:AB for weights — each word normalized by the configuration; stop words are dropped.",
 		Fn: func(a []types.Datum) (types.Datum, error) {

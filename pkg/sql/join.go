@@ -351,6 +351,16 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			// every row otherwise.
 			return false, newErrf(CodeFeatureNotSupported, "JSONB containment @> is not supported in join queries")
 		}
+		if tsVectorMatchCall(&cmp) {
+			ok, null, evalErr, matchErr := tsMatchFused(&cmp, joinEnv{sides, jr}, params)
+			if evalErr != nil {
+				return false, evalErr
+			}
+			if null || matchErr != nil || !ok {
+				return false, nil
+			}
+			continue
+		}
 		if cmp.Expr != nil {
 			// Computed left-hand side: evaluate both sides against the
 			// joined row and compare raw, mirroring matchesWhere.
