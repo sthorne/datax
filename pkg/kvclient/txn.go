@@ -833,6 +833,38 @@ func (t *Txn) prepareWrite(req kvpb.Request) (*kvpb.BatchRequest, keys.Key) {
 	return ba, key
 }
 
+// HasWrites reports whether the transaction has written anything (in
+// any epoch): a cheap test before HasWritten.
+func (t *Txn) HasWrites() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.mu.writes) > 0
+}
+
+// HasWritten reports whether the transaction has written key, in any
+// epoch and not rolled back to a savepoint since: a key whose readers
+// must read through the transaction rather than from a cache.
+func (t *Txn) HasWritten(key keys.Key) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.mu.writes[string(key)]
+	return ok
+}
+
+// WrittenIn returns the keys in [start, end) the transaction has written
+// (as HasWritten counts them), in no particular order.
+func (t *Txn) WrittenIn(start, end keys.Key) []keys.Key {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []keys.Key
+	for k := range t.mu.writes {
+		if key := keys.Key(k); key.Compare(start) >= 0 && key.Compare(end) < 0 {
+			out = append(out, key.Clone())
+		}
+	}
+	return out
+}
+
 func (t *Txn) recordWrite(key keys.Key) {
 	t.mu.Lock()
 	t.mu.writes[string(key)] = struct{}{}

@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -1422,13 +1423,27 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 	// Metadata from the final manifest: descriptors + namespace entries,
 	// users, admin markers — one small transaction.
 	var maxID uint64
+	// The databases the restore writes schemas into: their schema
+	// generations move, so gateways caching their schema sets re-read
+	// them (catalog/schemacache.go).
+	var schemaDBs []uint64
 	err = n.db.RunTxn(ctx, "restore-metadata", func(ctx context.Context, txn *kvclient.Txn) error {
 		var wb kvclient.WriteBatch
+		schemaDBs = schemaDBs[:0]
 		for _, kv := range final.Databases {
 			wb.Put(keys.Key(kv.Key), kv.Value)
 			// Schemas keep their ids, which the restored tables name.
-			if id, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
-				maxID = id
+			if id, ok := catalog.SchemaIDOfKey(keys.Key(kv.Key)); ok {
+				maxID = max(maxID, id)
+				var sd catalog.SchemaDescriptor
+				if json.Unmarshal(kv.Value, &sd) == nil && !slices.Contains(schemaDBs, sd.DatabaseID) {
+					schemaDBs = append(schemaDBs, sd.DatabaseID)
+				}
+			}
+		}
+		for _, dbID := range schemaDBs {
+			if err := catalog.BumpSchemaGen(ctx, txn, dbID); err != nil {
+				return err
 			}
 		}
 		for _, kv := range final.Sequences {
@@ -1484,6 +1499,15 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 	})
 	if err != nil {
 		return nil, err
+	}
+	if cat, cerr := n.catalogAccessor(); cerr == nil && cat != nil {
+		for _, dbID := range schemaDBs {
+			// Every gateway resolves through the restored schemas once
+			// this returns; failing that, its next lease renewal does.
+			if ferr := cat.FinishSchemaChange(ctx, dbID); ferr != nil {
+				log.Warnf("restore: draining the schemas of database %d: %v", dbID, ferr)
+			}
+		}
 	}
 	// The descriptor ID generator must never re-issue a restored ID.
 	if maxID > 0 {

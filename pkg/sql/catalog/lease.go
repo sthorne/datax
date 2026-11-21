@@ -337,6 +337,11 @@ func (a *Accessor) StartLeasing(db *kvclient.DB, clock *hlc.Clock, stopper *stop
 func (a *Accessor) renewalLoop(ctx context.Context) {
 	t := time.NewTicker(a.ttl / 3)
 	defer t.Stop()
+	// The schema generations are watched more often than leases are
+	// renewed, so a schema change's drain is not held up for a whole
+	// renewal period (schemacache.go, pollSchemaGens).
+	poll := time.NewTicker(max(a.ttl/20, 10*time.Millisecond))
+	defer poll.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,6 +352,13 @@ func (a *Accessor) renewalLoop(ctx context.Context) {
 			}
 			if err := a.renewAll(ctx); err != nil {
 				log.Debugf("lease renewal: %v", err)
+			}
+		case <-poll.C:
+			if a.renewalPaused.Load() {
+				continue
+			}
+			if err := a.pollSchemaGens(ctx); err != nil {
+				log.Debugf("schema generation poll: %v", err)
 			}
 		}
 	}
@@ -361,13 +373,16 @@ func (a *Accessor) renewAll(ctx context.Context) error {
 		a.releaseLease(ctx, c.desc.ID, c.expiration)
 	}
 	a.pruneStats()
+	var first error
+	if err := a.renewSchemaSets(ctx); err != nil {
+		first = fmt.Errorf("schema lease renewal: %w", err)
+	}
 	a.mu.Lock()
 	names := make([]string, 0, len(a.cache))
 	for name := range a.cache {
 		names = append(names, name)
 	}
 	a.mu.Unlock()
-	var first error
 	for _, name := range names {
 		if _, err := a.refreshOne(ctx, name); err != nil && first == nil {
 			first = fmt.Errorf("lease renewal for %q: %w", name, err)
@@ -675,7 +690,7 @@ func (a *Accessor) FinishDDLIn(ctx context.Context, db, name string) error {
 	var cands []nameCandidate
 	if err := a.db.RunTxn(ctx, "ddl-database", func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
-		cands, err = a.resolve(ctx, txn, db, name)
+		cands, err = a.resolveWith(ctx, txn, db, name, false)
 		return err
 	}); err != nil {
 		return err
@@ -737,6 +752,12 @@ func (a *Accessor) LeasesAdopted(ctx context.Context, descID, version uint64) (b
 
 func (a *Accessor) adopted(ctx context.Context, descID, version uint64) (bool, error) {
 	lo, hi := keys.DescLeaseSpan(descID)
+	return a.adoptedIn(ctx, lo, hi, version)
+}
+
+// adoptedIn is adopted for the lease records in [lo, hi): a table
+// descriptor's, or a database's schema set's (schemacache.go).
+func (a *Accessor) adoptedIn(ctx context.Context, lo, hi keys.Key, version uint64) (bool, error) {
 	rows, err := a.db.Scan(ctx, lo, hi, 0)
 	if err != nil {
 		return false, err
@@ -770,22 +791,29 @@ func (a *Accessor) adopted(ctx context.Context, descID, version uint64) (bool, e
 // anomalous (renewal adopts within TTL/3); it is logged and no longer
 // waited for — by then it has expired or its holder cannot renew.
 func (a *Accessor) waitForAdoption(ctx context.Context, descID, version uint64) error {
+	lo, hi := keys.DescLeaseSpan(descID)
+	return a.waitForAdoptionIn(ctx, lo, hi, version, fmt.Sprintf("descriptor %d", descID))
+}
+
+// waitForAdoptionIn is waitForAdoption for the lease records in [lo,
+// hi), which belong to what (for the log).
+func (a *Accessor) waitForAdoptionIn(ctx context.Context, lo, hi keys.Key, version uint64, what string) error {
 	deadline := time.Now().Add(2 * a.ttl)
 	poll := a.ttl / 20
 	if poll < 10*time.Millisecond {
 		poll = 10 * time.Millisecond
 	}
 	for {
-		adopted, err := a.adopted(ctx, descID, version)
+		adopted, err := a.adoptedIn(ctx, lo, hi, version)
 		adopted = adopted && err == nil
 		if adopted {
 			return nil
 		}
 		if time.Now().After(deadline) {
 			if version == droppedLeaseVersion {
-				log.Warnf("descriptor %d: a live lease never acknowledged the drop; proceeding after drain timeout", descID)
+				log.Warnf("%s: a live lease never acknowledged the drop; proceeding after drain timeout", what)
 			} else {
-				log.Warnf("descriptor %d: a live lease never adopted version %d; proceeding after drain timeout", descID, version)
+				log.Warnf("%s: a live lease never adopted version %d; proceeding after drain timeout", what, version)
 			}
 			return nil
 		}

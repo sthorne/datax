@@ -176,11 +176,19 @@ descriptor whatever the search path. The post-commit drain records each
 changed table so too (`Session.drainName`), because a `SET LOCAL
 search_path` has ended by the time `COMMIT` drains.
 
-Cost: an unqualified name under the default path reads the `"$user"`
-schema's name entry once per lookup (the statement memo makes that once
-per name per statement); a qualified one reads its schema's entry. No
-schema name is cached on the gateway, so no cache can resolve a name to
-a dropped-and-recreated schema's predecessor.
+Cost: none in KV. A leasing gateway caches each database's schema set
+(every schema's name and descriptor) under a lease at the database's
+schema generation, which every schema change increments in its own
+transaction; the session drains the set after the commit as it drains a
+table, so once `CREATE`, `DROP` or `ALTER SCHEMA`, or a `GRANT` / `REVOKE`
+on a schema, returns, every gateway resolves through the new set
+(`pkg/sql/catalog/schemacache.go`). The `"$user"` lookup of the default
+path, nearly always a miss, is answered from memory, as is a schema named
+on the path or in a qualified name. A historical transaction, and one
+that has itself changed the database's schemas, read the schema names in
+the transaction instead; so does the resolution of where an object is
+created (`ResolveTarget`), so that a concurrent `DROP SCHEMA` conflicts
+with the creation.
 
 A name reaches the catalog as the parser now keeps it: `x`, `a.b` or
 `a.b.c` (the parser used to drop `public.`).
