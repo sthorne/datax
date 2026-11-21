@@ -2004,6 +2004,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Large result sets stream at less than half the server CPU per row.**
+  The wire output is unchanged byte for byte.
+  - A scan whose select list is bare columns decodes each row into one
+    reused row, with only the columns it reads. That is about 1
+    allocation per row instead of 10.
+  - DataRows are encoded straight into the connection's buffer.
+  - Storage copies scan rows out of Pebble into per-scan chunks instead
+    of allocating per row.
+  - `bench scan` (20,000 rows per query) went from about 41 to 96
+    queries/s on one node, and CPU per row from 3.9 to 1.6 µs.
 - **Search and vector filters are much cheaper per row.** None of these
   changes alters a result.
   - **Exact vector nearest-neighbour scans** (`ORDER BY v <-> q LIMIT k`
