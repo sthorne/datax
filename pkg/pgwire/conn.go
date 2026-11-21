@@ -267,7 +267,10 @@ type conn struct {
 
 	// dataRow and complete are the connection's reused DataRow and
 	// CommandComplete messages (rowMsg, sendComplete).
-	dataRow  pgproto3.DataRow
+	dataRow pgproto3.DataRow
+	// rowBuf is the buffer result rows are encoded into, kept between
+	// results (sendStream, sendDataRowRange).
+	rowBuf   []byte
 	complete pgproto3.CommandComplete
 	// tok is the activity token of the statement in flight (Activity.begin).
 	tok stmtToken
@@ -942,22 +945,51 @@ func (c *conn) sendDataRows(res *sql.Result, formats []int16) {
 // sendDataRowRange sends rows [from, to) of a materialized result.
 func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) {
 	ts := c.textStyle()
+	buf := c.rowBuf[:0]
 	for _, row := range res.Rows[from:to] {
-		dr := c.rowMsg(len(row))
-		for i, d := range row {
-			format := int16(0)
-			if formats != nil && i < len(formats) {
-				format = formats[i]
+		var err error
+		if buf, err = appendDataRow(buf, row, formats, res.Columns, ts); err != nil {
+			// A row DataRow cannot carry: hand it to the backend the
+			// way it always was, which records the encode error.
+			if len(buf) > 0 {
+				c.backend.Send(rawRows(buf))
+				buf = buf[:0]
 			}
-			var col sql.ResultColumn
-			if i < len(res.Columns) {
-				col = res.Columns[i]
+			dr := c.rowMsg(len(row))
+			for i, d := range row {
+				format := int16(0)
+				if formats != nil && i < len(formats) {
+					format = formats[i]
+				}
+				var col sql.ResultColumn
+				if i < len(res.Columns) {
+					col = res.Columns[i]
+				}
+				dr.Values[i] = encodeDatumIn(d, format, col, ts)
 			}
-			dr.Values[i] = encodeDatumIn(d, format, col, ts)
+			c.backend.Send(dr)
+			clear(dr.Values)
+			continue
 		}
-		c.backend.Send(dr)
-		clear(dr.Values)
+		if len(buf) >= streamFlushBytes {
+			c.backend.Send(rawRows(buf))
+			buf = buf[:0]
+		}
 	}
+	if len(buf) > 0 {
+		c.backend.Send(rawRows(buf))
+	}
+	c.keepRowBuf(buf)
+}
+
+// keepRowBuf keeps buf (whose contents have been sent) for the next
+// result's rows, unless one huge row grew it past what is worth
+// holding on to between statements.
+func (c *conn) keepRowBuf(buf []byte) {
+	if cap(buf) > 4*streamFlushBytes {
+		buf = nil
+	}
+	c.rowBuf = buf[:0]
 }
 
 // rowMsg is the connection's DataRow message, reused for every row it
@@ -1627,7 +1659,9 @@ func (r rawRows) Encode(dst []byte) ([]byte, error) { return append(dst, r...), 
 // completion the result's tag is the stream's.
 func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16, max int64) (sent int64, more bool, serr *sql.Error) {
 	st := res.Stream
-	var buf []byte
+	buf := c.rowBuf[:0]
+	c.rowBuf = nil // buf is this call's until it hands it back
+	defer func() { c.keepRowBuf(buf) }()
 	ts := c.textStyle()
 	flush := func() bool {
 		if len(buf) == 0 {
@@ -1652,7 +1686,7 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 	finish := func() {
 		if len(buf) > 0 {
 			c.backend.Send(rawRows(buf))
-			buf = nil
+			buf = buf[:0]
 		}
 	}
 	for max <= 0 || sent < max {
@@ -1670,20 +1704,7 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 			finish()
 			return sent, false, nil
 		}
-		dr := c.rowMsg(len(row))
-		for i, d := range row {
-			format := int16(0)
-			if formats != nil && i < len(formats) {
-				format = formats[i]
-			}
-			var col sql.ResultColumn
-			if i < len(res.Columns) {
-				col = res.Columns[i]
-			}
-			dr.Values[i] = encodeDatumIn(d, format, col, ts)
-		}
-		buf, err = dr.Encode(buf)
-		clear(dr.Values)
+		buf, err = appendDataRow(buf, row, formats, res.Columns, ts)
 		if err != nil {
 			st.Close(context.Background())
 			return sent, false, &sql.Error{Code: sql.CodeInternal, Msg: err.Error()}

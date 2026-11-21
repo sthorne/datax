@@ -2432,28 +2432,46 @@ func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.Table
 // are), into into: an empty map the caller recycles, or nil for a new
 // one.
 func decodeRowInto(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, into map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
-	value, err := b.OpenValue(ctx, desc, key, value)
-	if err != nil {
+	if into == nil {
+		into = make(map[catalog.ColumnID]types.Datum)
+	}
+	if err := decodeFullRowInto(ctx, b, desc, key, value, need, rowenc.MapRow(into)); err != nil {
 		return nil, err
 	}
-	return decodeOpenedRowInto(desc, key, value, need, into)
+	return into, nil
+}
+
+// decodeFullRowInto is decodeRowInto into an empty row the caller
+// provides — a map (rowenc.MapRow) or a scan's own positional row: a
+// scan that is done with each row before it decodes the next reuses one
+// row (emptying it between rows) rather than building a map per row.
+func decodeFullRowInto(ctx context.Context, b *rowseal.Boundary, desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, row rowenc.RowSink) error {
+	value, err := b.OpenValue(ctx, desc, key, value)
+	if err != nil {
+		return err
+	}
+	return decodeOpenedRowInto(desc, key, value, need, row)
 }
 
 // decodeOpenedRow is decodeFullRow over a value already opened
 // (rowseal.Boundary.OpenValue): for a caller that reads the opened
 // value itself before deciding to decode the row.
 func decodeOpenedRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
-	return decodeOpenedRowInto(desc, key, value, nil, nil)
-}
-
-// decodeOpenedRowInto is decodeRowInto over a value already opened.
-func decodeOpenedRowInto(desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, into map[catalog.ColumnID]types.Datum) (map[catalog.ColumnID]types.Datum, error) {
-	row, err := rowenc.DecodeValueInto(desc, value, need, into)
-	if err != nil {
+	row := make(map[catalog.ColumnID]types.Datum)
+	if err := decodeOpenedRowInto(desc, key, value, nil, rowenc.MapRow(row)); err != nil {
 		return nil, err
 	}
-	if err := rowenc.DecodePKInto(desc, key, row); err != nil {
-		return nil, err
+	return row, nil
+}
+
+// decodeOpenedRowInto is decodeFullRowInto over a value already opened:
+// every decode of a primary row value ends here.
+func decodeOpenedRowInto(desc *catalog.TableDescriptor, key keys.Key, value []byte, need func(catalog.ColumnID) bool, row rowenc.RowSink) error {
+	if err := rowenc.DecodeValueInto(desc, value, need, row); err != nil {
+		return err
+	}
+	if err := rowenc.DecodePKTo(desc, key, row); err != nil {
+		return err
 	}
 	// Stamp DECIMAL(p,s) columns with their declared display scale so
 	// projections render fixed-scale ("9.90"), CHAR(n) columns with their
@@ -2464,12 +2482,12 @@ func decodeOpenedRowInto(desc *catalog.TableDescriptor, key keys.Key, value []by
 	for i := range desc.Columns {
 		col := &desc.Columns[i]
 		if col.Precision > 0 || col.Char || col.NoTZ || col.Type.IsArray() {
-			if d, ok := row[col.ID]; ok && !d.Null {
-				row[col.ID] = stampDisplay(col, d)
+			if d, ok := row.GetCol(col.ID); ok && !d.Null {
+				row.SetCol(col.ID, stampDisplay(col, d))
 			}
 		}
 	}
-	return row, nil
+	return nil
 }
 
 func (s *Session) execSelect(ctx context.Context, txn *kvclient.Txn, t *parser.Select, params []types.Datum) (*Result, error) {
