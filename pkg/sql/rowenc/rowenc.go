@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"unsafe"
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -465,6 +466,18 @@ func (m MapRow) GetCol(id catalog.ColumnID) (types.Datum, bool) {
 	return d, ok
 }
 
+// BorrowingSink is a RowSink that takes the values of some TEXT columns
+// as views of the row value being decoded instead of copies: no
+// allocation, but the strings are valid only as long as that value's
+// bytes are left unchanged, so a borrowed value must be read and
+// dropped, or copied (strings.Clone), before the value is let go. A
+// scan borrows a column only its filter reads, and only a filter that
+// keeps nothing of what it reads.
+type BorrowingSink interface {
+	RowSink
+	BorrowsCol(id catalog.ColumnID) bool
+}
+
 // DecodeValueInto is DecodeValueCols into a row the caller provides (and
 // empties between rows), so a scan reuses one row for every row it
 // decodes: only the columns need reports are decoded (every column when
@@ -480,6 +493,7 @@ func DecodeValueInto(desc *catalog.TableDescriptor, raw []byte, need func(catalo
 	if raw[0] != valueVersion {
 		return fmt.Errorf("corrupt row value: unknown version 0x%02x", raw[0])
 	}
+	borrower, _ := out.(BorrowingSink)
 	rest := raw[1:]
 	for len(rest) > 0 {
 		var id uint64
@@ -617,7 +631,11 @@ func DecodeValueInto(desc *catalog.TableDescriptor, raw []byte, need func(catalo
 				fam = types.Vector
 			}
 			if known && col.Type == fam {
-				out.SetCol(colID, types.Datum{Fam: fam, S: string(v)})
+				if fam == types.String && borrower != nil && borrower.BorrowsCol(colID) {
+					out.SetCol(colID, types.Datum{Fam: fam, S: unsafe.String(unsafe.SliceData(v), len(v))})
+				} else {
+					out.SetCol(colID, types.Datum{Fam: fam, S: string(v)})
+				}
 			}
 		case tagUUID:
 			if len(rest) < 16 {
