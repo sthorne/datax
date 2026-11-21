@@ -171,10 +171,11 @@ shows it as `kv batches/op` and flags an increase beyond the threshold
 as a regression; for a record written before the field it derives the
 value from the record's `metrics`. It counts every batch the node
 routed during the run, retried attempts and background work included,
-and only the scraped node's. It leaves out one-phase commits (an
-autocommit write's batch that carries its own EndTxn), which bypass the
-routed path the counter is kept on, so a write workload reads lower than
-its true count; the comparison between two runs holds. The exact per-statement counts are
+and only the scraped node's, one-phase commits (an autocommit write's
+batch that carries its own EndTxn) included. Records written before
+that were counted read lower on write workloads, so compare a write
+workload only against a record from a binary that counts them. The
+exact per-statement counts are
 pinned by `TestKVRoundTripsPerStatement` (`pkg/testutils/testcluster`).
 
 ## Profiles

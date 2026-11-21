@@ -1658,7 +1658,13 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		}
 		gh := ba.Header
 		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
+		start := time.Now()
 		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)
+		// This path bypasses DB.Send, so it counts itself: the one-phase
+		// commits of autocommit writes would otherwise be missing from
+		// datax_kv_batch_latency_seconds and from a bench record's
+		// kv_batches_per_op.
+		metrics.KVBatchLatency.Observe(time.Since(start).Seconds())
 		if obs := t.db.sendObserver.Load(); obs != nil {
 			(*obs)(ctx, ba, br) // this path bypasses DB.Send
 		}

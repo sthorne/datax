@@ -55,7 +55,7 @@ type knownExtra struct {
 // parallel; when the fix lands, change this line to
 // `var schemansLookup *knownExtra` and every shape that names it expects
 // its correct count with no allowance (the names can go later).
-var schemansLookup = &knownExtra{why: "schemans lookup, regression being fixed in parallel", match: isSchemaNamespaceGet}
+var schemansLookup *knownExtra
 
 func isSchemaNamespaceGet(ba *kvpb.BatchRequest) bool {
 	lo, hi := keys.AllSchemaNamespaceSpan()
