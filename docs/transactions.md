@@ -184,8 +184,14 @@ overlapping write either applied before the read evaluated, or its
 timestamp-cache check observed the read's bump and pushed it above the
 read. Disjoint operations need no ordering — a write cannot invalidate a
 read it does not overlap — so they run in parallel. Transaction-record
-operations latch under their **anchor key** (the record's addressed key),
-and splits take a whole-range exclusive latch.
+operations latch under their **anchor key** (the record's addressed key).
+A split takes an exclusive latch over its right-hand side only (from the
+split key to the end of the range): left-hand requests apply on the same
+range whether they land before or after the split, so they keep running
+while it lands. Merges and range clears take a whole-range exclusive
+latch. A range-wide latch (split, merge, range clear, closed-timestamp
+promise) is **fair**: once it waits, every later request that conflicts
+with it waits behind it, so a stream of writes cannot starve it.
 
 The manager keeps the held latches in a set and indexes every **point**
 span (a single key: every `Get`, `Put` and `ConditionalPut` in a batch) by

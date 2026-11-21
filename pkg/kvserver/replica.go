@@ -1344,7 +1344,7 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if k := r.store.cfg.TestingKnobs.BeforeLatch; k != nil {
 		k(ba)
 	}
-	guard, gerr := r.latches.Acquire(ctx, spans, mode)
+	guard, gerr := r.latches.AcquireOpts(ctx, spans, mode, batchLatchOpts(ba, mode))
 	if gerr != nil {
 		return nil, kvpb.NewError(gerr)
 	}
@@ -1361,9 +1361,9 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	}
 	// The bounds were checked before the latches were taken, and a split
 	// or merge that held them in between has since changed the range: a
-	// split holds the whole-range latch until it has applied here, so a
-	// batch that queued behind it can find its key handed to the new
-	// right-hand range. Served here it would bypass that range's latches
+	// split holds a latch over its right-hand side until it has applied
+	// here, so a batch that queued behind it can find its key handed to
+	// the new right-hand range. Served here it would bypass that range's latches
 	// and timestamp cache and apply through a second Raft group, in
 	// parallel with the owner's (issue #389: two Increments of the range
 	// ID counter, one through each group, read the same value and two
