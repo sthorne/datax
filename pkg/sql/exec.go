@@ -2425,6 +2425,13 @@ func decodeFullRow(ctx context.Context, b *rowseal.Boundary, desc *catalog.Table
 	if err != nil {
 		return nil, err
 	}
+	return decodeOpenedRow(desc, key, value)
+}
+
+// decodeOpenedRow is decodeFullRow over a value already opened
+// (rowseal.Boundary.OpenValue): for a caller that reads the opened
+// value itself before deciding to decode the row.
+func decodeOpenedRow(desc *catalog.TableDescriptor, key keys.Key, value []byte) (map[catalog.ColumnID]types.Datum, error) {
 	row, err := rowenc.DecodeValue(desc, value)
 	if err != nil {
 		return nil, err
