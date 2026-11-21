@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -332,10 +333,16 @@ type scanIter struct {
 	plain   bool
 	keep    []catalog.ColumnID
 	scratch map[catalog.ColumnID]types.Datum
-	dense   *denseRow
-	out     [][]types.Datum
-	slab    []types.Datum
-	pslab   []types.Datum
+	// borrowing, when set, decodes into scratch the TEXT columns only a
+	// text-search filter reads as views of the row value instead of
+	// copies (tsBorrowCols); clone marks the columns of keep that are
+	// borrowed, copied as a matching row is kept.
+	borrowing *borrowingRow
+	clone     []bool
+	dense     *denseRow
+	out       [][]types.Datum
+	slab      []types.Datum
+	pslab     []types.Datum
 	// env is the environment the select list's expressions are
 	// evaluated in, over the kept row being projected.
 	env keptEnv
@@ -445,6 +452,9 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 	case it.scratch != nil:
 		clear(it.scratch)
 		row = rowenc.MapRow(it.scratch)
+		if it.borrowing != nil {
+			row = it.borrowing
+		}
 	default:
 		// No filter to evaluate (it reads a map): the row by column
 		// position, when the column IDs index one.
@@ -456,6 +466,10 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 		} else {
 			it.scratch = make(map[catalog.ColumnID]types.Datum, len(it.desc.Columns))
 			row = rowenc.MapRow(it.scratch)
+			if it.borrowing != nil {
+				it.borrowing.MapRow = it.scratch
+				row = it.borrowing
+			}
 		}
 	}
 	value, err := it.s.rowSealer().OpenValue(ctx, it.desc, key, raw)
@@ -481,6 +495,10 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 		d, ok := row.GetCol(id)
 		if !ok {
 			d = types.DNull
+		}
+		if it.clone != nil && it.clone[i] && !d.Null {
+			// A borrowed view of the row value: the kept row gets its own.
+			d.S = strings.Clone(d.S)
 		}
 		out[i] = d
 	}
@@ -689,7 +707,7 @@ func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor
 
 // prepare settles, from the table, select list and filter, what the
 // scan decodes of each row and in what order, what it keeps of a row
-// that matches.
+// that matches, and what it may borrow.
 func (it *scanIter) prepare() {
 	desc, proj, where := it.desc, it.proj, it.where
 	it.plain = true
@@ -703,6 +721,17 @@ func (it *scanIter) prepare() {
 	if len(where) > 0 {
 		if need, need2 := filterFirstCols(desc, where, it.keep); need2 != nil {
 			it.need, it.need2 = need, need2
+		}
+		if borrow := tsBorrowCols(desc, where); len(borrow) > 0 {
+			it.borrowing = &borrowingRow{borrow: borrow}
+			for i, id := range it.keep {
+				if borrow[id] {
+					if it.clone == nil {
+						it.clone = make([]bool, len(it.keep))
+					}
+					it.clone[i] = true
+				}
+			}
 		}
 	}
 	it.env = keptEnv{desc: desc, ids: it.keep}
@@ -873,4 +902,59 @@ func filterFirstCols(desc *catalog.TableDescriptor, where []parser.Comparison, k
 		return nil, nil
 	}
 	return func(id catalog.ColumnID) bool { return filt[id] }, func(id catalog.ColumnID) bool { return rest[id] }
+}
+
+// borrowingRow is a scan's reused row map, taking the TEXT columns in
+// borrow as views of the row value (rowenc.BorrowingSink).
+type borrowingRow struct {
+	rowenc.MapRow
+	borrow map[catalog.ColumnID]bool
+}
+
+// BorrowsCol reports whether column id is borrowed.
+func (r *borrowingRow) BorrowsCol(id catalog.ColumnID) bool { return r.borrow[id] }
+
+// tsBorrowCols returns the TEXT columns a filter reads only as the text
+// of a top-level `to_tsvector(config, column) @@ query` conjunct, which
+// the scan may decode as views of the stored row value: the fused
+// match (tsMatchFused) reads the text and keeps nothing of it, and no
+// other conjunct, nor the configuration or query of any, reads the
+// column. Nil when there is none, or the filter's columns cannot be
+// told.
+func tsBorrowCols(desc *catalog.TableDescriptor, where []parser.Comparison) map[catalog.ColumnID]bool {
+	cand := map[catalog.ColumnID]bool{}
+	other := map[catalog.ColumnID]bool{}
+	for i := range where {
+		c := &where[i]
+		if tsVectorMatchCall(c) {
+			arg := &c.Expr.Args[1]
+			if col, ok := desc.Col(arg.Column); ok && col.Type == types.String && bareColumnRef(arg) {
+				cand[col.ID] = true
+				if !exprReadCols(desc, &c.Expr.Args[0], other) || !exprReadCols(desc, &c.Value, other) {
+					return nil
+				}
+				continue
+			}
+		}
+		if !whereReadCols(desc, where[i:i+1], other) {
+			return nil
+		}
+	}
+	for id := range cand {
+		if other[id] {
+			delete(cand, id)
+		}
+	}
+	if len(cand) == 0 {
+		return nil
+	}
+	return cand
+}
+
+// bareColumnRef reports whether an expression is a column's value and
+// nothing more.
+func bareColumnRef(e *parser.Expr) bool {
+	return e.Column != "" && len(e.Path) == 0 && e.Func == "" && len(e.Args) == 0 && e.BinOp == "" &&
+		e.Left == nil && e.Right == nil && e.Case == nil && e.Cmp == nil && e.Sub == nil && e.Cast == "" &&
+		e.Lit == nil && e.Param == 0 && e.Window == nil && e.Agg == nil && !e.IsDefault
 }

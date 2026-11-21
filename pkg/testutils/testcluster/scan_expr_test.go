@@ -3,6 +3,7 @@ package testcluster
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -182,15 +183,17 @@ func TestScanExprEvaluatedWhenPulled(t *testing.T) {
 // allocate about what the bare-column path does per row sent, in the
 // whole process. Before: computed items (k + 1, n * 2) 7.0 allocations
 // a row, lower(pad) 8.0, a computed filter passing one row in three 9.1
-// (3 per row scanned), a reverse scan 4.0. Now: about 0.1, 3 (lower's
+// (3 per row scanned), a reverse scan 4.0, a text-search filter passing
+// one row in four 12.2 (3 per row scanned). Now: about 0.1, 3 (lower's
 // result, its argument list and pad decoded), 1.1 (pad, decoded only
-// for the rows that pass) and 1.1 (pad).
+// for the rows that pass), 1.1 (pad) and 0.2 (the text matched where it
+// is stored).
 func TestScanShapesAllocsPerRow(t *testing.T) {
 	if raceEnabled {
 		t.Skip("allocation counts are not meaningful under the race detector")
 	}
 	const rows = 5000
-	limits := map[string]float64{"exprs": 0.5, "lower": 3.5, "computed-where": 1.6, "reverse": 1.5}
+	limits := map[string]float64{"exprs": 0.5, "lower": 3.5, "computed-where": 1.6, "reverse": 1.5, "tsearch": 0.6}
 	for _, sh := range scanShapes(rows) {
 		limit, ok := limits[sh.name]
 		if !ok {
@@ -202,6 +205,77 @@ func TestScanShapesAllocsPerRow(t *testing.T) {
 		t.Logf("%s: %.2f allocs/row", sh.name, perRow)
 		if perRow > limit {
 			t.Errorf("%s (%s): %.2f allocations per row sent, want at most %.1f", sh.name, sh.q, perRow, limit)
+		}
+	}
+}
+
+// TestScanTextSearchWireOutputEqual: a streamed scan filtering on
+// `to_tsvector(config, body) @@ query` (body decoded as a view of the
+// stored row when nothing else reads it, copied when a matching row
+// keeps it) sends the same DataRow bytes as the same statement
+// materialized, in text and binary, read in full or by a primary-key
+// range: body kept or not, in an expression, under NOT, read by another
+// conjunct too, NULL, empty, non-ASCII and past the length the fused
+// matcher reads directly. The same statements on a table with a GIN
+// index (an inverted scan, which materializes) give the same rows.
+func TestScanTextSearchWireOutputEqual(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, tbl := range []string{"docs", "docsgin"} {
+		for _, s := range []string{
+			`CREATE TABLE ` + tbl + ` (k INT8 PRIMARY KEY, body TEXT, title VARCHAR(60), ch CHAR(8))`,
+			`INSERT INTO ` + tbl + ` VALUES
+				(1, 'The quick brown fox jumps over the lazy dog', 'fox one', 'a'),
+				(2, 'A slow green turtle', 'turtle', NULL),
+				(3, NULL, 'no body', 'c'),
+				(4, '', 'empty', 'd'),
+				(5, 'Foxes, foxes everywhere: a fox den', NULL, 'e'),
+				(6, 'héllo wörld, the fox says ünïcode', 'unicode', 'f'),
+				(7, repeat('fox and hound ', 40000), 'long', 'g'),
+				(8, 'quick thinking saves the lazy', 'quick', 'h')`,
+		} {
+			if _, err := conn.Exec(ctx, s); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+		}
+	}
+	if _, err := conn.Exec(ctx, `CREATE INDEX docsgin_fts ON docsgin USING GIN (to_tsvector('english', body))`); err != nil {
+		t.Fatal(err)
+	}
+	r := dialRaw(t, tc)
+	for _, tbl := range []string{"docs", "docsgin"} {
+		for _, f := range []struct {
+			name    string
+			formats []int16
+		}{{"simple", nil}, {"binary", []int16{1}}} {
+			for _, q := range []string{
+				`SELECT k FROM %s WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox')`,
+				`SELECT k, body, title, ch FROM %s WHERE to_tsvector('english', body) @@ plainto_tsquery('english', 'quick fox')`,
+				`SELECT k, upper(body), length(title) FROM %s WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', 'fox -lazy')`,
+				`SELECT k, title FROM %s WHERE NOT (to_tsvector('english', body) @@ to_tsquery('english', 'fox'))`,
+				`SELECT k, title FROM %s WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox | lazy') AND length(body) < 100`,
+				`SELECT k, body FROM %s WHERE to_tsvector('simple', body) @@ to_tsquery('simple', 'the') AND k > 0`,
+			} {
+				streamed := r.rawRowsOf(fmt.Sprintf(q, tbl), f.formats)
+				mat := r.rawRowsOf(fmt.Sprintf(q, tbl)+` ORDER BY k + 0`, f.formats)
+				if len(streamed) == 0 || len(streamed) != len(mat) {
+					t.Fatalf("%s %s: %d / %d rows", f.name, fmt.Sprintf(q, tbl), len(streamed), len(mat))
+				}
+				for i := range streamed {
+					for c := range streamed[i] {
+						s, m := streamed[i][c], mat[i][c]
+						if !bytes.Equal(s, m) || (s == nil) != (m == nil) {
+							t.Errorf("%s %s: row %d value %d: streamed %.60q, materialized %.60q", f.name, fmt.Sprintf(q, tbl), i, c, s, m)
+						}
+					}
+				}
+			}
 		}
 	}
 }
