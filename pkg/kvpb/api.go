@@ -45,6 +45,31 @@ type PutRequest struct {
 	Value []byte `json:"value"`
 }
 
+// CPutRequest is a conditional put: it writes Value at Key only if the
+// key has no live value — never written, or deleted — at the
+// transaction's read timestamp, and otherwise fails the batch with a
+// ConditionFailedError naming the key. The existence check and the write
+// are one request, so an INSERT's uniqueness check travels in its write
+// batch (and an autocommit single-row INSERT is one one-phase commit)
+// instead of costing a read round trip of its own.
+//
+// It is evaluated on the write path like a locking read followed by a
+// Put: the read sees the transaction's own writes and conflicts with
+// another transaction's intent (pushed like any other); a committed
+// version above the read timestamp fails it with WriteTooOld (the
+// snapshot is stale, which subsumes the uncertainty interval); and a
+// failed check leaves the key's read in the timestamp cache, so no
+// writer can change the observed state beneath the read timestamp.
+// Outside a transaction it checks, and writes over, the latest value.
+//
+// Introduced under cluster version v24: senders use it only once the
+// cluster has finalized v24 (pkg/version rule 4); an older node does not
+// know the union member and refuses the batch.
+type CPutRequest struct {
+	RequestHeader
+	Value []byte `json:"value"`
+}
+
 // DeleteRequest deletes a key (writes a tombstone).
 type DeleteRequest struct {
 	RequestHeader
@@ -349,6 +374,7 @@ type AdminMergeRequest struct {
 type RequestUnion struct {
 	Get                 *GetRequest                 `json:"get,omitempty"`
 	Put                 *PutRequest                 `json:"put,omitempty"`
+	CPut                *CPutRequest                `json:"c_put,omitempty"`
 	Delete              *DeleteRequest              `json:"delete,omitempty"`
 	Increment           *IncrementRequest           `json:"increment,omitempty"`
 	Scan                *ScanRequest                `json:"scan,omitempty"`
@@ -380,6 +406,8 @@ func (u RequestUnion) GetInner() Request {
 		return u.Get
 	case u.Put != nil:
 		return u.Put
+	case u.CPut != nil:
+		return u.CPut
 	case u.Delete != nil:
 		return u.Delete
 	case u.Increment != nil:
@@ -439,6 +467,7 @@ type Request interface {
 
 func (h *GetRequest) Header() RequestHeader                 { return h.RequestHeader }
 func (h *PutRequest) Header() RequestHeader                 { return h.RequestHeader }
+func (h *CPutRequest) Header() RequestHeader                { return h.RequestHeader }
 func (h *DeleteRequest) Header() RequestHeader              { return h.RequestHeader }
 func (h *IncrementRequest) Header() RequestHeader           { return h.RequestHeader }
 func (h *ScanRequest) Header() RequestHeader                { return h.RequestHeader }
@@ -464,6 +493,7 @@ func (h *ClearRangeRequest) Header() RequestHeader          { return h.RequestHe
 
 func (*GetRequest) Method() string                 { return "Get" }
 func (*PutRequest) Method() string                 { return "Put" }
+func (*CPutRequest) Method() string                { return "CPut" }
 func (*DeleteRequest) Method() string              { return "Delete" }
 func (*IncrementRequest) Method() string           { return "Increment" }
 func (*ScanRequest) Method() string                { return "Scan" }
@@ -489,6 +519,7 @@ func (*ClearRangeRequest) Method() string          { return "ClearRange" }
 
 func (r *GetRequest) IsReadOnly() bool               { return !r.ForUpdate }
 func (*PutRequest) IsReadOnly() bool                 { return false }
+func (*CPutRequest) IsReadOnly() bool                { return false }
 func (*DeleteRequest) IsReadOnly() bool              { return false }
 func (*IncrementRequest) IsReadOnly() bool           { return false }
 func (r *ScanRequest) IsReadOnly() bool              { return !r.ForUpdate }
@@ -524,6 +555,9 @@ type GetResponse struct {
 }
 
 type PutResponse struct{}
+
+// CPutResponse acknowledges a CPutRequest that wrote its value.
+type CPutResponse struct{}
 
 type DeleteResponse struct{}
 
@@ -666,6 +700,7 @@ type UpdateMetaResponse struct {
 type ResponseUnion struct {
 	Get                 *GetResponse                 `json:"get,omitempty"`
 	Put                 *PutResponse                 `json:"put,omitempty"`
+	CPut                *CPutResponse                `json:"c_put,omitempty"`
 	Delete              *DeleteResponse              `json:"delete,omitempty"`
 	Increment           *IncrementResponse           `json:"increment,omitempty"`
 	Scan                *ScanResponse                `json:"scan,omitempty"`
@@ -738,7 +773,7 @@ func (b *BatchRequest) IsReadOnly() bool {
 func (b *BatchRequest) HasMVCCWrites() bool {
 	for _, u := range b.Requests {
 		switch r := u.GetInner().(type) {
-		case *PutRequest, *DeleteRequest, *IncrementRequest, *UpdateMetaRequest:
+		case *PutRequest, *CPutRequest, *DeleteRequest, *IncrementRequest, *UpdateMetaRequest:
 			return true
 		case *GetRequest:
 			if r.ForUpdate {
@@ -761,6 +796,8 @@ func (b *BatchRequest) Add(r Request) {
 		u.Get = t
 	case *PutRequest:
 		u.Put = t
+	case *CPutRequest:
+		u.CPut = t
 	case *DeleteRequest:
 		u.Delete = t
 	case *IncrementRequest:

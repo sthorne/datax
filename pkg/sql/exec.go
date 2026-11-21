@@ -1240,12 +1240,20 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		}
 		built = append(built, builtRow{target: rowTarget, vals: rowVals, row: row, key: key})
 	}
+	// A plain INSERT checks its keys' uniqueness with its writes, in one
+	// batch (cputPlan); every other shape reads them first.
+	var cp *cputPlan
+	if conflict == nil {
+		cp = newCPutPlan(txn, desc)
+	}
 	var ps *probeSet
 	if len(built) > 1 {
 		probeKeys := make([]keys.Key, 0, len(built)*2)
 		for _, b := range built {
-			probeKeys = append(probeKeys, b.key)
-			probeKeys = appendUniqueIndexKeys(probeKeys, desc, b.row)
+			if cp == nil {
+				probeKeys = append(probeKeys, b.key)
+				probeKeys = appendUniqueIndexKeys(probeKeys, desc, b.row)
+			}
 			probeKeys = guard.appendParentKeys(ctx, txn, probeKeys, nil, b.row)
 		}
 		if ps, err = newProbeSet(ctx, txn, probeKeys); err != nil {
@@ -1260,14 +1268,14 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		// role may not write is refused as such, whether or not a row
 		// with its key exists.
 		if err := rowSec.checkInsert(b.row); err != nil {
-			return nil, err
+			return nil, cp.firstFailure(ctx, txn, &wb, err)
 		}
 		if conflict == nil {
-			if row, err = insertRowReturning(ctx, s.rowSealer(), txn, desc, rowTarget, rowVals, &wb, inserted, ps); err != nil {
-				return nil, err
+			if row, err = insertRowReturning(ctx, s.rowSealer(), txn, desc, rowTarget, rowVals, &wb, inserted, ps, cp); err != nil {
+				return nil, cp.firstFailure(ctx, txn, &wb, err)
 			}
 			if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
-				return nil, err
+				return nil, cp.firstFailure(ctx, txn, &wb, err)
 			}
 		} else {
 			written, wrow, err := s.insertOnConflict(ctx, txn, desc, rowTarget, rowVals, conflict, params, &wb, inserted, guard, ps, rowSec, conflictVisible)
@@ -1283,7 +1291,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 		if ret != nil {
 			out, err := ret.project(desc, row, params)
 			if err != nil {
-				return nil, err
+				return nil, cp.firstFailure(ctx, txn, &wb, err)
 			}
 			res.Rows = append(res.Rows, out)
 		}
@@ -1392,12 +1400,12 @@ func resolveConflict(desc *catalog.TableDescriptor, t *parser.Insert, target []c
 }
 
 // insertRowReturning is insertRow, handing back the row it wrote.
-func insertRowReturning(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, ps *probeSet) (map[catalog.ColumnID]types.Datum, error) {
+func insertRowReturning(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, ps *probeSet, cp *cputPlan) (map[catalog.ColumnID]types.Datum, error) {
 	row, _, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return nil, err
 	}
-	if err := insertRow(ctx, b, txn, desc, target, vals, wb, inserted, false, ps); err != nil {
+	if err := insertRow(ctx, b, txn, desc, target, vals, wb, inserted, false, ps, cp); err != nil {
 		return nil, err
 	}
 	return row, nil
@@ -1471,7 +1479,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 	}
 	if oldRow == nil {
 		// No conflict: a plain insert (the PK read above already ran).
-		if err := insertRow(ctx, s.rowSealer(), txn, desc, target, vals, wb, inserted, true, ps); err != nil {
+		if err := insertRow(ctx, s.rowSealer(), txn, desc, target, vals, wb, inserted, true, ps, nil); err != nil {
 			return false, nil, err
 		}
 		if err := guard.checkInsert(ctx, txn, row, inserted); err != nil {
@@ -1723,7 +1731,7 @@ func buildInsertRow(desc *catalog.TableDescriptor, target []catalog.Column, vals
 // when the caller already probed the key, pkKnownAbsent), value encoding,
 // the reshard shadow write, and secondary index entries — all buffered
 // into wb. vals must be positionally parallel to target.
-func insertRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool, ps *probeSet) error {
+func insertRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc *catalog.TableDescriptor, target []catalog.Column, vals []types.Datum, wb *kvclient.WriteBatch, inserted map[string]bool, pkKnownAbsent bool, ps *probeSet, cp *cputPlan) error {
 	row, key, err := buildInsertRow(desc, target, vals)
 	if err != nil {
 		return err
@@ -1731,23 +1739,92 @@ func insertRow(ctx context.Context, b *rowseal.Boundary, txn *kvclient.Txn, desc
 	if inserted[string(key)] {
 		return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
 	}
-	if !pkKnownAbsent {
-		if existing, err := ps.get(ctx, txn, key); err != nil {
+	if cp != nil {
+		// The primary key's check travels with the row's write.
+		value, err := rowenc.EncodeValue(desc, row)
+		if err != nil {
 			return err
-		} else if existing != nil {
-			return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+		}
+		stored, err := b.SealValue(ctx, desc, key, value)
+		if err != nil {
+			return err
+		}
+		wb.CPut(key, stored, cp.pkErr())
+	} else {
+		if !pkKnownAbsent {
+			if existing, err := ps.get(ctx, txn, key); err != nil {
+				return err
+			} else if existing != nil {
+				return newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", desc.Name)
+			}
+		}
+		// Writes are buffered; the caller flushes the batch (one routed
+		// batch — one Raft proposal per touched range — per statement or
+		// chunk).
+		if err := putRowValue(ctx, b, desc, wb, key, row); err != nil {
+			return err
 		}
 	}
-	// Writes are buffered; the caller flushes the batch (one routed batch —
-	// one Raft proposal per touched range — per statement or chunk).
-	if err := putRowValue(ctx, b, desc, wb, key, row); err != nil {
-		return err
-	}
-	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted, ps); err != nil {
+	if err := addIndexEntries(ctx, txn, desc, row, wb, inserted, ps, cp); err != nil {
 		return err
 	}
 	inserted[string(key)] = true
 	return nil
+}
+
+// cputPlan is an INSERT whose uniqueness checks — of the primary key and
+// of the unique indexes' entries — travel in its write batch as
+// conditional puts (kvpb.CPutRequest), instead of being read first: a
+// point INSERT is then one batch, and an autocommit one a one-phase
+// commit. The check is the read it replaces, made by the write at the
+// transaction's timestamp, and a failed one reports the error the read
+// would have: the first key in the statement's order that holds a value
+// (kvclient.WriteBatch.CPut). Each constraint's error is built once per
+// statement.
+type cputPlan struct {
+	desc *catalog.TableDescriptor
+	pk   error
+	idx  []error // by position in desc.Indexes, built on first use
+}
+
+// newCPutPlan is the plan for a plain INSERT into desc (no ON CONFLICT,
+// no UPSERT), or nil when the statement keeps reading its keys first:
+// before the cluster has finalized v24, whose nodes all know the
+// conditional put, and for a table in the middle of a re-shard, whose
+// row is written twice.
+func newCPutPlan(txn *kvclient.Txn, desc *catalog.TableDescriptor) *cputPlan {
+	if txn == nil || txn.Historical() || txn.ClusterVersion() < version.V24 || desc.Reshard != nil {
+		return nil
+	}
+	return &cputPlan{desc: desc}
+}
+
+func (p *cputPlan) pkErr() error {
+	if p.pk == nil {
+		p.pk = newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint on %q", p.desc.Name)
+	}
+	return p.pk
+}
+
+func (p *cputPlan) indexErr(i int) error {
+	if p.idx == nil {
+		p.idx = make([]error, len(p.desc.Indexes))
+	}
+	if p.idx[i] == nil {
+		p.idx[i] = newErrf(CodeUniqueViolation, "duplicate key value violates unique constraint %q", p.desc.Indexes[i].Name)
+	}
+	return p.idx[i]
+}
+
+// firstFailure is the error a statement with this plan reports when it
+// fails with err before its batch is sent: a uniqueness check buffered
+// before the failure, had it been read in place, would have failed the
+// statement first — the first key holding a value, in buffered order.
+func (p *cputPlan) firstFailure(ctx context.Context, txn *kvclient.Txn, wb *kvclient.WriteBatch, err error) error {
+	if p == nil || !wb.HasCPuts() {
+		return err
+	}
+	return txn.FirstConditionFailure(ctx, wb, err)
 }
 
 func pkKey(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.Datum) (keys.Key, error) {
@@ -3191,7 +3268,7 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 			if err := putRowValue(ctx, s.rowSealer(), desc, writes, newKeys[i], fr.row); err != nil {
 				return nil, err
 			}
-			if err := addIndexEntries(ctx, txn, desc, fr.row, writes, nil, ps); err != nil {
+			if err := addIndexEntries(ctx, txn, desc, fr.row, writes, nil, ps, nil); err != nil {
 				return nil, err
 			}
 		}

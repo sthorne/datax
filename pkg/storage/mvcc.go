@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -511,6 +512,65 @@ func MVCCLock(b *Batch, key keys.Key, readTS hlc.Timestamp, value []byte, txn *e
 	// readTS.Next() makes mvccWrite's conflict check reject versions
 	// strictly above readTS while admitting one exactly at it.
 	return mvccWrite(b, key, readTS.Next(), value, value == nil, txn)
+}
+
+// latestTimestamp reads the newest version of a key, whatever its
+// timestamp.
+var latestTimestamp = hlc.Timestamp{WallTime: math.MaxInt64, Logical: math.MaxInt32}
+
+// MVCCConditionalPut writes value to key only if the key has no live
+// value — never written, or deleted — and otherwise fails with
+// ConditionFailedError, writing nothing. With a transaction it is a
+// locking read followed by a put: the key is read at readTS as the
+// transaction sees it (its own writes included, a foreign intent at or
+// below readTS a WriteIntentError); then, the key absent, the intent is
+// laid exactly as MVCCLock lays one, so a committed version ABOVE readTS
+// fails it with WriteTooOldError (the snapshot is stale — which also
+// covers every version an uncertainty interval would have caught) and a
+// foreign intent anywhere fails it with WriteIntentError. Without a
+// transaction it checks the latest value and writes over it, like any
+// non-transactional write. g, when non-nil, serves the read (over b).
+func MVCCConditionalPut(b *Batch, g *Getter, key keys.Key, readTS hlc.Timestamp, value []byte, txn *enginepb.TxnMeta) error {
+	at, opts := readTS, MVCCGetOptions{Txn: txn}
+	if txn == nil {
+		at = latestTimestamp
+	}
+	cur, err := conditionalRead(b, g, key, at, opts)
+	if err != nil {
+		return err
+	}
+	if cur != nil {
+		return &ConditionFailedError{Key: key.Clone()}
+	}
+	if txn == nil {
+		return mvccWrite(b, key, readTS, value, false, nil)
+	}
+	// readTS.Next(): mvccWrite's conflict check then refuses versions
+	// strictly above readTS (see MVCCLock); the intent itself lands at
+	// the transaction's write timestamp.
+	return mvccWrite(b, key, readTS.Next(), value, false, txn)
+}
+
+// MVCCConditionalPutCommitted is MVCCConditionalPut for a one-phase
+// commit: the key is read at ts (any intent at or below it conflicts)
+// and, absent, written as a committed version at ts with
+// MVCCPutCommitted's conflict rules.
+func MVCCConditionalPutCommitted(b *Batch, g *Getter, key keys.Key, ts hlc.Timestamp, value []byte) error {
+	cur, err := conditionalRead(b, g, key, ts, MVCCGetOptions{})
+	if err != nil {
+		return err
+	}
+	if cur != nil {
+		return &ConditionFailedError{Key: key.Clone()}
+	}
+	return mvccWriteCommitted(b, key, ts, value, false)
+}
+
+func conditionalRead(b *Batch, g *Getter, key keys.Key, ts hlc.Timestamp, opts MVCCGetOptions) ([]byte, error) {
+	if g != nil {
+		return g.Get(key, ts, opts)
+	}
+	return MVCCGet(b, key, ts, opts)
 }
 
 // KeyValue is one row of a scan result.

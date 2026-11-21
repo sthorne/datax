@@ -1528,7 +1528,29 @@ func (r *Replica) Execute(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.Bat
 	if kerr == nil && ba.Header.Txn != nil {
 		br.Txn = ba.Header.Txn
 	}
+	if kerr != nil && kerr.ConditionFailed != nil {
+		r.noteConditionFailed(kerr.ConditionFailed.Key, ba)
+	}
 	return br, kerr
+}
+
+// noteConditionFailed records, in the timestamp cache, the read a failed
+// conditional put made: the batch's transaction observed a live value at
+// key as of its read timestamp, and no writer may now land beneath that
+// read — a delete below it would make the observation false — exactly
+// as if the key had been read by a Get. A conditional put that succeeds
+// needs no entry: its own write (an intent, or a one-phase commit's
+// committed version) pins the key above the read. The entry is made
+// after the batch applied, but the batch still holds its exclusive latch
+// on key, so no write to it can have been checked against the cache in
+// between: to every writer it is as if the entry had been made before
+// evaluation (invariant L2).
+func (r *Replica) noteConditionFailed(key keys.Key, ba *kvpb.BatchRequest) {
+	addr, err := addrOf(key)
+	if err != nil {
+		return
+	}
+	r.tsCache.Bump([]latchSpan{{Start: addr}}, readTimestamp(ba), batchTxnID(ba))
 }
 
 // checkKeyBounds verifies every request key is addressed to this range.
@@ -1628,7 +1650,7 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 	spans := make([]latchSpan, 0, len(ba.Requests))
 	for _, u := range ba.Requests {
 		switch r := u.GetInner().(type) {
-		case *kvpb.PutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest, *kvpb.UpdateMetaRequest:
+		case *kvpb.PutRequest, *kvpb.CPutRequest, *kvpb.DeleteRequest, *kvpb.IncrementRequest, *kvpb.UpdateMetaRequest:
 		case *kvpb.GetRequest:
 			if !r.ForUpdate {
 				continue
@@ -1659,7 +1681,8 @@ func mvccWriteSpans(ba *kvpb.BatchRequest) []latchSpan {
 // is1PC reports whether the batch is one-phase-commit shaped: bound to a
 // transaction, its last request a committing EndTxn with All set (the
 // client's "this is the entire transaction" declaration), and every other
-// request a plain Put or Delete. Deterministic from batch content alone,
+// request a plain Put, a conditional Put or a Delete. Deterministic from
+// batch content alone,
 // so the leader's pre-propose gate and every replica's apply agree.
 func is1PC(ba *kvpb.BatchRequest) bool {
 	if ba.Header.Txn == nil || len(ba.Requests) < 2 {
@@ -1671,7 +1694,7 @@ func is1PC(ba *kvpb.BatchRequest) bool {
 	}
 	for i := 0; i < len(ba.Requests)-1; i++ {
 		switch ba.Requests[i].GetInner().(type) {
-		case *kvpb.PutRequest, *kvpb.DeleteRequest:
+		case *kvpb.PutRequest, *kvpb.CPutRequest, *kvpb.DeleteRequest:
 		default:
 			return false
 		}

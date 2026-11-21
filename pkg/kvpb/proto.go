@@ -249,6 +249,8 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		out.Value = &rpcpb.RequestUnion_Get{Get: &rpcpb.GetRequest{Header: reqHeaderToProto(r.RequestHeader), ForUpdate: r.ForUpdate, SkipLocked: r.SkipLocked}}
 	case *PutRequest:
 		out.Value = &rpcpb.RequestUnion_Put{Put: &rpcpb.PutRequest{Header: reqHeaderToProto(r.RequestHeader), Value: r.Value}}
+	case *CPutRequest:
+		out.Value = &rpcpb.RequestUnion_CPut{CPut: &rpcpb.CPutRequest{Header: reqHeaderToProto(r.RequestHeader), Value: r.Value}}
 	case *DeleteRequest:
 		out.Value = &rpcpb.RequestUnion_Delete{Delete: &rpcpb.DeleteRequest{Header: reqHeaderToProto(r.RequestHeader)}}
 	case *IncrementRequest:
@@ -365,6 +367,8 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 		u.Get = &GetRequest{RequestHeader: reqHeaderFromProto(v.Get.Header), ForUpdate: v.Get.ForUpdate, SkipLocked: v.Get.SkipLocked}
 	case *rpcpb.RequestUnion_Put:
 		u.Put = &PutRequest{RequestHeader: reqHeaderFromProto(v.Put.Header), Value: v.Put.Value}
+	case *rpcpb.RequestUnion_CPut:
+		u.CPut = &CPutRequest{RequestHeader: reqHeaderFromProto(v.CPut.Header), Value: v.CPut.Value}
 	case *rpcpb.RequestUnion_Delete:
 		u.Delete = &DeleteRequest{RequestHeader: reqHeaderFromProto(v.Delete.Header)}
 	case *rpcpb.RequestUnion_Increment:
@@ -566,6 +570,8 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		out.Value = &rpcpb.ResponseUnion_Get{Get: pb}
 	case u.Put != nil:
 		out.Value = &rpcpb.ResponseUnion_Put{Put: &rpcpb.PutResponse{}}
+	case u.CPut != nil:
+		out.Value = &rpcpb.ResponseUnion_CPut{CPut: &rpcpb.CPutResponse{}}
 	case u.Delete != nil:
 		out.Value = &rpcpb.ResponseUnion_Delete{Delete: &rpcpb.DeleteResponse{}}
 	case u.Increment != nil:
@@ -654,6 +660,8 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 		}
 	case *rpcpb.ResponseUnion_Put:
 		u.Put = &PutResponse{}
+	case *rpcpb.ResponseUnion_CPut:
+		u.CPut = &CPutResponse{}
 	case *rpcpb.ResponseUnion_Delete:
 		u.Delete = &DeleteResponse{}
 	case *rpcpb.ResponseUnion_Increment:
@@ -823,6 +831,9 @@ func ErrorToProto(e *Error) *rpcpb.Error {
 	if b := e.BelowGCThreshold; b != nil {
 		pb.BelowGcThreshold = &rpcpb.BelowGCThresholdError{Timestamp: tsToProto(b.Timestamp), Threshold: tsToProto(b.Threshold)}
 	}
+	if c := e.ConditionFailed; c != nil {
+		pb.ConditionFailed = &rpcpb.ConditionFailedError{Key: c.Key}
+	}
 	return pb
 }
 
@@ -882,6 +893,9 @@ func ErrorFromProto(pb *rpcpb.Error) (*Error, error) {
 	}
 	if b := pb.BelowGcThreshold; b != nil {
 		e.BelowGCThreshold = &BelowGCThresholdError{Timestamp: tsFromProto(b.Timestamp), Threshold: tsFromProto(b.Threshold)}
+	}
+	if c := pb.ConditionFailed; c != nil {
+		e.ConditionFailed = &ConditionFailedError{Key: c.Key}
 	}
 	return e, nil
 }

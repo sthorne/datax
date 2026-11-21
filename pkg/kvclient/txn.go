@@ -1625,6 +1625,10 @@ func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 	if err != nil {
 		t.markFinished()
 		t.wakeWaiters()
+		var kerr *kvpb.Error
+		if errors.As(err, &kerr) {
+			err = t.conditionFailure(wb, kerr)
+		}
 		return true, err
 	}
 	et := br.Responses[len(br.Responses)-1].EndTxn
@@ -1810,6 +1814,10 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 		// be RECOVERED AS COMMITTED, contradicting the error we return.
 		t.abortFailedCommit(ctx)
 		if wbErr != nil {
+			var kerr *kvpb.Error
+			if errors.As(wbErr, &kerr) {
+				return t.conditionFailure(wb, kerr)
+			}
 			return wbErr
 		}
 		return etErr
