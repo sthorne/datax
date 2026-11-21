@@ -65,7 +65,10 @@ func (s latchSpan) overlaps(o latchSpan) bool {
 type latch struct {
 	spans []latchSpan
 	mode  latchMode
-	done  chan struct{}
+	// done is closed when the latch is released. It is made (under the
+	// manager's mu) by the first acquirer that has to wait on it: most
+	// latches are never waited on.
+	done chan struct{}
 	// ranged is set when at least one span covers a key range; such latches
 	// are kept in latchManager.ranged so point lookups can consult them.
 	ranged bool
@@ -95,14 +98,21 @@ type latchGuard struct {
 	m    *latchManager
 	l    *latch
 	once sync.Once
+	// own is the latch l points to, allocated with its guard.
+	own latch
 }
 
 func (g *latchGuard) Release() {
 	g.once.Do(func() {
 		g.m.mu.Lock()
 		g.m.remove(g.l)
+		// Removed, the latch is found by no acquirer: no waiter makes
+		// done after this.
+		done := g.l.done
 		g.m.mu.Unlock()
-		close(g.l.done)
+		if done != nil {
+			close(done)
+		}
 	})
 }
 
@@ -110,7 +120,9 @@ func (g *latchGuard) Release() {
 // spans atomically — no incremental holds, hence no latch-latch deadlock),
 // or ctx is done.
 func (m *latchManager) Acquire(ctx context.Context, spans []latchSpan, mode latchMode) (*latchGuard, error) {
-	l := &latch{spans: spans, mode: mode, done: make(chan struct{})}
+	g := &latchGuard{m: m, own: latch{spans: spans, mode: mode}}
+	l := &g.own
+	g.l = l
 	for _, sp := range spans {
 		if sp.End != nil {
 			l.ranged = true
@@ -127,7 +139,10 @@ func (m *latchManager) Acquire(ctx context.Context, spans []latchSpan, mode latc
 			if !waitedSince.IsZero() {
 				metrics.LatchWait.Observe(time.Since(waitedSince).Seconds())
 			}
-			return &latchGuard{m: m, l: l}, nil
+			return g, nil
+		}
+		if conflict.done == nil {
+			conflict.done = make(chan struct{})
 		}
 		wait := conflict.done
 		m.mu.Unlock()
@@ -163,8 +178,9 @@ func (m *latchManager) remove(l *latch) {
 		if sp.End != nil {
 			continue
 		}
-		k := string(sp.Start)
-		hs := m.points[k]
+		// The key converted in place (no allocation) to look up and
+		// delete; only a key other holders keep is stored again.
+		hs := m.points[string(sp.Start)]
 		n := hs[:0]
 		for _, h := range hs {
 			if h != l {
@@ -172,11 +188,11 @@ func (m *latchManager) remove(l *latch) {
 			}
 		}
 		if len(n) == 0 {
-			delete(m.points, k)
+			delete(m.points, string(sp.Start))
 			continue
 		}
 		clear(hs[len(n):])
-		m.points[k] = n
+		m.points[string(sp.Start)] = n
 	}
 }
 

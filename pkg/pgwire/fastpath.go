@@ -97,7 +97,7 @@ func (c *conn) handleFunctionCall(ctx context.Context, m *pgproto3.FunctionCall)
 		return
 	}
 	var out types.Datum
-	_, serr := c.execute(ctx, stmts[0], text, params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+	_, serr := c.execute(ctx, stmts[0], text, nil, params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 		if len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
 			return 0, &sql.Error{Code: sql.CodeInternal, Msg: fmt.Sprintf("function %s returned %d rows", name, len(res.Rows))}
 		}

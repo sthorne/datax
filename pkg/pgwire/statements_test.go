@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/sql/parser"
 )
 
@@ -171,5 +172,27 @@ func TestStatementsPercentiles(t *testing.T) {
 	}
 	if st.MaxMicros != 100000 {
 		t.Errorf("max %dus, want 100000", st.MaxMicros)
+	}
+}
+
+// TestStmtCounterHandles: each statement kind counts through the handle
+// resolved once for it, the same series WithLabelValues names, and a
+// kind without one still counts.
+func TestStmtCounterHandles(t *testing.T) {
+	for _, q := range []string{"SELECT 1", "INSERT INTO t VALUES (1)", "UPDATE t SET a = 1", "DELETE FROM t", "BEGIN", "CREATE TABLE t (a INT8 PRIMARY KEY)", "SET x = 1"} {
+		stmts, err := parser.Parse(q)
+		if err != nil {
+			t.Fatalf("parse %q: %v", q, err)
+		}
+		kind := statementKind(stmts[0])
+		if _, ok := stmtCounters[kind]; !ok {
+			t.Errorf("%s: kind %q has no resolved handle", q, kind)
+		}
+		if stmtCounter(kind) != metrics.SQLStatements.WithLabelValues(kind) {
+			t.Errorf("%s: kind %q counts into another series", q, kind)
+		}
+	}
+	if stmtCounter("unlisted") != metrics.SQLStatements.WithLabelValues("unlisted") {
+		t.Error("an unlisted kind counts into another series")
 	}
 }

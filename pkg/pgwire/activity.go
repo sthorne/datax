@@ -314,8 +314,10 @@ func truncateStmt(text string) string {
 	return text
 }
 
-// begin marks c as running stmt; the returned token ends it.
-func (a *Activity) begin(c *conn, stmt parser.Statement, text string) *stmtToken {
+// begin marks c as running stmt; the returned token ends it. shape is
+// stmt's fingerprint when the caller has it already (nil: computed
+// here).
+func (a *Activity) begin(c *conn, stmt parser.Statement, text string, shape *parser.Shape) *stmtToken {
 	kind := statementKind(stmt)
 	now := time.Now()
 	a.mu.Lock()
@@ -325,7 +327,15 @@ func (a *Activity) begin(c *conn, stmt parser.Statement, text string) *stmtToken
 	}
 	a.mu.Unlock()
 	a.gauges()
-	return &stmtToken{a: a, c: c, kind: kind, text: text, start: now, shape: parser.Fingerprint(stmt)}
+	var sh parser.Shape
+	if shape != nil {
+		sh = *shape
+	} else {
+		sh = parser.Fingerprint(stmt)
+	}
+	// The connection's own token: it runs one statement at a time.
+	c.tok = stmtToken{a: a, c: c, kind: kind, text: text, start: now, shape: sh}
+	return &c.tok
 }
 
 type stmtToken struct {
@@ -385,7 +395,7 @@ func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 	// Charged to the shape, outside a.mu: the shape table has its own
 	// lock and no reason to contend with the connection map.
 	a.stmts.record(t.shape, t.kind, t.text, d, rows, t.scanned, serr != nil, retry)
-	metrics.SQLStatements.WithLabelValues(t.kind).Inc()
+	stmtCounter(t.kind).Inc()
 	metrics.SQLStatementLatency.Observe(d.Seconds())
 	if retry {
 		metrics.SQLSerializationFailures.Inc()
@@ -412,6 +422,24 @@ func (a *Activity) gauges() {
 	connGauges.open.Set(float64(open))
 	connGauges.active.Set(float64(active))
 	connGauges.idleTxn.Set(float64(idleTxn))
+}
+
+// stmtCounters are the statement counter's label handles, one per
+// statementKind, resolved once as connGauges are.
+var stmtCounters = func() map[string]prometheus.Counter {
+	m := map[string]prometheus.Counter{}
+	for _, k := range []string{"select", "insert", "update", "delete", "copy", "txn", "ddl", "other"} {
+		m[k] = metrics.SQLStatements.WithLabelValues(k)
+	}
+	return m
+}()
+
+// stmtCounter is the statement counter for kind.
+func stmtCounter(kind string) prometheus.Counter {
+	if c, ok := stmtCounters[kind]; ok {
+		return c
+	}
+	return metrics.SQLStatements.WithLabelValues(kind)
 }
 
 // connGauges are the connection gauges' label handles, resolved once

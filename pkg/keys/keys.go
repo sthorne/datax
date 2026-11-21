@@ -805,7 +805,10 @@ func RoleSpan() (Key, Key) {
 
 // TableDataPrefix is the prefix of all rows of a table.
 func TableDataPrefix(tableID uint64) Key {
-	return Key(encoding.EncodeUint64(TablePrefix.Clone(), tableID))
+	// One allocation, at the capacity the clone-and-grow it replaces
+	// ended with (callers append to the prefix).
+	k := append(make(Key, 0, 16), TablePrefix...)
+	return Key(encoding.EncodeUint64(k, tableID))
 }
 
 // TableDataSpan covers all rows of a table (every index).
@@ -817,7 +820,9 @@ func TableDataSpan(tableID uint64) (Key, Key) {
 // TableIndexPrefix is the prefix of one index of a table:
 // /t/<tableID>/<indexID>/. Primary rows are index 1 (see pkg/sql/rowenc).
 func TableIndexPrefix(tableID, indexID uint64) Key {
-	return Key(encoding.EncodeUint64(TableDataPrefix(tableID), indexID))
+	// One allocation, at the capacity the grow it replaces ended with.
+	k := append(make(Key, 0, 32), TablePrefix...)
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(k, tableID), indexID))
 }
 
 // TableAuxIndexID is the index ID no index ever has (primary rows are

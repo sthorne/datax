@@ -48,8 +48,20 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		// A data statement resolves each table once (the view check and
 		// the plan both ask); the memo lives for this attempt.
 		if s.stmtLookups == nil || s.stmtLookups.txn != txn {
-			s.stmtLookups = &lookupMemo{txn: txn, m: make(map[string]*catalog.TableDescriptor, 2)}
-			defer func() { s.stmtLookups = nil }()
+			// The previous statement's memo, emptied, if it is free.
+			memo := s.spareLookups
+			s.spareLookups = nil
+			if memo == nil {
+				memo = &lookupMemo{m: make(map[string]*catalog.TableDescriptor, 2)}
+			}
+			memo.txn = txn
+			s.stmtLookups = memo
+			defer func() {
+				s.stmtLookups = nil
+				memo.txn = nil
+				clear(memo.m)
+				s.spareLookups = memo
+			}()
 		}
 	}
 	if ct, ok := stmt.(*parser.CreateTable); ok {
@@ -2944,9 +2956,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	// must pass WITH CHECK below. A statement so filtered plans in full:
 	// the plan cache cannot tell roles or settings apart.
 	reads := updateReadsTable(t, corr) || len(setCorr) > 0
-	cmds := []string{catalog.PolicyUpdate}
+	cmdBuf := [2]string{catalog.PolicyUpdate, catalog.PolicySelect}
+	cmds := cmdBuf[:1]
 	if reads {
-		cmds = append(cmds, catalog.PolicySelect)
+		cmds = cmdBuf[:2]
 	}
 	where, secured, err := s.securedWhere(ctx, txn, desc, t.Where, cmds...)
 	if err != nil {
@@ -2977,7 +2990,10 @@ func (s *Session) execUpdate(ctx context.Context, txn *kvclient.Txn, t *parser.U
 	if err != nil {
 		return nil, err
 	}
-	setMemo := corrMemo{}
+	var setMemo corrMemo // for the correlated SET values, if any
+	if len(setCorr) > 0 {
+		setMemo = corrMemo{}
+	}
 	u := updateApply{
 		desc: desc, set: t.Set, rows: rows, pkSet: pkSet, reads: reads,
 		eval: func(i, j int) (types.Datum, error) {
@@ -3684,29 +3700,41 @@ func asErr[T error](err error, target *T) bool {
 // subquery's outer reference to its own table). The subqueries' names
 // are theirs to resolve.
 func stripTableAlias(t *parser.Select) error {
+	_, err := stripTableAliasN(t)
+	return err
+}
+
+// stripTableAliasN is stripTableAlias, reporting also whether it
+// rewrote any name.
+func stripTableAliasN(t *parser.Select) (rewrote bool, err error) {
 	if len(t.Joins) > 0 || t.Table == "" {
-		return nil
+		return false, nil
 	}
 	_, bare := catalog.SplitTableName(t.Table)
-	prefixes := map[string]bool{}
-	var hidden scopeLevel
-	if t.Alias != "" && t.Alias != bare && t.Alias != t.Table {
-		prefixes[t.Alias+"."] = true
-		hidden.hidden = []hiddenName{{table: bare, alias: t.Alias}, {table: t.Table, alias: t.Alias}}
-	} else {
-		prefixes[bare+"."], prefixes[t.Table+"."] = true, true
+	// The qualifiers stripped, each followed by "." in a name: the alias
+	// alone when it hides the table's names; else the bare and the
+	// written table name (at most one of which a name can begin with).
+	quals := [2]string{bare, t.Table}
+	aliased := t.Alias != "" && t.Alias != bare && t.Alias != t.Table
+	if aliased {
+		quals = [2]string{t.Alias, t.Alias}
 	}
-	var err error
 	// strip rewrites a name in place only when it changes: a statement
 	// already stripped (a prepared one, run again) is only read.
 	strip := func(name *string) {
-		for pre := range prefixes {
-			if strings.HasPrefix(*name, pre) && !strings.Contains((*name)[len(pre):], ".") {
-				*name = (*name)[len(pre):]
+		n := *name
+		for _, q := range quals {
+			if len(n) > len(q) && n[len(q)] == '.' && strings.HasPrefix(n, q) && !strings.Contains(n[len(q)+1:], ".") {
+				*name = n[len(q)+1:]
+				rewrote = true
 				return
 			}
 		}
-		if q, _ := splitQualified(*name); q != "" && err == nil {
+		if q, _ := splitQualified(n); q != "" && err == nil {
+			var hidden scopeLevel
+			if aliased {
+				hidden.hidden = []hiddenName{{table: bare, alias: t.Alias}, {table: t.Table, alias: t.Alias}}
+			}
 			err = fromEntryErr(q, hidden)
 		}
 	}
@@ -3714,10 +3742,8 @@ func stripTableAlias(t *parser.Select) error {
 	// arguments and filters, WHERE, HAVING, ORDER BY, windows); not its
 	// subqueries, whose qualified names may be correlated references
 	// to this very alias, nor its WITH members or set members.
-	self := *t
-	self.With, self.Union, self.Derived = nil, nil, nil
 	w := parser.Walker{
-		OnSelect: func(s *parser.Select) bool { return s == &self },
+		OnSelect: func(s *parser.Select) bool { return s == t },
 		OnExpr: func(e *parser.Expr) bool {
 			if e.Column != "" {
 				strip(&e.Column)
@@ -3741,8 +3767,8 @@ func stripTableAlias(t *parser.Select) error {
 			}
 		},
 	}
-	w.SelectStmt(&self)
-	return err
+	w.SelectOwn(t)
+	return rewrote, err
 }
 
 // emptyCatalogSelect answers a select whose base table is an

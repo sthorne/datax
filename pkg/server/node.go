@@ -888,14 +888,7 @@ func (n *Node) start() error {
 		}
 		return version.V1 // not yet mirrored: assume the floor
 	})
-	n.db.SetNodeLister(func() []base.NodeID {
-		nodes := n.registry.All()
-		ids := make([]base.NodeID, len(nodes))
-		for i, nd := range nodes {
-			ids[i] = nd.NodeID
-		}
-		return ids
-	})
+	n.db.SetNodeLister(n.registry.NodeIDs)
 	n.store.SetSender(n.db)
 	n.db.SetPurger(n.PurgeSpan)
 

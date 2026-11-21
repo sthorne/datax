@@ -115,6 +115,20 @@ func (w *Walker) selectMember(m *Select) {
 	if m.Derived != nil {
 		w.SelectStmt(m.Derived)
 	}
+	w.selectOwn(m)
+}
+
+// SelectOwn walks one select's own positions: what SelectStmt walks of
+// its first member, less its WITH members, its derived table and the
+// set-operation members chained to it.
+func (w *Walker) SelectOwn(m *Select) {
+	if w.OnSelect != nil && !w.OnSelect(m) {
+		return
+	}
+	w.selectOwn(m)
+}
+
+func (w *Walker) selectOwn(m *Select) {
 	if m.FuncTable != nil {
 		w.WalkExpr(m.FuncTable)
 	}
