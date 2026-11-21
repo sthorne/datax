@@ -11,6 +11,10 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax_range_latch_wait_seconds{op,outcome}`**: time spent waiting
+  for a latch by range-wide operations (`split`, `merge`, `clear_range`,
+  `closed_ts`), with outcome `acquired` or `abandoned`. The existing
+  `datax_latch_wait_seconds` counts only waits that end in an acquire.
 - **Cluster version v24: an INSERT checks uniqueness in its write.**
   Once v24 is finalized, a plain INSERT (and INSERT ... SELECT) writes
   its primary key and single-key unique-index entries with a conditional
@@ -2004,6 +2008,42 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A range under a steady write load keeps its closed timestamp.**
+  A closed-timestamp promise at T now waits only for writes that could
+  still land at or below T; writes at current timestamps and
+  transaction-record operations pass it. Before, on a range taking bulk
+  INSERTs or COPY, the promise timed out every round, the range never
+  published a closed timestamp (so no follower reads), and each timeout
+  delayed the promises of the store's other ranges.
+  - Measured on the busy range: closed timestamp "never published" →
+    at most about 4.4 s stale; latch wait under COPY on 3 nodes
+    1.45 → 0.23 s per second.
+- **Splits no longer block the left side, and range-wide operations are
+  no longer starved.** A split latches only its right-hand side.
+  Splits, merges, range clears and closed-timestamp promises queue
+  fairly: once one waits, later conflicting requests wait behind it.
+- **A `search_path` schema no longer costs a read per statement.** With
+  a schema other than `public` first on the path (for example
+  `SET search_path = app, public`, or a role with a schema of its own
+  name), a statement on a `public` table no longer reads the name in
+  that schema first: a point SELECT or INSERT is 1 KV batch instead of
+  2, with about 30% fewer allocations.
+  - CREATE TABLE/VIEW or RENAME to a name another schema in the
+    database already holds, and `ALTER TABLE ... SET SCHEMA`, now
+    drain gateways as CREATE SCHEMA does (about 0.5 s on a multi-node
+    cluster).
+- **Fewer allocations per row on three more scan shapes**, with output
+  unchanged byte for byte:
+  - Reverse scans (`ORDER BY pk DESC`, reverse index scans) copy rows
+    into per-scan chunks: 2,016 → 26 allocations per 1,000 rows.
+  - A streamed SELECT with computed select items or a computed WHERE
+    decodes only the columns it reads into one reused row, and decodes
+    the columns a filter does not read only for rows that pass:
+    `SELECT k + 1, n * 2` 7.0 → 0.06 allocations per row; a filter
+    passing one row in three 9.1 → 1.1. Select-list expressions are
+    still evaluated only for the rows the client pulls.
+  - A `to_tsvector(cfg, col) @@ q` filter matches the stored text in
+    place: 12.2 → 0.2 allocations per row returned.
 - **Large result sets stream at less than half the server CPU per row.**
   The wire output is unchanged byte for byte.
   - A scan whose select list is bare columns decodes each row into one
