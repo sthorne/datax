@@ -166,10 +166,11 @@ func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 	// One sequence for the whole batch: a savepoint cannot be established
 	// mid-statement, so a statement's writes roll back as a unit.
 	t.mu.txn.Sequence++
-	createRecord := false
+	createRecord, anchorSet := false, false
 	if !t.mu.anchored {
 		if len(t.mu.txn.Key) == 0 {
 			t.mu.txn.Key = b.kys[0].Clone()
+			anchorSet = true
 		}
 		// Only a batch that writes the anchor key itself may create the
 		// record (co-location with a write on the anchor range).
@@ -188,7 +189,7 @@ func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 		Requests: b.reqs,
 	}
 	if _, err := t.send(ctx, ba, true); err != nil {
-		return t.failedBatch(b, err, createRecord)
+		return t.failedBatch(b, err, createRecord, anchorSet)
 	}
 	for _, k := range b.kys {
 		t.recordWrite(k)
@@ -205,12 +206,26 @@ func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 // that is not there is a no-op), and a batch that was to create the
 // record counts it as created (the record's part is sent first, alone,
 // and succeeded if any other part was sent).
-func (t *Txn) failedBatch(b *WriteBatch, err error, createRecord bool) error {
+//
+// When none of it applied and the batch chose the transaction's anchor
+// (anchorSet: the first key of its first write), the choice is undone: the
+// record was never created, and a later write that does not touch the
+// failed batch's first key would otherwise never create it — its intents
+// would belong to a transaction with no record, which COMMIT, seeing no
+// anchor, would take for read-only and leave unresolved.
+func (t *Txn) failedBatch(b *WriteBatch, err error, createRecord, anchorSet bool) error {
 	var kerr *kvpb.Error
 	if !b.HasCPuts() || !errors.As(err, &kerr) || kerr.ConditionFailed == nil {
 		return err
 	}
 	if kerr.ConditionFailed.NoneApplied {
+		if anchorSet {
+			t.mu.Lock()
+			if !t.mu.anchored {
+				t.mu.txn.Key = nil
+			}
+			t.mu.Unlock()
+		}
 		return t.conditionFailure(b, kerr)
 	}
 	t.mu.Lock()

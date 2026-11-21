@@ -7,6 +7,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/kvpb"
+	"github.com/sthorne/datax/pkg/storage"
 )
 
 func condFailed(k string) *kvpb.Error {
@@ -87,5 +88,35 @@ func TestConditionFailedAt(t *testing.T) {
 	}
 	if at := conditionFailedAt(g, condFailed("a")); at != math.MaxInt {
 		t.Fatalf("a plain put's key at %d", at)
+	}
+}
+
+// A conflict on a conditional put's key is the read the put replaces,
+// and waits for a live owner; any other conflict in the batch is a
+// write's, and may abort the owner by priority.
+func TestOnlyCPutConflicts(t *testing.T) {
+	var b WriteBatch
+	b.CPut(keys.Key("a"), []byte("v"), nil)
+	b.Put(keys.Key("p"), []byte("v"))
+	ba := &kvpb.BatchRequest{Requests: b.reqs}
+	at := func(ks ...string) []storage.Intent {
+		var out []storage.Intent
+		for _, k := range ks {
+			out = append(out, storage.Intent{Key: keys.Key(k)})
+		}
+		return out
+	}
+	for _, c := range []struct {
+		intents []storage.Intent
+		want    bool
+	}{
+		{at("a"), true},
+		{at("p"), false},
+		{at("a", "p"), false},
+		{nil, false},
+	} {
+		if got := onlyCPutConflicts(ba, c.intents); got != c.want {
+			t.Fatalf("%v: got %v, want %v", c.intents, got, c.want)
+		}
 	}
 }
