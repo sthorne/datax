@@ -1,7 +1,6 @@
 package testcluster
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -47,25 +46,6 @@ type knownExtra struct {
 	why string
 	// match reports whether a batch is the known extra one.
 	match func(ba *kvpb.BatchRequest) bool
-}
-
-// schemansLookup: every statement that resolves a table reads its
-// database's schema namespace (Get /system/schemans/<db>/"root")
-// without the cache, a second batch on a point SELECT. Being fixed in
-// parallel; when the fix lands, change this line to
-// `var schemansLookup *knownExtra` and every shape that names it expects
-// its correct count with no allowance (the names can go later).
-var schemansLookup *knownExtra
-
-func isSchemaNamespaceGet(ba *kvpb.BatchRequest) bool {
-	lo, hi := keys.AllSchemaNamespaceSpan()
-	for _, ru := range ba.Requests {
-		in := ru.GetInner()
-		if k := in.Header().Key; in.Method() != "Get" || bytes.Compare(k, lo) < 0 || bytes.Compare(k, hi) >= 0 {
-			return false
-		}
-	}
-	return len(ba.Requests) > 0
 }
 
 // roundTripShape is one statement shape and what it should cost.
@@ -178,7 +158,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			stmts:   []string{`SELECT v FROM rt WHERE k = $1`},
 			args:    one(func(i int) []any { return []any{int64(1 + i%50)} }),
 			batches: 1, requests: 1,
-			knownExtra: schemansLookup,
 		},
 		{
 			name:  "point UPDATE by primary key, autocommit",
@@ -187,7 +166,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			// The row read, then the write committed in one batch (s is
 			// unchanged, so no index entry).
 			batches: 2, requests: 3, onePhase: true,
-			knownExtra: schemansLookup,
 		},
 		{
 			name:  "point INSERT, autocommit",
@@ -196,7 +174,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			// The primary key's existence check, then the row and its
 			// index entry committed in one batch.
 			batches: 2, requests: 4, onePhase: true,
-			knownExtra: schemansLookup,
 		},
 		{
 			name:  "DELETE by primary key",
@@ -205,7 +182,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			// The row read, then the row and its index entry deleted and
 			// committed in one batch.
 			batches: 2, requests: 4, onePhase: true,
-			knownExtra: schemansLookup,
 		},
 		{
 			name:  "SELECT through a secondary index (index join)",
@@ -213,7 +189,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			args:  one(func(i int) []any { return []any{fmt.Sprintf("s%d", 51+i%50)} }),
 			// The index scan, then the primary fetch.
 			batches: 2, requests: 2,
-			knownExtra: schemansLookup,
 		},
 		{
 			name:  "two-statement explicit transaction",
@@ -226,7 +201,6 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			// and the intent resolution the commit sends before it
 			// returns.
 			batches: 5, requests: 5,
-			knownExtra: schemansLookup, extras: 2, // SELECT and UPDATE each
 		},
 		{
 			name:    "SELECT 1", // no KV at all
@@ -316,7 +290,7 @@ func checkRoundTrips(t *testing.T, sh roundTripShape, got []*kvpb.BatchRequest) 
 		}
 		switch {
 		case extras == 0:
-			t.Errorf("%s: the known extra batch (%s) no longer occurs: the regression is fixed, so remove the allowance (var schemansLookup *knownExtra)\nbatches:\n%s",
+			t.Errorf("%s: the known extra batch (%s) no longer occurs: the regression is fixed, so remove the allowance\nbatches:\n%s",
 				sh.name, sh.knownExtra.why, listing)
 		case extras != want:
 			t.Errorf("%s: %d batches match the known extra (%s), allowed %d\nbatches:\n%s",
