@@ -63,6 +63,11 @@ type benchResult struct {
 	// Metrics are the server's counter deltas over the run (every plain
 	// datax_* series that moved), from --server-url or --metrics-url.
 	Metrics map[string]float64 `json:"metrics,omitempty"`
+	// KVBatchesPerOp is the KV batches the scraped node routed per
+	// measured operation (datax_kv_batch_latency_seconds_count over Ops,
+	// from Metrics): a count, so a change that adds a round trip to every
+	// statement shows on a noisy machine where throughput does not.
+	KVBatchesPerOp float64 `json:"kv_batches_per_op,omitempty"`
 	// ReadPhase is the timeseries workload's windowed-read phase.
 	ReadPhase *benchReadPhase `json:"read_phase,omitempty"`
 	// Vector is the vector-knn workload's own record: the index build
@@ -972,10 +977,10 @@ func runBenchWorkload(args []string) (*benchResult, error) {
 	if before != nil {
 		after := scrapeCounters(httpClient, *metricsURL)
 		res.Metrics = counterDeltas(before, after)
-		if total > 0 {
-			// Routed KV batches per operation: a count, so robust to a
-			// noisy machine where throughput is not (sealed tables, #310).
-			fmt.Printf("  kv batches: %.3f per op\n", res.Metrics["datax_kv_batch_latency_seconds_count"]/float64(total))
+		// Routed KV batches per operation: a count, so robust to a noisy
+		// machine where throughput is not (sealed tables, #310).
+		if res.KVBatchesPerOp = kvBatchesPerOp(res.Metrics, total); res.KVBatchesPerOp > 0 {
+			fmt.Printf("  kv batches: %.3f per op\n", res.KVBatchesPerOp)
 		}
 		fmt.Printf("  hard write stalls: %+.0f (must be 0 at the target rate)\n", res.Metrics["datax_storage_write_stalls_total"])
 		fmt.Printf("  backpressured writes: %+.0f\n", res.Metrics["datax_storage_backpressure_total"])
@@ -1289,6 +1294,28 @@ func presplitTable(ctx context.Context, conn *pgx.Conn, table string, n int, max
 	return nil
 }
 
+// kvBatchSeries is the counter of KV batches a node routed.
+const kvBatchSeries = "datax_kv_batch_latency_seconds_count"
+
+// kvBatchesPerOp is the KV batches routed per operation over a run, from
+// its counter deltas: 0 when the run measured no operation or carries no
+// deltas.
+func kvBatchesPerOp(deltas map[string]float64, ops int64) float64 {
+	if ops <= 0 {
+		return 0
+	}
+	return deltas[kvBatchSeries] / float64(ops)
+}
+
+// kvBatches is a record's KV batches per operation, derived from its
+// counter deltas when the record predates the field.
+func (r *benchResult) kvBatches() float64 {
+	if r.KVBatchesPerOp != 0 {
+		return r.KVBatchesPerOp
+	}
+	return kvBatchesPerOp(r.Metrics, r.Ops)
+}
+
 func counterDeltas(before, after map[string]float64) map[string]float64 {
 	out := map[string]float64{}
 	for name, a := range after {
@@ -1542,6 +1569,7 @@ func runBenchCompare(args []string) error {
 		{"1st row p99 µs", func(r *benchResult) float64 { return float64(r.FirstRowP99us) }, false, "%.0f"},
 		{"errors", func(r *benchResult) float64 { return float64(r.Errors) }, false, "%.0f"},
 		{"retries", func(r *benchResult) float64 { return float64(r.Retries) }, false, "%.0f"},
+		{"kv batches/op", (*benchResult).kvBatches, false, "%.3f"},
 	}
 	regressions := 0
 	fmt.Printf("%-24s %-14s %14s %14s %9s\n", "workload", "metric", "before", "after", "delta")
@@ -1574,7 +1602,7 @@ func runBenchCompare(args []string) error {
 			fmt.Printf("%-24s %-14s %14s %14s %9s%s\n", n, m.name, fmt.Sprintf(m.fmt, bv), fmt.Sprintf(m.fmt, av), delta, flag)
 		}
 	}
-	fmt.Printf("\n! beyond ±%.0f%%; !! a regression (lower throughput or higher latency, errors, retries)\n", *threshold)
+	fmt.Printf("\n! beyond ±%.0f%%; !! a regression (lower throughput or higher latency, errors, retries, kv batches/op)\n", *threshold)
 	if *failOn && regressions > 0 {
 		return fmt.Errorf("%d regression(s) beyond ±%.0f%%", regressions, *threshold)
 	}
