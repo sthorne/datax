@@ -220,18 +220,23 @@ func (s *Server) backendControl(pid int32, terminate bool) (bool, error) {
 }
 
 // beginStatement derives the statement's context and registers its
-// cancel; endStatement forgets it.
+// cancel; endStatement, given the cancel returned, forgets it and
+// releases the context.
 func (c *conn) beginStatement(ctx context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	c.mu.Lock()
 	c.stmtCancel = cancel
 	c.mu.Unlock()
-	return ctx, func() {
-		c.mu.Lock()
-		c.stmtCancel = nil
-		c.mu.Unlock()
-		cancel()
-	}
+	return ctx, cancel
+}
+
+// endStatement ends what beginStatement began. (A method rather than a
+// returned closure: this runs for every statement.)
+func (c *conn) endStatement(cancel context.CancelFunc) {
+	c.mu.Lock()
+	c.stmtCancel = nil
+	c.mu.Unlock()
+	cancel()
 }
 
 // cancelStatement cancels the statement in flight, if any (an idle

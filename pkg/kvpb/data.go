@@ -182,7 +182,13 @@ type Transaction struct {
 
 // NewTransaction creates a transaction starting at now.
 func NewTransaction(name string, priority int32, now hlc.Timestamp) *Transaction {
-	return &Transaction{
+	t := MakeTransaction(name, priority, now)
+	return &t
+}
+
+// MakeTransaction is NewTransaction by value (no allocation of its own).
+func MakeTransaction(name string, priority int32, now hlc.Timestamp) Transaction {
+	return Transaction{
 		TxnMeta: enginepb.TxnMeta{
 			ID:             uuid.New(),
 			Epoch:          0,

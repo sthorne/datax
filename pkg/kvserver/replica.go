@@ -1065,7 +1065,21 @@ func (r *Replica) proposeCmd(ctx context.Context, ba *kvpb.BatchRequest, trig cm
 // confirmation is in flight share the NEXT one — registered before it is
 // issued, so its index still covers everything committed before they
 // arrived.
+//
+// A reader that arrives with no round in flight, on a leader holding its
+// lease, confirms through the lease itself (as the round's first step
+// would), without a cohort, a channel or a goroutine.
 func (r *Replica) linearizableReadIndex(ctx context.Context) *kvpb.Error {
+	if r.leaseReads {
+		r.mu.Lock()
+		busy := r.mu.riInFlight
+		r.mu.Unlock()
+		if !busy {
+			if idx, ok := r.leaseReadIndex(); ok {
+				return r.waitApplied(ctx, idx)
+			}
+		}
+	}
 	mine := make(chan readIndexResult, 1)
 	r.mu.Lock()
 	r.mu.riPending = append(r.mu.riPending, mine)

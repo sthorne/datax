@@ -290,12 +290,13 @@ func condenseSpans(spans []readSpan, max int) []readSpan {
 // NewTxn begins a transaction at the current clock reading.
 func (db *DB) NewTxn(name string) *Txn {
 	t := &Txn{db: db}
-	t.mu.txn = *kvpb.NewTransaction(name, rand.Int31n(1<<20), db.clock.Now())
+	t.mu.txn = kvpb.MakeTransaction(name, rand.Int31n(1<<20), db.clock.Now())
 	t.mu.txn.HistoryFloor = -1 // no savepoint yet: rewrites keep no history (issue #162)
 	// From cluster version v14 the intents and the record are stored in
 	// the binary encoding (issue #141); the flag rides in every command.
 	t.mu.txn.BinaryMeta = db.ClusterVersion() >= version.V14
-	t.mu.writes = make(map[string]struct{})
+	// t.mu.writes is made by the first write (recordWrite): a read-only
+	// transaction never needs it.
 	return t
 }
 
@@ -835,6 +836,9 @@ func (t *Txn) prepareWrite(req kvpb.Request) (*kvpb.BatchRequest, keys.Key) {
 
 func (t *Txn) recordWrite(key keys.Key) {
 	t.mu.Lock()
+	if t.mu.writes == nil {
+		t.mu.writes = make(map[string]struct{})
+	}
 	t.mu.writes[string(key)] = struct{}{}
 	anchoredNow := !t.mu.anchored && keys.Key(t.mu.txn.Key).Equal(key)
 	if anchoredNow {
@@ -1135,7 +1139,8 @@ func (t *Txn) publishWait(ctx context.Context, pushee *enginepb.TxnMeta) {
 		// them and they can never be part of a cycle — no edge to publish.
 		return
 	}
-	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	hb := txn // the snapshot sent; txn stays on the stack on the early return
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &hb}}
 	ba.Add(&kvpb.HeartbeatTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
 		Now:           t.db.clock.Now(),
@@ -1425,7 +1430,8 @@ func (t *Txn) Commit(ctx context.Context) error {
 		intentKeys = append(intentKeys, keys.Key(k).Clone())
 	}
 	t.mu.Unlock()
-	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	end := txn // the snapshot sent; txn stays on the stack for a read-only commit
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &end}}
 	ba.Add(&kvpb.EndTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
 		Commit:        true,

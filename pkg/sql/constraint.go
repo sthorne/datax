@@ -576,7 +576,15 @@ type inflightRow struct {
 }
 
 func newCascadeState(budget int) *cascadeState {
-	return &cascadeState{budget: budget, rows: map[string]*inflightRow{}}
+	return &cascadeState{budget: budget} // rows: made by the first put
+}
+
+// put records a row's in-flight version under its primary key.
+func (st *cascadeState) put(key string, r *inflightRow) {
+	if st.rows == nil {
+		st.rows = map[string]*inflightRow{}
+	}
+	st.rows[key] = r
 }
 
 type guardCheck struct {
@@ -930,7 +938,7 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 					if err := deleteRow(child, fr, wb); err != nil {
 						return err
 					}
-					g.st.rows[string(fr.key)] = &inflightRow{deleted: true}
+					g.st.put(string(fr.key), &inflightRow{deleted: true})
 					continue
 				}
 				updated := copyRow(fr.row)
@@ -962,9 +970,9 @@ func (g *rowGuard) enforceReferencing(ctx context.Context, txn *kvclient.Txn, ol
 					return err
 				}
 				if !newKey.Equal(fr.key) {
-					g.st.rows[string(fr.key)] = &inflightRow{deleted: true}
+					g.st.put(string(fr.key), &inflightRow{deleted: true})
 				}
-				g.st.rows[string(newKey)] = &inflightRow{row: updated}
+				g.st.put(string(newKey), &inflightRow{row: updated})
 			}
 		}
 	}

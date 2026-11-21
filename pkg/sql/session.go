@@ -236,6 +236,10 @@ type Session struct {
 		raw    string
 		parsed []string
 	}
+	// resMemo is the last resolution context built (resolution): it is
+	// reused while the path slice and the user it was built from are
+	// the session's current ones.
+	resMemo  *catalog.Resolution
 	viewPath []string
 	// viewBindings, while a view's query runs, are the relations its
 	// names were bound to at creation (catalog ViewBindings).
@@ -283,6 +287,9 @@ type Session struct {
 	// for the view check and again for the plan).
 	plans       *planCache
 	stmtLookups *lookupMemo
+	// spareLookups is a finished statement's memo, kept for the next
+	// statement to reuse (execStmt).
+	spareLookups *lookupMemo
 	// streaming lets scan-shaped SELECTs return a RowStream instead of
 	// materialized rows (the wire layer opts in; internal callers read
 	// Result.Rows). memUsed is the running statement's charged memory
@@ -411,8 +418,10 @@ func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version,
 // the current database shadows) or a table in the session's current
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
-	if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
-		name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+	if strings.IndexByte(name, '.') >= 0 {
+		if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
+			name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+		}
 	}
 	name = s.pinName(name)
 	if s.viewBindings != nil {

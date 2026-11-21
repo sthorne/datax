@@ -689,8 +689,9 @@ func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name stri
 	if db == "" {
 		db = DefaultDatabase
 	}
-	parts := SplitName(name)
-	if len(parts) == 1 {
+	// Unqualified (SplitName's one part, without its allocation: a
+	// reserved name has returned above).
+	if strings.IndexByte(name, '.') < 0 {
 		dbID, err := a.databaseID(ctx, txn, db)
 		if err != nil {
 			return nil, err
@@ -711,6 +712,7 @@ func (a *Accessor) resolve(ctx context.Context, txn *kvclient.Txn, db, name stri
 		}
 		return out, nil
 	}
+	parts := SplitName(name)
 	if len(parts) == 2 && parts[0] == TempSchema {
 		return nil, nil // the session's temporary tables are its own to resolve
 	}

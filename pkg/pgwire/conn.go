@@ -179,6 +179,12 @@ type prepared struct {
 	nParams   int
 	paramFams []types.Family // inferred; Unknown = text
 	cols      []sql.ResultColumn
+	// shape is the statement's fingerprint for the activity accounting,
+	// taken once at Parse from the statement as written (planning may
+	// rewrite the tree in place: stripTableAlias), so every execution
+	// is charged to the shape the same text has in the simple protocol.
+	// nil without accounting.
+	shape *parser.Shape
 }
 
 type portal struct {
@@ -258,6 +264,13 @@ type conn struct {
 	pushStart sync.Once
 	// done is closed when the connection's goroutine returns.
 	done chan struct{}
+
+	// dataRow and complete are the connection's reused DataRow and
+	// CommandComplete messages (rowMsg, sendComplete).
+	dataRow  pgproto3.DataRow
+	complete pgproto3.CommandComplete
+	// tok is the activity token of the statement in flight (Activity.begin).
+	tok stmtToken
 }
 
 // connState is the drain-visible phase of a connection. idle means
@@ -339,9 +352,12 @@ func isTimeout(err error) bool {
 // and activity accounting. emit, when given, delivers the result's rows
 // inside that scope (a streamed result is pulled there, so cancellation
 // covers the pull) and returns how many it sent.
-func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, params []types.Datum, emit func(context.Context, *sql.Result) (int64, *sql.Error)) (*sql.Result, *sql.Error) {
-	ctx, done := c.beginStatement(ctx)
-	defer done()
+//
+// shape is the statement's fingerprint when the caller has it (a
+// prepared statement's, taken at Parse); nil computes it here.
+func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, shape *parser.Shape, params []types.Datum, emit func(context.Context, *sql.Result) (int64, *sql.Error)) (*sql.Result, *sql.Error) {
+	ctx, cancel := c.beginStatement(ctx)
+	defer c.endStatement(cancel)
 	_, isSet := stmt.(*parser.SetVar)
 	discardAll := false
 	if d, ok := stmt.(*parser.Discard); ok && d.Kind == "all" {
@@ -353,7 +369,7 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	}
 	var tok *stmtToken
 	if c.act != nil {
-		tok = c.act.begin(c, stmt, text)
+		tok = c.act.begin(c, stmt, text, shape)
 	}
 	res, serr := c.session.Execute(ctx, stmt, params)
 	var rows int64
@@ -865,7 +881,7 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			c.handleCopyIn(ctx, cf)
 			return
 		}
-		res, serr := c.execute(ctx, stmt, q, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+		res, serr := c.execute(ctx, stmt, q, nil, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			if res.Copy != nil {
 				// COPY ... TO STDOUT: the rows go out in copy-out mode.
 				// It reads nothing from the client, so unlike COPY FROM
@@ -887,7 +903,7 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			c.sendError(serr)
 			return
 		}
-		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(res.Tag)})
+		c.sendComplete(res.Tag)
 	}
 }
 
@@ -927,7 +943,7 @@ func (c *conn) sendDataRows(res *sql.Result, formats []int16) {
 func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) {
 	ts := c.textStyle()
 	for _, row := range res.Rows[from:to] {
-		dr := &pgproto3.DataRow{Values: make([][]byte, len(row))}
+		dr := c.rowMsg(len(row))
 		for i, d := range row {
 			format := int16(0)
 			if formats != nil && i < len(formats) {
@@ -940,7 +956,25 @@ func (c *conn) sendDataRowRange(res *sql.Result, formats []int16, from, to int) 
 			dr.Values[i] = encodeDatumIn(d, format, col, ts)
 		}
 		c.backend.Send(dr)
+		clear(dr.Values)
 	}
+}
+
+// rowMsg is the connection's DataRow message, reused for every row it
+// sends (Send and Encode copy the values out at once), with n values.
+func (c *conn) rowMsg(n int) *pgproto3.DataRow {
+	if cap(c.dataRow.Values) < n {
+		c.dataRow.Values = make([][]byte, n)
+	}
+	c.dataRow.Values = c.dataRow.Values[:n]
+	return &c.dataRow
+}
+
+// sendComplete sends CommandComplete with tag, through the connection's
+// reused message (Send encodes it at once).
+func (c *conn) sendComplete(tag string) {
+	c.complete.CommandTag = append(c.complete.CommandTag[:0], tag...)
+	c.backend.Send(&c.complete)
 }
 
 // encodeDatum renders a datum in the requested wire format.
@@ -1298,6 +1332,10 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 		}
 		p.stmt = stmts[0]
 		p.nParams = parser.CountParams(stmts[0])
+		if c.act != nil {
+			shape := parser.Fingerprint(stmts[0])
+			p.shape = &shape
+		}
 		cols, serr := c.session.PlanColumns(ctx, stmts[0])
 		if serr != nil {
 			c.extError(serr)
@@ -1445,12 +1483,12 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	if pt.done {
 		// A completed portal stays completed: further Executes return no
 		// rows (re-running requires a re-Bind).
-		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+		c.sendComplete(pt.res.Tag)
 		return
 	}
 	if pt.res == nil {
 		var suspended bool
-		_, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
+		_, serr := c.execute(ctx, pt.stmt.stmt, pt.stmt.text, pt.stmt.shape, pt.params, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			pt.res = res
 			if res.Copy != nil {
 				// COPY ... TO STDOUT runs to completion in one Execute
@@ -1485,7 +1523,7 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 			return
 		}
 		if pt.res.Copy != nil {
-			c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+			c.sendComplete(pt.res.Tag)
 			return
 		}
 		if pt.res.Stream != nil {
@@ -1495,7 +1533,7 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 	}
 	if pt.res.Stream != nil {
 		if pt.done {
-			c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+			c.sendComplete(pt.res.Tag)
 			return
 		}
 		if c.session.State() == sql.StateFailed {
@@ -1504,16 +1542,16 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 			c.extError(&sql.Error{Code: sql.CodeInFailedTransaction, Msg: "current transaction is aborted, commands ignored until end of transaction block"})
 			return
 		}
-		ctx, done := c.beginStatement(ctx)
+		ctx, cancel := c.beginStatement(ctx)
 		_, suspended, serr := c.sendStream(ctx, pt.res, pt.resFormats, int64(m.MaxRows))
-		done()
+		c.endStatement(cancel)
 		c.finishStreamExecute(pt, suspended, serr)
 		return
 	}
 	if pt.res.Columns == nil {
 		// Row-less statements complete in one Execute regardless of limit.
 		pt.done = true
-		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+		c.sendComplete(pt.res.Tag)
 		return
 	}
 	end := len(pt.res.Rows)
@@ -1527,7 +1565,7 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 		return
 	}
 	pt.done = true
-	c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+	c.sendComplete(pt.res.Tag)
 }
 
 // resultMatchesDescribe checks a result against the columns Describe
@@ -1562,7 +1600,7 @@ func (c *conn) finishStreamExecute(pt *portal, suspended bool, serr *sql.Error) 
 		c.backend.Send(&pgproto3.PortalSuspended{})
 	default:
 		pt.done = true
-		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(pt.res.Tag)})
+		c.sendComplete(pt.res.Tag)
 	}
 }
 
@@ -1632,7 +1670,7 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 			finish()
 			return sent, false, nil
 		}
-		dr := &pgproto3.DataRow{Values: make([][]byte, len(row))}
+		dr := c.rowMsg(len(row))
 		for i, d := range row {
 			format := int16(0)
 			if formats != nil && i < len(formats) {
@@ -1645,6 +1683,7 @@ func (c *conn) sendStream(ctx context.Context, res *sql.Result, formats []int16,
 			dr.Values[i] = encodeDatumIn(d, format, col, ts)
 		}
 		buf, err = dr.Encode(buf)
+		clear(dr.Values)
 		if err != nil {
 			st.Close(context.Background())
 			return sent, false, &sql.Error{Code: sql.CodeInternal, Msg: err.Error()}

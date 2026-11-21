@@ -106,7 +106,8 @@ type DB struct {
 	metaLookup bool
 	// nodeLister enumerates known cluster nodes (the registry): the routing
 	// fallback when a cached descriptor's replicas are unreachable (e.g. a
-	// stale pre-upreplication descriptor whose only replica died).
+	// stale pre-upreplication descriptor whose only replica died). The
+	// slice it returns is only read.
 	nodeLister func() []base.NodeID
 	// versionGate reports the finalized cluster version; version-gated
 	// request shapes (pkg/version rule 4) are sent only when it allows
@@ -418,7 +419,11 @@ func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchRespo
 		if kerr != nil {
 			return nil, kerr
 		}
-		out.Responses = append(out.Responses, br.Responses...)
+		if out.Responses == nil && j == len(ba.Requests) {
+			out.Responses = br.Responses // the one group: its responses are the batch's
+		} else {
+			out.Responses = append(out.Responses, br.Responses...)
+		}
 		if br.Txn != nil {
 			// Merge, never overwrite: a multi-range batch executes as
 			// per-range sub-batches, and any ONE of them may have had its

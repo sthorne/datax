@@ -43,7 +43,18 @@ func (s *Session) resolution() *catalog.Resolution {
 	if path == nil {
 		path = s.pathOf(s.vars.searchPath)
 	}
-	return &catalog.Resolution{Path: path, User: s.user, CanUse: s.pathSchemaUsable}
+	if r := s.resMemo; r != nil && r.User == s.user && sameSlice(r.Path, path) {
+		return r // nothing reads it but to resolve; it is never changed
+	}
+	r := &catalog.Resolution{Path: path, User: s.user, CanUse: s.pathSchemaUsable}
+	s.resMemo = r
+	return r
+}
+
+// sameSlice reports whether a and b are the same slice (the same
+// backing array and length), or both empty.
+func sameSlice(a, b []string) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 // pathSchemaUsable reports whether the acting role holds USAGE on a
