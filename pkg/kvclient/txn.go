@@ -213,7 +213,17 @@ type readSpan struct {
 // timestamp is pushed rather than restart (issue #322); before, it gave
 // up its read set and every push ended in a restart, which an implicit
 // transaction retried until it gave up with 40001.
-const maxReadSpans = 512
+//
+// It is sized for a bulk INSERT's uniqueness probes: a statement reads
+// one key per row (more with unique indexes and foreign keys) and writes
+// rows next to other writers' rows. Condensed, its reads of random keys
+// become spans covering most of the table, which fail to refresh once
+// any other worker has committed a row there — every push became a
+// restart — and which latch, and push through the timestamp cache,
+// every concurrent writer of the table. At 512, INSERTs of 1,000 rows
+// under 16 workers spent 1.5 to 3 s per second waiting on latches and
+// ran at less than half the rows/s of 100-row INSERTs.
+const maxReadSpans = 4096
 
 // maxCondensedSpans bounds the condensed read spans, and so the refresh
 // requests a transaction's commit can need.
@@ -1101,12 +1111,7 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	}
 	provisional.ReadTimestamp = newTS
 	provisional.WriteTimestamp = newTS
-	for _, sp := range spans {
-		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: provisional.Clone()}}
-		ba.Add(&kvpb.RefreshRequest{
-			RequestHeader: kvpb.RequestHeader{Key: sp.start, EndKey: sp.end},
-			FromTS:        oldRead,
-		})
+	for _, ba := range refreshBatches(spans, &provisional, oldRead) {
 		if _, kerr := t.db.Send(ctx, ba); kerr != nil {
 			log.Debugf("txn %s refresh to %s failed: %v", provisional.ID, newTS, kerr)
 			return false
@@ -1120,6 +1125,38 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	t.mu.txn.ReadTimestamp = newTS
 	t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(newTS)
 	return true
+}
+
+// refreshBatches builds the requests that refresh spans from oldRead to
+// txn's (provisional) read timestamp: every point span in ONE batch, which
+// the DB fans out per range like any batch of point requests, and the
+// ranged spans in another, each stitched across ranges on its own. A
+// refresh used to send one batch per span, one after another: a pushed
+// 1,000-row INSERT, whose uniqueness probes are 1,000 point reads, paid
+// 1,000 sequential round trips and latch acquisitions before it could
+// commit, and kept its probes' keys latched (shared) the whole time.
+func refreshBatches(spans []readSpan, txn *kvpb.Transaction, oldRead hlc.Timestamp) []*kvpb.BatchRequest {
+	var points, ranged *kvpb.BatchRequest
+	for _, sp := range spans {
+		b := &points
+		if len(sp.end) > 0 {
+			b = &ranged
+		}
+		if *b == nil {
+			*b = &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}}
+		}
+		(*b).Add(&kvpb.RefreshRequest{
+			RequestHeader: kvpb.RequestHeader{Key: sp.start, EndKey: sp.end},
+			FromTS:        oldRead,
+		})
+	}
+	var out []*kvpb.BatchRequest
+	for _, b := range []*kvpb.BatchRequest{points, ranged} {
+		if b != nil {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // AdvanceTo moves the transaction forward so that it commits at or above
