@@ -21,11 +21,13 @@ import (
 // one-replica store (startClearTestStore): range 9 over one table's span.
 
 // abortTestTxn starts a transaction anchored on key: its first write
-// lays an intent there and creates its record.
+// lays an intent there and creates its record. Like a coordinator, it
+// bumps the sequence before the write.
 func (e *clearTestEnv) abortTestTxn(t *testing.T, key keys.Key) *kvpb.Transaction {
 	t.Helper()
 	txn := kvpb.NewTransaction("victim", 1, e.clock.Now())
 	txn.Key = key
+	txn.Sequence = 1
 	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn, CreateTxnRecord: true}}
 	ba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: key}, Value: []byte("mine")})
 	if _, kerr := e.exec(t, ba); kerr != nil {
@@ -402,5 +404,98 @@ func TestAbortSpanInSnapshot(t *testing.T) {
 	}
 	if bytes.Equal(sum3, sum2) {
 		t.Fatal("an abort-span entry does not change the consistency checksum")
+	}
+}
+
+// countingGetter counts the Gets of one key it passes on.
+type countingGetter struct {
+	getter
+	key []byte
+	n   int
+}
+
+func (g *countingGetter) Get(key []byte) ([]byte, error) {
+	if bytes.Equal(key, g.key) {
+		g.n++
+	}
+	return g.getter.Get(key)
+}
+
+// TestAbortSpanNotReadForReadOnlyTxn: a transaction that has written
+// nothing (Sequence 0, no anchor) cannot have had a write removed, so
+// its reads do not look the abort span up; one that has written does,
+// whichever of the two says so.
+func TestAbortSpanNotReadForReadOnlyTxn(t *testing.T) {
+	env := startClearTestStore(t)
+	k := env.key("k")
+	for _, c := range []struct {
+		name  string
+		seq   int32
+		key   keys.Key
+		reads int
+	}{
+		{"read-only", 0, nil, 0},
+		{"has written", 3, nil, 1},
+		{"anchored only", 0, k, 1},
+	} {
+		txn := kvpb.NewTransaction(c.name, 1, env.clock.Now())
+		txn.Sequence, txn.Key = c.seq, c.key
+		for _, req := range []kvpb.Request{
+			&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}},
+			&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: env.start, EndKey: env.end}},
+			&kvpb.RefreshRequest{RequestHeader: kvpb.RequestHeader{Key: k}},
+		} {
+			ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn, RangeID: env.r.rangeID}}
+			ba.Add(req)
+			g := &countingGetter{getter: env.store.cfg.Engine, key: keys.AbortSpanKey(env.r.rangeID, txn.ID)}
+			if kerr := env.r.checkAbortSpan(g, ba); kerr != nil {
+				t.Fatalf("%s %T: %v", c.name, req, kerr)
+			}
+			if g.n != c.reads {
+				t.Errorf("%s %T: %d abort-span lookups, want %d", c.name, req, g.n, c.reads)
+			}
+		}
+		// The served read path agrees.
+		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn}}
+		ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}})
+		if got := abortSpanChecked(ba); got != (c.reads > 0) {
+			t.Errorf("%s: checked %v, want %v", c.name, got, c.reads > 0)
+		}
+	}
+}
+
+// TestAbortSpanRefusesAfterWriteThenReadsOnly: the transaction's
+// sequence alone, carried by every batch after its first write, is what
+// makes its later reads check: a transaction whose write a pusher removed
+// and which from then on only reads on the range (its sequence stays
+// where its last write left it) is refused on the read path and the
+// apply path alike, and so is a later epoch of it.
+func TestAbortSpanRefusesAfterWriteThenReadsOnly(t *testing.T) {
+	env := startClearTestStore(t)
+	k := env.key("k")
+	victim := env.abortTestTxn(t, k)
+	env.resolve(t, k, victim, enginepb.ABORTED, true, env.clock.Now())
+	reader := victim.Clone()
+	reader.Key = nil // nothing but the sequence says it has written
+	for _, c := range []struct {
+		name string
+		req  kvpb.Request
+	}{
+		{"get", &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}}},
+		{"scan", &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: env.start, EndKey: env.end}}},
+		{"refresh", &kvpb.RefreshRequest{RequestHeader: kvpb.RequestHeader{Key: k}}},
+	} {
+		if kerr := env.txnRequest(t, reader, c.req); kerr == nil || kerr.TxnAborted == nil {
+			t.Errorf("%s: got %v, want a TxnAbortedError", c.name, kerr)
+		}
+	}
+	restarted := reader.Clone()
+	restarted.Restart(env.clock.Now())
+	if kerr := env.txnRequest(t, restarted, &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}}); kerr == nil || kerr.TxnAborted == nil {
+		t.Errorf("a later epoch's read: got %v, want a TxnAbortedError", kerr)
+	}
+	// The apply-time check (a locking read is a write batch) too.
+	if kerr := env.txnRequest(t, reader, &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: k}, ForUpdate: true}); kerr == nil || kerr.TxnAborted == nil {
+		t.Errorf("locking get: got %v, want a TxnAbortedError", kerr)
 	}
 }

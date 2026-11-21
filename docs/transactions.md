@@ -637,6 +637,21 @@ that missed the intent ran after that batch had committed, and so does
 the check that follows it (checked before, a removal could land in
 between). An entry also outranks whatever else the read ran into.
 
+*Who is checked.* Only a transaction that has written can have had a
+write removed, so only its batches look the entry up: those whose
+transaction carries a non-zero `Sequence` or an anchor `Key`
+(`mayHaveWritten`). The coordinator bumps `Sequence` before every
+request that can lay an intent (a point write, an increment, a locking
+read, a write batch, a parallel commit) and copies the transaction into
+the batch after, and never lowers it (a restart and a savepoint rollback
+keep it), so a batch with `Sequence` 0 and no anchor comes from a
+transaction that has laid no intent anywhere. A read-only transaction's
+reads, nearly all of a read-mostly workload, skip the point read, which
+cost 4 to 7 µs each. The test reads only the batch, never replica state,
+so every replica decides alike and no split, merge, snapshot or restart
+can make it wrong; `TestTxnSequenceMarksEveryWrite` holds the
+coordinator to its half.
+
 *The coordinator.* Once it knows — a request refused, a heartbeat that
 finds the record ABORTED, or its own choice as a deadlock victim — the
 coordinator fails every further request itself (also on ranges where
