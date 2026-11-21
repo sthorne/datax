@@ -149,9 +149,10 @@ func (r *Replica) adminSplit(ctx context.Context, req *kvpb.AdminSplitRequest) (
 			k(r.rangeID, "split")
 		}
 
-		// Serialize against everything: nothing may be in flight through the
-		// old bounds while the split lands.
-		guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
+		// Serialize against everything on the right-hand side: nothing may
+		// be in flight there through the old range while the split lands
+		// (splitLatchSpan explains why the left side need not wait).
+		guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{splitLatchSpan(splitKey)}, latchExclusive, latchOpts{fair: true, op: "split"})
 		if gerr != nil {
 			return nil, kvpb.NewError(gerr)
 		}

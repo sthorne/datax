@@ -145,7 +145,7 @@ func (s *Store) ClearRange(ctx context.Context, rangeID base.RangeID, start, end
 	// the latch (resolving them needs it).
 	r.resolveIntentsForPurge(ctx, desc)
 
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
+	guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{wholeRangeSpan}, latchExclusive, latchOpts{fair: true, op: "clear_range"})
 	if gerr != nil {
 		return res, gerr
 	}

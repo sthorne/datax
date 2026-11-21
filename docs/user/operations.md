@@ -594,7 +594,12 @@ see [Capacity planning](#capacity-planning)),
 replica had more than 64 MiB of committed entries queued for apply — a
 follower falling behind its leader), `datax_latch_wait_seconds` (time
 requests spent waiting for a conflicting in-flight request's latch: key
-contention), `datax_sql_plan_cache_hits_total` /
+contention; it also counts the waits of the range-wide operations below
+when they acquire), `datax_range_latch_wait_seconds{op,outcome}` (time a
+split, merge, range clear or closed-timestamp promise waited for in-flight
+requests, `outcome="acquired"` or `"abandoned"` at its deadline — an
+abandoned `closed_ts` wait means the range's closed timestamp, and with it
+follower reads, fell behind), `datax_sql_plan_cache_hits_total` /
 `datax_sql_plan_cache_misses_total` (prepared statements reusing their
 plan; a low hit rate under an ORM workload means statements are not
 being prepared, or schemas or statistics change constantly),
