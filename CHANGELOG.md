@@ -11,6 +11,20 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Cluster version v24: an INSERT checks uniqueness in its write.**
+  Once v24 is finalized, a plain INSERT (and INSERT ... SELECT) writes
+  its primary key and single-key unique-index entries with a conditional
+  put, the new KV request `CPut`, which fails if the key holds a live
+  value.
+  - An autocommit single-row INSERT is one KV batch, a one-phase
+    commit, instead of a read followed by a write.
+  - A multi-row INSERT no longer reads every key first.
+  - Errors, including which duplicate is reported first, are unchanged.
+  - ON CONFLICT, UPSERT, UPDATE and COPY keep the read-then-write path.
+  - Before the finalize, every node uses the old path. Only senders
+    decide, so replicas never read the cluster version.
+  - Measured: KV batches per INSERT 2 → 1; server CPU per op −12% at
+    one row and −16% at 100 rows.
 - **`TestKVRoundTripsPerStatement`** pins the exact KV batches and
   requests of point reads and writes, an index join, an explicit
   transaction and `SELECT 1`, over both protocols on one and three
@@ -1990,6 +2004,31 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Search and vector filters are much cheaper per row.** None of these
+  changes alters a result.
+  - **Exact vector nearest-neighbour scans** (`ORDER BY v <-> q LIMIT k`
+    without an index) compute distances on the stored bytes. They decode
+    only rows that make the top k. Server CPU per query fell 117 → 48 ms
+    over 50,000 × 64-dimension vectors, with 4× fewer allocations.
+    Distances and tie order are bit-identical.
+  - **ivfflat** scores candidates without decoding index entries and,
+    without a filter, keeps only the k nearest instead of sorting them
+    all.
+  - **`to_tsvector(cfg, text) @@ query` as a filter** checks the text
+    against the query while tokenizing and stops once the answer is
+    known, instead of building, rendering and re-parsing a tsvector for
+    every row. About 24 → 1.2 µs per document.
+    - A constant tsquery is made once per statement.
+    - The GIN recheck shares the fast path, roughly doubling GIN query
+      throughput.
+    - `to_tsvector` and tsvector parsing allocate about 5× less.
+  - **jsonb `@>` and `<@`** walk the stored text, stopping as soon as the
+    answer is known, with a constant right operand compiled once per
+    statement. An unindexed containment filter costs about 0.8 µs and 1
+    allocation per row, against about 10 µs and 70. GIN-served `@>` is
+    about 1.6× faster.
+    - A streaming scan decodes only the columns its filter and
+      projection read.
 - **Point reads and writes are back to their speed before 0.58.0's
   catalog work** (performance analysis, 2026-11-20). Server CPU per point
   read had grown from 78 µs to 128 µs since 0.57, and `kv-95-5` had
