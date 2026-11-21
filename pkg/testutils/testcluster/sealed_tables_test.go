@@ -315,6 +315,9 @@ func TestSealedTables(t *testing.T) {
 			t.Fatalf("GIN notices: %q", got)
 		}
 		sameStrings(t, "through the inverted index", queryStrings(t, ctx, conn, `SELECT id FROM notes WHERE doc @> '{"k": 0}' ORDER BY id`), "2", "4")
+		// The exact scan ranks sealed rows by distance off their opened
+		// values.
+		sameStrings(t, "the exact scan", queryStrings(t, ctx, conn, `SELECT id FROM notes ORDER BY v <-> '[2, 0, 0]' LIMIT 2`), "2", "1")
 		sealExec(t, ctx, conn, `CREATE INDEX notes_v ON notes USING ivfflat (v vector_l2_ops) WITH (lists = 2)`)
 		if got := notices.take(); len(got) != 1 || !strings.Contains(got[0], "vector") {
 			t.Fatalf("ivfflat notices: %q", got)

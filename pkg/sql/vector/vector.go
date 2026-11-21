@@ -18,6 +18,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 // OID is the type's object ID in pg_type and on the wire. pgvector is
@@ -262,25 +263,38 @@ func (m Metric) Distance(a, b []float32) float64 {
 // (Encode), of the same dimension, without decoding either into a
 // slice: what a scan computes once per row.
 func (m Metric) StoredDistance(a, b string) float64 {
+	return m.storedDistance(stringBytes(a), stringBytes(b))
+}
+
+// StoredDistanceBytes is StoredDistance with the first vector as bytes
+// (a row value or an index entry as read from the store), so neither
+// side is copied or decoded. b must be at least as long as a.
+func (m Metric) StoredDistanceBytes(a []byte, b string) float64 {
+	return m.storedDistance(a, stringBytes(b))
+}
+
+// stringBytes views a string's bytes without copying them; the view is
+// only read.
+func stringBytes(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }
+
+// storedDistance computes each metric exactly as Distance does over the
+// decoded elements — the same float64 terms summed in the same order —
+// so its results are bit-identical to Distance(Decode(a), Decode(b)).
+// One loop per metric keeps the switch out of the inner loop, and each
+// element is one big-endian load.
+func (m Metric) storedDistance(a, b []byte) float64 {
+	a = a[:len(a)&^3]
 	b = b[:len(a)]
-	var l2, dot, na, nb float64
-	for i := 0; i+4 <= len(a); i += 4 {
-		x := float64(math.Float32frombits(uint32(a[i])<<24 | uint32(a[i+1])<<16 | uint32(a[i+2])<<8 | uint32(a[i+3])))
-		y := float64(math.Float32frombits(uint32(b[i])<<24 | uint32(b[i+1])<<16 | uint32(b[i+2])<<8 | uint32(b[i+3])))
-		switch m {
-		case Cosine:
+	switch m {
+	case Cosine:
+		var dot, na, nb float64
+		for i := 0; i < len(a); i += 4 {
+			x := float64(math.Float32frombits(binary.BigEndian.Uint32(a[i:])))
+			y := float64(math.Float32frombits(binary.BigEndian.Uint32(b[i:])))
 			dot += x * y
 			na += x * x
 			nb += y * y
-		case IP:
-			dot += x * y
-		default:
-			d := x - y
-			l2 += d * d
 		}
-	}
-	switch m {
-	case Cosine:
 		sim := dot / math.Sqrt(na*nb)
 		if math.IsNaN(sim) {
 			return math.NaN()
@@ -292,7 +306,20 @@ func (m Metric) StoredDistance(a, b string) float64 {
 		}
 		return 1 - sim
 	case IP:
+		var dot float64
+		for i := 0; i < len(a); i += 4 {
+			x := float64(math.Float32frombits(binary.BigEndian.Uint32(a[i:])))
+			y := float64(math.Float32frombits(binary.BigEndian.Uint32(b[i:])))
+			dot += x * y
+		}
 		return -dot
+	}
+	var l2 float64
+	for i := 0; i < len(a); i += 4 {
+		x := float64(math.Float32frombits(binary.BigEndian.Uint32(a[i:])))
+		y := float64(math.Float32frombits(binary.BigEndian.Uint32(b[i:])))
+		d := x - y
+		l2 += d * d
 	}
 	return math.Sqrt(l2)
 }

@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"strings"
@@ -176,11 +177,55 @@ func TestStoredDistance(t *testing.T) {
 		if i%50 == 0 {
 			a = make([]float32, len(a)) // the zero vector
 		}
+		if i%7 == 3 {
+			copy(b, a) // a tie with itself: distance zero, or -|a|² under <#>
+		}
+		same := func(x, y float64) bool {
+			return math.Float64bits(x) == math.Float64bits(y) || (math.IsNaN(x) && math.IsNaN(y))
+		}
 		for _, m := range []Metric{L2, Cosine, IP} {
-			want, got := m.Distance(a, b), m.StoredDistance(string(Encode(a)), string(Encode(b)))
-			if want != got && !(math.IsNaN(want) && math.IsNaN(got)) {
+			want := m.Distance(a, b)
+			if got := m.StoredDistance(string(Encode(a)), string(Encode(b))); !same(got, want) {
 				t.Fatalf("%s over %v and %v: stored %v, decoded %v", m, a, b, got, want)
 			}
+			if got := m.StoredDistanceBytes(Encode(a), string(Encode(b))); !same(got, want) {
+				t.Fatalf("%s over %v and %v: stored bytes %v, decoded %v", m, a, b, got, want)
+			}
+			// The operands the other way round: the three distances are
+			// symmetric to the bit, which lets a caller put the column on
+			// either side.
+			if got := m.StoredDistanceBytes(Encode(b), string(Encode(a))); !same(got, want) {
+				t.Fatalf("%s over %v and %v swapped: %v, want %v", m, a, b, got, want)
+			}
+		}
+	}
+}
+
+// BenchmarkStoredDistance is the per-row arithmetic of the exact k-NN
+// scan and of ivfflat candidate ranking: one distance between a stored
+// row vector (bytes as read from the store) and the stored query, at
+// 64 and 1536 dimensions. It must not allocate.
+//
+//	go test ./pkg/sql/vector -run - -bench StoredDistance -benchmem
+func BenchmarkStoredDistance(b *testing.B) {
+	for _, dims := range []int{64, 1536} {
+		r := rand.New(rand.NewSource(1))
+		x, y := make([]float32, dims), make([]float32, dims)
+		for j := range x {
+			x[j], y[j] = float32(r.NormFloat64()), float32(r.NormFloat64())
+		}
+		row, q := Encode(x), string(Encode(y))
+		for _, m := range []Metric{L2, Cosine, IP} {
+			b.Run(fmt.Sprintf("%s/%d", m, dims), func(b *testing.B) {
+				b.ReportAllocs()
+				var sink float64
+				for i := 0; i < b.N; i++ {
+					sink += m.StoredDistanceBytes(row, q)
+				}
+				if math.IsInf(sink, 0) {
+					b.Fatal(sink)
+				}
+			})
 		}
 	}
 }

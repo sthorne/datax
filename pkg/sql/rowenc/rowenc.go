@@ -598,6 +598,138 @@ func DecodeValue(desc *catalog.TableDescriptor, raw []byte) (map[catalog.ColumnI
 	return out, nil
 }
 
+// VectorColumn finds a VECTOR column's stored elements in an opened row
+// value (EncodeValue's form) without decoding the rest of the row: the
+// returned bytes alias raw. ok is false whenever DecodeValue would not
+// produce a non-NULL vector datum from those very bytes — the column is
+// NULL, absent (fill-on-read, or a row that predates it), stored under
+// another tag, not a vector column of desc, or the value does not parse
+// — and the caller then decodes the whole row, which reports or
+// resolves whatever the case is exactly as it always has.
+func VectorColumn(desc *catalog.TableDescriptor, raw []byte, id catalog.ColumnID) (stored []byte, ok bool) {
+	if col, known := desc.ColByID(id); !known || col.Type != types.Vector {
+		return nil, false
+	}
+	if len(raw) == 0 || raw[0] != valueVersion {
+		return nil, false
+	}
+	rest := raw[1:]
+	for len(rest) > 0 {
+		var cid uint64
+		var err error
+		if rest, cid, err = encoding.DecodeUvarint(rest); err != nil || len(rest) == 0 {
+			return nil, false
+		}
+		tag := rest[0]
+		rest = rest[1:]
+		if catalog.ColumnID(cid) == id {
+			if tag != tagVector {
+				return nil, false
+			}
+			var n uint64
+			if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+				return nil, false
+			}
+			// A column appears once in a value; DecodeValue would keep
+			// the last occurrence, so a value that repeats it is left to
+			// DecodeValue too.
+			stored = rest[:n]
+			if after, ok := skipValueColumns(rest[n:], id); !ok || after {
+				return nil, false
+			}
+			return stored, true
+		}
+		if rest, ok = skipValuePayload(tag, rest); !ok {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// skipValueColumns walks the rest of a value; found reports whether
+// column id appears in it again, ok whether it parsed.
+func skipValueColumns(rest []byte, id catalog.ColumnID) (found, ok bool) {
+	for len(rest) > 0 {
+		var cid uint64
+		var err error
+		if rest, cid, err = encoding.DecodeUvarint(rest); err != nil || len(rest) == 0 {
+			return false, false
+		}
+		if catalog.ColumnID(cid) == id {
+			return true, true
+		}
+		tag := rest[0]
+		if rest, ok = skipValuePayload(tag, rest[1:]); !ok {
+			return false, false
+		}
+	}
+	return false, true
+}
+
+// skipValuePayload steps over one column payload of the given tag, as
+// DecodeValue reads it.
+func skipValuePayload(tag byte, rest []byte) ([]byte, bool) {
+	fixed := func(n int) ([]byte, bool) {
+		if len(rest) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	}
+	switch tag {
+	case tagNull:
+		return rest, true
+	case tagInt, tagTimestamp, tagDate, tagTime, tagFloat:
+		return fixed(8)
+	case tagInterval:
+		return fixed(24)
+	case tagUUID:
+		return fixed(16)
+	case tagBool:
+		return fixed(1)
+	case tagString, tagBytes, tagDecimal, tagJsonb, tagTsvector, tagTsquery, tagVector:
+		var n uint64
+		var err error
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	case tagEnum:
+		var n uint64
+		var err error
+		if rest, _, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil || uint64(len(rest)) < n {
+			return nil, false
+		}
+		return rest[n:], true
+	case tagArray:
+		var elemN, n uint64
+		var err error
+		if rest, elemN, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		if rest, n, err = encoding.DecodeUvarint(rest); err != nil {
+			return nil, false
+		}
+		for j := uint64(0); j < n; j++ {
+			if len(rest) == 0 {
+				return nil, false
+			}
+			flag := rest[0]
+			rest = rest[1:]
+			if flag == 0 {
+				continue
+			}
+			if rest, _, err = decodeKeyDatum(rest, types.Family(elemN)); err != nil {
+				return nil, false
+			}
+		}
+		return rest, true
+	}
+	return nil, false
+}
+
 // ---------------------------------------------------------------------------
 // Secondary index entries.
 

@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -341,6 +342,7 @@ type vectorPlan struct {
 	idx    *catalog.IndexDescriptor
 	metric vector.Metric
 	query  []float32
+	stored string // query in the stored form
 	probes int
 }
 
@@ -452,7 +454,7 @@ func (s *Session) pickVectorIndex(desc *catalog.TableDescriptor, plan accessPlan
 		if _, loaded := vector.Lookup(idx.Vector.Build); !loaded {
 			return nil
 		}
-		return &vectorPlan{idx: idx, metric: metric, query: qv.VectorVal(), probes: s.probesFor(idx.Vector)}
+		return &vectorPlan{idx: idx, metric: metric, query: qv.VectorVal(), stored: qv.S, probes: s.probesFor(idx.Vector)}
 	}
 	return nil
 }
@@ -466,6 +468,37 @@ func (vp *vectorPlan) String() string {
 type vectorCandidate struct {
 	dist float64
 	pk   []byte // the encoded primary key at the end of the entry's key
+}
+
+// vectorCandLess orders candidates nearest first; NaN (the cosine
+// distance to a zero vector) after every number; ties in primary-key
+// order, as the exact scan breaks them.
+func vectorCandLess(a, b vectorCandidate) bool {
+	if a.dist != b.dist {
+		an, bn := math.IsNaN(a.dist), math.IsNaN(b.dist)
+		if an || bn {
+			if an != bn {
+				return bn
+			}
+		} else {
+			return a.dist < b.dist
+		}
+	}
+	return string(a.pk) < string(b.pk)
+}
+
+// vectorCandHeap holds candidates farthest on top (when it bounds them;
+// unbounded, it is only appended to and then sorted).
+type vectorCandHeap struct{ c []vectorCandidate }
+
+func (h *vectorCandHeap) Len() int           { return len(h.c) }
+func (h *vectorCandHeap) Less(i, j int) bool { return vectorCandLess(h.c[j], h.c[i]) }
+func (h *vectorCandHeap) Swap(i, j int)      { h.c[i], h.c[j] = h.c[j], h.c[i] }
+func (h *vectorCandHeap) Push(x any)         { h.c = append(h.c, x.(vectorCandidate)) }
+func (h *vectorCandHeap) Pop() any {
+	c := h.c[len(h.c)-1]
+	h.c = h.c[:len(h.c)-1]
+	return c
 }
 
 // executeVectorScan answers the plan: it reads the probed lists,
@@ -482,8 +515,15 @@ func (s *Session) executeVectorScan(ctx context.Context, txn *kvclient.Txn, desc
 	}
 	noteIndexScan(desc, vp.idx.ID)
 	lists := cents.Probe(vp.query, vp.probes)
-	var cands []vectorCandidate
+	// Without a filter only the first keep candidates are ever fetched,
+	// so only those are held: a heap of the keep nearest so far, the
+	// farthest on top. The order is total (distance, then primary key),
+	// so the survivors are exactly the first keep of the full sort.
+	general := TestingNoStoredDistance.Load()
+	bounded := len(where) == 0 && keep > 0 && !general
 	var buf []float32
+	ch := &vectorCandHeap{}
+	var charged int64 // candidates charged to the statement's memory
 	entries := 0
 	for _, list := range lists {
 		start := rowenc.VectorListPrefix(desc.ID, vp.idx.ID, list)
@@ -499,13 +539,37 @@ func (s *Session) executeVectorScan(ctx context.Context, txn *kvclient.Txn, desc
 				if len(kv.Value) != 4*len(vp.query) {
 					return nil, newErrf(CodeInternal, "index %q entry holds %d bytes, want a %d-dimension vector", vp.idx.Name, len(kv.Value), len(vp.query))
 				}
-				buf = vector.DecodeBytes(kv.Value, buf)
-				cands = append(cands, vectorCandidate{dist: vp.metric.Distance(vp.query, buf), pk: kv.Key[at:]})
+				// The distance off the entry's bytes (bit-identical to
+				// decoding them first: vector.storedDistance).
+				c := vectorCandidate{pk: kv.Key[at:]}
+				if general {
+					buf = vector.DecodeBytes(kv.Value, buf)
+					c.dist = vp.metric.Distance(vp.query, buf)
+				} else {
+					c.dist = vp.metric.StoredDistanceBytes(kv.Value, vp.stored)
+				}
+				switch {
+				case !bounded:
+					ch.c = append(ch.c, c)
+				case int64(len(ch.c)) < keep:
+					heap.Push(ch, c)
+				case vectorCandLess(c, ch.c[0]):
+					ch.c[0] = c
+					heap.Fix(ch, 0)
+				}
 			}
+			held := len(kvs)
+			if bounded {
+				held = 0
+				if grown := int64(len(ch.c)) - charged; grown > 0 {
+					held = int(grown)
+				}
+			}
+			charged += int64(held)
 			entries += len(kvs)
 			// The candidates are held until the rows are fetched: they
 			// count against the statement's memory like rows do.
-			if err := s.charge(int64(len(kvs)) * int64(40+len(desc.PrimaryKey)*9)); err != nil {
+			if err := s.charge(int64(held) * int64(40+len(desc.PrimaryKey)*9)); err != nil {
 				return nil, err
 			}
 			if len(kvs) < vectorScanPage {
@@ -517,23 +581,8 @@ func (s *Session) executeVectorScan(ctx context.Context, txn *kvclient.Txn, desc
 	metrics.SQLRowsScanned.Add(float64(entries))
 	s.AddScanned(int64(entries))
 	noteIndexRows(desc, vp.idx.ID, entries)
-	// Nearest first; NaN (the cosine distance to a zero vector) after
-	// every number; ties in primary-key order, as the exact scan breaks
-	// them.
-	sort.Slice(cands, func(i, j int) bool {
-		a, b := cands[i], cands[j]
-		if a.dist != b.dist {
-			an, bn := math.IsNaN(a.dist), math.IsNaN(b.dist)
-			if an || bn {
-				if an != bn {
-					return bn
-				}
-			} else {
-				return a.dist < b.dist
-			}
-		}
-		return string(a.pk) < string(b.pk)
-	})
+	cands := ch.c
+	sort.Slice(cands, func(i, j int) bool { return vectorCandLess(cands[i], cands[j]) })
 	prefix := rowenc.PrimaryKeyPrefixFor(desc)
 	var out []fetchedRow
 	fetched, batches := 0, 0
