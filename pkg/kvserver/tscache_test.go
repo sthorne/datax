@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -109,10 +110,15 @@ func TestTSCacheFloor(t *testing.T) {
 // caps at two generations), and precise for recent reads.
 func TestTSCacheRotation(t *testing.T) {
 	var c tsCache
+	clock := newFakeTSCacheClock(&c)
 	c.Bump(spans(sp("old", "")), ts(500), uuid.Nil)
-	// Two full generations of unrelated reads at a lower timestamp: the
-	// "old" entry ages out of span storage and into the floor.
+	// Two full generations of unrelated reads at a lower timestamp, the
+	// second more than the retention after the first: the "old" entry
+	// ages out of span storage and into the floor.
 	for i := 0; i < 2*tsCacheGenerationSize+1; i++ {
+		if i == tsCacheGenerationSize {
+			clock.advance(tsCacheMinRetention)
+		}
 		c.Bump(spans(sp(fmt.Sprintf("f%06d", i), "")), ts(10), uuid.Nil)
 	}
 	if ok, low := c.AllowsWrite(spans(sp("unrelated", "")), ts(400), uuid.Nil); ok || !low.Equal(ts(500)) {
@@ -127,6 +133,80 @@ func TestTSCacheRotation(t *testing.T) {
 	c.mu.Unlock()
 	if total > 2*tsCacheGenerationSize {
 		t.Fatalf("cache grew unbounded: %d entries", total)
+	}
+}
+
+type fakeTSCacheClock struct{ now time.Time }
+
+func newFakeTSCacheClock(c *tsCache) *fakeTSCacheClock {
+	f := &fakeTSCacheClock{now: time.Unix(1, 0)}
+	c.now = func() time.Time { return f.now }
+	return f
+}
+
+func (f *fakeTSCacheClock) advance(d time.Duration) { f.now = f.now.Add(d) }
+
+// TestTSCacheRotationKeepsRecentReads: a generation that took reads less
+// than tsCacheMinRetention ago is not folded into the floor when the next
+// one fills — the floor would then be as new as the transactions in
+// flight, and every one of them would be pushed. Batched ingest filled a
+// generation every few statements, so nearly every write was pushed and
+// had to refresh. The current generation grows instead, its point reads
+// up to tsCacheMaxGenerationSize and its ranged reads (which every write
+// scans) up to tsCacheGenerationSize, and folds once the retention has
+// passed.
+func TestTSCacheRotationKeepsRecentReads(t *testing.T) {
+	writer := uuid.New()
+	pushed := func(c *tsCache) bool {
+		ok, _ := c.AllowsWrite(spans(sp("unread", "")), ts(150), writer)
+		return !ok
+	}
+	fill := func(c *tsCache, prefix string, n int, ranged bool) {
+		for i := 0; i < n; i++ {
+			k := fmt.Sprintf("%s%06d", prefix, i)
+			s := sp(k, "")
+			if ranged {
+				s = sp(k, k+"z")
+			}
+			c.Bump(spans(s), ts(200), uuid.Nil)
+		}
+	}
+
+	var c tsCache
+	clock := newFakeTSCacheClock(&c)
+	fill(&c, "a", tsCacheGenerationSize, false) // first rotation: prev was empty
+	fill(&c, "b", 2*tsCacheGenerationSize, false)
+	if pushed(&c) {
+		t.Fatal("reads taken just now were folded into the floor")
+	}
+	clock.advance(tsCacheMinRetention)
+	fill(&c, "c", 1, false)
+	if !pushed(&c) {
+		t.Fatal("reads older than the retention were not folded into the floor")
+	}
+
+	// Point reads stop growing the generation at the cap.
+	var p tsCache
+	newFakeTSCacheClock(&p)
+	fill(&p, "a", tsCacheGenerationSize, false)
+	fill(&p, "b", tsCacheMaxGenerationSize, false)
+	if !pushed(&p) {
+		t.Fatal("a generation grew past tsCacheMaxGenerationSize")
+	}
+	p.mu.Lock()
+	total := p.cur.len() + p.prev.len()
+	p.mu.Unlock()
+	if total > 2*tsCacheMaxGenerationSize {
+		t.Fatalf("cache grew unbounded: %d entries", total)
+	}
+
+	// Ranged reads never grow a generation past tsCacheGenerationSize.
+	var r tsCache
+	newFakeTSCacheClock(&r)
+	fill(&r, "a", tsCacheGenerationSize, true)
+	fill(&r, "b", tsCacheGenerationSize, true)
+	if !pushed(&r) {
+		t.Fatal("ranged reads grew a generation past tsCacheGenerationSize")
 	}
 }
 

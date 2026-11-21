@@ -344,3 +344,173 @@ func TestTxnAbortSpanAcrossSplitAndMerge(t *testing.T) {
 	refused("after the merge", second, k2)
 	refused("after the merge", first, k)
 }
+
+// TestTxnSequenceMarksEveryWrite (issue #320): the servers look the abort
+// span up only for a transaction whose batch says it has written (a
+// non-zero Sequence or an anchor key; kvserver's mayHaveWritten), and
+// skip it for read-only transactions. That is sound only if the
+// coordinator stamps every batch that can lay an intent, and every batch
+// after it, so: whatever the transaction's first write is (a point
+// write, an increment, a locking read, a write batch, a pipelined batch
+// flushed by a read or by the commit), that batch and every later one
+// carry it, through a savepoint rollback and a restart; a read-only
+// transaction's batches carry neither.
+func TestTxnSequenceMarksEveryWrite(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db := tc.Nodes[0].DB()
+	prefix := keys.TableDataPrefix(436)
+	key := func(s string) keys.Key { return append(prefix.Clone(), s...) }
+
+	type seen struct {
+		locking bool // the batch can lay an intent
+		marked  bool // it says its transaction has written
+		what    string
+	}
+	var mu sync.Mutex
+	batches := map[string][]seen{} // by transaction name, unique below
+	db.TestingSetSendObserver(func(_ context.Context, ba *kvpb.BatchRequest, _ *kvpb.BatchResponse) {
+		if ba.Header.Txn == nil {
+			return
+		}
+		s := seen{marked: ba.Header.Txn.Sequence != 0 || len(ba.Header.Txn.Key) != 0}
+		for _, u := range ba.Requests {
+			switch {
+			case u.Put != nil, u.Delete != nil, u.Increment != nil,
+				u.Get != nil && u.Get.ForUpdate, u.Scan != nil && u.Scan.ForUpdate:
+				s.locking = true
+			}
+			s.what += fmt.Sprintf("%T ", u.GetInner())
+		}
+		mu.Lock()
+		batches[ba.Header.Txn.Name] = append(batches[ba.Header.Txn.Name], s)
+		mu.Unlock()
+	})
+	defer db.TestingSetSendObserver(nil)
+	// check fails if a locking batch, or any batch after one, is unmarked,
+	// or if a read-only transaction's batch is marked.
+	check := func(name string, readOnly bool) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		bs := batches[name]
+		if len(bs) == 0 {
+			t.Fatalf("%s: no batch observed", name)
+		}
+		wrote := false
+		for i, b := range bs {
+			wrote = wrote || b.locking
+			if readOnly && b.marked {
+				t.Errorf("%s: batch %d (%s) of a read-only transaction says it has written", name, i, b.what)
+			}
+			if wrote && !b.marked {
+				t.Errorf("%s: batch %d (%s) at or after the first write does not say the transaction has written", name, i, b.what)
+			}
+		}
+		if !readOnly && !wrote {
+			t.Errorf("%s: no locking batch observed", name)
+		}
+	}
+
+	ro := db.NewTxn("read-only")
+	if _, err := ro.Get(ctx, key("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ro.Scan(ctx, prefix, prefix.PrefixEnd(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ro.GetBatch(ctx, []keys.Key{key("a"), key("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ro.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check("read-only", true)
+
+	for i, c := range []struct {
+		name      string
+		pipelined bool
+		write     func(txn *kvclient.Txn, k keys.Key) error
+	}{
+		{"put", false, func(txn *kvclient.Txn, k keys.Key) error { return txn.Put(ctx, k, []byte("v")) }},
+		{"delete", false, func(txn *kvclient.Txn, k keys.Key) error { return txn.Delete(ctx, k) }},
+		{"increment", false, func(txn *kvclient.Txn, k keys.Key) error { _, err := txn.Increment(ctx, k, 1); return err }},
+		{"get for update", false, func(txn *kvclient.Txn, k keys.Key) error { _, err := txn.GetForUpdate(ctx, k); return err }},
+		{"scan for update", false, func(txn *kvclient.Txn, k keys.Key) error {
+			_, err := txn.ScanForUpdate(ctx, k, k.PrefixEnd(), 0)
+			return err
+		}},
+		{"batch for update", false, func(txn *kvclient.Txn, k keys.Key) error {
+			_, err := txn.GetBatchForUpdate(ctx, []keys.Key{k, append(k.Clone(), '2')})
+			return err
+		}},
+		{"batch for update nowait", false, func(txn *kvclient.Txn, k keys.Key) error {
+			_, err := txn.GetBatchForUpdateNoWait(ctx, []keys.Key{k, append(k.Clone(), '2')}, false)
+			return err
+		}},
+		{"write batch", false, func(txn *kvclient.Txn, k keys.Key) error {
+			var b kvclient.WriteBatch
+			b.Put(k, []byte("v"))
+			b.Put(append(k.Clone(), '2'), []byte("v"))
+			return txn.RunBatch(ctx, &b)
+		}},
+		{"pipelined write batch", true, func(txn *kvclient.Txn, k keys.Key) error {
+			var b kvclient.WriteBatch
+			b.Put(k, []byte("v"))
+			return txn.RunBatch(ctx, &b)
+		}},
+	} {
+		k := key(fmt.Sprintf("w%d", i))
+		txn := db.NewTxn(c.name)
+		if c.pipelined {
+			txn.EnablePipelining()
+		}
+		if _, err := txn.Get(ctx, key("before")); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Savepoint("sp"); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.write(txn, k); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		// Reads after the write (the first flushes a pipelined batch),
+		// a savepoint rollback, and a restart keep the mark.
+		if _, err := txn.Get(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.RollbackToSavepoint(ctx, "sp"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := txn.Scan(ctx, prefix, prefix.PrefixEnd(), 0); err != nil {
+			t.Fatal(err)
+		}
+		txn.Restart(errors.New("test restart"))
+		if _, err := txn.Get(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		check(c.name, false)
+	}
+
+	// A pipelined batch flushed by the commit itself (parallel commit),
+	// after reads.
+	pc := db.NewTxn("parallel commit")
+	pc.EnablePipelining()
+	if _, err := pc.Get(ctx, key("pc")); err != nil {
+		t.Fatal(err)
+	}
+	var b kvclient.WriteBatch
+	b.Put(key("pc"), []byte("v"))
+	b.Put(key("pd"), []byte("v"))
+	if err := pc.RunBatch(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check("parallel commit", false)
+}

@@ -189,7 +189,10 @@ type JoinResponse struct {
 type Registry struct {
 	mu    sync.Mutex
 	nodes map[base.NodeID]kvpb.NodeDescriptor
-	now   func() int64 // wall clock for piggybacked-address liveness; may be nil
+	// ids is the sorted IDs of nodes (NodeIDs), nil until built and
+	// whenever a node has been added since (nodes only ever grows).
+	ids []base.NodeID
+	now func() int64 // wall clock for piggybacked-address liveness; may be nil
 	// local is this node's own locality, against which a peer's
 	// --locality-advertise entries are matched (ResolveLocality).
 	local base.Locality
@@ -236,6 +239,9 @@ func (r *Registry) Upsert(nd kvpb.NodeDescriptor) {
 	defer r.mu.Unlock()
 	if cur, ok := r.nodes[nd.NodeID]; !ok || cur.LivenessTime < nd.LivenessTime {
 		r.nodes[nd.NodeID] = nd
+		if !ok {
+			r.ids = nil
+		}
 	}
 }
 
@@ -250,6 +256,9 @@ func (r *Registry) UpsertAddress(id base.NodeID, addr string) {
 	cur, ok := r.nodes[id]
 	if ok && cur.Address == addr {
 		return
+	}
+	if !ok {
+		r.ids = nil
 	}
 	cur.NodeID = id
 	cur.Address = addr
@@ -266,6 +275,24 @@ func (r *Registry) Get(id base.NodeID) (kvpb.NodeDescriptor, bool) {
 	defer r.mu.Unlock()
 	nd, ok := r.nodes[id]
 	return nd, ok
+}
+
+// NodeIDs returns the IDs of the known nodes, sorted: those of All,
+// without building the descriptors (the routing fallback asks on every
+// request). The slice is shared until a node is added; the caller must
+// not modify it.
+func (r *Registry) NodeIDs() []base.NodeID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ids == nil || len(r.ids) != len(r.nodes) {
+		ids := make([]base.NodeID, 0, len(r.nodes))
+		for id := range r.nodes {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		r.ids = ids
+	}
+	return r.ids
 }
 
 // All returns descriptors sorted by node ID.

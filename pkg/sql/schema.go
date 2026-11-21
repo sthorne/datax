@@ -43,7 +43,18 @@ func (s *Session) resolution() *catalog.Resolution {
 	if path == nil {
 		path = s.pathOf(s.vars.searchPath)
 	}
-	return &catalog.Resolution{Path: path, User: s.user, CanUse: s.pathSchemaUsable}
+	if r := s.resMemo; r != nil && r.User == s.user && sameSlice(r.Path, path) {
+		return r // nothing reads it but to resolve; it is never changed
+	}
+	r := &catalog.Resolution{Path: path, User: s.user, CanUse: s.pathSchemaUsable}
+	s.resMemo = r
+	return r
+}
+
+// sameSlice reports whether a and b are the same slice (the same
+// backing array and length), or both empty.
+func sameSlice(a, b []string) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
 }
 
 // pathSchemaUsable reports whether the acting role holds USAGE on a
@@ -80,14 +91,16 @@ func formatSearchPath(path []string) string {
 }
 
 // pathSchemas is the schemas of the session's search path that exist
-// in its current database, in order (current_schema, current_schemas,
-// the creation target).
+// in its current database, in order (current_schema, current_schemas, a
+// view's recorded path), through the gateway's leased schema set
+// (catalog/schemacache.go). The creation target is ResolveTarget's,
+// read in the transaction.
 func (s *Session) pathSchemas(ctx context.Context, txn *kvclient.Txn) ([]*catalog.SchemaDescriptor, error) {
 	dbID, err := s.cat.DatabaseID(ctx, txn, s.database)
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	return catalog.PathSchemas(ctx, txn, dbID, s.resolution())
+	return s.cat.PathSchemas(ctx, txn, dbID, s.resolution())
 }
 
 // lookupPathSchemas is pathSchemas for resolving existing objects:
@@ -98,7 +111,7 @@ func (s *Session) lookupPathSchemas(ctx context.Context, txn *kvclient.Txn) ([]*
 	if err != nil {
 		return nil, ToSQLError(err)
 	}
-	return catalog.LookupPathSchemas(ctx, txn, dbID, s.resolution())
+	return s.cat.LookupPathSchemas(ctx, txn, dbID, s.resolution())
 }
 
 // requireSchemas gates the statements that create schemas on cluster

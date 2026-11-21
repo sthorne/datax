@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sthorne/datax/pkg/util/hlc"
@@ -46,6 +47,11 @@ type tsCache struct {
 	floor hlc.Timestamp
 	cur   tsCacheGen
 	prev  tsCacheGen
+	// rotated is when cur last became prev, so when prev took its last
+	// read (zero before the first rotation).
+	rotated time.Time
+	// now is the clock rotation reads (tests); nil = time.Now.
+	now func() time.Time
 }
 
 // tsCacheGen is one generation of entries.
@@ -75,6 +81,18 @@ type tsCacheEntry struct {
 // entry per key however often the key is read, so a hot key set never
 // rotates on its own.
 const tsCacheGenerationSize = 4096
+
+// tsCacheMinRetention is how long a generation keeps its reads, at the
+// least, after it stops taking new ones, before a rotation may fold it
+// into the floor (mayRotate); tsCacheMaxGenerationSize bounds the current
+// generation's growth meanwhile. Memory beyond tsCacheGenerationSize is
+// then at most the point reads a range served in the last
+// tsCacheMinRetention, and never more than tsCacheMaxGenerationSize a
+// generation.
+const (
+	tsCacheMinRetention      = time.Second
+	tsCacheMaxGenerationSize = 16 * tsCacheGenerationSize
+)
 
 // len is the generation's entry count (tests).
 func (g *tsCacheGen) len() int { return g.n }
@@ -120,7 +138,7 @@ func (c *tsCache) Bump(spans []latchSpan, ts hlc.Timestamp, txnID uuid.UUID) {
 		c.cur.ranged = append(c.cur.ranged, tsCacheEntry{span: sp, ts: ts, txnID: txnID})
 		c.cur.n++
 	}
-	if c.cur.n >= tsCacheGenerationSize {
+	if c.cur.n >= tsCacheGenerationSize && c.mayRotate() {
 		for _, e := range c.prev.points {
 			if c.floor.Less(e.ts) {
 				c.floor = e.ts
@@ -133,7 +151,39 @@ func (c *tsCache) Bump(spans []latchSpan, ts hlc.Timestamp, txnID uuid.UUID) {
 		}
 		c.prev = c.cur
 		c.cur = tsCacheGen{}
+		c.rotated = c.clock()
 	}
+}
+
+// mayRotate reports whether a full current generation may rotate now,
+// folding the previous one into the floor. Not while the previous one
+// took reads within the last tsCacheMinRetention: its timestamps are
+// then about as new as the transactions in flight, and folding them
+// pushes every one of those transactions (all their writes land below
+// the new floor), each of which must then refresh its reads before it
+// can commit. Under batched ingest — 16 workers whose 1,000-row INSERTs
+// each probe 1,000 keys — a generation filled every few statements, so
+// nearly every statement was pushed, often twice. The current generation
+// grows instead, up to tsCacheMaxGenerationSize point reads; its ranged
+// reads stay within tsCacheGenerationSize, since every write scans
+// them. Keeping reads longer is never incorrect: an entry only says a
+// read happened.
+func (c *tsCache) mayRotate() bool {
+	switch {
+	case c.cur.n >= tsCacheMaxGenerationSize, len(c.cur.ranged) >= tsCacheGenerationSize:
+		return true
+	case c.rotated.IsZero():
+		// First rotation: prev is empty, folding it costs nothing.
+		return true
+	}
+	return c.clock().Sub(c.rotated) >= tsCacheMinRetention
+}
+
+func (c *tsCache) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // AllowsWrite reports whether a write to the given spans at ts by txnID

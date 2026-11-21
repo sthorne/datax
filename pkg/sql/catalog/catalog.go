@@ -1186,6 +1186,13 @@ type Accessor struct {
 	flights   map[string]*leaseFlight
 	flightSeq uint64
 
+	// Schema-set leases (schemacache.go), by database ID: the leased
+	// sets, the mutexes serializing their lease transactions, and the
+	// generation a committing lease transaction is publishing.
+	schemaSets     map[uint64]*cachedSchemaSet
+	schemaAcq      map[uint64]*sync.Mutex
+	schemaAdopting map[uint64]uint64
+
 	// Statistics cache (stats.go); statsDB nil = stats disabled.
 	statsMu    sync.Mutex
 	statsDB    *kvclient.DB
@@ -1503,7 +1510,7 @@ func (a *Accessor) LookupFreshIn(ctx context.Context, txn *kvclient.Txn, db, nam
 // reading every entry in txn, never the cache; it returns the
 // descriptor and the candidate it was found at.
 func (a *Accessor) lookupUncachedByName(ctx context.Context, txn *kvclient.Txn, db, name string) (*TableDescriptor, nameCandidate, error) {
-	cands, err := a.resolve(ctx, txn, db, name)
+	cands, err := a.resolveWith(ctx, txn, db, name, false)
 	if err != nil {
 		return nil, nameCandidate{}, err
 	}

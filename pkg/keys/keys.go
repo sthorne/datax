@@ -648,6 +648,36 @@ func AllSchemaNamespaceSpan() (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// SchemaGenKey holds database dbID's schema generation: a counter every
+// transaction that changes the database's schemas (their names or
+// descriptors) increments, which gateways cache the schema set under
+// and lease at (catalog.Accessor, schemacache.go).
+func SchemaGenKey(dbID uint64) Key {
+	return Key(encoding.EncodeUint64(systemKey("schemagen"), dbID))
+}
+
+// AllSchemaGenSpan covers every database's schema generation.
+func AllSchemaGenSpan() (Key, Key) {
+	p := systemKey("schemagen")
+	return p, p.PrefixEnd()
+}
+
+// SchemaLeaseKey holds one gateway's lease on database dbID's schema
+// set: proof that the gateway may be resolving schema names from the
+// set at the recorded generation until the recorded expiration. Schema
+// DDL drains against these, as table DDL drains against DescLeaseKey.
+func SchemaLeaseKey(dbID uint64, gateway uuid.UUID) Key {
+	k := Key(encoding.EncodeUint64(systemKey("schemalease"), dbID))
+	return append(k, gateway[:]...)
+}
+
+// SchemaLeaseSpan covers all gateways' leases on one database's schema
+// set.
+func SchemaLeaseSpan(dbID uint64) (Key, Key) {
+	p := Key(encoding.EncodeUint64(systemKey("schemalease"), dbID))
+	return p, p.PrefixEnd()
+}
+
 // SequenceDescKey holds the JSON sequence descriptor for a sequence ID
 // (IDs come from the shared descriptor counter, so tables and sequences
 // never collide).
@@ -775,7 +805,10 @@ func RoleSpan() (Key, Key) {
 
 // TableDataPrefix is the prefix of all rows of a table.
 func TableDataPrefix(tableID uint64) Key {
-	return Key(encoding.EncodeUint64(TablePrefix.Clone(), tableID))
+	// One allocation, at the capacity the clone-and-grow it replaces
+	// ended with (callers append to the prefix).
+	k := append(make(Key, 0, 16), TablePrefix...)
+	return Key(encoding.EncodeUint64(k, tableID))
 }
 
 // TableDataSpan covers all rows of a table (every index).
@@ -787,7 +820,9 @@ func TableDataSpan(tableID uint64) (Key, Key) {
 // TableIndexPrefix is the prefix of one index of a table:
 // /t/<tableID>/<indexID>/. Primary rows are index 1 (see pkg/sql/rowenc).
 func TableIndexPrefix(tableID, indexID uint64) Key {
-	return Key(encoding.EncodeUint64(TableDataPrefix(tableID), indexID))
+	// One allocation, at the capacity the grow it replaces ended with.
+	k := append(make(Key, 0, 32), TablePrefix...)
+	return Key(encoding.EncodeUint64(encoding.EncodeUint64(k, tableID), indexID))
 }
 
 // TableAuxIndexID is the index ID no index ever has (primary rows are

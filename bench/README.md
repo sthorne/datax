@@ -26,7 +26,8 @@ workload set and the runner that produces comparable records.
    ```
 
    `!` marks a delta beyond ±5 % (`--threshold`), `!!` a regression:
-   lower throughput, or higher latency, errors or retries.
+   lower throughput, or higher latency, errors, retries or KV batches
+   per operation.
    `--fail-on-regression` turns that into an exit status.
 
 4. Paste both tables into the PR body under "Before/after", with the
@@ -158,6 +159,24 @@ and runs the set against each, writing `OUT/single/<name>.json` and
 and retry counts, the run's arguments and seed, and the deltas of every
 server counter that moved (`metrics`), so a storage change shows up as
 stalls or backpressure even when throughput hides it.
+
+`kv_batches_per_op` is the KV batches the scraped node routed per
+measured operation: the `datax_kv_batch_latency_seconds_count` delta in
+`metrics` over `ops` (present only when the run scraped a node's
+counters, `--server-url` or `--metrics-url`). It is a count, not a
+timing, so it holds on a noisy machine: a change that adds a round trip
+to every statement — an uncached catalog read, say — doubles it for a
+point-read workload while throughput barely moves. `datax bench compare`
+shows it as `kv batches/op` and flags an increase beyond the threshold
+as a regression; for a record written before the field it derives the
+value from the record's `metrics`. It counts every batch the node
+routed during the run, retried attempts and background work included,
+and only the scraped node's, one-phase commits (an autocommit write's
+batch that carries its own EndTxn) included. Records written before
+that were counted read lower on write workloads, so compare a write
+workload only against a record from a binary that counts them. The
+exact per-statement counts are
+pinned by `TestKVRoundTripsPerStatement` (`pkg/testutils/testcluster`).
 
 ## Profiles
 

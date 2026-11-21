@@ -236,6 +236,10 @@ type Session struct {
 		raw    string
 		parsed []string
 	}
+	// resMemo is the last resolution context built (resolution): it is
+	// reused while the path slice and the user it was built from are
+	// the session's current ones.
+	resMemo  *catalog.Resolution
 	viewPath []string
 	// viewBindings, while a view's query runs, are the relations its
 	// names were bound to at creation (catalog ViewBindings).
@@ -283,6 +287,9 @@ type Session struct {
 	// for the view check and again for the plan).
 	plans       *planCache
 	stmtLookups *lookupMemo
+	// spareLookups is a finished statement's memo, kept for the next
+	// statement to reuse (execStmt).
+	spareLookups *lookupMemo
 	// streaming lets scan-shaped SELECTs return a RowStream instead of
 	// materialized rows (the wire layer opts in; internal callers read
 	// Result.Rows). memUsed is the running statement's charged memory
@@ -411,8 +418,10 @@ func (s *Session) FinalizedClusterVersion(ctx context.Context) (version.Version,
 // the current database shadows) or a table in the session's current
 // database (or the name's own qualifier).
 func (s *Session) lookup(ctx context.Context, txn *kvclient.Txn, name string) (*catalog.TableDescriptor, error) {
-	if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
-		name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+	if strings.IndexByte(name, '.') >= 0 {
+		if parts := catalog.SplitName(name); len(parts) == 3 && parts[0] == s.database && vtable.IsSchema(parts[1]) {
+			name = parts[1] + "." + parts[2] // db.pg_catalog.x, in the current database
+		}
 	}
 	name = s.pinName(name)
 	if s.viewBindings != nil {
@@ -994,6 +1003,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.pendingDrops = append(s.pendingDrops, s.extraDrops...)
 		s.extraDDL, s.extraDrops = nil, nil
 		s.tempEndTxn()
+		committed := s.txn
 		err := s.txn.Commit(ctx)
 		s.tempTxnDone(err == nil)
 		s.loEndTxn(ctx, err == nil)
@@ -1016,7 +1026,11 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		// its notifications go out, whatever the steps below report.
 		s.commitNotify()
 		// Schema changes are visible everywhere once COMMIT returns: drain
-		// lease adoption for every table this transaction altered.
+		// the schema sets of the databases whose schemas this transaction
+		// changed, and lease adoption for every table it altered.
+		if derr := s.cat.FinishSchemaChanges(ctx, committed); derr != nil {
+			return nil, ToSQLError(derr)
+		}
 		for _, name := range pending {
 			if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {
 				return nil, ToSQLError(derr)
@@ -1432,8 +1446,10 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 		return s.executeStreamingSelect(ctx, sel, params)
 	}
 	var res *Result
+	var committed *kvclient.Txn
 	err := s.runImplicit(ctx, stmt, func(ctx context.Context, txn *kvclient.Txn) error {
 		var err error
+		committed = txn
 		s.extraDDL, s.extraDrops, s.pendingWipes = nil, nil, nil
 		s.keyLeaseAfterCommit = false
 		s.discardNotify() // a retry starts the statement over
@@ -1459,6 +1475,9 @@ func (s *Session) executeData(ctx context.Context, stmt parser.Statement, params
 	s.extraDDL, s.extraDrops = nil, nil
 	if name := ddlTableName(stmt); name != "" {
 		names = append([]string{name}, names...)
+	}
+	if derr := s.cat.FinishSchemaChanges(ctx, committed); derr != nil {
+		return nil, ToSQLError(derr)
 	}
 	for _, name := range names {
 		if derr := s.cat.FinishDDLIn(s.rctx(ctx), s.database, s.pinName(name)); derr != nil {

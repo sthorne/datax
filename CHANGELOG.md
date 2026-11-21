@@ -11,6 +11,13 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`TestKVRoundTripsPerStatement`** pins the exact KV batches and
+  requests of point reads and writes, an index join, an explicit
+  transaction and `SELECT 1`, over both protocols on one and three
+  nodes. A change that adds a round trip to every statement now fails
+  CI, where before only a throughput drop in a paused nightly run would
+  have shown it. `datax bench` records carry `kv_batches_per_op`, and
+  `datax bench compare` flags an increase as a regression.
 - **`datax demo --gc-ttl`** sets the history window of a demo cluster,
   so an in-memory cluster that runs create-and-drop test suites need not
   hold 25 hours of dropped tables in memory (#391).
@@ -1983,6 +1990,51 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Point reads and writes are back to their speed before 0.58.0's
+  catalog work** (performance analysis, 2026-11-20). Server CPU per point
+  read had grown from 78 µs to 128 µs since 0.57, and `kv-95-5` had
+  fallen 29% on one node and 34% on three. Three causes are fixed:
+  - Every statement read `/system/schemans/<db>/"<role>"` to resolve the
+    `"$user"` entry of the default `search_path`, an uncached KV round
+    trip that almost always missed. Each node now caches every
+    database's schemas under a lease, as it does tables. A schema change
+    (`CREATE`, `ALTER` or `DROP SCHEMA`, `GRANT` / `REVOKE` on a schema,
+    a restore) bumps the database's schema generation and returns once
+    every node resolves through the new set, which adds up to about half
+    a second on a multi-node cluster. A prepared point read is one KV
+    batch again, and its server CPU fell from 109 to 81 µs.
+  - Every transactional read looked up the range's abort span (#320).
+    A transaction that has not written cannot have an entry, so the
+    lookup now runs only when the batch's sequence or anchor key says it
+    has written, which removes about 4 µs per read.
+  - The statement path had picked up allocations: a prepared point
+    SELECT made 159 server allocations, against 97 on 11-14, and a point
+    UPDATE 346, against 259. They are down to 97 and 272 before the
+    schema fix, which removes another 47 from the SELECT. The changes:
+    - The activity fingerprint is taken once per prepared statement.
+    - Wire messages and session resolution state are reused.
+    - The routing fallback caches its node list.
+    - A latch makes its release channel only when someone waits.
+    - A lease-holding leader with no read-index round in flight
+      confirms a read through its lease inline, the round's own first
+      step, instead of through a goroutine.
+- Executions of a prepared statement are recorded under one statement
+  shape, the one its text has in the simple protocol. They were split
+  between the qualified and the alias-stripped forms.
+- **Bulk INSERTs of 1,000 rows no longer push and refresh each other.**
+  Each statement's uniqueness checks filled a timestamp-cache generation
+  every few statements, and folding it into the floor pushed every
+  statement in flight. The pushed statements then refreshed reads
+  condensed into spans covering most of the table, one batch per span,
+  latching against every concurrent writer and usually failing. Now a
+  generation that took reads within the last second grows instead of
+  folding (up to 65,536 point reads). A transaction keeps 4,096 read
+  spans before condensing (512 before), and a refresh sends its point
+  spans in one batch. One node, 16 workers, 1,000-row batches: KV batches
+  per statement 525 → 2.6, refreshes 195 → 0, restarts 365 → 0, p99
+  8 s → 0.8 s.
+- One-phase commits (autocommit writes) were missing from
+  `datax_kv_batch_latency_seconds`; they are counted now.
 - **Two range splits could be given the same range ID** when the range
   holding the ID counter was split or merged at the same moment, which
   heavy DDL load does (#389). A write queued behind a split was applied

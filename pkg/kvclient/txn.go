@@ -213,7 +213,17 @@ type readSpan struct {
 // timestamp is pushed rather than restart (issue #322); before, it gave
 // up its read set and every push ended in a restart, which an implicit
 // transaction retried until it gave up with 40001.
-const maxReadSpans = 512
+//
+// It is sized for a bulk INSERT's uniqueness probes: a statement reads
+// one key per row (more with unique indexes and foreign keys) and writes
+// rows next to other writers' rows. Condensed, its reads of random keys
+// become spans covering most of the table, which fail to refresh once
+// any other worker has committed a row there — every push became a
+// restart — and which latch, and push through the timestamp cache,
+// every concurrent writer of the table. At 512, INSERTs of 1,000 rows
+// under 16 workers spent 1.5 to 3 s per second waiting on latches and
+// ran at less than half the rows/s of 100-row INSERTs.
+const maxReadSpans = 4096
 
 // maxCondensedSpans bounds the condensed read spans, and so the refresh
 // requests a transaction's commit can need.
@@ -290,12 +300,13 @@ func condenseSpans(spans []readSpan, max int) []readSpan {
 // NewTxn begins a transaction at the current clock reading.
 func (db *DB) NewTxn(name string) *Txn {
 	t := &Txn{db: db}
-	t.mu.txn = *kvpb.NewTransaction(name, rand.Int31n(1<<20), db.clock.Now())
+	t.mu.txn = kvpb.MakeTransaction(name, rand.Int31n(1<<20), db.clock.Now())
 	t.mu.txn.HistoryFloor = -1 // no savepoint yet: rewrites keep no history (issue #162)
 	// From cluster version v14 the intents and the record are stored in
 	// the binary encoding (issue #141); the flag rides in every command.
 	t.mu.txn.BinaryMeta = db.ClusterVersion() >= version.V14
-	t.mu.writes = make(map[string]struct{})
+	// t.mu.writes is made by the first write (recordWrite): a read-only
+	// transaction never needs it.
 	return t
 }
 
@@ -833,8 +844,43 @@ func (t *Txn) prepareWrite(req kvpb.Request) (*kvpb.BatchRequest, keys.Key) {
 	return ba, key
 }
 
+// HasWrites reports whether the transaction has written anything (in
+// any epoch): a cheap test before HasWritten.
+func (t *Txn) HasWrites() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.mu.writes) > 0
+}
+
+// HasWritten reports whether the transaction has written key, in any
+// epoch and not rolled back to a savepoint since: a key whose readers
+// must read through the transaction rather than from a cache.
+func (t *Txn) HasWritten(key keys.Key) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.mu.writes[string(key)]
+	return ok
+}
+
+// WrittenIn returns the keys in [start, end) the transaction has written
+// (as HasWritten counts them), in no particular order.
+func (t *Txn) WrittenIn(start, end keys.Key) []keys.Key {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []keys.Key
+	for k := range t.mu.writes {
+		if key := keys.Key(k); key.Compare(start) >= 0 && key.Compare(end) < 0 {
+			out = append(out, key.Clone())
+		}
+	}
+	return out
+}
+
 func (t *Txn) recordWrite(key keys.Key) {
 	t.mu.Lock()
+	if t.mu.writes == nil {
+		t.mu.writes = make(map[string]struct{})
+	}
 	t.mu.writes[string(key)] = struct{}{}
 	anchoredNow := !t.mu.anchored && keys.Key(t.mu.txn.Key).Equal(key)
 	if anchoredNow {
@@ -1069,12 +1115,7 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	}
 	provisional.ReadTimestamp = newTS
 	provisional.WriteTimestamp = newTS
-	for _, sp := range spans {
-		ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: provisional.Clone()}}
-		ba.Add(&kvpb.RefreshRequest{
-			RequestHeader: kvpb.RequestHeader{Key: sp.start, EndKey: sp.end},
-			FromTS:        oldRead,
-		})
+	for _, ba := range refreshBatches(spans, &provisional, oldRead) {
 		if _, kerr := t.db.Send(ctx, ba); kerr != nil {
 			log.Debugf("txn %s refresh to %s failed: %v", provisional.ID, newTS, kerr)
 			return false
@@ -1088,6 +1129,38 @@ func (t *Txn) maybeRefresh(ctx context.Context, newTS hlc.Timestamp) bool {
 	t.mu.txn.ReadTimestamp = newTS
 	t.mu.txn.WriteTimestamp = t.mu.txn.WriteTimestamp.Forward(newTS)
 	return true
+}
+
+// refreshBatches builds the requests that refresh spans from oldRead to
+// txn's (provisional) read timestamp: every point span in ONE batch, which
+// the DB fans out per range like any batch of point requests, and the
+// ranged spans in another, each stitched across ranges on its own. A
+// refresh used to send one batch per span, one after another: a pushed
+// 1,000-row INSERT, whose uniqueness probes are 1,000 point reads, paid
+// 1,000 sequential round trips and latch acquisitions before it could
+// commit, and kept its probes' keys latched (shared) the whole time.
+func refreshBatches(spans []readSpan, txn *kvpb.Transaction, oldRead hlc.Timestamp) []*kvpb.BatchRequest {
+	var points, ranged *kvpb.BatchRequest
+	for _, sp := range spans {
+		b := &points
+		if len(sp.end) > 0 {
+			b = &ranged
+		}
+		if *b == nil {
+			*b = &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}}
+		}
+		(*b).Add(&kvpb.RefreshRequest{
+			RequestHeader: kvpb.RequestHeader{Key: sp.start, EndKey: sp.end},
+			FromTS:        oldRead,
+		})
+	}
+	var out []*kvpb.BatchRequest
+	for _, b := range []*kvpb.BatchRequest{points, ranged} {
+		if b != nil {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // AdvanceTo moves the transaction forward so that it commits at or above
@@ -1135,7 +1208,8 @@ func (t *Txn) publishWait(ctx context.Context, pushee *enginepb.TxnMeta) {
 		// them and they can never be part of a cycle — no edge to publish.
 		return
 	}
-	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	hb := txn // the snapshot sent; txn stays on the stack on the early return
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &hb}}
 	ba.Add(&kvpb.HeartbeatTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
 		Now:           t.db.clock.Now(),
@@ -1425,7 +1499,8 @@ func (t *Txn) Commit(ctx context.Context) error {
 		intentKeys = append(intentKeys, keys.Key(k).Clone())
 	}
 	t.mu.Unlock()
-	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &txn}}
+	end := txn // the snapshot sent; txn stays on the stack for a read-only commit
+	ba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: &end}}
 	ba.Add(&kvpb.EndTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(txn.Key).Clone()},
 		Commit:        true,
@@ -1589,7 +1664,13 @@ func (t *Txn) sendSingleRange(ctx context.Context, ba *kvpb.BatchRequest, desc k
 		}
 		gh := ba.Header
 		gh.Txn = t.proto() // re-stamp: refreshes move the timestamps
+		start := time.Now()
 		br, regroup, kerr := t.db.sendPartial(ctx, &gh, ba.Requests, desc)
+		// This path bypasses DB.Send, so it counts itself: the one-phase
+		// commits of autocommit writes would otherwise be missing from
+		// datax_kv_batch_latency_seconds and from a bench record's
+		// kv_batches_per_op.
+		metrics.KVBatchLatency.Observe(time.Since(start).Seconds())
 		if obs := t.db.sendObserver.Load(); obs != nil {
 			(*obs)(ctx, ba, br) // this path bypasses DB.Send
 		}

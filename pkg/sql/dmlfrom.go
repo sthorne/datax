@@ -499,18 +499,21 @@ func (s *Session) execDeleteUsing(ctx context.Context, txn *kvclient.Txn, t *par
 // alias). A qualifier naming no FROM item — the table's own name behind
 // an alias included — is refused (42P01), as stripTableAlias does.
 func stripUpdateAlias(t *parser.Update) (*parser.Update, error) {
-	c := *t
 	sel := &parser.Select{Table: t.Table, Alias: t.Alias, Where: append([]parser.Comparison(nil), t.Where...)}
+	sel.Exprs = make([]parser.SelectExpr, 0, len(t.Set)+len(t.Returning))
 	for _, sc := range t.Set {
 		sel.Exprs = append(sel.Exprs, parser.SelectExpr{Expr: sc.Value})
 	}
 	sel.Exprs = append(sel.Exprs, t.Returning...)
-	if err := stripTableAlias(sel); err != nil {
+	rewrote, err := stripTableAliasN(sel)
+	if err != nil {
 		return nil, err
 	}
-	if t.Alias == "" && unchangedStrip(sel, t.Where, len(t.Set), t.Set, t.Returning) {
+	// Nothing rewritten: sel holds copies of t's own clauses, unchanged.
+	if t.Alias == "" && (!rewrote || unchangedStrip(sel, t.Where, len(t.Set), t.Set, t.Returning)) {
 		return t, nil // keeps the statement's identity (the plan cache's key)
 	}
+	c := *t
 	c.Set = append([]parser.SetClause(nil), t.Set...)
 	for i := range c.Set {
 		c.Set[i].Value = sel.Exprs[i].Expr
@@ -524,14 +527,15 @@ func stripUpdateAlias(t *parser.Update) (*parser.Update, error) {
 
 // stripDeleteAlias is stripUpdateAlias for DELETE.
 func stripDeleteAlias(t *parser.Delete) (*parser.Delete, error) {
-	c := *t
 	sel := &parser.Select{Table: t.Table, Alias: t.Alias, Where: append([]parser.Comparison(nil), t.Where...), Exprs: append([]parser.SelectExpr(nil), t.Returning...)}
-	if err := stripTableAlias(sel); err != nil {
+	rewrote, err := stripTableAliasN(sel)
+	if err != nil {
 		return nil, err
 	}
-	if t.Alias == "" && unchangedStrip(sel, t.Where, 0, nil, t.Returning) {
+	if t.Alias == "" && (!rewrote || unchangedStrip(sel, t.Where, 0, nil, t.Returning)) {
 		return t, nil
 	}
+	c := *t
 	if t.Returning != nil {
 		c.Returning = sel.Exprs
 	}

@@ -127,8 +127,10 @@ still equals `readTS`. Events that force the write timestamp above
 - `WriteTooOld`: a committed version exists above our write timestamp,
 - an uncertainty restart.
 
-The coordinator tracks every span the transaction has read. Past 512
-spans it **condenses** them (issue #322): the spans recorded so far are
+The coordinator tracks every span the transaction has read. Past 4,096
+spans (512 before; a 1,000-row INSERT's uniqueness probes are 1,000
+point reads, and condensed, random keys become spans over most of the
+table that every concurrent writer of it fails) it **condenses** them (issue #322): the spans recorded so far are
 merged with the earlier condensed ones into at most 64 spans covering
 every key read — closing first the gaps between keys that share the
 longest prefix, so a merged span stays within the keyspace its reads
@@ -212,7 +214,14 @@ entry per row in the cache — a 100-key write against two full
 generations went from ~1.5 ms to ~2 µs). Bumps go to the current
 generation; when it fills (4,096 entries), the older generation folds
 into the floor (the max of its timestamps — conservative, never
-incorrect) and rotation continues. Memory stays bounded per range,
+incorrect) and rotation continues — unless the older generation took
+reads within the last second: its timestamps are then as new as the
+transactions in flight, and folding them would push every one of them.
+The current generation grows instead, its point reads up to 65,536 and
+its ranged reads (which every write scans) up to 4,096, and folds once
+the second has passed. Batched ingest, 16 workers of 1,000-row INSERTs,
+filled a generation every few statements, so nearly every statement was
+pushed and had to refresh its probes before it could commit. Memory stays bounded per range,
 recent reads keep full span precision, and old reads age into
 range-wide coverage. The floor is also set directly by
 whole-range events: leadership acquisition (a new leader cannot know what
@@ -636,6 +645,21 @@ it is then: the removal and the entry are one engine batch, so a read
 that missed the intent ran after that batch had committed, and so does
 the check that follows it (checked before, a removal could land in
 between). An entry also outranks whatever else the read ran into.
+
+*Who is checked.* Only a transaction that has written can have had a
+write removed, so only its batches look the entry up: those whose
+transaction carries a non-zero `Sequence` or an anchor `Key`
+(`mayHaveWritten`). The coordinator bumps `Sequence` before every
+request that can lay an intent (a point write, an increment, a locking
+read, a write batch, a parallel commit) and copies the transaction into
+the batch after, and never lowers it (a restart and a savepoint rollback
+keep it), so a batch with `Sequence` 0 and no anchor comes from a
+transaction that has laid no intent anywhere. A read-only transaction's
+reads, nearly all of a read-mostly workload, skip the point read, which
+cost 4 to 7 µs each. The test reads only the batch, never replica state,
+so every replica decides alike and no split, merge, snapshot or restart
+can make it wrong; `TestTxnSequenceMarksEveryWrite` holds the
+coordinator to its half.
 
 *The coordinator.* Once it knows — a request refused, a heartbeat that
 finds the record ABORTED, or its own choice as a deadlock victim — the
