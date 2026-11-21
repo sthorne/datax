@@ -9,11 +9,13 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/server"
 )
 
@@ -41,6 +43,15 @@ type stmtBenchConn struct {
 
 func startStmtBench(b *testing.B, query string) *stmtBenchConn {
 	b.Helper()
+	c, _ := startStmtBenchPath(b, query, "")
+	return c
+}
+
+// startStmtBenchPath is startStmtBench with the statement prepared on a
+// session whose search_path is searchPath (the default when empty),
+// after an empty schema app is created; it returns the cluster too.
+func startStmtBenchPath(b *testing.B, query, searchPath string) (*stmtBenchConn, *TestCluster) {
+	b.Helper()
 	tc := Start(b, 1)
 	ctx := context.Background()
 	setup, err := pgx.Connect(ctx, pgURL(tc, 0))
@@ -61,9 +72,21 @@ func startStmtBench(b *testing.B, query string) *stmtBenchConn {
 	if _, err := setup.Exec(ctx, sb.String()); err != nil {
 		b.Fatal(err)
 	}
+	if searchPath != "" {
+		if _, err := setup.Exec(ctx, "CREATE SCHEMA app"); err != nil {
+			b.Fatal(err)
+		}
+	}
 	_ = setup.Close(ctx)
 
-	pc, err := pgconn.Connect(ctx, pgURL(tc, 0))
+	pcfg, err := pgconn.ParseConfig(pgURL(tc, 0))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if searchPath != "" {
+		pcfg.RuntimeParams["search_path"] = searchPath
+	}
+	pc, err := pgconn.ConnectConfig(ctx, pcfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -76,7 +99,7 @@ func startStmtBench(b *testing.B, query string) *stmtBenchConn {
 	}
 	c := &stmtBenchConn{conn: hj.Conn, r: bufio.NewReaderSize(hj.Conn, 16<<10)}
 	b.Cleanup(func() { _ = c.conn.Close() })
-	return c
+	return c, tc
 }
 
 // run sends Bind(s, params)/Execute/Sync and reads to ReadyForQuery. The
@@ -143,6 +166,29 @@ func BenchmarkPreparedPointSelect(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		c.run(b, false, "", int64(i%stmtBenchRows))
 	}
+}
+
+// BenchmarkPreparedPointSelectSearchPath is BenchmarkPreparedPointSelect
+// under search_path = app, public: kv is a table of public, so every
+// execution looks it up in app first, a miss the gateway's schema set
+// answers (catalog/schemacache.go). Besides allocs/op it reports the KV
+// batches the node routed per op (background work included).
+func BenchmarkPreparedPointSelectSearchPath(b *testing.B) {
+	c, tc := startStmtBenchPath(b, "SELECT v FROM kv WHERE k = $1", "app, public")
+	for i := 0; i < 200; i++ {
+		c.run(b, false, "", int64(i%stmtBenchRows))
+	}
+	var batches atomic.Int64
+	db := tc.Nodes[0].DB()
+	db.TestingSetSendObserver(func(context.Context, *kvpb.BatchRequest, *kvpb.BatchResponse) { batches.Add(1) })
+	defer db.TestingSetSendObserver(nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.run(b, false, "", int64(i%stmtBenchRows))
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(batches.Load())/float64(b.N), "kv-batches/op")
 }
 
 // BenchmarkPreparedPointUpdate is the write of `datax bench kv`:

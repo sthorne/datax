@@ -611,6 +611,15 @@ func TableNamespaceSpan(dbID uint64) (Key, Key) {
 	return p, p.PrefixEnd()
 }
 
+// TableNamespacePrefixSpan covers database dbID's table names that
+// begin with prefix: the encoding of such a name begins with prefix's,
+// less the terminator.
+func TableNamespacePrefixSpan(dbID uint64, prefix string) (Key, Key) {
+	k := encoding.EncodeString(encoding.EncodeUint64(systemKey("nsdb"), dbID), prefix)
+	p := Key(k[:len(k)-2])
+	return p, p.PrefixEnd()
+}
+
 // AllTableNamespaceSpan covers every database's table names.
 func AllTableNamespaceSpan() (Key, Key) {
 	p := systemKey("nsdb")

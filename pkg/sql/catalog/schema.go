@@ -397,6 +397,10 @@ func (a *Accessor) SetTableSchema(ctx context.Context, txn *kvclient.Txn, d *Tab
 	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newEntry), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
+	// The schema sets cache the tables filed in schemas (schemacache.go).
+	if err := bumpSchemaGen(ctx, txn, d.DatabaseID); err != nil {
+		return err
+	}
 	d.SchemaID = schemaID
 	if err := a.Update(ctx, txn, d); err != nil {
 		return err
@@ -689,6 +693,11 @@ type nameCandidate struct {
 	dbID      uint64
 	entry     string // the name entry within the database
 	isDefault bool   // the default database's flat namespace may hold it
+	// noTable: the leased schema set answers that no table is filed
+	// under entry (schemaSet.tableAbsent), so a table lookup skips it.
+	// A sequence or type lookup, whose names are filed elsewhere, does
+	// not.
+	noTable bool
 }
 
 // Target is where a name resolves to be created, or where an existing
@@ -812,13 +821,15 @@ func (a *Accessor) resolveWith(ctx context.Context, txn *kvclient.Txn, db, name 
 			// lookup, exactly as before schemas existed.
 			return []nameCandidate{{db: db, dbID: dbID, entry: name, isDefault: isDefaultDatabase(db)}}, nil
 		}
-		schemas, err := lookupPathSchemas(ctx, a.schemas(txn, dbID, cached), r)
+		l := a.schemas(txn, dbID, cached)
+		schemas, err := lookupPathSchemas(ctx, l, r)
 		if err != nil {
 			return nil, err
 		}
 		out := make([]nameCandidate, 0, len(schemas))
 		for _, sd := range schemas {
-			out = append(out, nameCandidate{db: db, dbID: dbID, entry: SchemaNamespaceName(sd.ID, name), isDefault: sd.ID == 0 && isDefaultDatabase(db)})
+			entry := SchemaNamespaceName(sd.ID, name)
+			out = append(out, nameCandidate{db: db, dbID: dbID, entry: entry, isDefault: sd.ID == 0 && isDefaultDatabase(db), noTable: l.set.tableAbsent(sd.ID, entry)})
 		}
 		return out, nil
 	}
