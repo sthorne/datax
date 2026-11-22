@@ -1189,6 +1189,15 @@ state or the internode protocol does, and an entry below says so.
   cannot hold is now refused with `22P03`. A binary COPY field's buffer
   likewise grows with the data that arrives instead of being sized by
   the field's declared length.
+- **Client messages are capped, before authentication most of all.**
+  The server allocated the whole body a message header declared before
+  reading any of it, and set no cap. So a client that had sent only a
+  StartupMessage could cost about 2 GiB per connection with a 5-byte
+  header (`p` and a length of 0x7ffffff0). A message is now capped at
+  10000 bytes until the client has authenticated, and at 256 MiB after
+  (`ServerOptions.MaxMessageSize`; PostgreSQL's cap is 1 GB). A longer
+  message ends the connection with a FATAL `08P01` before its body is
+  allocated. COPY is unaffected: the cap is per CopyData message.
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the

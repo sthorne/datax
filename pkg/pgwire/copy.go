@@ -39,6 +39,8 @@ type copyDataReader struct {
 	buf     []byte // unread remainder of scratch
 	scratch []byte // owned copy of the latest CopyData payload
 	done    bool
+	// err is the failed receive that ended the stream, if one did.
+	err error
 }
 
 func (r *copyDataReader) Read(p []byte) (int, error) {
@@ -48,7 +50,7 @@ func (r *copyDataReader) Read(p []byte) (int, error) {
 		}
 		msg, err := r.backend.Receive()
 		if err != nil {
-			r.done = true
+			r.done, r.err = true, err
 			return 0, err
 		}
 		switch m := msg.(type) {
@@ -81,7 +83,7 @@ func (r *copyDataReader) drain() {
 	for !r.done {
 		msg, err := r.backend.Receive()
 		if err != nil {
-			r.done = true
+			r.done, r.err = true, err
 			return
 		}
 		switch msg.(type) {
@@ -117,6 +119,9 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	}
 
 	r := &copyDataReader{backend: c.backend}
+	// A CopyData over the message size cap ends the connection, once the
+	// COPY has been failed: the stream cannot be resynchronized.
+	defer func() { c.refuseOversized(r.err) }()
 	br := bufio.NewReaderSize(r, 64<<10)
 	var derr error
 	switch opts.Format {

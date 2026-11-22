@@ -593,7 +593,10 @@ write can carry: a statement that writes more than 60 MiB to one range
 in one piece is refused with `54000` (PostgreSQL allows a 1 GB field).
 Well below that a large value is already expensive — it is written,
 replicated and read whole, with no out-of-line storage — so values of
-more than a few MiB belong in large objects.
+more than a few MiB belong in large objects. One protocol message from
+a client is capped at 256 MiB (PostgreSQL: 1 GB); a longer one ends
+the connection with a FATAL `08P01`. COPY is not affected: its data
+arrives in many messages.
 
 ### Large objects
 

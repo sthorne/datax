@@ -423,11 +423,19 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	return res, serr
 }
 
+// newPreAuthBackend is a backend on nc with the pre-authentication
+// message size cap; startup lifts it once the client has authenticated.
+func newPreAuthBackend(nc net.Conn) *pgproto3.Backend {
+	be := pgproto3.NewBackend(nc, nc)
+	be.SetMaxBodyLen(maxPreAuthMessageSize)
+	return be
+}
+
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	session := sql.NewSession(db, cat)
 	session.SetStreaming(true)
 	c := &conn{
-		backend:  pgproto3.NewBackend(nc, nc),
+		backend:  newPreAuthBackend(nc),
 		nc:       nc,
 		session:  session,
 		opts:     opts,
@@ -466,6 +474,55 @@ func isLoopbackAddr(a net.Addr) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// Client message size caps (the body after the type byte and length).
+// pgproto3 allocates a message's declared length before it reads a byte
+// of the body, so without a cap 5 bytes from anyone who can open a
+// socket ('p' and a length of 0x7ffffff0) cost 2 GiB.
+const (
+	// maxPreAuthMessageSize bounds every message read before
+	// authentication completes. The SASL messages are a few hundred
+	// bytes; 10000 is PostgreSQL's MAX_STARTUP_PACKET_LENGTH, the bound
+	// pgproto3 itself applies to the startup packet (which is read by
+	// ReceiveStartupMessage, not under this cap).
+	maxPreAuthMessageSize = 10000
+	// DefaultMaxMessageSize bounds a message once the connection is
+	// authenticated. PostgreSQL's bound is 1 GB, its largest field; a
+	// datax value is bounded by what one replicated write carries
+	// (60 MiB to a range), so 256 MiB leaves room for such a value in a
+	// statement's text, hex-encoded (twice its size), with plenty to
+	// spare. COPY streams its data in CopyData messages that drivers cut
+	// at 64 KiB (pgx) or a row (psql), so its total size is unbounded.
+	DefaultMaxMessageSize = 256 << 20
+)
+
+// maxMessageSize is the post-authentication cap in force (0 = none).
+func (c *conn) maxMessageSize() int {
+	switch {
+	case c.opts.MaxMessageSize < 0:
+		return 0
+	case c.opts.MaxMessageSize == 0:
+		return DefaultMaxMessageSize
+	}
+	return c.opts.MaxMessageSize
+}
+
+// refuseOversized ends the connection when err is a message over the
+// size cap and reports whether it was: the client is told with a FATAL
+// 08P01 (protocol_violation, as PostgreSQL reports an invalid message
+// length) and the socket is closed. pgproto3 has read only the header,
+// so the stream is at an unknown point and nothing more can be read.
+func (c *conn) refuseOversized(err error) bool {
+	var tooLong *pgproto3.ExceededMaxBodyLenErr
+	if !errors.As(err, &tooLong) {
+		return false
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sendFatal(sql.CodeInvalidParameter, fmt.Sprintf("invalid message length: %d bytes exceeds the limit of %d",
+		tooLong.ActualBodyLen, tooLong.MaxExpectedBodyLen))
+	_ = c.nc.Close()
+	return true
 }
 
 // testingPanicOnMessage, when set, sees every message the message loop
@@ -550,6 +607,9 @@ func (c *conn) run(ctx context.Context) (err error) {
 			return err
 		}
 		if err != nil {
+			if c.refuseOversized(err) {
+				return err
+			}
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
 				return nil
@@ -674,6 +734,9 @@ func (c *conn) startup(ctx context.Context) error {
 	err := c.handleStartup(ctx)
 	_ = c.nc.SetDeadline(time.Time{})
 	c.authDeadline = time.Time{}
+	if err == nil {
+		c.backend.SetMaxBodyLen(c.maxMessageSize())
+	}
 	if err != nil && isTimeout(err) {
 		metrics.SQLPreAuthClosed.WithLabelValues(metrics.PreAuthHandshakeTimeout).Inc()
 		log.Audit("sql-preauth-closed", "remote", c.nc.RemoteAddr().String(), "cause", metrics.PreAuthHandshakeTimeout)
@@ -699,7 +762,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 					return err
 				}
 				c.nc = tc
-				c.backend = pgproto3.NewBackend(tc, tc)
+				c.backend = newPreAuthBackend(tc)
 				c.tlsDone = true
 				c.session.SetTransport(true, isLoopbackAddr(tc.RemoteAddr()))
 				continue
