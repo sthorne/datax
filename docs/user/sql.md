@@ -76,10 +76,14 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
   column converts (correctly rounded).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
-  operand demotes the expression to float. `AVG` of an `INT8` or a
-  `DECIMAL` is a DECIMAL rounded to 6 fractional digits (half-even), as
-  in PostgreSQL; `AVG(FLOAT8)` is a FLOAT8. Float values never
-  implicitly convert *to* DECIMAL.
+  operand demotes the expression to float. DECIMAL division, and `AVG`
+  of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use
+  PostgreSQL's result scale: at least 16 significant digits and at
+  least as many fractional digits as either operand, at most 1000,
+  halves rounded away from zero (`1::numeric / 3` is
+  `0.33333333333333333333`, `0.0000001::numeric / 3` is
+  `0.000000033333333333333333`). `AVG(FLOAT8)` is a FLOAT8. Float
+  values never implicitly convert *to* DECIMAL.
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored

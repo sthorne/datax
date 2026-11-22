@@ -204,6 +204,77 @@ func Cmp(a, b Dec) int {
 // DivQuantize returns a ÷ b rounded half-even to the given decimal scale
 // (digits after the point), then canonicalized. Division by zero errors.
 func DivQuantize(a, b Dec, scale int32) (Dec, error) {
+	return divRound(a, b, scale, true)
+}
+
+// Div returns a ÷ b rounded to the given decimal scale with halves away
+// from zero (PostgreSQL's numeric division), then canonicalized; the
+// SQL `/` and avg pick the scale with SelectDivScale. Division by zero
+// errors.
+func Div(a, b Dec, scale int32) (Dec, error) {
+	return divRound(a, b, scale, false)
+}
+
+// PostgreSQL's numeric display-scale limits (numeric.c).
+const (
+	numericMinSigDigits    = 16
+	numericMaxDisplayScale = 1000
+	numericMinDisplayScale = 0
+	nbaseDigits            = 4 // decimal digits per base-10000 digit
+)
+
+// Scale returns the number of digits after the point in the canonical
+// form (0 for an integer): the display scale a value carries when
+// nothing declared one.
+func (d Dec) Scale() int32 {
+	if d.Sign() == 0 || d.exp >= 0 {
+		return 0
+	}
+	return -d.exp
+}
+
+// SelectDivScale is PostgreSQL's select_div_scale: the result scale of
+// a ÷ b, given the operands' display scales. The quotient gets at least
+// 16 significant digits, and no fewer fractional digits than either
+// operand shows, within [0, 1000]. The quotient's weight is estimated
+// in base-10000 digits from the operands' leading digits, exactly as
+// numeric.c does, so the scale (and the trailing zeros shown) match.
+func SelectDivScale(a, b Dec, ascale, bscale int32) int32 {
+	w1, f1 := nbaseLead(a)
+	w2, f2 := nbaseLead(b)
+	qweight := w1 - w2
+	if f1 <= f2 {
+		qweight--
+	}
+	rscale := int64(numericMinSigDigits) - qweight*nbaseDigits
+	rscale = max(rscale, int64(ascale), int64(bscale), numericMinDisplayScale)
+	return int32(min(rscale, numericMaxDisplayScale))
+}
+
+// nbaseLead returns the weight and value of a's leading nonzero digit
+// in PostgreSQL's base-10000 representation (digit groups aligned on
+// the decimal point); zero has weight 0 and digit 0.
+func nbaseLead(a Dec) (weight, first int64) {
+	if a.Sign() == 0 {
+		return 0, 0
+	}
+	digits := new(big.Int).Abs(a.coeff).String()
+	e := int64(len(digits)) + int64(a.exp) - 1 // power of ten of the first digit
+	weight = e / nbaseDigits
+	if e%nbaseDigits < 0 {
+		weight--
+	}
+	lead := int(e - weight*nbaseDigits + 1) // 1..4 decimal digits
+	for i := 0; i < lead; i++ {
+		first *= 10
+		if i < len(digits) {
+			first += int64(digits[i] - '0')
+		}
+	}
+	return weight, first
+}
+
+func divRound(a, b Dec, scale int32, halfEven bool) (Dec, error) {
 	if b.Sign() == 0 {
 		return Dec{}, fmt.Errorf("division by zero")
 	}
@@ -228,7 +299,8 @@ func DivQuantize(a, b Dec, scale int32) (Dec, error) {
 			den.Mul(den, ten)
 		}
 	}
-	// Round half-even on |num/den|, then restore the sign.
+	// Round |num/den| (half-even or half away from zero), then restore
+	// the sign.
 	sign := num.Sign() * den.Sign()
 	num.Abs(num)
 	den.Abs(den)
@@ -237,8 +309,8 @@ func DivQuantize(a, b Dec, scale int32) (Dec, error) {
 	switch c := r.Cmp(den); {
 	case c > 0:
 		q.Add(q, big.NewInt(1))
-	case c == 0: // exactly half: round to even
-		if q.Bit(0) == 1 {
+	case c == 0: // exactly half
+		if !halfEven || q.Bit(0) == 1 {
 			q.Add(q, big.NewInt(1))
 		}
 	}

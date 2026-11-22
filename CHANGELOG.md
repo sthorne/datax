@@ -2088,6 +2088,15 @@ state or the internode protocol does, and an entry below says so.
   binary's version: one restarting into a newer cluster is refused at
   re-announce or join, and a running one that sees the version pass it
   stops serving, never adopting or persisting the version.
+- **Numeric division and `avg` keep PostgreSQL's precision.** DECIMAL
+  `/` and `avg` over DECIMAL or integer columns rounded to a fixed 6
+  fractional digits, half to even, so `0.0000005::numeric / 1` gave
+  `0`, `1::numeric / 3` gave `0.333333` (PostgreSQL:
+  `0.33333333333333333333`) and a filter such as `WHERE x / y > 1e-7`
+  silently dropped rows. Both now use PostgreSQL's result scale (at
+  least 16 significant digits and at least either operand's scale, at
+  most 1000), round halves away from zero, and show the result at that
+  scale with PostgreSQL's trailing zeros, in text and binary.
 - **`DECIMAL(p,s)` columns round halves away from zero, as PostgreSQL
   does.** A value written to a `DECIMAL(p,s)` / `NUMERIC(p,s)` column
   rounded half to even, so `1.005` into `DECIMAL(10,2)` stored `1.00`

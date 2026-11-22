@@ -1958,11 +1958,11 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 		case "*":
 			return types.NewDecimal(decimal.Mul(lv, rv).String()), nil
 		case "/":
-			q, err := decimal.DivQuantize(lv, rv, 6)
-			if err != nil {
-				return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+			q, derr := divideDecimal(lv, rv, max(lv.Scale(), ld.Dscale), max(rv.Scale(), rd.Dscale))
+			if derr != nil {
+				return types.Datum{}, derr
 			}
-			return types.NewDecimal(q.String()), nil
+			return q, nil
 		}
 	}
 	lf, err := l.Coerce(types.Float)
@@ -3137,4 +3137,24 @@ func byteaConcatOperands(e parser.Expr, l, r types.Datum) (types.Datum, types.Da
 		}
 	}
 	return l, r
+}
+
+// divideDecimal is numeric division as PostgreSQL does it: the result
+// scale is select_div_scale's (at least 16 significant digits, at least
+// either operand's display scale lscale/rscale, at most 1000), the
+// quotient rounds half away from zero at it, and the datum carries that
+// scale for display (1::numeric/3 is 0.33333333333333333333). A zero
+// divisor is SQLSTATE 22012.
+func divideDecimal(lv, rv decimal.Dec, lscale, rscale int32) (types.Datum, *Error) {
+	if rv.Sign() == 0 {
+		return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+	}
+	scale := decimal.SelectDivScale(lv, rv, lscale, rscale)
+	q, err := decimal.Div(lv, rv, scale)
+	if err != nil {
+		return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "%v", err)
+	}
+	out := types.NewDecimal(q.String())
+	out.Dscale = scale
+	return out, nil
 }

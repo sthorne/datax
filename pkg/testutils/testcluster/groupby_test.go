@@ -236,7 +236,7 @@ func TestGroupBySession(t *testing.T) {
 	if len(res.Rows) != 3 {
 		t.Fatalf("rows: %+v", res.Rows)
 	}
-	if res.Rows[0][1].I != 10 || res.Rows[0][2].I != 20 || res.Rows[0][3].Fam != types.Decimal || res.Rows[0][3].Text() != "15" {
+	if res.Rows[0][1].I != 10 || res.Rows[0][2].I != 20 || res.Rows[0][3].Fam != types.Decimal || res.Rows[0][3].Text() != "15.0000000000000000" {
 		t.Fatalf("group 1: %+v", res.Rows[0]) // AVG of integers is DECIMAL, as in PostgreSQL
 	}
 

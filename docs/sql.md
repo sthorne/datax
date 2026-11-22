@@ -108,8 +108,14 @@ SHOW STATS FOR t
 - DECIMAL is exact arbitrary-precision arithmetic (`math/big` coefficient
   × 10^exp). Non-integer numeric literals are DECIMAL, as in PostgreSQL —
   `0.1` survives to a DECIMAL column unrounded, and `SUM`/`AVG` over
-  DECIMAL stay exact where float64 breaks (`AVG` quantizes to 6 fractional
-  digits, round-half-even). Int operands mix exactly; a FLOAT8 operand
+  DECIMAL stay exact where float64 breaks. Division and `AVG` (sum ÷
+  count) take PostgreSQL's `select_div_scale` result scale — at least 16
+  significant digits (the quotient's weight estimated in base-10000
+  digits, as numeric.c does), at least either operand's display scale,
+  within [0, 1000] — rounded half away from zero, and the datum carries
+  that scale as its display-only `Dscale`, so the text shows PostgreSQL's
+  trailing zeros (`1::numeric / 3` → `0.33333333333333333333`). Int
+  operands mix exactly; a FLOAT8 operand
   demotes the expression to float. Float→Decimal coercion is rejected —
   cast through text if you really mean it.
 - `DECIMAL(p,s)` is enforced at the two row-completion choke points every
