@@ -2068,6 +2068,20 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Health sees replicas that a live node cannot serve.** A raft-engine
+  write error (ENOSPC, EIO) or a failed apply stops a replica's group
+  until the node restarts, but the replica stayed in the store map with
+  only a log line, and a replica lost before it reached disk is never
+  loaded. Either way the node kept heartbeating, so `quorum-lost` and
+  `under-replicated`, computed from liveness alone, said nothing while a
+  range ran a replica short or had no quorum. Each node now reports such
+  replicas in its heartbeat (failed ones at once, ranges whose
+  descriptor has named it for over a minute with no replica loaded as
+  missing), exports them as the new gauges `datax_replicas_failed` and
+  `datax_replicas_missing`, and the health check counts them as
+  unavailable and raises the new checks `replicas-failed` (critical) and
+  `replicas-missing` (warning). Additive heartbeat fields, so no version
+  gate. Dead-node repair still acts on liveness only.
 - **A backup reported written survives a power loss.** Backup data
   files, the manifest, their renames and the destination directory were
   never fsynced, nor was `metadata-backup.json`, so a power loss soon

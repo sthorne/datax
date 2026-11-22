@@ -584,6 +584,9 @@ type Node struct {
 	consistencyFailures atomic.Int64
 	// health caches the problems panel (see health_api.go).
 	health healthCache
+	// replicaHealth is what the node last found of its replicas that do
+	// not serve although it is up (see replica_health.go).
+	replicaHealth replicaHealth
 	// cat is the node's own catalog accessor (the SQL server and the
 	// metrics recorder share it); catOnce builds it on first use.
 	cat     *catalog.Accessor

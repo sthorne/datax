@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -546,6 +547,21 @@ func (s *Store) LocalDescriptor(id base.RangeID) (kvpb.RangeDescriptor, bool) {
 		return kvpb.RangeDescriptor{}, false
 	}
 	return r.Desc(), true
+}
+
+// FailedReplicas lists, in order, the ranges whose replica on this store
+// was stopped by a failure (Replica.Failed): still in the store map,
+// serving nothing until the node restarts.
+func (s *Store) FailedReplicas() []base.RangeID {
+	var out []base.RangeID
+	s.VisitReplicas(func(r *Replica) bool {
+		if r.Failed() {
+			out = append(out, r.rangeID)
+		}
+		return true
+	})
+	slices.Sort(out)
+	return out
 }
 
 // VisitReplicas calls f for each replica until it returns false.
