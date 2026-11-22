@@ -536,6 +536,10 @@ type Node struct {
 	// be initiated from any node) and re-asserts it on every beat, so the
 	// flag survives both heartbeat overwrites and restarts.
 	draining atomic.Bool
+	// versionRefused is set once the node has seen a finalized cluster
+	// version above what its binary supports and begun to stop (see
+	// mirrorClusterVersion).
+	versionRefused atomic.Bool
 	// shuttingDown is set by Drain: the node is shedding its leases and
 	// SQL connections ahead of a stop, and says so in its heartbeats.
 	shuttingDown atomic.Bool
@@ -972,8 +976,11 @@ func (n *Node) start() error {
 		// persisted registry — BEFORE raft groups spin up, so peers stop
 		// dialing the old address and their responses can find us. Purely
 		// best-effort: peers that moved too are healed by piggybacked
-		// addresses on raft envelopes once any link forms.
-		n.reannounce()
+		// addresses on raft envelopes once any link forms. Its one hard
+		// failure: a peer at a cluster version above this binary's.
+		if err := n.reannounce(); err != nil {
+			return err
+		}
 	}
 
 	// Bring up replicas: restart from disk, or create the fresh range 1.
@@ -1101,7 +1108,10 @@ func loadLocalRange1(eng *storage.Engine) (kvpb.RangeDescriptor, bool, error) {
 // best-effort. Successful responses carry the fresh node
 // list the peer holds — including addresses of other nodes that also moved
 // — which is what re-forms a cluster restarted entirely on new addresses.
-func (n *Node) reannounce() {
+// The one error it returns is a peer reporting a finalized cluster version
+// above this binary's: the store-local downgrade gate misses a node that
+// was down when the cluster finalized, and such a node must not start.
+func (n *Node) reannounce() error {
 	// Keyed by the address as given (the join target) or the peer's
 	// public address; the address dialed is chosen in the announcing
 	// goroutine, since proving a peer's locality address takes a dial.
@@ -1115,7 +1125,7 @@ func (n *Node) reannounce() {
 		}
 	}
 	if len(targets) == 0 {
-		return
+		return nil
 	}
 	req := cluster.JoinRequest{
 		Address:           n.addr,
@@ -1127,8 +1137,10 @@ func (n *Node) reannounce() {
 		MinSupported:      int(n.minSupportedVersion()),
 	}
 	var (
-		wg sync.WaitGroup
-		mu sync.Mutex // guards n.joinRange1 across the announce goroutines
+		wg       sync.WaitGroup
+		mu       sync.Mutex // guards n.joinRange1 and tooNew across the announce goroutines
+		tooNew   version.Version
+		tooNewAt string
 	)
 	for _, target := range targets {
 		wg.Add(1)
@@ -1155,14 +1167,30 @@ func (n *Node) reannounce() {
 			if resp.Range1.RangeID != 0 && n.joinRange1.RangeID == 0 {
 				n.joinRange1 = resp.Range1
 			}
+			if cv := version.Version(resp.ClusterVersion); cv > n.binaryVersion() && cv > tooNew {
+				tooNew, tooNewAt = cv, addr
+			}
 			mu.Unlock()
 			log.Infof("re-announced %s at %s via %s", n.ident.NodeID, n.addr, addr)
 		}(target)
 	}
 	wg.Wait()
+	if tooNew != 0 {
+		return tooNewVersionError(tooNew, n.binaryVersion(), "the peer at "+tooNewAt)
+	}
 	if err := cluster.PersistRegistry(n.engine, n.registry.All()); err != nil {
 		log.Debugf("persisting registry: %v", err)
 	}
+	return nil
+}
+
+// tooNewVersionError is the refusal of a node whose binary is older than
+// the cluster's finalized version.
+func tooNewVersionError(cv, bv version.Version, source string) error {
+	return fmt.Errorf(
+		"%s reports cluster version %s but this binary supports at most %s: "+
+			"downgrading a node after the cluster upgrade was finalized is not supported; "+
+			"restart it on a binary that supports %s", source, cv, bv, cv)
 }
 
 // binaryVersion is the protocol version this node runs (and advertises):
@@ -1214,6 +1242,10 @@ func (n *Node) join() error {
 	}
 	if resp.Error != "" {
 		return fmt.Errorf("join rejected: %s", resp.Error)
+	}
+	// The joiner checks the version too, not only the node it asked.
+	if cv := version.Version(resp.ClusterVersion); cv > n.binaryVersion() {
+		return tooNewVersionError(cv, n.binaryVersion(), "the cluster (via "+n.cfg.Join+")")
 	}
 	n.ident = cluster.StoreIdent{ClusterID: resp.ClusterID, NodeID: resp.NodeID, StoreID: base.StoreID(resp.NodeID)}
 	if err := cluster.WriteStoreIdent(n.engine, n.ident); err != nil {

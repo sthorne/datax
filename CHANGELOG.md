@@ -2030,6 +2030,19 @@ state or the internode protocol does, and an entry below says so.
   once per created replica, before its raft group starts. A store that
   drops raft messages for a range it holds raft state for now logs a
   rate-limited warning instead of a debug line.
+- **Finalizing an upgrade no longer ignores nodes that are down or
+  draining.** `datax debug upgrade` checked only live, non-draining
+  nodes, so a node down (or decommissioning) on the old binary could
+  come back, or keep serving, under the new cluster version: it failed
+  to apply commands it did not know, skipped the write and moved on, and
+  its replicas diverged. Finalize now refuses while any node that may
+  hold replicas is not known to run the new binary (every registry row
+  except fully decommissioned nodes, and every node in a range
+  descriptor), and names each one with what to do: restart it on the
+  new binary or decommission it. A node also never runs above its
+  binary's version: one restarting into a newer cluster is refused at
+  re-announce or join, and a running one that sees the version pass it
+  stops serving, never adopting or persisting the version.
 - **A range under a steady write load keeps its closed timestamp.**
   A closed-timestamp promise at T now waits only for writes that could
   still land at or below T; writes at current timestamps and
