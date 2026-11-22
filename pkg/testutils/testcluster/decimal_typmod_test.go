@@ -334,3 +334,80 @@ func TestDecimalTypmodRoundsHalfAwayFromZero(t *testing.T) {
 		t.Errorf("stored value differs from the cast: count %s", got)
 	}
 }
+
+// TestAlterColumnTypeNarrowsDecimalScale: ALTER COLUMN ... TYPE
+// DECIMAL(p,s) with a smaller scale rounds the stored values like every
+// other write into the column (halves away from zero), not just checks
+// them, and a value that no longer fits fails with 22003 and leaves the
+// table as it was. Expected values are PostgreSQL 16's.
+func TestAlterColumnTypeNarrowsDecimalScale(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	scfg, _ := pgx.ParseConfig(pgURL(tc, 0))
+	scfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol // text results
+	conn, err := pgx.ConnectConfig(ctx, scfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	exec := func(q string) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	rows := func(q string) string {
+		t.Helper()
+		rs, err := conn.Query(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		var out []string
+		for rs.Next() {
+			var s string
+			if err := rs.Scan(&s); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out = append(out, s)
+		}
+		if err := rs.Err(); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return strings.Join(out, ";")
+	}
+
+	exec(`CREATE TABLE nar (id INT8 PRIMARY KEY, c DECIMAL(10,3), a DECIMAL(10,3)[], b NUMERIC)`)
+	exec(`INSERT INTO nar VALUES (1, 1.005, '{1.005,-2.125}', 1.005), (2, 2.125, NULL, -2.125), (3, -1.005, NULL, NULL)`)
+	exec(`ALTER TABLE nar ALTER COLUMN c TYPE DECIMAL(10,2)`)
+	exec(`ALTER TABLE nar ALTER COLUMN a TYPE DECIMAL(10,2)[]`)
+	exec(`ALTER TABLE nar ALTER COLUMN b TYPE DECIMAL(10,2)`)
+	want := "1|1.01|{1.01,-2.13}|1.01;2|2.13|NULL|-2.13;3|-1.01|NULL|NULL"
+	if got := rows(`SELECT id::text || '|' || c::text || '|' || coalesce(a::text, 'NULL') || '|' || coalesce(b::text, 'NULL') FROM nar ORDER BY id`); got != want {
+		t.Errorf("after narrowing: got %s, want %s", got, want)
+	}
+	// The stored value is the rounded one, not just its display.
+	if got := rows(`SELECT id::text FROM nar WHERE c = 1.01 OR c = 2.13 OR c = -1.01 ORDER BY id`); got != "1;2;3" {
+		t.Errorf("stored values: rows matching the rounded values: %s", got)
+	}
+
+	// Overflow on narrowing, before and only after rounding: 22003.
+	exec(`CREATE TABLE nov (id INT8 PRIMARY KEY, c DECIMAL(10,3))`)
+	exec(`INSERT INTO nov VALUES (1, 12.345)`)
+	exec(`INSERT INTO nov VALUES (2, 99.995)`)
+	expectCode(t, ctx, conn, `ALTER TABLE nov ALTER COLUMN c TYPE DECIMAL(4,2)`, "22003")
+	exec(`DELETE FROM nov WHERE id = 2`)
+	exec(`INSERT INTO nov VALUES (3, 123.4)`)
+	expectCode(t, ctx, conn, `ALTER TABLE nov ALTER COLUMN c TYPE DECIMAL(4,2)`, "22003")
+	if got := rows(`SELECT c::text FROM nov ORDER BY id`); got != "12.345;123.400" {
+		t.Errorf("after a failed ALTER: got %s, want 12.345;123.400", got)
+	}
+
+	// Narrowing an array's element type checks every element too (it
+	// was a descriptor-only change that kept values the new type
+	// cannot hold).
+	exec(`CREATE TABLE narr (id INT8 PRIMARY KEY, v VARCHAR(10)[], i INT8[])`)
+	exec(`INSERT INTO narr VALUES (1, '{abcdef}', '{70000}')`)
+	expectCode(t, ctx, conn, `ALTER TABLE narr ALTER COLUMN v TYPE VARCHAR(3)[]`, "22001")
+	expectCode(t, ctx, conn, `ALTER TABLE narr ALTER COLUMN i TYPE INT2[]`, "22003")
+}

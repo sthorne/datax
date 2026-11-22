@@ -76,10 +76,14 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
   column converts (correctly rounded).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
-  operand demotes the expression to float. `AVG` of an `INT8` or a
-  `DECIMAL` is a DECIMAL rounded to 6 fractional digits (half-even), as
-  in PostgreSQL; `AVG(FLOAT8)` is a FLOAT8. Float values never
-  implicitly convert *to* DECIMAL.
+  operand demotes the expression to float. DECIMAL division, and `AVG`
+  of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use
+  PostgreSQL's result scale: at least 16 significant digits and at
+  least as many fractional digits as either operand, at most 1000,
+  halves rounded away from zero (`1::numeric / 3` is
+  `0.33333333333333333333`, `0.0000001::numeric / 3` is
+  `0.000000033333333333333333`). `AVG(FLOAT8)` is a FLOAT8. Float
+  values never implicitly convert *to* DECIMAL.
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored
@@ -482,9 +486,12 @@ conversion is the type's cast: widening (`INT8` to `DECIMAL` or
 `FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
 typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
 `BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
-typmod change rescales, and a change of integer width, character
-length or timestamp form checks every stored value against the new
-modifier (`22003` / `22001`). A value that cannot convert fails the
+typmod change rescales every stored value as a write into the column
+does (halves away from zero: `1.005` to `DECIMAL(10,2)` is `1.01`) and
+fails with `22003` when one no longer fits, and a change of integer
+width, character length or timestamp form checks every stored value
+against the new modifier (`22003` / `22001`). An array column's
+modifiers are its elements', and change the same way. A value that cannot convert fails the
 statement (`22P02`) and the column is left as it was. A modifier change
 that cannot lose a value (a wider integer, a longer `VARCHAR`, more
 timestamp digits) skips the rewrite: one descriptor write, and the

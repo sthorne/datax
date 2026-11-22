@@ -310,6 +310,11 @@ func EncodeValue(desc *catalog.TableDescriptor, row map[catalog.ColumnID]types.D
 		if d, err = named.Conform(d); err != nil {
 			return nil, err // a *catalog.ValueError: the caller keeps its SQLSTATE
 		}
+		// A DECIMAL(p,s) target rounds (and overflow-checks) the value
+		// as every other write into the column does.
+		if d, err = named.ConformDecimal(d); err != nil {
+			return nil, err
+		}
 		row[col.ID] = d
 	}
 	ids := make([]catalog.ColumnID, 0, len(row))

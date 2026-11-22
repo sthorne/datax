@@ -505,13 +505,13 @@ func TestExpressionsJSONAndAggregates(t *testing.T) {
 			t.Errorf("%s\n  got  %q\n  want %q", q, got, want)
 		}
 	}
-	check(`SELECT count(*), count(qty), count(DISTINCT qty), sum(DISTINCT qty), sum(qty * 2), avg(amount) FROM o`, "5|4|3|6|16|12.625")
+	check(`SELECT count(*), count(qty), count(DISTINCT qty), sum(DISTINCT qty), sum(qty * 2), avg(amount) FROM o`, "5|4|3|6|16|12.6250000000000000")
 	check(`SELECT min(amount + 1), max(upper(city)), max(length(city) * qty) FROM o`, "6|ROME|12")
 	check(`SELECT string_agg(city, ',') FROM o`, "oslo,oslo,oslo,rome,rome")
 	check(`SELECT string_agg(DISTINCT city, ', ') FROM o`, "oslo, rome")
 	check(`SELECT array_agg(qty) FROM o`, "{1,2,3,2,NULL}")
 	check(`SELECT bool_and(ok), bool_or(ok), every(ok) FROM o`, "f|t|f")
-	check(`SELECT count(*) FILTER (WHERE ok), sum(amount) FILTER (WHERE city = 'rome'), avg(qty) FILTER (WHERE qty > 1) FROM o`, "3|20|2.333333")
+	check(`SELECT count(*) FILTER (WHERE ok), sum(amount) FILTER (WHERE city = 'rome'), avg(qty) FILTER (WHERE qty > 1) FROM o`, "3|20|2.3333333333333333")
 	check(`SELECT stddev(qty), var_pop(qty), stddev_pop(amount) FROM o`, "0.816496580927726|0.5|5.53821947921893")
 	check(`SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY qty), percentile_disc(0.5) WITHIN GROUP (ORDER BY amount), percentile_cont(0.25) WITHIN GROUP (ORDER BY qty DESC) FROM o`, "2|10.5|2.25")
 	check(`SELECT jsonb_agg(qty), jsonb_object_agg(id, city) FROM o WHERE id <= 2`, `[1,2]|{"1":"oslo","2":"oslo"}`)

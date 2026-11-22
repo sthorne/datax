@@ -79,7 +79,8 @@ func TestWindowFunctions(t *testing.T) {
 	expect(`SELECT id, sum(amount) OVER (PARTITION BY region ORDER BY id) AS running, sum(amount) OVER (PARTITION BY region) AS total, count(*) OVER () AS n FROM sales ORDER BY id`,
 		"1|10|60|6", "2|40|60|6", "3|60|60|6", "4|5|60|6", "5|10|60|6", "6|60|60|6")
 	expect(`SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sliding, avg(amount) OVER (ORDER BY id ROWS 2 PRECEDING) AS trailing FROM sales ORDER BY id`,
-		"1|40|10", "2|60|20", "3|55|20", "4|30|18.333333", "5|60|10", "6|55|20")
+		"1|40|10.0000000000000000", "2|60|20.0000000000000000", "3|55|20.0000000000000000",
+		"4|30|18.3333333333333333", "5|60|10.0000000000000000", "6|55|20.0000000000000000")
 	expect(`SELECT id, count(*) OVER (ORDER BY amount) AS peers_incl FROM sales ORDER BY id`, "1|3", "2|5", "3|4", "4|2", "5|2", "6|6")
 	expect(`SELECT id, string_agg(note, ',') OVER (PARTITION BY region ORDER BY id) FROM sales ORDER BY id`, "1|a", "2|a", "3|a,c", "4|d", "5|d", "6|d,f")
 	// WHERE filters before the window stage, as in PostgreSQL.
