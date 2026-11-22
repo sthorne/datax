@@ -1173,6 +1173,16 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **An Admin RPC can no longer stop a node through its clock.** The
+  Admin RPC ratcheted the node's clock to the caller's timestamp before
+  authorizing anything, and a timestamp past `--max-offset` exited the
+  process, so any client certificate (or anyone, on an insecure cluster)
+  could stop a node, sealed or not, with one call. A caller without the
+  node certificate no longer moves the clock at all, and a Join or Admin
+  call whose timestamp is past `--max-offset` now fails with
+  `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
+  Snapshot messages from authenticated node peers still exit on a clock
+  past `--max-offset`, as documented.
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the
@@ -2043,6 +2053,18 @@ state or the internode protocol does, and an entry below says so.
   binary's version: one restarting into a newer cluster is refused at
   re-announce or join, and a running one that sees the version pass it
   stops serving, never adopting or persisting the version.
+- **`DECIMAL(p,s)` columns round halves away from zero, as PostgreSQL
+  does.** A value written to a `DECIMAL(p,s)` / `NUMERIC(p,s)` column
+  rounded half to even, so `1.005` into `DECIMAL(10,2)` stored `1.00`
+  and `2.5` into `DECIMAL(5,0)` stored `2` (PostgreSQL: `1.01` and
+  `3`), while `SELECT 1.005::decimal(10,2)` already gave `1.01`. Every
+  write path (INSERT, UPDATE, ON CONFLICT, COPY, text input, prepared
+  parameters, column defaults) now rounds like the cast; negative
+  values round away from zero too (`-1.005` → `-1.01`). This changes
+  the stored value of new writes only: rows already stored keep the
+  value they were rounded to, and a value that ties now may land on a
+  different primary or unique key than an identical value written
+  before the upgrade.
 - **A range under a steady write load keeps its closed timestamp.**
   A closed-timestamp promise at T now waits only for writes that could
   still land at or below T; writes at current timestamps and

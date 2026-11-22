@@ -10,11 +10,16 @@ import (
 func TestEnforceTypmod(t *testing.T) {
 	col := catalog.Column{Name: "amt", Type: types.Decimal, Precision: 4, Scale: 2}
 
-	// Rescale round-half-even; canonical S, declared Dscale.
+	// Rescale with halves away from zero, as PostgreSQL does; canonical
+	// S, declared Dscale.
 	for _, c := range []struct{ in, s string }{
 		{"9.9", "9.9"},
-		{"1.005", "1"}, // ties to even
+		{"1.005", "1.01"}, // half away from zero, not to even (1.00)
 		{"1.015", "1.02"},
+		{"1.025", "1.03"},
+		{"1.0049", "1"},
+		{"-1.005", "-1.01"},
+		{"-1.0049", "-1"},
 		{"-1.006", "-1.01"},
 		{"99.994", "99.99"},
 	} {
@@ -27,8 +32,17 @@ func TestEnforceTypmod(t *testing.T) {
 		}
 	}
 
+	// Scale 0: 2.5 → 3, -2.5 → -3, 3.5 → 4 (half-even gave 2, -2, 4).
+	int5 := catalog.Column{Name: "n", Type: types.Decimal, Precision: 5, Scale: 0}
+	for _, c := range []struct{ in, s string }{{"2.5", "3"}, {"-2.5", "-3"}, {"3.5", "4"}, {"0.5", "1"}, {"-0.4", "0"}} {
+		d, err := enforceTypmod(int5, types.NewDecimal(c.in))
+		if err != nil || d.S != c.s {
+			t.Fatalf("%q into DECIMAL(5,0): got %q, %v; want %q", c.in, d.S, err, c.s)
+		}
+	}
+
 	// Overflow: integer digits exceed p−s — including only-after-rounding.
-	for _, in := range []string{"100", "-100", "99.995", "123.4"} {
+	for _, in := range []string{"100", "-100", "99.995", "-99.995", "123.4"} {
 		if _, err := enforceTypmod(col, types.NewDecimal(in)); err == nil {
 			t.Fatalf("%q: accepted", in)
 		} else if e, ok := err.(*Error); !ok || e.Code != CodeNumericValueOutOfRange {

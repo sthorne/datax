@@ -114,7 +114,8 @@ SHOW STATS FOR t
   cast through text if you really mean it.
 - `DECIMAL(p,s)` is enforced at the two row-completion choke points every
   write funnels through (insert-row build — INSERT, COPY, defaults — and
-  the UPDATE SET loop): values quantize to scale `s` round-half-even,
+  the UPDATE SET loop): values round to scale `s` with halves away from zero (PostgreSQL's
+  rule, and the `::numeric(p,s)` cast's),
   then overflow past `p−s` integer digits is SQLSTATE `22003` (checked
   after rounding, so `9.999` into `DECIMAL(3,2)` rounds to `10.00` and
   then overflows — PostgreSQL order). Quantization happens before key
