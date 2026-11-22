@@ -463,6 +463,36 @@ record COMMITTED; any missing → ABORTED. Recovery and the coordinator's
 own finalize are idempotent and commute. GC never reclaims `STAGING`
 records.
 
+"Present" means the staged write itself, not any intent of the
+transaction. The coordinator sends the in-flight batch with the staged
+record's own epoch and sequence, and a push of a `STAGING` record
+returns them (`PushTxnResponse.StagedEpoch`, `StagedSequence`); the
+probe counts an intent only at that epoch and at that sequence or above
+(`stagedWritePresent`). An earlier write of the transaction to the same
+key, from an earlier statement (a lower sequence) or an earlier epoch,
+also sits at or below the staged timestamp, and counting it would commit
+the earlier statement without the final one if the final batch never
+landed. Such an intent counts as missing, and the prevention read keeps
+the final write from landing beneath it: a final write still in flight
+from a live coordinator lands above the staged timestamp, the
+coordinator settles classically, and its finalize finds the record
+ABORTED and reports the error. A push answered by a leaseholder from
+before these fields carries sequence 0 (a parallel commit always stages
+at 1 or above); the probe then matches on the transaction ID alone, as
+before, so a mixed-version cluster is no less safe than the old binary
+and never leaves a record unrecoverable.
+
+From cluster version v25 the `RecoverTxn` also names the staged record
+it verified (`StagedTS`, `StagedEpoch`, `StagedSequence`), and the
+record is finalized only if it is still staged at exactly those. A
+transaction that re-staged in between, at a new epoch or timestamp with
+a new in-flight set, keeps its record `STAGING` for a fresh recovery
+instead of being finalized on a verdict about the old one. The fields
+are sent only once v25 is finalized: a v24 replica would drop them and
+finalize what a v25 replica refuses, and the replicas of the record's
+range would diverge. Below v25, `RecoverTxn` finalizes whatever is
+staged, as before.
+
 On the write-only kv workload (implicit UPDATEs), the shorter
 intent-hold window roughly triples committed throughput.
 

@@ -194,6 +194,15 @@ func (db *DB) CPutsOK() bool {
 	return db.ClusterVersion() >= version.V24
 }
 
+// recoverGuardOK reports whether a RecoverTxnRequest may name the staged
+// record it verified (StagedTS, StagedEpoch, StagedSequence): they were
+// introduced under cluster version v25, and an older replica drops them
+// and would finalize a record a newer one leaves as is (pkg/version
+// rule 4).
+func (db *DB) recoverGuardOK() bool {
+	return db.ClusterVersion() >= version.V25
+}
+
 // ClusterVersion reports the finalized cluster version the gate observes
 // (the binary's own version when no gate is installed: a single-binary
 // process).

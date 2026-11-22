@@ -122,3 +122,81 @@ func TestGCEnumeratesBothRecordEncodings(t *testing.T) {
 		}
 	}
 }
+
+// TestRecoverTxnOnlyFinalizesVerifiedRecord: a push of a STAGING record
+// reports the staged epoch and sequence status recovery needs, and a
+// RecoverTxn naming the staged record it verified finalizes only that
+// record. One naming another epoch, sequence or timestamp (the
+// transaction re-staged since) leaves the record STAGING; one naming
+// nothing (a recoverer from before cluster version v25) finalizes it as
+// before.
+func TestRecoverTxnOnlyFinalizesVerifiedRecord(t *testing.T) {
+	eng, err := storage.Open("", storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eng.Close() }()
+	r := &Replica{}
+	for _, tt := range []struct {
+		name     string
+		edit     func(req *kvpb.RecoverTxnRequest)
+		finalize bool
+	}{
+		{"verified", func(*kvpb.RecoverTxnRequest) {}, true},
+		{"unguarded", func(req *kvpb.RecoverTxnRequest) { req.StagedTS = hlc.Timestamp{} }, true},
+		{"other-epoch", func(req *kvpb.RecoverTxnRequest) { req.StagedEpoch = 0 }, false},
+		{"other-sequence", func(req *kvpb.RecoverTxnRequest) { req.StagedSequence = 3 }, false},
+		{"other-timestamp", func(req *kvpb.RecoverTxnRequest) { req.StagedTS = hlc.Timestamp{WallTime: 9} }, false},
+	} {
+		for _, commit := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/commit=%v", tt.name, commit), func(t *testing.T) {
+				b := eng.NewBatch()
+				defer func() { _ = b.Close() }()
+				txn := kvpb.NewTransaction("t", 5, hlc.Timestamp{WallTime: 10})
+				txn.Key = keys.Key("anchor")
+				txn.Epoch, txn.Sequence = 1, 4
+				txn.Status = enginepb.STAGING
+				txn.InFlightKeys = []keys.Key{keys.Key("a")}
+				key := txnRecordKey(&txn.TxnMeta)
+				if err := putTxnRecord(b, key, txn); err != nil {
+					t.Fatal(err)
+				}
+				push, perr := r.evalPushTxn(b, &kvpb.PushTxnRequest{PusheeTxn: txn.TxnMeta, Now: hlc.Timestamp{WallTime: 11}})
+				if perr != nil {
+					t.Fatal(perr)
+				}
+				if push.Status != enginepb.STAGING || push.StagedEpoch != 1 || push.StagedSequence != 4 ||
+					!push.CommitTS.Equal(txn.WriteTimestamp) {
+					t.Fatalf("push of a staged record = %+v", push)
+				}
+				req := &kvpb.RecoverTxnRequest{
+					RequestHeader:  kvpb.RequestHeader{Key: txn.Key},
+					TxnID:          txn.ID,
+					Commit:         commit,
+					StagedTS:       push.CommitTS,
+					StagedEpoch:    push.StagedEpoch,
+					StagedSequence: push.StagedSequence,
+				}
+				tt.edit(req)
+				resp, rerr := r.evalRecoverTxn(b, req)
+				if rerr != nil {
+					t.Fatal(rerr)
+				}
+				want := enginepb.STAGING
+				switch {
+				case tt.finalize && commit:
+					want = enginepb.COMMITTED
+				case tt.finalize:
+					want = enginepb.ABORTED
+				}
+				rec, err := loadTxnRecord(b, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.Status != want || rec.Status != want {
+					t.Fatalf("recover answered %s, record %s; want %s", resp.Status, rec.Status, want)
+				}
+			})
+		}
+	}
+}

@@ -1958,11 +1958,45 @@ func (t *Txn) parallelCommit(ctx context.Context, wb *WriteBatch) error {
 	return nil
 }
 
+// stagedWritePresent reports whether the intents a status-recovery probe
+// ran into include the staged in-flight write itself. Matching the
+// transaction ID is not enough: the transaction may have written the key
+// before, at a lower sequence (an earlier statement, flushed), or at an
+// earlier epoch (before a restart), and that intent stays at or below the
+// staged timestamp while the in-flight rewrite may never land. Counting
+// it would commit the earlier statement without the final one. The
+// coordinator sends the in-flight writes with the staged record's own
+// epoch and sequence, so only an intent at that epoch and at that
+// sequence or above is the in-flight write. A push answered by a
+// leaseholder from before the staged fields carries StagedSequence 0 (a
+// parallel commit always stages at 1 or above); recovery then matches on
+// the ID alone, as before, rather than never finalizing the record.
+func stagedWritePresent(intents []storage.Intent, pushee uuid.UUID, push *kvpb.PushTxnResponse) bool {
+	for _, in := range intents {
+		if in.Txn.ID != pushee {
+			continue
+		}
+		if push.StagedSequence == 0 {
+			return true
+		}
+		if in.Txn.Epoch == push.StagedEpoch && in.Txn.Sequence >= push.StagedSequence {
+			return true
+		}
+	}
+	return false
+}
+
 // recoverStagedTxn runs status recovery against a STAGING record: verify
 // each staged in-flight write with a PREVENTION READ at the staged
 // timestamp — the ordinary read path bumps the timestamp cache first
 // (invariant L2), so a write found missing can never land at or below the
 // staged timestamp afterwards — then finalize the record accordingly.
+// An intent of the transaction counts only if it is the staged write
+// itself (stagedWritePresent); an earlier write of the transaction to
+// the key is as good as missing, and the bump keeps the staged one from
+// landing beneath the read. The finalize names the staged record it
+// verified (from cluster version v25), so a transaction that re-staged
+// in between is not finalized on this verdict.
 func (db *DB) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, push *kvpb.PushTxnResponse) {
 	stagedTS := push.CommitTS
 	committed := true
@@ -1977,17 +2011,12 @@ func (db *DB) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, pus
 			break
 		}
 		if kerr.WriteIntent != nil {
-			present := false
-			for _, in := range kerr.WriteIntent.Intents {
-				if in.Txn.ID == pushee.ID {
-					present = true
-				}
-			}
-			if present {
+			if stagedWritePresent(kerr.WriteIntent.Intents, pushee.ID, push) {
 				continue
 			}
-			// A different transaction's intent: ours is not there, and the
-			// bump (taken before evaluation) prevents it.
+			// A different transaction's intent, or an earlier write of
+			// ours: the staged write is not there, and the bump (taken
+			// before evaluation) prevents it.
 			committed = false
 			break
 		}
@@ -1998,11 +2027,17 @@ func (db *DB) recoverStagedTxn(ctx context.Context, pushee enginepb.TxnMeta, pus
 	}
 	metrics.TxnRecoveries.Inc()
 	rba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Timestamp: db.clock.Now()}}
-	rba.Add(&kvpb.RecoverTxnRequest{
+	rreq := &kvpb.RecoverTxnRequest{
 		RequestHeader: kvpb.RequestHeader{Key: keys.Key(pushee.Key).Clone()},
 		TxnID:         pushee.ID,
 		Commit:        committed,
-	})
+	}
+	if db.recoverGuardOK() {
+		rreq.StagedTS = stagedTS
+		rreq.StagedEpoch = push.StagedEpoch
+		rreq.StagedSequence = push.StagedSequence
+	}
+	rba.Add(rreq)
 	if _, kerr := db.Send(ctx, rba); kerr != nil {
 		log.Debugf("recovering staged txn %s: %v", pushee.ID, kerr)
 	}
