@@ -34,7 +34,10 @@ import (
 //   - Structural changes flush first. Before a merge or a replica removal
 //     deletes a range's raft state, and before a catch-up snapshot resets
 //     a log, the state engine flushes, so the two engines never disagree
-//     about which replicas exist in a way replay cannot repair. A split
+//     about which replicas exist in a way replay cannot repair. So does
+//     the creation of a replica that no log on this store re-creates —
+//     one seeded by a preseed snapshot, or bootstrapped — before its raft
+//     group starts and it can vote or acknowledge entries. A split
 //     needs no flush: an RHS whose split was lost is re-created by the
 //     LHS's replay, and finds its own raft state where it left it.
 //

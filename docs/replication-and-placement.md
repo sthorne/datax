@@ -587,7 +587,9 @@ replica restarts at its last flushed applied index and raft re-delivers
 the committed entries above it. The rare structural changes — a merge
 absorbing its RHS, a replica removed from its range, a catch-up
 snapshot replacing a state — flush the state engine before touching the
-raft engine, so the two never disagree about which replicas exist in a
+raft engine, and a replica created from a preseed snapshot (which no log
+on the store would re-create) is flushed before its raft group starts,
+so the two never disagree about which replicas exist in a
 way replay cannot repair; raft state a crash orphaned on the raft engine
 is swept at startup when the state engine holds the range's tombstone,
 and kept otherwise (an RHS whose split the LHS is about to replay). A
