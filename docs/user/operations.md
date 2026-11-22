@@ -1332,12 +1332,22 @@ Rules of the road:
   mixed-version clusters are supported for the duration of the roll.
 - **After finalize there is no downgrade.** A node restarted on an older
   binary refuses to start ("downgrading a node after the cluster upgrade
-  was finalized is not supported"); a too-old binary is also refused at
-  join time.
+  was finalized is not supported"), including a node that was down
+  during the finalize (its peers tell it the version); a too-old binary
+  is also refused at join time. A running node on an older binary that
+  sees the version finalized past it stops serving rather than run at
+  it.
 - Finalize is deliberate, not automatic: verify the upgraded cluster looks
   healthy first, because finalize is the point of no return.
 - `datax debug upgrade` names any node still on the old binary instead of
-  finalizing — nothing to time or coordinate.
+  finalizing — nothing to time or coordinate. That counts **every** node
+  that may hold replicas, not only the live ones: a node that is down
+  counts as running the binary it last reported, and a draining node
+  counts until no replica is left on it. For a node that is down, either
+  bring it back on the new binary or decommission it (`datax debug
+  decommission --node N`) and let its replicas move off (a dead node's
+  replicas move once it is declared dead); a fully decommissioned node
+  no longer blocks finalize.
 - **v13 needs one more rolling restart after finalize**: each node's next
   start migrates its store to the split layout (the raft log on its own
   engine under `--dir/raft`, the state engine without a WAL; see
