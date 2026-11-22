@@ -11,9 +11,12 @@ Every node runs an HLC (`pkg/util/hlc`): a `(wallTime, logical)` pair that is
 monotonic on each node and ratcheted by every message received, so causally
 related events always order correctly even with bounded physical clock skew.
 
-- `--max-offset` (default 500ms) bounds tolerated skew. A message from a clock
-  more than max-offset ahead crashes the node — loudly wrong beats silently
-  inconsistent.
+- `--max-offset` (default 500ms) bounds tolerated skew. A Raft, Batch, Ping or
+  Snapshot message from a node peer whose clock is more than max-offset ahead
+  crashes the node — loudly wrong beats silently inconsistent. A Join or
+  Admin call with such a timestamp fails instead, and an Admin call without
+  the node certificate (an operator's client certificate) never moves the
+  clock.
 - **Uncertainty**: a reader at `readTS` that sees a value from another node in
   `(readTS, readTS + maxOffset]` cannot know whether that write "really"
   happened before or after it began, so it restarts at a higher timestamp

@@ -220,16 +220,31 @@ func (s *Server) requireNode(ctx context.Context, method string) error {
 	return nil
 }
 
+// fromNode reports whether the caller is a cluster peer by the test
+// requireNode applies (the node certificate in secure mode; everyone in
+// insecure mode, which has no identities), ignoring the sealed state.
+func (s *Server) fromNode(ctx context.Context) bool {
+	return !s.secure || PeerCN(ctx) == "node"
+}
+
+// updateClock ratchets the clock to a timestamp carried by a message from
+// an authenticated node peer (Batch, Ping, Raft, Snapshot: each passed
+// requireNode first). A peer clock past --max-offset is fatal by design
+// (docs/transactions.md): continuing would undermine the uncertainty
+// guarantee and risk serving inconsistent reads.
 func (s *Server) updateClock(now *rpcpb.Hlc) {
-	if now == nil {
-		return
-	}
-	ts := hlc.Timestamp{WallTime: now.WallTime, Logical: now.Logical}
-	if err := s.clock.Update(ts); err != nil {
-		// A clock this far off undermines the uncertainty guarantee;
-		// continuing risks serving inconsistent reads.
+	if err := s.tryUpdateClock(now); err != nil {
 		log.Fatalf("clock synchronization violated: %v", err)
 	}
+}
+
+// tryUpdateClock ratchets the clock to now and returns, instead of acting
+// on, a max-offset violation; the clock is left unchanged in that case.
+func (s *Server) tryUpdateClock(now *rpcpb.Hlc) error {
+	if now == nil {
+		return nil
+	}
+	return s.clock.Update(hlc.Timestamp{WallTime: now.WallTime, Logical: now.Logical})
 }
 
 func (s *Server) RaftMessages(stream rpcpb.Internode_RaftMessagesServer) error {
@@ -311,8 +326,19 @@ func (s *Server) Ping(ctx context.Context, in *rpcpb.PingRequest) (*rpcpb.PingRe
 	}, nil
 }
 
+// payload serves a unary JSON call (Join, Admin). Only a node peer's
+// timestamp moves the clock: Admin is also open to operators' client
+// certificates, which carry no authority over this node's clock, so their
+// timestamp is ignored. A timestamp past --max-offset fails the call
+// rather than the process: a request (an operator command, a joining
+// node) must never be able to take a serving node down.
 func (s *Server) payload(ctx context.Context, h PayloadHandler, in *rpcpb.Payload) (*rpcpb.Payload, error) {
-	s.updateClock(in.Now)
+	if s.fromNode(ctx) {
+		if err := s.tryUpdateClock(in.Now); err != nil {
+			log.Warnf("refusing a call whose clock is too far ahead: %v", err)
+			return nil, status.Errorf(codes.FailedPrecondition, "clock synchronization violated: %v", err)
+		}
+	}
 	out, err := h(ctx, in.Json)
 	if err != nil {
 		return nil, err
@@ -364,6 +390,9 @@ func (s *Server) Join(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, e
 	return s.payload(ctx, s.handlers.Join, in)
 }
 
+// Admin serves operators (client certificates) as well as peers, and
+// authorizes per op inside the handler; payload keeps a non-node caller's
+// timestamp away from the clock.
 func (s *Server) Admin(ctx context.Context, in *rpcpb.Payload) (*rpcpb.Payload, error) {
 	return s.payload(ctx, s.handlers.Admin, in)
 }

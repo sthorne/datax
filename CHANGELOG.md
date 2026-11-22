@@ -1173,6 +1173,16 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **An Admin RPC can no longer stop a node through its clock.** The
+  Admin RPC ratcheted the node's clock to the caller's timestamp before
+  authorizing anything, and a timestamp past `--max-offset` exited the
+  process, so any client certificate (or anyone, on an insecure cluster)
+  could stop a node, sealed or not, with one call. A caller without the
+  node certificate no longer moves the clock at all, and a Join or Admin
+  call whose timestamp is past `--max-offset` now fails with
+  `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
+  Snapshot messages from authenticated node peers still exit on a clock
+  past `--max-offset`, as documented.
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the
