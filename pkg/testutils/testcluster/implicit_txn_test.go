@@ -76,6 +76,21 @@ func TestImplicitTransactionBoundaries(t *testing.T) {
 	if _, err := conn.Exec(ctx, `CREATE TABLE pipe (id INT8 PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := conn.Exec(ctx, `CREATE TABLE mig (id INT8 PRIMARY KEY, v INT8)`); err != nil {
+		t.Fatal(err)
+	}
+	// count is the single value a query returns.
+	count := func(q string) int64 {
+		t.Helper()
+		var n int64
+		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return n
+	}
+	indexes := func(name string) int64 {
+		return count(`SELECT count(*) FROM pg_indexes WHERE indexname = '` + name + `'`)
+	}
 	ids := func() string {
 		t.Helper()
 		var s string
@@ -146,11 +161,79 @@ func TestImplicitTransactionBoundaries(t *testing.T) {
 	check("simple, BEGIN inside, committed later", query("COMMIT"), "", 'I', "1,2")
 	check("simple, savepoint in the implicit transaction",
 		query("INSERT INTO pipe VALUES (1); SAVEPOINT a"), "25P01", 'I', "")
-	// A statement that cannot run inside a transaction block runs alone,
-	// and is refused in a multi-statement implicit transaction.
-	check("simple, ANALYZE alone", query("ANALYZE pipe"), "", 'I', "")
-	check("simple, ANALYZE after an insert", query("INSERT INTO pipe VALUES (1); ANALYZE pipe"), "25001", 'I', "")
-	check("pipeline, ANALYZE alone", r.cycle(pipeline("ANALYZE pipe")...), "", 'I', "")
+	// A statement PostgreSQL refuses in any transaction block (VACUUM)
+	// runs alone, and is refused in a multi-statement implicit
+	// transaction, which then rolls back. As the first Execute of a
+	// pipeline it runs on its own, as in PostgreSQL, and the rest of the
+	// pipeline is one implicit transaction.
+	check("simple, VACUUM alone", query("VACUUM"), "", 'I', "")
+	check("simple, VACUUM after an insert", query("INSERT INTO pipe VALUES (1); VACUUM"), "25001", 'I', "")
+	check("pipeline, VACUUM alone", r.cycle(pipeline("VACUUM")...), "", 'I', "")
+	check("pipeline, VACUUM after an insert", r.cycle(pipeline("INSERT INTO pipe VALUES (1)", "VACUUM")...), "25001", 'I', "")
+	check("pipeline, VACUUM first",
+		r.cycle(pipeline("VACUUM", "INSERT INTO pipe VALUES (1)", "INSERT INTO pipe VALUES (2)", "SELECT 1/0")...), "22012", 'I', "")
+
+	// datax's online statements (CREATE INDEX on an existing table,
+	// ALTER TABLE ... ADD CONSTRAINT, ANALYZE, ...) run in transactions
+	// of their own: in an implicit transaction one commits what came
+	// before it and runs alone; the statements after it are another
+	// implicit transaction.
+	check("simple, ANALYZE after an insert", query("INSERT INTO pipe VALUES (1); ANALYZE pipe"), "", 'I', "1")
+	check("simple, CREATE INDEX between inserts",
+		query("INSERT INTO pipe VALUES (1); CREATE INDEX mig_v_simple ON mig (v); INSERT INTO pipe VALUES (2); SELECT 1/0"), "22012", 'I', "1")
+	if n := indexes("mig_v_simple"); n != 1 {
+		t.Errorf("simple, CREATE INDEX between inserts: %d indexes, want 1", n)
+	}
+	check("pipeline, CREATE INDEX between inserts",
+		r.cycle(pipeline("INSERT INTO pipe VALUES (1)", "CREATE INDEX mig_v_pipe ON mig (v)", "INSERT INTO pipe VALUES (2)", "SELECT 1/0")...), "22012", 'I', "1")
+	if n := indexes("mig_v_pipe"); n != 1 {
+		t.Errorf("pipeline, CREATE INDEX between inserts: %d indexes, want 1", n)
+	}
+	check("pipeline, CREATE INDEX first",
+		r.cycle(pipeline("CREATE INDEX mig_v_first ON mig (v)", "INSERT INTO pipe VALUES (1)", "SELECT 1/0")...), "22012", 'I', "")
+	if n := indexes("mig_v_first"); n != 1 {
+		t.Errorf("pipeline, CREATE INDEX first: %d indexes, want 1", n)
+	}
+	// A migration file sent as one Exec, as golang-migrate does.
+	migration := func(sfx string) string {
+		return `CREATE TABLE mig_` + sfx + ` (id INT8 PRIMARY KEY, ref INT8);
+			INSERT INTO mig_` + sfx + ` VALUES (1, 1);
+			CREATE INDEX mig_v_` + sfx + ` ON mig (v);
+			ALTER TABLE mig_` + sfx + ` ADD CONSTRAINT mig_` + sfx + `_ref_pos CHECK (ref > 0);
+			INSERT INTO pipe VALUES (7)`
+	}
+	if _, err := conn.Exec(ctx, migration("script")); err != nil {
+		t.Errorf("migration script: %v", err)
+	}
+	if g := ids(); g != "7" {
+		t.Errorf("migration script: rows %q, want 7", g)
+	}
+	reset()
+	var stmts []string
+	for _, q := range strings.Split(migration("batch"), ";") {
+		stmts = append(stmts, strings.TrimSpace(q))
+	}
+	check("pipeline, migration", r.cycle(pipeline(stmts...)...), "", 'I', "7")
+	for _, sfx := range []string{"script", "batch"} {
+		if n := count(`SELECT count(*) FROM mig_` + sfx); n != 1 {
+			t.Errorf("migration %s: %d rows, want 1", sfx, n)
+		}
+		if n := indexes("mig_v_" + sfx); n != 1 {
+			t.Errorf("migration %s: %d indexes, want 1", sfx, n)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO mig_`+sfx+` VALUES (2, -1)`); err == nil {
+			t.Errorf("migration %s: the CHECK constraint was not added", sfx)
+		}
+	}
+	// In an explicit block, the one BEGIN made of an implicit
+	// transaction included, they are still refused.
+	check("simple, CREATE INDEX in a block",
+		then(query("BEGIN; INSERT INTO pipe VALUES (1); CREATE INDEX mig_v_block ON mig (v)"), query("ROLLBACK")), "25001", 'I', "")
+	check("simple, CREATE INDEX after BEGIN in an implicit transaction",
+		then(query("INSERT INTO pipe VALUES (1); BEGIN; CREATE INDEX mig_v_block ON mig (v)"), query("ROLLBACK")), "25001", 'I', "")
+	if n := indexes("mig_v_block"); n != 0 {
+		t.Errorf("CREATE INDEX in a block: %d indexes, want 0", n)
+	}
 
 	// pgx's SendBatch is one pipeline: all or nothing.
 	b := &pgx.Batch{}

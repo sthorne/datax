@@ -2184,7 +2184,14 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   inside it clears the flag (the block, earlier statements included,
   becomes explicit and outlives the message), `COMMIT` / `ROLLBACK` end
   it and the next statement opens another, savepoints are refused, and
-  so are the statements that cannot run inside a block (`25001`). A
+  so are the statements PostgreSQL refuses in a block
+  (`refusedInBlock`: `25001`). datax's online statements
+  (`onlineOutsideBlock`: CREATE INDEX on a table the block did not
+  create, the online ALTER TABLE actions, CREATE TABLE AS, ANALYZE, AS
+  OF SYSTEM TIME, key statements) are refused only in an explicit
+  block: in an implicit one, `Session.Execute` commits the block so far
+  and runs the statement alone, and the next statement opens a new
+  block. A
   string of one statement keeps the single-statement path, with its
   automatic retry (`runImplicit`). Results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).
@@ -2199,7 +2206,9 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   message fails. Before running an Execute outside a block the server
   reads the next message (`conn.readAhead`): a Sync means the Execute
   is alone in its pipeline and runs as a single statement, auto-retry
-  included; anything else opens the implicit transaction. A pipeline
+  included; anything else opens the implicit transaction. A statement
+  that runs only outside a block (`Session.RunsAlone`) never opens it:
+  as the first Execute of a pipeline it runs alone, as in PostgreSQL. A pipeline
   that ends without a Sync (the connection closes) is rolled back, as in
   PostgreSQL. Portal suspension is supported: a row-limited Execute
   returns up to that many rows and `PortalSuspended`; re-Execute resumes,

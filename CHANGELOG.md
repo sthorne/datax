@@ -2062,9 +2062,14 @@ state or the internode protocol does, and an entry below says so.
   end of the Query or at the `Sync` and rolled back if a statement
   fails; `BEGIN`, `COMMIT` and `ROLLBACK` among them follow PostgreSQL's
   rules. A lone statement (one Execute before its `Sync`) still runs on
-  its own, with the automatic retry. Savepoints and the statements that
-  cannot run inside a transaction block (`25001`) are refused in a
-  multi-statement implicit transaction; send them on their own.
+  its own, with the automatic retry. Savepoints, and the statements
+  PostgreSQL refuses in a transaction block (`VACUUM`, `CREATE INDEX
+  CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `DISCARD ALL`: `25001`), are
+  refused in a multi-statement implicit transaction. datax's online
+  statements (`CREATE INDEX` on an existing table, the `ALTER TABLE`
+  actions that read the rows, `CREATE TABLE ... AS`, `ANALYZE`, `AS OF
+  SYSTEM TIME`, ...) commit the statements before them and run on their
+  own, so a migration file sent as one `Exec` keeps working.
 - **A COMMIT no longer reports success for writes it then loses after
   a multi-range write failed in part.** When a write spanning ranges
   failed for any reason other than a duplicate key (a write shed under

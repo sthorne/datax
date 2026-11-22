@@ -16,7 +16,7 @@ syntax error or `0A000` feature not supported):
 | Functions beyond the [Functions reference](functions.md) (`SHOW FUNCTIONS`) — SQLSTATE `42883`; `row_to_json` and other whole-row functions; named arguments (`make_interval(days => 1)`); a set-returning function (`generate_series`, `jsonb_array_elements`, ...) in the select list of a query with `FROM`, or with arguments that read another `FROM` member (`0A000`); regular expressions with back references or lookaround (`0A000`: datax runs them on RE2); `setseed` (`random()` cannot be seeded); `to_ascii` without an encoding (as in PostgreSQL on a UTF8 database, `0A000`); `TIME WITH TIME ZONE`; `INTERVAL` field qualifiers as a constraint (`INTERVAL DAY TO SECOND` stores the full triple); `IntervalStyle` other than `postgres` in `::text` casts, arrays and JSON (the wire's text format of an `INTERVAL` column follows it); user-defined functions | compute client-side or in a derived table; the regular-expression, set-returning and jsonb processing functions **are supported** ([set-returning functions](sql.md#set-returning-functions)); `INTERVAL` and `TIME` **are supported** ([types](sql.md#types)) |
 | `EXPLAIN` options in parentheses (`FORMAT JSON`, `VERBOSE`, `BUFFERS`); `RANGE` frames with a numeric offset, `GROUPS` frames, `EXCLUDE`, `FILTER` on a window call; correlated subqueries over set operations | `EXPLAIN ANALYZE` (stage rows and times), expressions over aggregates and `GROUP BY` expressions, `ROLLUP` / `CUBE` / `GROUPING SETS`, `DISTINCT ON`, `FILTER (WHERE ...)` and `DISTINCT` on aggregate calls, window functions (ranking, offset, value and aggregate, with `PARTITION BY`, `ORDER BY`, `ROWS` frames and `WINDOW` names), `WITH` / `WITH RECURSIVE` (data-modifying members too), `INSERT ... SELECT`, `OFFSET`, `FETCH FIRST`, `UNION` / `INTERSECT` / `EXCEPT [ALL]`, `RIGHT` / `FULL` / `NATURAL` joins and `USING` **are supported** ([reference](sql.md#reading)) |
 | `DEFERRABLE` constraints, `ON DELETE SET DEFAULT`, `MATCH FULL`, `ADD PRIMARY KEY` on a table that has one, `EXCLUDE` | `CHECK`, `UNIQUE` and `FOREIGN KEY` constraints **are supported** ([reference](sql.md#constraints-check-unique-and-foreign-key)), checked at statement end; the referencing side of a foreign key gets an index automatically, and a cascade is capped per statement (`foreign_key_cascade_limit`) |
-| A volatile `DEFAULT` (`gen_random_uuid()`, `random()`), `SERIAL`, or a constraint on `ADD COLUMN`, and `ALTER TABLE` actions that read the rows (`ADD CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`), inside a transaction block, the implicit one of a multi-statement query or pipeline included (`25001`) | run the statement outside the block (Rails: `disable_ddl_transaction!`); `ADD COLUMN` with any default, several actions in one `ALTER TABLE`, and the descriptor-only actions in a block **are supported** ([reference](sql.md#ddl)) |
+| A volatile `DEFAULT` (`gen_random_uuid()`, `random()`), `SERIAL`, or a constraint on `ADD COLUMN`, and `ALTER TABLE` actions that read the rows (`ADD CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`), inside a transaction block (`25001`) | run the statement outside the block (Rails: `disable_ddl_transaction!`); `ADD COLUMN` with any default, several actions in one `ALTER TABLE`, and the descriptor-only actions in a block **are supported** ([reference](sql.md#ddl)) |
 | `DROP` of a primary key declared in `CREATE TABLE` (one added by `ADD PRIMARY KEY` to a table keyed by its hidden `rowid` is an index, and drops as one: [reference](sql.md#tables-without-a-primary-key)), `RENAME TO` across databases, `ALTER COLUMN TYPE ... USING expr` and conversions across type families (`FLOAT8` to `INT8`), `COMMENT ON` objects other than tables, views, indexes, columns and constraints, `SELECT ... INTO` | `DROP INDEX`, `ALTER INDEX RENAME`, the `RENAME` forms, `TRUNCATE`, `IF [NOT] EXISTS` everywhere, `ALTER COLUMN TYPE` (an online rewrite for widening, text conversions and narrower modifiers of the same family — `INT8` to `INT4`, a shorter `VARCHAR`, which check every stored value: `22003` / `22001`), `CREATE TABLE ... AS` (a hidden `rowid` key unless `PRIMARY KEY (cols)` is written among the column names), `CREATE TABLE ... (LIKE t INCLUDING ...)` and `COMMENT ON TABLE / VIEW / INDEX / COLUMN / CONSTRAINT` **are supported** ([reference](sql.md#ddl)); recreate the table for the rest |
 | `COPY FROM`'s `DEFAULT` and `ON_ERROR` options; `COPY TO` a server file or program; `COPY ... ENCODING` other than `UTF8` | `COPY t FROM STDIN` **is supported** (text, CSV, binary — psql `\copy` and pgx `CopyFrom` work) with `HEADER [MATCH]`, `DELIMITER`, `NULL`, `QUOTE`, `ESCAPE`, `FORCE_NULL` and `FORCE_NOT_NULL` ([reference](sql.md#bulk-loading-with-copy)), and so is `COPY ... TO STDOUT` with every option ([reference](sql.md#exporting-with-copy-to)): use `\copy ... to` for a client-side file |
 | `CREATE SCHEMA ... CREATE TABLE ...` schema elements, `COMMENT ON SCHEMA`, `ALTER DEFAULT PRIVILEGES IN SCHEMA s` | Schemas **are supported** ([reference](sql.md#schemas)): `CREATE / DROP / ALTER SCHEMA`, tables, views, sequences (`SERIAL` and identity columns included) and enum types in any schema, `ALTER TABLE / VIEW / SEQUENCE / TYPE ... SET SCHEMA`, `search_path`, `USAGE` / `CREATE` grants, the catalogs. A two-part name `x.t` is a schema `x` first and, failing that, database `x` (a deprecated datax extension); databases are real (`CREATE DATABASE`, the URL's database, `USE`, `SET database`, `current_database()`); see [Databases](sql.md#databases) |
@@ -28,6 +28,27 @@ syntax error or `0A000` feature not supported):
 
 ## Things that exist but behave differently
 
+- **A multi-statement query or a pipeline is atomic, except around
+  online DDL.** As in PostgreSQL, the statements of one query string
+  and of one pipeline up to its `Sync` (pgx `SendBatch`) are one
+  implicit transaction: committed together, or not at all if one
+  fails. The exception is datax's online statements, which PostgreSQL
+  runs inside a transaction but datax runs in transactions of its own:
+  `CREATE INDEX` (except on a table created earlier in the same
+  transaction), `ALTER TABLE` with `ADD CONSTRAINT`, `VALIDATE
+  CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`, `ADD COLUMN` with a
+  volatile default, a constraint or `SERIAL`, `SET (...)`, `RESET`,
+  `SPLIT AT`, `UNSPLIT`, `PURGE` or `ROTATE ENCRYPTION KEY`, `CREATE
+  TABLE ... AS`, `ANALYZE`, `SELECT ... AS OF SYSTEM TIME`, the
+  encryption-key statements and `SET CLUSTER SETTING`. One of them
+  commits the statements before it, runs on its own, and the statements
+  after it form a new implicit transaction — so a migration file sent
+  as one `Exec` works, but is not all-or-nothing. Inside `BEGIN` they
+  are refused (`25001`). Statements PostgreSQL itself refuses in a
+  transaction block (`VACUUM`, `CREATE INDEX CONCURRENTLY`, `DROP INDEX
+  CONCURRENTLY`, `DISCARD ALL`) are refused in a multi-statement query
+  too, and run on their own as the first statement of a pipeline, as in
+  PostgreSQL.
 - **Serializable only.** No isolation levels to choose; every transaction
   can fail with `40001` and clients **must** retry
   ([details](sql.md#transactions-and-retries)). Code written for

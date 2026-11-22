@@ -682,7 +682,7 @@ func (c *conn) run(ctx context.Context) (err error) {
 			}
 		case *pgproto3.Execute:
 			if !c.skipToSync {
-				m = c.readAhead(m)
+				m = c.readAhead(ctx, m)
 				c.handleExecute(ctx, m)
 			}
 		case *pgproto3.Close:
@@ -972,7 +972,8 @@ func (c *conn) parse(q string) ([]parser.Statement, error) {
 // has run, rolled back if one fails (the rest are not run). A COMMIT or
 // ROLLBACK among them ends that transaction early and the statements
 // after it start another; a BEGIN turns it into a transaction block that
-// outlives the message. A query of one statement runs as its own
+// outlives the message. One of datax's online statements commits it too,
+// and runs alone (Session.BeginImplicit). A query of one statement runs as its own
 // implicit transaction (Session.Execute), automatically re-run on a
 // serialization failure.
 func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
@@ -1060,11 +1061,20 @@ func (c *conn) runSimpleStatements(ctx context.Context, q string, stmts []parser
 // follow, and PostgreSQL runs everything up to the Sync as one implicit
 // transaction: one is opened here for the Sync (or the end of a simple
 // Query) to commit, or for the rollback should a message fail first or
-// the connection end without a Sync. The message read ahead is handled
+// the connection end without a Sync. A statement that runs only outside
+// a block (Session.RunsAlone) is not read ahead of: it runs alone, as
+// the first Execute of a pipeline does in PostgreSQL, and the next
+// Execute decides for the rest. The message read ahead is handled
 // next by run. It returns the Execute, copied: reading the next message
 // may reuse the one m points to.
-func (c *conn) readAhead(m *pgproto3.Execute) *pgproto3.Execute {
+func (c *conn) readAhead(ctx context.Context, m *pgproto3.Execute) *pgproto3.Execute {
 	if c.session.State() != sql.StateIdle || c.peeked {
+		return m
+	}
+	if pt, ok := c.portals[m.Portal]; ok && pt.res == nil && pt.stmt.stmt != nil && c.session.RunsAlone(ctx, pt.stmt.stmt) {
+		// A statement that runs only outside a block runs on its own,
+		// as the first of a pipeline does in PostgreSQL; the next
+		// Execute opens the implicit transaction for the rest.
 		return m
 	}
 	ex := *m

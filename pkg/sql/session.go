@@ -826,14 +826,20 @@ func (s *Session) State() TxnState { return s.state }
 // transaction, as in a block opened by BEGIN, which EndImplicit commits
 // at that boundary or rolls back if any of them failed. Inside it a
 // BEGIN turns the block explicit (it then outlives the boundary), a
-// COMMIT or ROLLBACK ends it early, savepoints are refused, and a
-// statement that cannot run inside a transaction block is refused, as
-// PostgreSQL does. It is a no-op unless the session is idle.
+// COMMIT or ROLLBACK ends it early, savepoints are refused, and so is a
+// statement PostgreSQL refuses in any transaction block (refusedInBlock).
+// It is a no-op unless the session is idle.
 //
 // A lone statement does not need one: it runs as its own implicit
 // transaction (runImplicit), which, unlike a block, can be re-run
 // transparently on a serialization failure, because nothing of it has
 // reached the client yet.
+//
+// datax's online statements (onlineOutsideBlock) are the exception to
+// the block's atomicity: PostgreSQL runs them inside a transaction, but
+// datax runs them in transactions of their own. Reached in an implicit
+// block, one commits the block so far and runs on its own, as if sent
+// alone; the statements after it open another block.
 func (s *Session) BeginImplicit() {
 	if s.state != StateIdle {
 		return
@@ -844,6 +850,73 @@ func (s *Session) BeginImplicit() {
 	s.tempEndTxn()
 	s.txnQueried = false
 	s.txnStartedReadOnly = s.vars.defaultReadOnly
+}
+
+// RunsAlone reports whether stmt runs only outside a transaction block:
+// one PostgreSQL itself refuses in a block (refusedInBlock), or one of
+// datax's online statements (onlineOutsideBlock). The wire layer runs
+// such a statement on its own when it is the first Execute of a
+// pipeline, as PostgreSQL does, instead of opening the pipeline's
+// implicit block with it.
+func (s *Session) RunsAlone(ctx context.Context, stmt parser.Statement) bool {
+	return refusedInBlock(stmt) || s.onlineOutsideBlock(ctx, stmt)
+}
+
+// refusedInBlock reports a statement PostgreSQL refuses inside any
+// transaction block, an implicit one included (PreventInTransactionBlock):
+// refused here too (25001).
+func refusedInBlock(stmt parser.Statement) bool {
+	switch t := stmt.(type) {
+	case *parser.Vacuum:
+		return true
+	case *parser.CreateIndex:
+		return t.Concurrently
+	case *parser.DropIndex:
+		return t.Concurrently
+	case *parser.Discard:
+		return t.Kind == "all"
+	}
+	return false
+}
+
+// onlineOutsideBlock reports a statement PostgreSQL runs inside a
+// transaction but datax runs in transactions of its own, so refuses in
+// an explicit block (25001): CREATE INDEX on a table the block did not
+// create, the ALTER TABLE actions that read the rows or work outside
+// any transaction, CREATE TABLE ... AS, ANALYZE, AS OF SYSTEM TIME, and
+// the key service's statements. Inside an implicit block one of them
+// ends the block (Execute) instead of being refused.
+func (s *Session) onlineOutsideBlock(ctx context.Context, stmt parser.Statement) bool {
+	switch t := stmt.(type) {
+	case *parser.CreateIndex:
+		if t.Concurrently {
+			return false
+		}
+		if t.Using == "ivfflat" || t.Using == "hnsw" || s.state != StateOpen {
+			return true
+		}
+		desc, err := s.lookup(ctx, s.txn, t.Table)
+		return err == nil && !s.createdInBlock(s.txn, desc.ID)
+	case *parser.AlterTable:
+		if t.SplitAt != nil || t.UnsplitAt != nil || t.UnsplitAll || t.ResetOptions != nil || t.Purge || t.RotateKey || t.SetOptions != nil {
+			return true
+		}
+		for _, c := range alterCmds(t) {
+			if alterActionNeedsRows(c) {
+				return true
+			}
+		}
+		return false
+	case *parser.CreateTable:
+		return t.As != nil
+	case *parser.Analyze:
+		return true
+	case *parser.Select:
+		return t.AsOf != "" || t.AsOfMaxStaleness != "" || t.AsOfMinTimestamp != ""
+	case *parser.ShowClusterSetting:
+		return false
+	}
+	return isKeyStatement(stmt)
 }
 
 // InImplicit reports whether an implicit transaction block is open.
@@ -921,6 +994,13 @@ func (s *Session) Close(ctx context.Context) {
 // Execute runs one parsed statement with the given parameter values,
 // under the session's statement_timeout and lock_timeout.
 func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []types.Datum) (res *Result, serr *Error) {
+	// One of datax's online statements in an implicit block: the block
+	// so far commits, and the statement runs on its own (BeginImplicit).
+	if s.implicitBlock && s.state == StateOpen && s.onlineOutsideBlock(ctx, stmt) {
+		if serr := s.EndImplicit(ctx, true); serr != nil {
+			return nil, serr
+		}
+	}
 	params = s.zoneParams(params)
 	s.releaseRowFuncs()
 	s.stmtNow = 0

@@ -1970,11 +1970,14 @@ none of them does. A `COMMIT` or `ROLLBACK` among them ends the implicit
 transaction early, and the statements after it start another; a `BEGIN`
 among them turns it into a transaction block, the statements before it
 included, which stays open after the query. `SAVEPOINT` is refused in
-an implicit transaction (`25P01`), and so are the statements that
-cannot run inside a transaction block (`25001`: `VACUUM`, `ANALYZE`,
-`CREATE INDEX` on an existing table, the `ALTER TABLE` actions that
-read the rows, `CREATE TABLE ... AS`, `AS OF SYSTEM TIME`, ...): send
-those on their own. An implicit transaction of several statements is
+an implicit transaction (`25P01`), and so are the statements PostgreSQL
+refuses in any transaction block (`25001`: `VACUUM`, `CREATE INDEX
+CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `DISCARD ALL`). datax's online
+statements — `CREATE INDEX` on an existing table, the `ALTER TABLE`
+actions that read the rows, `CREATE TABLE ... AS`, `ANALYZE`, `AS OF
+SYSTEM TIME`, ... ([the list](postgres-differences.md#things-that-exist-but-behave-differently))
+— commit the statements before them and run on their own; the
+statements after them are a new implicit transaction. An implicit transaction of several statements is
 not retried by the server — results have already gone to the client —
 so it can fail with `40001` like a `BEGIN` block. Other transaction
 tools:
