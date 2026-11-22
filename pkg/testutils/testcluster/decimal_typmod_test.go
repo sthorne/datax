@@ -24,7 +24,7 @@ func expectCode(t *testing.T, ctx context.Context, conn *pgx.Conn, q, code strin
 }
 
 // TestDecimalTypmodOverPgwire: DECIMAL(p,s) is enforced — values rescale
-// to the declared scale (round-half-even) on every ingest path, integer
+// to the declared scale (halves away from zero) on every ingest path, integer
 // overflow is SQLSTATE 22003, and stored values render with the fixed
 // declared scale in both wire formats. Issue #39.
 func TestDecimalTypmodOverPgwire(t *testing.T) {
@@ -68,8 +68,8 @@ func TestDecimalTypmodOverPgwire(t *testing.T) {
 		want string
 	}{
 		{1, "9.90"},  // padded
-		{2, "1.00"},  // 1.005 ties to even
-		{3, "1.02"},  // 1.015 ties to even
+		{2, "1.01"},  // 1.005: half away from zero
+		{3, "1.02"},  // 1.015: half away from zero
 		{4, "-2.50"}, // negative padded
 		{6, "1234.57"} /* binary param rescaled */} {
 		var got string
@@ -144,7 +144,7 @@ func TestDecimalTypmodOverPgwire(t *testing.T) {
 		t.Fatalf("insert with default: %v", err)
 	}
 	var fee string
-	if err := sconn.QueryRow(ctx, `SELECT fee FROM prices WHERE id = 7`).Scan(&fee); err != nil || fee != "0.12" {
+	if err := sconn.QueryRow(ctx, `SELECT fee FROM prices WHERE id = 7`).Scan(&fee); err != nil || fee != "0.13" {
 		t.Fatalf("default fee: %q, %v", fee, err)
 	}
 	expectCode(t, ctx, conn, `CREATE TABLE bad (id INT8 PRIMARY KEY, d DECIMAL(3,2) DEFAULT 99)`, "22003")
@@ -239,5 +239,98 @@ func TestDecimalTypmodKeysAndCopy(t *testing.T) {
 		}))
 	if err == nil || !strings.Contains(err.Error(), "22003") && !strings.Contains(err.Error(), "overflow") {
 		t.Fatalf("copy overflow: %v", err)
+	}
+}
+
+// TestDecimalTypmodRoundsHalfAwayFromZero: a value stored into
+// DECIMAL(p,s) rounds halves away from zero, as PostgreSQL does and as
+// the ::decimal(p,s) cast already did: 1.005 → 1.01 (not 1.00), 2.5 → 3
+// (not 2), -1.005 → -1.01, on every write path.
+func TestDecimalTypmodRoundsHalfAwayFromZero(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	scfg, _ := pgx.ParseConfig(pgURL(tc, 0))
+	scfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	sconn, err := pgx.ConnectConfig(ctx, scfg)
+	if err != nil {
+		t.Fatalf("simple connect: %v", err)
+	}
+	defer func() { _ = sconn.Close(ctx) }()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	text := func(q string) string {
+		t.Helper()
+		var s string
+		if err := sconn.QueryRow(ctx, q).Scan(&s); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return s
+	}
+
+	exec(`CREATE TABLE r (id INT8 PRIMARY KEY, amt DECIMAL(10,2), n DECIMAL(5,0))`)
+	// Literals, a text literal, a text parameter and a binary parameter.
+	exec(`INSERT INTO r VALUES (1, 1.005, 2.5), (2, -1.005, -2.5), (3, '1.005', '0.5')`)
+	exec(`INSERT INTO r VALUES ($1, $2, $3)`, int64(4), "1.005", "3.5")
+	exec(`INSERT INTO r VALUES ($1, $2, $3)`, int64(5),
+		pgtype.Numeric{Int: big.NewInt(-1005), Exp: -3, Valid: true},
+		pgtype.Numeric{Int: big.NewInt(-5), Exp: -1, Valid: true})
+	// An explicitly prepared statement (simple protocol, where its $n
+	// are its own and not the outer statement's).
+	for _, q := range []string{`PREPARE ins(int8, numeric, numeric) AS INSERT INTO r VALUES ($1, $2, $3)`, `EXECUTE ins(6, 2.675, 1.5)`} {
+		if _, err := sconn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	// UPDATE and ON CONFLICT DO UPDATE.
+	exec(`INSERT INTO r VALUES (7, 0, 0)`)
+	exec(`UPDATE r SET amt = 1.115, n = 4.5 WHERE id = 7`)
+	exec(`INSERT INTO r VALUES (8, 0, 0)`)
+	exec(`INSERT INTO r VALUES (8, -2.345, -6.5) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt, n = excluded.n`)
+	// COPY.
+	if _, err := conn.CopyFrom(ctx, pgx.Identifier{"r"}, []string{"id", "amt", "n"},
+		pgx.CopyFromRows([][]any{{int64(9),
+			pgtype.Numeric{Int: big.NewInt(1005), Exp: -3, Valid: true},
+			pgtype.Numeric{Int: big.NewInt(25), Exp: -1, Valid: true}}})); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	for _, c := range []struct {
+		id      string
+		amt, n  string
+		comment string
+	}{
+		{"1", "1.01", "3", "literal (half-even gave 1.00, 2)"},
+		{"2", "-1.01", "-3", "negative literal"},
+		{"3", "1.01", "1", "text literal"},
+		{"4", "1.01", "4", "text parameter"},
+		{"5", "-1.01", "-1", "binary parameter"},
+		{"6", "2.68", "2", "PREPARE / EXECUTE"},
+		{"7", "1.12", "5", "UPDATE"},
+		{"8", "-2.35", "-7", "ON CONFLICT DO UPDATE"},
+		{"9", "1.01", "3", "COPY"},
+	} {
+		got := text(`SELECT amt::text || '|' || n::text FROM r WHERE id = ` + c.id)
+		if want := c.amt + "|" + c.n; got != want {
+			t.Errorf("id %s (%s): got %s, want %s", c.id, c.comment, got, want)
+		}
+	}
+
+	// The cast agrees with the stored value.
+	if got := text(`SELECT 1.005::decimal(10,2)::text || '|' || (-1.005)::decimal(10,2)::text || '|' || 2.5::decimal(5,0)::text`); got != "1.01|-1.01|3" {
+		t.Errorf("cast: got %s, want 1.01|-1.01|3", got)
+	}
+	if got := text(`SELECT count(*)::text FROM r WHERE id = 1 AND amt = 1.005::decimal(10,2)`); got != "1" {
+		t.Errorf("stored value differs from the cast: count %s", got)
 	}
 }

@@ -253,7 +253,8 @@ func FromInt(i int64) Dec { return New(i, 0) }
 
 // Quantize returns a rounded half-even to the given decimal scale (digits
 // after the point), then canonicalized — so a value already representable
-// at that scale is unchanged. Used to enforce DECIMAL(p,s) column scale.
+// at that scale is unchanged. Not PostgreSQL's numeric(p,s) coercion,
+// which rounds halves away from zero (RoundHalfAway).
 func Quantize(a Dec, scale int32) (Dec, error) {
 	return DivQuantize(a, FromInt(1), scale)
 }

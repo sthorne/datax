@@ -91,7 +91,7 @@ syntax error or `0A000` feature not supported):
   so an insert-or-fail loop that already retries `40001` behaves as in
   PostgreSQL; code that only expects `23505` there needs that retry.
 - **Type modifiers are enforced** — `DECIMAL(p,s)` (rescale to `s`
-  half-even, `22003` on overflow, fixed-scale rendering), the integer
+  with halves away from zero, `22003` on overflow, fixed-scale rendering), the integer
   widths (`INT` / `INTEGER` is `INT4` as in PostgreSQL; `SERIAL` too),
   `VARCHAR(n)` / `CHAR(n)` (`22001`), `TIMESTAMP` without time zone and
   `TIMESTAMP(p)` — with small deviations: an invalid typmod

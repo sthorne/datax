@@ -51,7 +51,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
 | `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
-| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
+| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` with halves away from zero as in PostgreSQL (`1.005` → `1.01`, `-2.5` → `-3`), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
 | `TEXT` | `STRING`, `VARCHAR` | unbounded |
 | `VARCHAR(n)` | `CHARACTER VARYING(n)` | at most `n` characters: a longer value is refused (`22001`) unless the excess is spaces, which are dropped; `varchar` (OID 1043) with the typmod on the wire |
 | `CHAR(n)` | `CHARACTER(n)`; bare `CHAR` is `CHAR(1)` | fixed width: stored trimmed of trailing spaces, rendered blank-padded to `n` (`'ab'` in a `CHAR(3)` reads back as `'ab '`); `length()`, `||` and comparisons see the trimmed value; `bpchar` (OID 1042) on the wire |

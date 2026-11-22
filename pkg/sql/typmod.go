@@ -113,8 +113,8 @@ func pureWidening(old, new catalog.Column) bool {
 }
 
 // enforceTypmod applies a column's type modifiers to a value about to
-// be stored. For DECIMAL(p,s) the value is rescaled to s (round-half-
-// even), and rejected with SQLSTATE 22003 when its integer digits
+// be stored. For DECIMAL(p,s) the value is rescaled to s (halves away
+// from zero: 1.005 → 1.01, -1.005 → -1.01), and rejected with SQLSTATE 22003 when its integer digits
 // exceed p−s — PostgreSQL semantics, including the order (9.999 into
 // DECIMAL(3,2) first rounds to 10.00, then overflows); the returned
 // datum keeps canonical text in S (identity/storage) and carries the
@@ -169,10 +169,9 @@ func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
 	if err != nil {
 		return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
 	}
-	q, err := decimal.Quantize(v, col.Scale)
-	if err != nil {
-		return d, newErrf(CodeNumericValueOutOfRange, "column %q: %v", col.Name, err)
-	}
+	// Halves round away from zero, as PostgreSQL's numeric typmod
+	// coercion does, and as the ::numeric(p,s) cast here does.
+	q := decimal.RoundHalfAway(v, col.Scale)
 	abs := q
 	if abs.Sign() < 0 {
 		abs = decimal.Neg(abs)

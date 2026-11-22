@@ -34,7 +34,9 @@ type Column struct {
 	Name string       `json:"name"`
 	Type types.Family `json:"type"`
 	// Precision/Scale enforce a DECIMAL(p,s) typmod: values are rescaled
-	// to Scale (round-half-even) on write and rejected (22003) when their
+	// to Scale on write, halves away from zero as in PostgreSQL (until
+	// 0.58 halves went to even; rows written then keep that rounding),
+	// and rejected (22003) when their
 	// integer digits exceed Precision−Scale. Zero Precision = bare
 	// DECIMAL, unconstrained — the safe pre-existing meaning, so old
 	// descriptors keep their behavior (append-only JSON, pkg/version
