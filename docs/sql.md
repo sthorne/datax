@@ -2099,7 +2099,14 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   stalled; and past `--sql-max-pending-auth` (512) connections still in
   startup, a new one is refused at accept with a FATAL `53300` before
   anything is allocated for it (a client mid-`SSLRequest` sees that as
-  a failed TLS negotiation).
+  a failed TLS negotiation). A client message is capped at 10000
+  bytes until the client has authenticated (the SASL messages are a few
+  hundred) and at 256 MiB after (`pgwire.ServerOptions.MaxMessageSize`;
+  PostgreSQL's cap is 1 GB, and a datax value is bounded well below
+  either by the 60 MiB a replicated write carries). A longer message
+  ends the connection with a FATAL `08P01` before its body is
+  allocated. The cap is per message: COPY data streams in CopyData
+  messages of any number.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is
   all-powerful; members of the **admin role** (`GRANT ADMIN TO user`,

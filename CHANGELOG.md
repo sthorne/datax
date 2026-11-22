@@ -1183,6 +1183,41 @@ state or the internode protocol does, and an entry below says so.
   `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
   Snapshot messages from authenticated node peers still exit on a clock
   past `--max-offset`, as documented.
+- **A Bind with the wrong number of format codes no longer crashes the
+  node.** A Bind whose parameter format codes were neither 0, 1 nor one
+  per parameter (for example 2 codes for 3 parameters) indexed past
+  the end of the list. The panic took the whole process down. Such a
+  Bind, and one with a wrong count of result format codes, is now
+  refused with `08P01`. A panic on a connection's goroutine now closes
+  only that connection: it is logged at error level with its stack, and
+  the client gets a FATAL `XX000`.
+- **A binary array parameter can no longer exhaust the node's memory.**
+  The element count of a binary-format array (a Bind parameter or a
+  binary COPY field) sized an allocation before any element was read,
+  so a 20-byte `int8[]` declaring 0xF0000000 elements had the runtime
+  ask for about 480 GB and the process died. A count the value's bytes
+  cannot hold is now refused with `22P03`. A binary COPY field's buffer
+  likewise grows with the data that arrives instead of being sized by
+  the field's declared length.
+- **Client messages are capped, before authentication most of all.**
+  The server allocated the whole body a message header declared before
+  reading any of it, and set no cap. So a client that had sent only a
+  StartupMessage could cost about 2 GiB per connection with a 5-byte
+  header (`p` and a length of 0x7ffffff0). A message is now capped at
+  10000 bytes until the client has authenticated, and at 256 MiB after
+  (`ServerOptions.MaxMessageSize`; PostgreSQL's cap is 1 GB). A longer
+  message ends the connection with a FATAL `08P01` before its body is
+  allocated. COPY is unaffected: the cap is per CopyData message.
+- **Binary datetime parameters no longer wrap silently.** A binary
+  timestamp, date, interval or time (a Bind parameter or a binary COPY
+  field) was converted with no range check. The year 2400 was stored as
+  1815, timestamptz infinity as 1999-12-31, date infinity as
+  5881610-07-11, and an interval of 2^62 µs as `00:00:00`. A value
+  outside what the text input accepts is now refused with `22008`, as
+  the text path refuses it: timestamps 1678-01-01 to 2261-12-31, dates
+  0000-01-01 to 9999-12-31, times 00:00 to 24:00, and intervals whose
+  microseconds fit in nanoseconds. PostgreSQL's infinity encodings are
+  refused the same way, with a message naming them (PG-T-005).
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the

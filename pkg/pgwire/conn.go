@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -422,11 +423,19 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	return res, serr
 }
 
+// newPreAuthBackend is a backend on nc with the pre-authentication
+// message size cap; startup lifts it once the client has authenticated.
+func newPreAuthBackend(nc net.Conn) *pgproto3.Backend {
+	be := pgproto3.NewBackend(nc, nc)
+	be.SetMaxBodyLen(maxPreAuthMessageSize)
+	return be
+}
+
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	session := sql.NewSession(db, cat)
 	session.SetStreaming(true)
 	c := &conn{
-		backend:  pgproto3.NewBackend(nc, nc),
+		backend:  newPreAuthBackend(nc),
 		nc:       nc,
 		session:  session,
 		opts:     opts,
@@ -467,6 +476,59 @@ func isLoopbackAddr(a net.Addr) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// Client message size caps (the body after the type byte and length).
+// pgproto3 allocates a message's declared length before it reads a byte
+// of the body, so without a cap 5 bytes from anyone who can open a
+// socket ('p' and a length of 0x7ffffff0) cost 2 GiB.
+const (
+	// maxPreAuthMessageSize bounds every message read before
+	// authentication completes. The SASL messages are a few hundred
+	// bytes; 10000 is PostgreSQL's MAX_STARTUP_PACKET_LENGTH, the bound
+	// pgproto3 itself applies to the startup packet (which is read by
+	// ReceiveStartupMessage, not under this cap).
+	maxPreAuthMessageSize = 10000
+	// DefaultMaxMessageSize bounds a message once the connection is
+	// authenticated. PostgreSQL's bound is 1 GB, its largest field; a
+	// datax value is bounded by what one replicated write carries
+	// (60 MiB to a range), so 256 MiB leaves room for such a value in a
+	// statement's text, hex-encoded (twice its size), with plenty to
+	// spare. COPY streams its data in CopyData messages that drivers cut
+	// at 64 KiB (pgx) or a row (psql), so its total size is unbounded.
+	DefaultMaxMessageSize = 256 << 20
+)
+
+// maxMessageSize is the post-authentication cap in force (0 = none).
+func (c *conn) maxMessageSize() int {
+	switch {
+	case c.opts.MaxMessageSize < 0:
+		return 0
+	case c.opts.MaxMessageSize == 0:
+		return DefaultMaxMessageSize
+	}
+	return c.opts.MaxMessageSize
+}
+
+// refuseOversized ends the connection when err is a message over the
+// size cap and reports whether it was: the client is told with a FATAL
+// 08P01 (protocol_violation, as PostgreSQL reports an invalid message
+// length) and the socket is closed. pgproto3 has read only the header,
+// so the stream is at an unknown point and nothing more can be read.
+func (c *conn) refuseOversized(err error) bool {
+	var tooLong *pgproto3.ExceededMaxBodyLenErr
+	if !errors.As(err, &tooLong) {
+		return false
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sendFatal(sql.CodeInvalidParameter, fmt.Sprintf("invalid message length: %d bytes exceeds the limit of %d",
+		tooLong.ActualBodyLen, tooLong.MaxExpectedBodyLen))
+	_ = c.nc.Close()
+	return true
+}
+
+// testingPanicOnMessage, when set, sees every message the message loop
+// receives: a test's way to inject a panic into a connection.
+var testingPanicOnMessage func(pgproto3.FrontendMessage)
+
 // errCancelServed ends a connection that carried a CancelRequest: it
 // never authenticates and carries nothing else, so it does not go on to
 // the message loop (where it would sit, unauthenticated and now past its
@@ -484,13 +546,29 @@ func (c *conn) authTimeout() time.Duration {
 	return c.opts.AuthTimeout
 }
 
-func (c *conn) run(ctx context.Context) error {
+func (c *conn) run(ctx context.Context) (err error) {
 	defer close(c.done)
 	if c.listener != nil {
 		defer c.listener.Close()
 	}
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
+	// A panic on this connection's goroutine ends this connection, not
+	// the node: it is logged at error level with its stack (the evidence
+	// of the bug underneath), the client is told with a FATAL XX000 when
+	// the socket still takes it, and the deferred cleanup above runs as
+	// for any other end.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("panic on pgwire connection %s (recovered; the connection is closed): %v\n%s", c.nc.RemoteAddr(), r, debug.Stack())
+			_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+			c.backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: sql.CodeInternal,
+				Message: fmt.Sprintf("internal error: %v", r)})
+			_ = c.backend.Flush()
+			_ = c.nc.Close()
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	if err := c.startup(ctx); err != nil {
 		if errors.Is(err, errCancelServed) {
 			return nil
@@ -518,6 +596,9 @@ func (c *conn) run(ctx context.Context) error {
 			c.allowPush()
 		}
 		msg, err := c.backend.Receive()
+		if err == nil && testingPanicOnMessage != nil {
+			testingPanicOnMessage(msg)
+		}
 		if idleArmed {
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}
@@ -526,6 +607,9 @@ func (c *conn) run(ctx context.Context) error {
 			return err
 		}
 		if err != nil {
+			if c.refuseOversized(err) {
+				return err
+			}
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
 				return nil
@@ -650,6 +734,9 @@ func (c *conn) startup(ctx context.Context) error {
 	err := c.handleStartup(ctx)
 	_ = c.nc.SetDeadline(time.Time{})
 	c.authDeadline = time.Time{}
+	if err == nil {
+		c.backend.SetMaxBodyLen(c.maxMessageSize())
+	}
 	if err != nil && isTimeout(err) {
 		metrics.SQLPreAuthClosed.WithLabelValues(metrics.PreAuthHandshakeTimeout).Inc()
 		log.Audit("sql-preauth-closed", "remote", c.nc.RemoteAddr().String(), "cause", metrics.PreAuthHandshakeTimeout)
@@ -675,7 +762,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 					return err
 				}
 				c.nc = tc
-				c.backend = pgproto3.NewBackend(tc, tc)
+				c.backend = newPreAuthBackend(tc)
 				c.tlsDone = true
 				c.session.SetTransport(true, isLoopbackAddr(tc.RemoteAddr()))
 				continue
@@ -1206,6 +1293,14 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 	}
 	n := binary.BigEndian.Uint32(raw[:4])
 	raw = raw[8:]
+	// Every element takes at least its 4-byte length, so a count the
+	// rest of the value cannot hold is refused before it sizes anything:
+	// a 20-byte value declaring 0xF0000000 elements used to ask the
+	// runtime for hundreds of gigabytes and kill the process.
+	if uint64(n) > uint64(len(raw)/4) {
+		return types.Datum{}, &sql.Error{Code: sql.CodeInvalidBinaryRepresentation,
+			Msg: fmt.Sprintf("binary array declares %d elements in %d bytes", n, len(raw))}
+	}
 	elems := make([]types.Datum, 0, n)
 	for i := uint32(0); i < n; i++ {
 		if len(raw) < 4 {
@@ -1228,6 +1323,45 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 		elems = append(elems, d)
 	}
 	return types.NewArray(elem, elems), nil
+}
+
+// The range a binary datetime parameter may hold: what the text input
+// accepts, refused outside with 22008 rather than wrapped. A timestamp
+// is Unix nanoseconds in an int64, the years 1678 to 2261 (as
+// types.ParseTimestamp refuses outside them); a date the years 0000 to
+// 9999 that types.ParseDate reads. Timestamp bounds are microseconds
+// from PostgreSQL's epoch (as sent), date bounds days from the Unix
+// epoch (as stored).
+var (
+	minBinaryTimestamp = time.Date(1678, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros
+	maxBinaryTimestamp = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros // exclusive
+	minBinaryDate      = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400
+	maxBinaryDate      = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC).Unix() / 86400
+)
+
+// datetimeOverflow is the 22008 (datetime_field_overflow) for a binary
+// datetime parameter outside what datax represents. PostgreSQL encodes
+// infinity as the type's extreme value; datax has no infinite datetimes
+// (the text 'infinity' is refused too), so it is named in the message.
+func datetimeOverflow(typ string, infinite bool) *sql.Error {
+	msg := typ + " out of range"
+	if infinite {
+		msg = fmt.Sprintf("%s: infinite %s values are not supported", msg, typ)
+	}
+	return &sql.Error{Code: codeDatetimeOverflow, Msg: msg}
+}
+
+// codeDatetimeOverflow is PostgreSQL's datetime_field_overflow.
+const codeDatetimeOverflow = "22008"
+
+// binaryErrCode is the SQLSTATE for a binary decode failure: the
+// decoder's own when it gave one (*sql.Error), def otherwise.
+func binaryErrCode(err error, def string) string {
+	var serr *sql.Error
+	if errors.As(err, &serr) && serr.Code != "" {
+		return serr.Code
+	}
+	return def
 }
 
 // decodeBinaryParam decodes a binary-format parameter of a known type.
@@ -1270,13 +1404,21 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		return types.Datum{}, fmt.Errorf("bad binary bool length %d", len(raw))
 	case types.Timestamp:
 		if len(raw) == 8 {
-			micros := int64(binary.BigEndian.Uint64(raw)) + pgEpochOffsetMicros
-			return types.NewTimestamp(micros * 1000), nil
+			pgMicros := int64(binary.BigEndian.Uint64(raw))
+			if pgMicros < minBinaryTimestamp || pgMicros >= maxBinaryTimestamp {
+				return types.Datum{}, datetimeOverflow("timestamp", pgMicros == math.MinInt64 || pgMicros == math.MaxInt64)
+			}
+			return types.NewTimestamp((pgMicros + pgEpochOffsetMicros) * 1000), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary timestamptz length %d", len(raw))
 	case types.Date:
 		if len(raw) == 4 {
-			return types.NewDate(int64(int32(binary.BigEndian.Uint32(raw))) + pgEpochOffsetDays), nil
+			pgDays := int32(binary.BigEndian.Uint32(raw))
+			days := int64(pgDays) + pgEpochOffsetDays
+			if days < minBinaryDate || days > maxBinaryDate {
+				return types.Datum{}, datetimeOverflow("date", pgDays == math.MinInt32 || pgDays == math.MaxInt32)
+			}
+			return types.NewDate(days), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary date length %d", len(raw))
 	case types.Bytes:
@@ -1315,8 +1457,12 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 16 {
 			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
 		}
+		micros := int64(binary.BigEndian.Uint64(raw[:8]))
+		if micros > math.MaxInt64/1000 || micros < math.MinInt64/1000 {
+			return types.Datum{}, datetimeOverflow("interval", micros == math.MinInt64 || micros == math.MaxInt64)
+		}
 		return types.NewInterval(types.Interval{
-			Nanos:  int64(binary.BigEndian.Uint64(raw[:8])) * 1000,
+			Nanos:  micros * 1000,
 			Days:   int64(int32(binary.BigEndian.Uint32(raw[8:12]))),
 			Months: int64(int32(binary.BigEndian.Uint32(raw[12:16]))),
 		}), nil
@@ -1324,7 +1470,11 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 8 {
 			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
 		}
-		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
+		micros := int64(binary.BigEndian.Uint64(raw))
+		if micros < 0 || micros > types.NanosPerDay/1000 {
+			return types.Datum{}, datetimeOverflow("time", false)
+		}
+		return types.NewTime(micros * 1000), nil
 	case types.Vector:
 		stored, err := vector.DecodeBinary(raw)
 		if err != nil {
@@ -1406,6 +1556,18 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 			Msg: fmt.Sprintf("bind supplies %d parameters, statement needs %d", len(m.Parameters), p.nParams)})
 		return
 	}
+	// A format-code list holds no code (all text), one (for every item)
+	// or one per item; pgproto3 decodes whatever count the client sent.
+	if n := len(m.ParameterFormatCodes); n > 1 && n != len(m.Parameters) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d parameter formats but %d parameters", n, len(m.Parameters))})
+		return
+	}
+	if n := len(m.ResultFormatCodes); n > 1 && n != len(p.cols) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d result formats but query has %d columns", n, len(p.cols))})
+		return
+	}
 	paramFormat := func(i int) int16 {
 		switch len(m.ParameterFormatCodes) {
 		case 0:
@@ -1434,7 +1596,7 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		}
 		d, err := decodeBinaryParam(raw, fam)
 		if err != nil {
-			c.extError(&sql.Error{Code: sql.CodeInvalidBinaryRepresentation, Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
+			c.extError(&sql.Error{Code: binaryErrCode(err, sql.CodeInvalidBinaryRepresentation), Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
 			return
 		}
 		params[i] = d
