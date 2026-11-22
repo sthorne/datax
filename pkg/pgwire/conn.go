@@ -1230,6 +1230,14 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 	}
 	n := binary.BigEndian.Uint32(raw[:4])
 	raw = raw[8:]
+	// Every element takes at least its 4-byte length, so a count the
+	// rest of the value cannot hold is refused before it sizes anything:
+	// a 20-byte value declaring 0xF0000000 elements used to ask the
+	// runtime for hundreds of gigabytes and kill the process.
+	if uint64(n) > uint64(len(raw)/4) {
+		return types.Datum{}, &sql.Error{Code: sql.CodeInvalidBinaryRepresentation,
+			Msg: fmt.Sprintf("binary array declares %d elements in %d bytes", n, len(raw))}
+	}
 	elems := make([]types.Datum, 0, n)
 	for i := uint32(0); i < n; i++ {
 		if len(raw) < 4 {
@@ -1252,6 +1260,16 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 		elems = append(elems, d)
 	}
 	return types.NewArray(elem, elems), nil
+}
+
+// binaryErrCode is the SQLSTATE for a binary decode failure: the
+// decoder's own when it gave one (*sql.Error), def otherwise.
+func binaryErrCode(err error, def string) string {
+	var serr *sql.Error
+	if errors.As(err, &serr) && serr.Code != "" {
+		return serr.Code
+	}
+	return def
 }
 
 // decodeBinaryParam decodes a binary-format parameter of a known type.
@@ -1470,7 +1488,7 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		}
 		d, err := decodeBinaryParam(raw, fam)
 		if err != nil {
-			c.extError(&sql.Error{Code: sql.CodeInvalidBinaryRepresentation, Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
+			c.extError(&sql.Error{Code: binaryErrCode(err, sql.CodeInvalidBinaryRepresentation), Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
 			return
 		}
 		params[i] = d

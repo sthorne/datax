@@ -1181,6 +1181,14 @@ state or the internode protocol does, and an entry below says so.
   refused with `08P01`. A panic on a connection's goroutine now closes
   only that connection: it is logged at error level with its stack, and
   the client gets a FATAL `XX000`.
+- **A binary array parameter can no longer exhaust the node's memory.**
+  The element count of a binary-format array (a Bind parameter or a
+  binary COPY field) sized an allocation before any element was read,
+  so a 20-byte `int8[]` declaring 0xF0000000 elements had the runtime
+  ask for about 480 GB and the process died. A count the value's bytes
+  cannot hold is now refused with `22P03`. A binary COPY field's buffer
+  likewise grows with the data that arrives instead of being sized by
+  the field's declared length.
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the

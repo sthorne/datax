@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -155,5 +156,44 @@ func TestPanicInConnectionClosesOnlyIt(t *testing.T) {
 	expectClosed(t, nc, 5*time.Second)
 	if got := bindOutcome(t, other, "SELECT $1::text", &pgproto3.Bind{Parameters: [][]byte{[]byte("x")}}); got != "" {
 		t.Fatalf("the other connection's Bind answered %q", got)
+	}
+}
+
+// binaryArray builds a one-dimensional binary array value declaring n
+// elements of type oid, followed by body.
+func binaryArray(oid, n uint32, body []byte) []byte {
+	raw := binary.BigEndian.AppendUint32(nil, 1) // ndim
+	raw = binary.BigEndian.AppendUint32(raw, 0)  // has nulls
+	raw = binary.BigEndian.AppendUint32(raw, oid)
+	raw = binary.BigEndian.AppendUint32(raw, n) // dimension length
+	raw = binary.BigEndian.AppendUint32(raw, 1) // lower bound
+	return append(raw, body...)
+}
+
+// TestBindBinaryArrayElementCount: a binary array's element count is
+// the client's word; one its bytes cannot hold is refused with 22P03
+// before anything is sized by it. A 20-byte int8[] declaring
+// 0xF0000000 elements used to have the runtime map hundreds of
+// gigabytes, a fatal out-of-memory error for the whole node.
+func TestBindBinaryArrayElementCount(t *testing.T) {
+	s := startServer(t, ServerOptions{})
+	_, fe := trustConn(t, s)
+	two := binary.BigEndian.AppendUint32(nil, 8)
+	two = binary.BigEndian.AppendUint64(two, 7)
+	two = binary.BigEndian.AppendUint32(two, 0xffffffff) // NULL
+	for _, c := range []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{"two elements", binaryArray(oidInt8, 2, two), ""},
+		{"empty", binaryArray(oidInt8, 0, nil), ""},
+		{"huge count, no elements", binaryArray(oidInt8, 0xF0000000, nil), "22P03"},
+		{"count past the bytes", binaryArray(oidInt8, 4, two), "22P03"},
+	} {
+		got := bindOutcome(t, fe, "SELECT $1::int8[]", &pgproto3.Bind{ParameterFormatCodes: []int16{1}, Parameters: [][]byte{c.raw}})
+		if got != c.want {
+			t.Errorf("%s: Bind answered %q, want %q", c.name, got, c.want)
+		}
 	}
 }

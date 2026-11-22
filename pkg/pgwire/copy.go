@@ -567,13 +567,13 @@ func copyBinaryLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols 
 			if flen < 0 {
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "negative field length %d", flen)
 			}
-			raw := make([]byte, flen)
-			if _, err := io.ReadFull(br, raw); err != nil {
+			raw, err := readCopyField(br, int(flen))
+			if err != nil {
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "reading field data: %v", err)
 			}
 			d, derr := decodeBinaryParam(raw, cols[i].Type)
 			if derr != nil {
-				return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, derr)
+				return rowFmtErr(ci, binaryErrCode(derr, sql.CodeInvalidTextRepresentation), "column %q: %v", cols[i].Name, derr)
 			}
 			vals[i] = d
 		}
@@ -581,4 +581,33 @@ func copyBinaryLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols 
 			return err
 		}
 	}
+}
+
+// copyFieldChunk is the most a binary COPY field's buffer is sized
+// to on the strength of its declared length alone.
+const copyFieldChunk = 64 << 10
+
+// readCopyField reads a binary COPY field of the declared length n. The
+// length is the client's word: a field up to copyFieldChunk is read
+// into a buffer of that size, a longer one into a buffer that grows
+// with the bytes that actually arrive, so a 4-byte length declaring
+// 2 GiB costs memory only as the data is sent.
+func readCopyField(r io.Reader, n int) ([]byte, error) {
+	if n <= copyFieldChunk {
+		raw := make([]byte, n)
+		if _, err := io.ReadFull(r, raw); err != nil {
+			return nil, err
+		}
+		return raw, nil
+	}
+	var b bytes.Buffer
+	b.Grow(copyFieldChunk)
+	got, err := io.CopyN(&b, r, int64(n))
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("%w after %d of %d bytes", err, got, n)
+	}
+	return b.Bytes(), nil
 }
