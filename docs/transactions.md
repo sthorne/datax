@@ -98,9 +98,11 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   compare-and-set PENDING→COMMITTED. The moment it applies, every intent the
   transaction wrote anywhere in the cluster is logically committed — readers
   who find those intents will push, discover COMMITTED, and resolve them.
-- After commit the coordinator resolves intents asynchronously and finally
-  deletes the record. If the coordinator dies first, resolution happens lazily
-  via pushes. This is the **crashed-coordinator story**: no intent outlives
+- After commit the coordinator resolves intents asynchronously; it never
+  deletes the record. The finalized record stays until GC reclaims it once
+  it is older than the GC TTL (`enumerateGarbageTxnRecords`; a committed
+  record's write set is resolved first). If the coordinator dies first,
+  resolution happens lazily via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
 - A **commit that fails** — the refresh it needed failed, its deadline had
   passed, a pusher had aborted it — aborts the record and resolves the
