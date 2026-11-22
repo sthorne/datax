@@ -486,9 +486,12 @@ conversion is the type's cast: widening (`INT8` to `DECIMAL` or
 `FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
 typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
 `BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
-typmod change rescales, and a change of integer width, character
-length or timestamp form checks every stored value against the new
-modifier (`22003` / `22001`). A value that cannot convert fails the
+typmod change rescales every stored value as a write into the column
+does (halves away from zero: `1.005` to `DECIMAL(10,2)` is `1.01`) and
+fails with `22003` when one no longer fits, and a change of integer
+width, character length or timestamp form checks every stored value
+against the new modifier (`22003` / `22001`). An array column's
+modifiers are its elements', and change the same way. A value that cannot convert fails the
 statement (`22P02`) and the column is left as it was. A modifier change
 that cannot lose a value (a wider integer, a longer `VARCHAR`, more
 timestamp digits) skips the rewrite: one descriptor write, and the

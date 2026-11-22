@@ -2088,6 +2088,18 @@ state or the internode protocol does, and an entry below says so.
   binary's version: one restarting into a newer cluster is refused at
   re-announce or join, and a running one that sees the version pass it
   stops serving, never adopting or persisting the version.
+- **`ALTER COLUMN ... TYPE DECIMAL(p,s)` rounds the stored values.**
+  Narrowing a DECIMAL column's scale checked each value against the new
+  type but stored it unrounded, so after `ALTER COLUMN c TYPE
+  DECIMAL(10,2)` a row holding `1.005` still held and showed `1.005`
+  (PostgreSQL: `1.01`), and `c = 1.01` did not match it. The rewrite now
+  rounds like every other write into the column (halves away from
+  zero), and a value that no longer fits is `22003`. Narrowing the
+  element type of an array column (`DECIMAL(10,3)[]` to
+  `DECIMAL(10,2)[]`, `VARCHAR(10)[]` to `VARCHAR(3)[]`, `INT8[]` to
+  `INT2[]`) was a descriptor-only change that kept values the new type
+  cannot hold; it is now the online rewrite, which rounds or checks
+  every element.
 - **Numeric division and `avg` keep PostgreSQL's precision.** DECIMAL
   `/` and `avg` over DECIMAL or integer columns rounded to a fixed 6
   fractional digits, half to even, so `0.0000005::numeric / 1` gave
