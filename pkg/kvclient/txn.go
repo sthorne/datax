@@ -178,7 +178,17 @@ type Txn struct {
 		txn      kvpb.Transaction
 		writes   map[string]struct{} // keys with intents (across epochs)
 		anchored bool                // transaction record created
-		finished bool
+		// recordMaybe: a request that creates the record on the anchor
+		// key (txn.Key) has been sent, so a record may exist even while
+		// anchored is false — the request failed, and a failure need not
+		// mean nothing applied (a multi-range batch's anchor part is sent
+		// first, alone, and may have applied before another part failed;
+		// a timed-out write may have been proposed). Such a transaction
+		// is finished like an anchored one: COMMIT and ROLLBACK end its
+		// record (EndTxn writes one if none exists) rather than taking
+		// it for read-only and leaving its intents to expire.
+		recordMaybe bool
+		finished    bool
 		// readSpans are the spans this transaction has observed; refresh
 		// verifies them when moving the read timestamp forward.
 		readSpans []readSpan
@@ -755,6 +765,7 @@ func (t *Txn) GetBatchForUpdate(ctx context.Context, ks []keys.Key) ([][]byte, e
 		for _, k := range ks {
 			if keys.Key(t.mu.txn.Key).Equal(k) {
 				createRecord = true
+				t.mu.recordMaybe = true
 				break
 			}
 		}
@@ -767,6 +778,7 @@ func (t *Txn) GetBatchForUpdate(ctx context.Context, ks []keys.Key) ([][]byte, e
 	}
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
+		t.mayHaveWritten(ks, createRecord)
 		return nil, err
 	}
 	vals := make([][]byte, len(ks))
@@ -791,6 +803,7 @@ func (t *Txn) ScanForUpdate(ctx context.Context, start, end keys.Key, max int64)
 	ba, k := t.prepareWrite(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: start.Clone(), EndKey: end.Clone()}, ForUpdate: true, MaxRows: max})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
+		t.mayHaveWritten([]keys.Key{k}, ba.Header.CreateTxnRecord)
 		return nil, err
 	}
 	resp := br.Responses[0].Scan
@@ -824,6 +837,7 @@ func (t *Txn) Increment(ctx context.Context, key keys.Key, by int64) (int64, err
 	ba, key0 := t.prepareWrite(&kvpb.IncrementRequest{RequestHeader: kvpb.RequestHeader{Key: key.Clone()}, By: by})
 	br, err := t.send(ctx, ba, true)
 	if err != nil {
+		t.mayHaveWritten([]keys.Key{key0}, ba.Header.CreateTxnRecord)
 		return 0, err
 	}
 	t.recordWrite(key0)
@@ -839,6 +853,7 @@ func (t *Txn) write(ctx context.Context, req kvpb.Request) error {
 	}
 	ba, key := t.prepareWrite(req)
 	if _, err := t.send(ctx, ba, true); err != nil {
+		t.mayHaveWritten([]keys.Key{key}, ba.Header.CreateTxnRecord)
 		return err
 	}
 	t.recordWrite(key)
@@ -860,6 +875,7 @@ func (t *Txn) prepareWrite(req kvpb.Request) (*kvpb.BatchRequest, keys.Key) {
 		// range, so only the batch writing the anchor key itself creates it.
 		if keys.Key(t.mu.txn.Key).Equal(key) {
 			createRecord = true
+			t.mu.recordMaybe = true
 		}
 	}
 	txn := t.mu.txn
@@ -916,6 +932,37 @@ func (t *Txn) recordWrite(key keys.Key) {
 	if anchoredNow {
 		t.startHeartbeat()
 	}
+}
+
+// mayHaveWritten settles a write request over ks that failed: the
+// failure need not mean that nothing applied (a multi-range batch may
+// have applied on some ranges before another failed, and a write whose
+// attempt timed out may have been proposed), so every key is tracked as
+// written — a savepoint rollback, and the transaction's end, then remove
+// whatever did apply; resolving a key that holds no intent of this
+// transaction is a no-op. A request that was to create the record
+// (createRecord) leaves the transaction with a record that may exist
+// (recordMaybe, set when it was sent), kept alive by the heartbeat until
+// the transaction ends. Callers that know none of it applied undo the
+// anchor choice instead.
+func (t *Txn) mayHaveWritten(ks []keys.Key, createRecord bool) {
+	t.mu.Lock()
+	if t.mu.writes == nil {
+		t.mu.writes = make(map[string]struct{})
+	}
+	for _, k := range ks {
+		t.mu.writes[string(k)] = struct{}{}
+	}
+	t.mu.Unlock()
+	if createRecord {
+		t.startHeartbeat()
+	}
+}
+
+// mayHaveRecordLocked reports whether the transaction has, or may have, a
+// record to end; t.mu must be held.
+func (t *Txn) mayHaveRecordLocked() bool {
+	return t.mu.anchored || t.mu.recordMaybe
 }
 
 // send executes a batch, handling conflicts: intents are pushed (and
@@ -1226,7 +1273,7 @@ func (t *Txn) publishWait(ctx context.Context, pushee *enginepb.TxnMeta) {
 	t.mu.Lock()
 	changed := t.mu.waitingFor != id
 	t.mu.waitingFor, t.mu.waitingForKey = id, key
-	anchored := t.mu.anchored
+	anchored := t.mayHaveRecordLocked()
 	txn := t.mu.txn
 	t.mu.Unlock()
 	if !changed || !anchored {
@@ -1510,7 +1557,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 		return t.parallelCommit(ctx, wb)
 	}
 	t.mu.Lock()
-	anchored := t.mu.anchored
+	anchored := t.mayHaveRecordLocked()
 	txn := t.mu.txn
 	t.mu.Unlock()
 
@@ -1562,7 +1609,7 @@ func (t *Txn) Commit(ctx context.Context) error {
 // left to the pushers that find them, which read the record's verdict.
 func (t *Txn) abortFailedCommit(ctx context.Context) {
 	t.mu.Lock()
-	anchored := t.mu.anchored
+	anchored := t.mayHaveRecordLocked()
 	txn := t.mu.txn
 	cleaned := t.mu.abortCleaned
 	t.mu.abortCleaned = true
@@ -1603,7 +1650,7 @@ func (t *Txn) abortFailedCommit(ctx context.Context) {
 // in its response.
 func (t *Txn) commit1PC(ctx context.Context, wb *WriteBatch) (bool, error) {
 	t.mu.Lock()
-	if t.mu.anchored || len(t.mu.writes) != 0 {
+	if t.mayHaveRecordLocked() || len(t.mu.writes) != 0 {
 		t.mu.Unlock()
 		return false, nil
 	}
@@ -1968,7 +2015,7 @@ func (t *Txn) Rollback(ctx context.Context) error {
 		t.mu.Unlock()
 		return nil
 	}
-	anchored := t.mu.anchored
+	anchored := t.mayHaveRecordLocked()
 	txn := t.mu.txn
 	t.mu.Unlock()
 	t.markFinished()
