@@ -1198,6 +1198,16 @@ state or the internode protocol does, and an entry below says so.
   (`ServerOptions.MaxMessageSize`; PostgreSQL's cap is 1 GB). A longer
   message ends the connection with a FATAL `08P01` before its body is
   allocated. COPY is unaffected: the cap is per CopyData message.
+- **Binary datetime parameters no longer wrap silently.** A binary
+  timestamp, date, interval or time (a Bind parameter or a binary COPY
+  field) was converted with no range check. The year 2400 was stored as
+  1815, timestamptz infinity as 1999-12-31, date infinity as
+  5881610-07-11, and an interval of 2^62 µs as `00:00:00`. A value
+  outside what the text input accepts is now refused with `22008`, as
+  the text path refuses it: timestamps 1678-01-01 to 2261-12-31, dates
+  0000-01-01 to 9999-12-31, times 00:00 to 24:00, and intervals whose
+  microseconds fit in nanoseconds. PostgreSQL's infinity encodings are
+  refused the same way, with a message naming them (PG-T-005).
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the

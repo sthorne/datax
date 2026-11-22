@@ -1325,6 +1325,35 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 	return types.NewArray(elem, elems), nil
 }
 
+// The range a binary datetime parameter may hold: what the text input
+// accepts, refused outside with 22008 rather than wrapped. A timestamp
+// is Unix nanoseconds in an int64, the years 1678 to 2261 (as
+// types.ParseTimestamp refuses outside them); a date the years 0000 to
+// 9999 that types.ParseDate reads. Timestamp bounds are microseconds
+// from PostgreSQL's epoch (as sent), date bounds days from the Unix
+// epoch (as stored).
+var (
+	minBinaryTimestamp = time.Date(1678, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros
+	maxBinaryTimestamp = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros // exclusive
+	minBinaryDate      = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400
+	maxBinaryDate      = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC).Unix() / 86400
+)
+
+// datetimeOverflow is the 22008 (datetime_field_overflow) for a binary
+// datetime parameter outside what datax represents. PostgreSQL encodes
+// infinity as the type's extreme value; datax has no infinite datetimes
+// (the text 'infinity' is refused too), so it is named in the message.
+func datetimeOverflow(typ string, infinite bool) *sql.Error {
+	msg := typ + " out of range"
+	if infinite {
+		msg = fmt.Sprintf("%s: infinite %s values are not supported", msg, typ)
+	}
+	return &sql.Error{Code: codeDatetimeOverflow, Msg: msg}
+}
+
+// codeDatetimeOverflow is PostgreSQL's datetime_field_overflow.
+const codeDatetimeOverflow = "22008"
+
 // binaryErrCode is the SQLSTATE for a binary decode failure: the
 // decoder's own when it gave one (*sql.Error), def otherwise.
 func binaryErrCode(err error, def string) string {
@@ -1375,13 +1404,21 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		return types.Datum{}, fmt.Errorf("bad binary bool length %d", len(raw))
 	case types.Timestamp:
 		if len(raw) == 8 {
-			micros := int64(binary.BigEndian.Uint64(raw)) + pgEpochOffsetMicros
-			return types.NewTimestamp(micros * 1000), nil
+			pgMicros := int64(binary.BigEndian.Uint64(raw))
+			if pgMicros < minBinaryTimestamp || pgMicros >= maxBinaryTimestamp {
+				return types.Datum{}, datetimeOverflow("timestamp", pgMicros == math.MinInt64 || pgMicros == math.MaxInt64)
+			}
+			return types.NewTimestamp((pgMicros + pgEpochOffsetMicros) * 1000), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary timestamptz length %d", len(raw))
 	case types.Date:
 		if len(raw) == 4 {
-			return types.NewDate(int64(int32(binary.BigEndian.Uint32(raw))) + pgEpochOffsetDays), nil
+			pgDays := int32(binary.BigEndian.Uint32(raw))
+			days := int64(pgDays) + pgEpochOffsetDays
+			if days < minBinaryDate || days > maxBinaryDate {
+				return types.Datum{}, datetimeOverflow("date", pgDays == math.MinInt32 || pgDays == math.MaxInt32)
+			}
+			return types.NewDate(days), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary date length %d", len(raw))
 	case types.Bytes:
@@ -1420,8 +1457,12 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 16 {
 			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
 		}
+		micros := int64(binary.BigEndian.Uint64(raw[:8]))
+		if micros > math.MaxInt64/1000 || micros < math.MinInt64/1000 {
+			return types.Datum{}, datetimeOverflow("interval", micros == math.MinInt64 || micros == math.MaxInt64)
+		}
 		return types.NewInterval(types.Interval{
-			Nanos:  int64(binary.BigEndian.Uint64(raw[:8])) * 1000,
+			Nanos:  micros * 1000,
 			Days:   int64(int32(binary.BigEndian.Uint32(raw[8:12]))),
 			Months: int64(int32(binary.BigEndian.Uint32(raw[12:16]))),
 		}), nil
@@ -1429,7 +1470,11 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 8 {
 			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
 		}
-		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
+		micros := int64(binary.BigEndian.Uint64(raw))
+		if micros < 0 || micros > types.NanosPerDay/1000 {
+			return types.Datum{}, datetimeOverflow("time", false)
+		}
+		return types.NewTime(micros * 1000), nil
 	case types.Vector:
 		stored, err := vector.DecodeBinary(raw)
 		if err != nil {

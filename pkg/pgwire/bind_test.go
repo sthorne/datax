@@ -2,11 +2,14 @@ package pgwire
 
 import (
 	"encoding/binary"
+	"math"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 // Bind-time checks on what a client sends, driven as raw protocol
@@ -194,6 +197,100 @@ func TestBindBinaryArrayElementCount(t *testing.T) {
 		got := bindOutcome(t, fe, "SELECT $1::int8[]", &pgproto3.Bind{ParameterFormatCodes: []int16{1}, Parameters: [][]byte{c.raw}})
 		if got != c.want {
 			t.Errorf("%s: Bind answered %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// pgMicros is t as a binary timestamp: microseconds since 2000-01-01.
+func pgMicros(t time.Time) []byte {
+	return binary.BigEndian.AppendUint64(nil, uint64(t.UnixMicro()-pgEpochOffsetMicros))
+}
+
+func pgDays(t time.Time) []byte {
+	return binary.BigEndian.AppendUint32(nil, uint32(int32(t.Unix()/86400-pgEpochOffsetDays)))
+}
+
+func i64(v int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(v)) }
+
+func pgInterval(micros int64, days, months int32) []byte {
+	out := i64(micros)
+	out = binary.BigEndian.AppendUint32(out, uint32(days))
+	return binary.BigEndian.AppendUint32(out, uint32(months))
+}
+
+// TestBinaryDatetimeRange: binary timestamp, date, interval and time
+// parameters outside what the text input accepts are refused with
+// 22008, PostgreSQL's infinity encodings among them, where they used to
+// wrap silently: the year 2400 was stored as 1815, timestamptz infinity
+// as 1999-12-31, date infinity as 5881610-07-11, an interval of 2^62 µs
+// as 00:00:00. The same decoder serves binary COPY.
+func TestBinaryDatetimeRange(t *testing.T) {
+	utc := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
+	for _, c := range []struct {
+		name string
+		fam  types.Family
+		raw  []byte
+		want int64 // the stored value when accepted
+		code string
+	}{
+		{"timestamp 2024", types.Timestamp, pgMicros(utc(2024, 7, 1)), utc(2024, 7, 1).UnixNano(), ""},
+		{"timestamp first", types.Timestamp, pgMicros(utc(1678, 1, 1)), utc(1678, 1, 1).UnixNano(), ""},
+		{"timestamp last", types.Timestamp, pgMicros(utc(2262, 1, 1).Add(-time.Microsecond)), utc(2262, 1, 1).Add(-time.Microsecond).UnixNano(), ""},
+		{"timestamp 2262", types.Timestamp, pgMicros(utc(2262, 1, 1)), 0, "22008"},
+		{"timestamp 2400", types.Timestamp, pgMicros(utc(2400, 1, 1)), 0, "22008"},
+		{"timestamp 1677", types.Timestamp, pgMicros(utc(1677, 12, 31)), 0, "22008"},
+		{"timestamp infinity", types.Timestamp, i64(math.MaxInt64), 0, "22008"},
+		{"timestamp -infinity", types.Timestamp, i64(math.MinInt64), 0, "22008"},
+		{"date 2400", types.Date, pgDays(utc(2400, 1, 1)), utc(2400, 1, 1).Unix() / 86400, ""},
+		{"date 9999-12-31", types.Date, pgDays(utc(9999, 12, 31)), utc(9999, 12, 31).Unix() / 86400, ""},
+		{"date 0000-01-01", types.Date, pgDays(utc(0, 1, 1)), utc(0, 1, 1).Unix() / 86400, ""},
+		{"date 10000", types.Date, pgDays(utc(10000, 1, 1)), 0, "22008"},
+		{"date before year 0", types.Date, pgDays(utc(-1, 12, 31)), 0, "22008"},
+		{"date infinity", types.Date, binary.BigEndian.AppendUint32(nil, math.MaxInt32), 0, "22008"},
+		{"date -infinity", types.Date, binary.BigEndian.AppendUint32(nil, 1<<31), 0, "22008"},
+		{"interval 1 h", types.IntervalFam, pgInterval(3600e6, 2, 3), int64(time.Hour), ""},
+		{"interval largest", types.IntervalFam, pgInterval(math.MaxInt64/1000, 0, 0), math.MaxInt64 / 1000 * 1000, ""},
+		{"interval 2^62 us", types.IntervalFam, pgInterval(1<<62, 0, 0), 0, "22008"},
+		{"interval -2^62 us", types.IntervalFam, pgInterval(-1<<62, 0, 0), 0, "22008"},
+		{"interval infinity", types.IntervalFam, pgInterval(math.MaxInt64, math.MaxInt32, math.MaxInt32), 0, "22008"},
+		{"time noon", types.Time, i64(12 * 3600e6), int64(12 * time.Hour), ""},
+		{"time 24:00", types.Time, i64(24 * 3600e6), int64(24 * time.Hour), ""},
+		{"time past 24:00", types.Time, i64(24*3600e6 + 1), 0, "22008"},
+		{"time negative", types.Time, i64(-1), 0, "22008"},
+		{"time 2^62 us", types.Time, i64(1 << 62), 0, "22008"},
+	} {
+		d, err := decodeBinaryParam(c.raw, c.fam)
+		switch {
+		case c.code == "" && err != nil:
+			t.Errorf("%s: refused: %v", c.name, err)
+		case c.code == "" && d.I != c.want:
+			t.Errorf("%s: decoded %d, want %d", c.name, d.I, c.want)
+		case c.code != "" && binaryErrCode(err, "") != c.code:
+			t.Errorf("%s: decoded %+v, %v; want %s", c.name, d, err, c.code)
+		}
+	}
+}
+
+// TestBindBinaryDatetimeRange: the 22008 reaches the client as the
+// Bind's error.
+func TestBindBinaryDatetimeRange(t *testing.T) {
+	s := startServer(t, ServerOptions{})
+	_, fe := trustConn(t, s)
+	y2400 := pgMicros(time.Date(2400, 1, 1, 0, 0, 0, 0, time.UTC))
+	for _, c := range []struct {
+		query string
+		raw   []byte
+		want  string
+	}{
+		{"SELECT $1::timestamptz", pgMicros(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)), ""},
+		{"SELECT $1::timestamptz", y2400, "22008"},
+		{"SELECT $1::timestamptz", i64(math.MaxInt64), "22008"},
+		{"SELECT $1::date", binary.BigEndian.AppendUint32(nil, math.MaxInt32), "22008"},
+		{"SELECT $1::interval", pgInterval(1<<62, 0, 0), "22008"},
+	} {
+		got := bindOutcome(t, fe, c.query, &pgproto3.Bind{ParameterFormatCodes: []int16{1}, Parameters: [][]byte{c.raw}})
+		if got != c.want {
+			t.Errorf("%s with %x: Bind answered %q, want %q", c.query, c.raw, got, c.want)
 		}
 	}
 }
