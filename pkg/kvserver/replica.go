@@ -254,7 +254,23 @@ type Replica struct {
 	// entries (finishReady's conf-change path) rather than an apply
 	// worker: a merge apply then tells stopReplica which pass is its own.
 	inlineApply atomic.Bool
+
+	// failed is set when the group was stopped by a failure (a raft
+	// engine write error such as ENOSPC or EIO, a failed apply) rather
+	// than by removal, a merge or shutdown: the replica stays in the
+	// store map but serves nothing until the node restarts. The node
+	// reports such replicas in its heartbeat so the health check counts
+	// them as unavailable (Store.FailedReplicas).
+	failed atomic.Bool
 }
+
+// Failed reports whether the replica's group was stopped by a failure
+// and will serve nothing until the node restarts.
+func (r *Replica) Failed() bool { return r.failed.Load() }
+
+// TestingFailReady stops the group as a Ready that could not be handled
+// with err would (a raft engine write error, say).
+func (r *Replica) TestingFailReady(err error) { r.failReady(err) }
 
 // errRaftStopped is returned by every raft-group call on a stopped
 // replica.
@@ -832,9 +848,11 @@ func (r *Replica) failReady(err error) {
 		// Aborted without a shutdown (a dead local RHS at merge apply,
 		// issue #70): nothing was applied, and this replica is out of
 		// service until the node restarts.
+		r.failed.Store(true)
 		log.Warnf("%s/%d: %v", r.rangeID, r.replicaID, err)
 	} else {
-		log.Errorf("%s/%d: ready handling failed: %v", r.rangeID, r.replicaID, err)
+		r.failed.Store(true)
+		log.Errorf("%s/%d: ready handling failed: %v; the replica serves nothing until the node restarts", r.rangeID, r.replicaID, err)
 	}
 	r.markStopped()
 }

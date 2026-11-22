@@ -270,7 +270,13 @@ No gossip protocol in v1; membership is join-based:
   descriptor — the **routing bootstrap**. All other range addressing goes
   through `/meta/` records stored *in* range 1.
 - Every node heartbeats a liveness timestamp into `/system/nodes/<id>` every
-  3s; this doubles as the allocator's liveness signal.
+  3s; this doubles as the allocator's liveness signal. The same row lists
+  the ranges the live node holds no serving replica of: replicas a
+  storage failure stopped until restart (`failed_replicas`), and ranges
+  whose descriptor has named it for over a minute with no replica loaded
+  (`missing_replicas`). The health check counts those as unavailable;
+  the allocator does not yet act on them (dead-node repair below is
+  driven by liveness alone).
 
 **Upreplication**: a background loop on the node leading range 1 scans all
 range descriptors; any range below the replication factor (default 3), when

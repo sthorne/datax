@@ -268,6 +268,12 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	byID := map[base.NodeID]kvpb.NodeDescriptor{}
 	cv := n.readClusterVersion(req.Context())
 	minBinary, maxBinary := version.Version(0), version.Version(0)
+	// Replicas a live node reports holding but not serving (failed), or
+	// not holding at all (missing): they count as unavailable below, as a
+	// dead node's do. This node's own are read now, not from its last
+	// heartbeat (replica_health.go).
+	unavailable := map[base.NodeID]map[base.RangeID]bool{}
+	selfFailed, selfMissing := n.unavailableReplicas()
 	for _, nd := range nodes {
 		byID[nd.NodeID] = nd
 		age := nowWall - nd.LivenessTime
@@ -280,6 +286,19 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				Summary: fmt.Sprintf("n%d has not heartbeated for %s (declared dead after %s)", nd.NodeID, time.Duration(age).Truncate(time.Second), time.Duration(dead))})
 		default:
 			live[nd.NodeID] = true
+			failed, missing := nd.FailedReplicas, nd.MissingReplicas
+			if nd.NodeID == n.ident.NodeID {
+				failed, missing = selfFailed, selfMissing
+			}
+			markUnavailable(unavailable, nd.NodeID, failed, missing)
+			if len(failed) > 0 {
+				add(Problem{Severity: SeverityCritical, Check: "replicas-failed", Node: int(nd.NodeID), Range: int64(failed[0]), Section: "nodes",
+					Summary: fmt.Sprintf("n%d has %d replica(s) stopped by a storage failure (e.g. %s): they serve nothing until the node restarts; check its log and disk", nd.NodeID, len(failed), failed[0])})
+			}
+			if len(missing) > 0 {
+				add(Problem{Severity: SeverityWarning, Check: "replicas-missing", Node: int(nd.NodeID), Range: int64(missing[0]), Section: "nodes",
+					Summary: fmt.Sprintf("n%d is a member of %d range(s) it holds no replica of (e.g. %s): it counts toward their quorum but cannot vote", nd.NodeID, len(missing), missing[0])})
+			}
 		}
 		if nd.Draining {
 			add(Problem{Severity: SeverityInfo, Check: "node-draining", Node: int(nd.NodeID), Section: "nodes",
@@ -355,7 +374,7 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			liveReps, seen := 0, map[string]bool{}
 			dup := false
 			for _, rep := range d.Replicas {
-				if live[rep.NodeID] {
+				if live[rep.NodeID] && !unavailable[rep.NodeID][d.RangeID] {
 					liveReps++
 				}
 				if nd, ok := byID[rep.NodeID]; ok {

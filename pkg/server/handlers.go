@@ -180,6 +180,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		}
 		n.mirrorClusterVersion(hctx)
 		n.auditEncryptionCutover(hctx)
+		n.refreshMissingReplicas(hctx)
 		cancel()
 	}
 }
@@ -231,6 +232,7 @@ func (n *Node) publishLiveness(ctx context.Context) {
 	if n.sqlServer() != nil {
 		nd.SQL = n.sqlServer().Activity().Summary()
 	}
+	nd.FailedReplicas, nd.MissingReplicas = n.unavailableReplicas()
 	raw, _ := json.Marshal(nd)
 	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 		log.Debugf("liveness heartbeat failed: %v", err)

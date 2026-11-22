@@ -787,6 +787,12 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 			// by a failed one must not open as a whole table.
 			err = sw.Close()
 		}
+		if err == nil {
+			// On disk before the manifest names it: a power loss after
+			// "backup written" must not leave a manifest over a data
+			// file that is truncated or empty.
+			err = syncFile(f)
+		}
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
@@ -846,17 +852,7 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 			return nil, err
 		}
 	}
-	tmp := filepath.Join(staging, backupManifestName)
-	if err = os.WriteFile(tmp, raw, 0o600); err != nil {
-		return nil, err
-	}
-	for _, bt := range man.Tables {
-		if err = os.Rename(filepath.Join(staging, bt.File), filepath.Join(dest, bt.File)); err != nil {
-			return nil, fmt.Errorf("moving %s into %s: %w", bt.File, dest, err)
-		}
-		moved = append(moved, bt.File)
-	}
-	if err = os.Rename(tmp, filepath.Join(dest, backupManifestName)); err != nil {
+	if moved, err = commitBackup(staging, dest, man.Tables, raw); err != nil {
 		return nil, err
 	}
 	n.events.RecordEnd("backup", opID, "ok", "backup written to %s: %d tables", dest, len(descs))
@@ -864,6 +860,40 @@ func (n *Node) RunBackupWith(ctx context.Context, opts BackupOptions) (_ *cluste
 	sum.Sealed = dataKey != nil
 	sum.Notes = notes
 	return sum, nil
+}
+
+// commitBackup moves a finished backup's data files from staging into
+// dest and writes its manifest there last, durably: the data files are
+// already synced (exportTable), the manifest is synced before its
+// rename, and dest is synced after the data files' renames and again
+// after the manifest's, so the manifest never survives a power loss
+// without the files it names, and success is reported only once all of
+// it is on disk. It returns the data files moved, for the caller's
+// cleanup on failure. Backups go only to this node's local filesystem.
+func commitBackup(staging, dest string, tables []backupTable, manifest []byte) (moved []string, err error) {
+	tmp := filepath.Join(staging, backupManifestName)
+	if err = writeFileSynced(tmp, manifest); err != nil {
+		return moved, err
+	}
+	for _, bt := range tables {
+		if err = os.Rename(filepath.Join(staging, bt.File), filepath.Join(dest, bt.File)); err != nil {
+			return moved, fmt.Errorf("moving %s into %s: %w", bt.File, dest, err)
+		}
+		moved = append(moved, bt.File)
+	}
+	if err = syncDir(dest); err != nil {
+		return moved, fmt.Errorf("syncing %s: %w", dest, err)
+	}
+	if err = os.Rename(tmp, filepath.Join(dest, backupManifestName)); err != nil {
+		return moved, err
+	}
+	if err = syncDir(dest); err != nil {
+		// Not known to be durable: the caller removes the data files,
+		// so the manifest goes too rather than name missing files.
+		_ = os.Remove(filepath.Join(dest, backupManifestName))
+		return moved, fmt.Errorf("syncing %s: %w", dest, err)
+	}
+	return moved, nil
 }
 
 // baseCollected says an incremental's export of a table was refused

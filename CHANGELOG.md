@@ -1173,6 +1173,20 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **The HTTP port no longer holds connections forever.** It bounded
+  only a request's headers (`--auth-timeout`), and Go closes an idle
+  keep-alive connection only at an idle or read timeout, of which it set
+  neither. Anyone who could reach the port, unauthenticated, could hold
+  a connection by sending one request and then nothing, or by trickling
+  a body to `/api/login` (which runs before authentication), and nothing
+  capped how many, so file descriptors and goroutines could be
+  exhausted. Now `--auth-timeout` bounds reading the whole request,
+  body included; an idle keep-alive connection is closed after 2
+  minutes; headers are capped at 64 KiB; and the new `--http-max-conns`
+  (default 512, negative for no cap) closes connections past the cap as
+  they are accepted, counted in the new
+  `datax_http_conns_refused_total`. Responses are not bounded: long
+  polls and pprof profiles run as before.
 - **An Admin RPC can no longer stop a node through its clock.** The
   Admin RPC ratcheted the node's clock to the caller's timestamp before
   authorizing anything, and a timestamp past `--max-offset` exited the
@@ -1555,9 +1569,10 @@ state or the internode protocol does, and an entry below says so.
   no floor, and the flag says so).
   **An authentication deadline** (`--auth-timeout`, default 60 s,
   PostgreSQL's `authentication_timeout`) closes a connection that has
-  not reached ReadyForQuery, wherever in the handshake it stalled; the
-  same setting is the HTTP server's `ReadHeaderTimeout`, which it had
-  none of. **A cap on connections in the pre-authentication state**
+  not reached ReadyForQuery, wherever in the handshake it stalled; on
+  the HTTP port the same setting bounds reading a request, its headers
+  and its body (see "The HTTP port no longer holds connections
+  forever" above). **A cap on connections in the pre-authentication state**
   (`--sql-max-pending-auth`, default 512) refuses at accept, with a
   FATAL 53300 and before anything is allocated for the connection,
   rather than accepting and holding; a client refused mid-SSLRequest
@@ -2068,6 +2083,29 @@ state or the internode protocol does, and an entry below says so.
   recovery. Before the finalize recovery finalizes as before; with a
   leaseholder on the old binary the probe matches on the transaction ID
   as before.
+- **Health sees replicas that a live node cannot serve.** A raft-engine
+  write error (ENOSPC, EIO) or a failed apply stops a replica's group
+  until the node restarts, but the replica stayed in the store map with
+  only a log line, and a replica lost before it reached disk is never
+  loaded. Either way the node kept heartbeating, so `quorum-lost` and
+  `under-replicated`, computed from liveness alone, said nothing while a
+  range ran a replica short or had no quorum. Each node now reports such
+  replicas in its heartbeat (failed ones at once, ranges whose
+  descriptor has named it for over a minute with no replica loaded as
+  missing), exports them as the new gauges `datax_replicas_failed` and
+  `datax_replicas_missing`, and the health check counts them as
+  unavailable and raises the new checks `replicas-failed` (critical) and
+  `replicas-missing` (warning). Additive heartbeat fields, so no version
+  gate. Dead-node repair still acts on liveness only.
+- **A backup reported written survives a power loss.** Backup data
+  files, the manifest, their renames and the destination directory were
+  never fsynced, nor was `metadata-backup.json`, so a power loss soon
+  after "backup written" could leave a manifest over empty or truncated
+  data files, found only when a restore refused the chain. Each file is
+  now synced before its rename and the directory after, and the backup
+  reports success only then. On a split store the local copy of the
+  peer-unseal setting is also flushed when it changes, so a crash cannot
+  roll "off" back to "on".
 - **A COMMIT no longer reports success for writes it then loses after
   a multi-range write failed in part.** When a write spanning ranges
   failed for any reason other than a duplicate key (a write shed under

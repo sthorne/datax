@@ -468,6 +468,14 @@ Rejected credentials are audited (`datax_auth_failures_total`); an
 authenticated non-admin hitting an admin endpoint gets 403 and an
 `admin-denied` audit record (`datax_admin_denied_total`).
 
+The HTTP port bounds what a peer can hold before (or without)
+authenticating, in either mode. A request has `--auth-timeout` (60 s)
+to send its headers and body; a keep-alive connection that sends no
+new request for 2 minutes is closed; headers are capped at 64 KiB; and
+past `--http-max-conns` (512) open connections a new one is closed as
+it is accepted (`datax_http_conns_refused_total`). Responses are not
+bounded, so long polls and `/debug/pprof/profile` are unaffected.
+
 Prometheus scrape config:
 
 ```yaml

@@ -55,6 +55,12 @@ func (n *Node) startHTTP() error {
 			Name: "datax_ranges", Help: "Replicas hosted by this node.",
 		}, func() float64 { return float64(len(n.rangeStatuses())) }),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "datax_replicas_failed", Help: "Replicas on this node whose raft group was stopped by a failure (a raft engine write error such as ENOSPC or EIO, a failed apply): they serve nothing until the node restarts. Non-zero needs attention.",
+		}, func() float64 { f, _ := n.unavailableReplicas(); return float64(len(f)) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "datax_replicas_missing", Help: "Ranges whose descriptor has named this node for over a minute while no replica of them is loaded here (rescanned every 15s): the node counts in their membership but serves nothing for them.",
+		}, func() float64 { _, m := n.unavailableReplicas(); return float64(len(m)) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "datax_range_leaders", Help: "Ranges this node currently leads.",
 		}, func() float64 {
 			leaders := 0
@@ -354,12 +360,12 @@ func (n *Node) startHTTP() error {
 		_, _ = w.Write(page)
 	})
 
-	// ReadHeaderTimeout is the HTTP port's half of the authentication
-	// deadline (issue #212): a peer that opens a connection and sends its
-	// headers slowly, or never, is closed at it rather than holding the
-	// connection. Bodies and responses are not bounded by it — the
-	// console's long polls are unaffected.
-	srv := &http.Server{Handler: n.httpTask(n.httpAuth(mux)), ReadHeaderTimeout: n.authTimeout()}
+	// The authentication deadline (issue #212) bounds a request's headers
+	// and, separately, its body; idle keep-alive connections, header size
+	// and the number of open connections are bounded too. Responses are
+	// not — the console's long polls and pprof profiles are unaffected.
+	// See newHTTPServer.
+	srv, lis := n.newHTTPServer(n.httpTask(n.httpAuth(mux)), lis)
 	if n.tlsCfgs != nil {
 		srv.TLSConfig = n.tlsCfgs.PGServer.Clone()
 		go func() {

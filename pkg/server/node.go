@@ -133,6 +133,10 @@ type Config struct {
 	// state; past it new connections are refused rather than held (0 =
 	// 512; negative = no cap).
 	SQLMaxPendingAuth int
+	// HTTPMaxConns caps the HTTP port's open connections; past it a new
+	// connection is closed as it is accepted (0 = 512; negative = no
+	// cap).
+	HTTPMaxConns int
 	// HealthRateWindow is how far back the health check's rate-based
 	// problems (auth-failures, auth-throttled, write-stalls) look. They
 	// report a rate rather than a lifetime total so that a problem
@@ -580,6 +584,9 @@ type Node struct {
 	consistencyFailures atomic.Int64
 	// health caches the problems panel (see health_api.go).
 	health healthCache
+	// replicaHealth is what the node last found of its replicas that do
+	// not serve although it is up (see replica_health.go).
+	replicaHealth replicaHealth
 	// cat is the node's own catalog accessor (the SQL server and the
 	// metrics recorder share it); catOnce builds it on first use.
 	cat     *catalog.Accessor

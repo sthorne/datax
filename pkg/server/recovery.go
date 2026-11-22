@@ -140,12 +140,19 @@ func (n *Node) writeMetadataBackup(raw []byte) {
 	}
 	tmp := filepath.Join(n.cfg.Dir, MetadataBackupFile+".tmp")
 	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// Synced before the rename and the directory after it, so a power
+	// loss leaves the previous export or this one, never a truncated file
+	// under the final name.
+	if err := writeFileSynced(tmp, raw); err != nil {
 		log.Debugf("metadata export: %v", err)
 		return
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		log.Debugf("metadata export: %v", err)
+		return
+	}
+	if err := syncDir(n.cfg.Dir); err != nil {
+		log.Debugf("metadata export: syncing %s: %v", n.cfg.Dir, err)
 	}
 }
 
