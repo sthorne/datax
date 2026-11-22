@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -467,6 +468,10 @@ func isLoopbackAddr(a net.Addr) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// testingPanicOnMessage, when set, sees every message the message loop
+// receives: a test's way to inject a panic into a connection.
+var testingPanicOnMessage func(pgproto3.FrontendMessage)
+
 // errCancelServed ends a connection that carried a CancelRequest: it
 // never authenticates and carries nothing else, so it does not go on to
 // the message loop (where it would sit, unauthenticated and now past its
@@ -484,13 +489,29 @@ func (c *conn) authTimeout() time.Duration {
 	return c.opts.AuthTimeout
 }
 
-func (c *conn) run(ctx context.Context) error {
+func (c *conn) run(ctx context.Context) (err error) {
 	defer close(c.done)
 	if c.listener != nil {
 		defer c.listener.Close()
 	}
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
+	// A panic on this connection's goroutine ends this connection, not
+	// the node: it is logged at error level with its stack (the evidence
+	// of the bug underneath), the client is told with a FATAL XX000 when
+	// the socket still takes it, and the deferred cleanup above runs as
+	// for any other end.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("panic on pgwire connection %s (recovered; the connection is closed): %v\n%s", c.nc.RemoteAddr(), r, debug.Stack())
+			_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+			c.backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: sql.CodeInternal,
+				Message: fmt.Sprintf("internal error: %v", r)})
+			_ = c.backend.Flush()
+			_ = c.nc.Close()
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	if err := c.startup(ctx); err != nil {
 		if errors.Is(err, errCancelServed) {
 			return nil
@@ -518,6 +539,9 @@ func (c *conn) run(ctx context.Context) error {
 			c.allowPush()
 		}
 		msg, err := c.backend.Receive()
+		if err == nil && testingPanicOnMessage != nil {
+			testingPanicOnMessage(msg)
+		}
 		if idleArmed {
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}
@@ -1404,6 +1428,18 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 	if len(m.Parameters) != p.nParams {
 		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
 			Msg: fmt.Sprintf("bind supplies %d parameters, statement needs %d", len(m.Parameters), p.nParams)})
+		return
+	}
+	// A format-code list holds no code (all text), one (for every item)
+	// or one per item; pgproto3 decodes whatever count the client sent.
+	if n := len(m.ParameterFormatCodes); n > 1 && n != len(m.Parameters) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d parameter formats but %d parameters", n, len(m.Parameters))})
+		return
+	}
+	if n := len(m.ResultFormatCodes); n > 1 && n != len(p.cols) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d result formats but query has %d columns", n, len(p.cols))})
 		return
 	}
 	paramFormat := func(i int) int16 {

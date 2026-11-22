@@ -1173,6 +1173,14 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **A Bind with the wrong number of format codes no longer crashes the
+  node.** A Bind whose parameter format codes were neither 0, 1 nor one
+  per parameter (for example 2 codes for 3 parameters) indexed past
+  the end of the list. The panic took the whole process down. Such a
+  Bind, and one with a wrong count of result format codes, is now
+  refused with `08P01`. A panic on a connection's goroutine now closes
+  only that connection: it is logged at error level with its stack, and
+  the client gets a FATAL `XX000`.
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the
