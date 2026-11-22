@@ -321,11 +321,17 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 		// priority aborts, or expiry may decide its fate — the pusher must
 		// run status recovery against the staged write set (even for an
 		// expired record: an implicitly committed transaction must never
-		// be aborted).
+		// be aborted). The staged epoch and sequence tell the recoverer
+		// which intents are the in-flight writes: the coordinator sends
+		// them with the record's own, and an earlier write of the
+		// transaction to the same key (a lower sequence, or an earlier
+		// epoch) is not one.
 		return &kvpb.PushTxnResponse{
-			Status:       enginepb.STAGING,
-			CommitTS:     rec.WriteTimestamp,
-			InFlightKeys: rec.InFlightKeys,
+			Status:         enginepb.STAGING,
+			CommitTS:       rec.WriteTimestamp,
+			InFlightKeys:   rec.InFlightKeys,
+			StagedEpoch:    rec.Epoch,
+			StagedSequence: rec.Sequence,
 		}, nil
 	}
 
@@ -366,6 +372,14 @@ func (r *Replica) evalPushTxn(b *storage.Batch, req *kvpb.PushTxnRequest) (*kvpb
 // landing -> abort). Idempotent: a record no longer STAGING is reported
 // as is; a missing record is reported ABORTED (already recovered and
 // GC'd, or never staged — either way not committed).
+//
+// A request naming the staged record it verified (StagedTS set, cluster
+// version v25) is applied only to that record: if the transaction has
+// re-staged since — another epoch, sequence or timestamp, hence another
+// in-flight write set — the verdict is about a record that no longer
+// exists, and the record is left STAGING for a fresh recovery. A request
+// without it (an older recoverer) finalizes whatever is staged, as
+// before.
 func (r *Replica) evalRecoverTxn(b *storage.Batch, req *kvpb.RecoverTxnRequest) (*kvpb.RecoverTxnResponse, *kvpb.Error) {
 	key := keys.TransactionKey(req.Key, req.TxnID)
 	rec, err := loadTxnRecord(b, key)
@@ -376,6 +390,10 @@ func (r *Replica) evalRecoverTxn(b *storage.Batch, req *kvpb.RecoverTxnRequest) 
 		return &kvpb.RecoverTxnResponse{Status: enginepb.ABORTED}, nil
 	}
 	if rec.Status != enginepb.STAGING {
+		return &kvpb.RecoverTxnResponse{Status: rec.Status}, nil
+	}
+	if !req.StagedTS.IsEmpty() && (rec.Epoch != req.StagedEpoch || rec.Sequence != req.StagedSequence ||
+		!rec.WriteTimestamp.Equal(req.StagedTS)) {
 		return &kvpb.RecoverTxnResponse{Status: rec.Status}, nil
 	}
 	if req.Commit {

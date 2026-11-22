@@ -407,12 +407,28 @@ message PushTxnResponse {
   bytes waiting_for_key = 4;
   int32 priority = 5;
   repeated bytes in_flight_keys = 6; // STAGING: recovery input
+  // STAGING: the staged record's epoch and sequence. The in-flight writes
+  // were sent with them, so status recovery counts an intent as one of
+  // them only at this epoch and at this sequence or above. 0 sequence =
+  // a leaseholder from before the fields (recovery then matches on the
+  // transaction ID alone, as before).
+  int32 staged_epoch = 7;
+  int32 staged_sequence = 8;
 }
 
 message RecoverTxnRequest {
   RequestHeader header = 1;
   bytes txn_id = 2;
   bool commit = 3;
+  // The staged record the recoverer verified: when staged_ts is set the
+  // record is finalized only if it is still STAGING at exactly this
+  // epoch, sequence and timestamp. Introduced under cluster version v25
+  // and sent only once it is finalized (pkg/version rule 4): a v24
+  // replica drops the fields and would finalize a record a v25 replica
+  // refuses.
+  int32 staged_epoch = 4;
+  int32 staged_sequence = 5;
+  Hlc staged_ts = 6;
 }
 
 message RecoverTxnResponse {

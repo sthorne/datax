@@ -2053,6 +2053,21 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Status recovery no longer commits a transaction's earlier writes
+  without its final ones.** A pipelined transaction that wrote a key and
+  then rewrote it in its final batch, sent in parallel with the STAGING
+  commit record, could be recovered as committed with the earlier value
+  if the final batch never landed (the coordinator crashed, or the batch
+  failed and the cleanup abort failed too): the probe counted any intent
+  of the transaction as the staged write. It now counts only an intent
+  at the staged record's epoch and at its sequence or above, which a
+  push of the record reports; earlier-epoch intents left by a restart no
+  longer fool it either. **Cluster version v25:** once finalized, the
+  `RecoverTxn` that ends recovery also names the staged record it
+  checked, and a record that re-staged in between is left for a fresh
+  recovery. Before the finalize recovery finalizes as before; with a
+  leaseholder on the old binary the probe matches on the transaction ID
+  as before.
 - **A COMMIT no longer reports success for writes it then loses after
   a multi-range write failed in part.** When a write spanning ranges
   failed for any reason other than a duplicate key (a write shed under

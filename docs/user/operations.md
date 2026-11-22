@@ -1363,6 +1363,12 @@ Rules of the road:
   Errors are the same as before. Until finalize a node on the new
   binary reads the keys first, as before: an older node does not know
   the conditional put.
+- **v25 makes transaction status recovery check the record it ends.**
+  Once it is finalized, the request that ends the recovery of a
+  crashed parallel commit names the staged record it checked, and a
+  record that has changed since is left for a fresh recovery. Nothing
+  changes for clients. Until finalize recovery ends the record as
+  before: an older node would ignore the check.
 - **v23 turns on range-safety checks at apply** (issue #389). Before
   finalize, a node on the new binary already re-checks that a write
   still belongs to its range once it holds its latches, and a split draws

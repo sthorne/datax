@@ -79,6 +79,8 @@ func TestBatchRequestProtoRoundTrip(t *testing.T) {
 	ba.Add(&HeartbeatTxnRequest{RequestHeader: h("h"), Now: mkts(60)})
 	ba.Add(&PushTxnRequest{RequestHeader: h("q"), PusherTxn: testTxn(), PusheeTxn: testTxn().TxnMeta, PushAbort: true, Now: mkts(61)})
 	ba.Add(&ResolveIntentRequest{RequestHeader: h("r"), TxnID: uuid.New(), Status: enginepb.COMMITTED, CommitTS: mkts(62)})
+	ba.Add(&RecoverTxnRequest{RequestHeader: h("rt"), TxnID: uuid.New(), Commit: true})
+	ba.Add(&RecoverTxnRequest{RequestHeader: h("rt"), TxnID: uuid.New(), StagedTS: mkts(63), StagedEpoch: 2, StagedSequence: 7})
 	ba.Add(&RefreshRequest{RequestHeader: hr("c", "d"), FromTS: mkts(40)})
 	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5})
 	ba.Add(&ExportRequest{RequestHeader: hr("a", "z"), StartTS: mkts(30), MaxRecords: 5, AllRevisions: true})
@@ -126,6 +128,7 @@ func TestBatchEnvelopeProtoRoundTrip(t *testing.T) {
 		{EndTxn: &EndTxnResponse{CommitTimestamp: mkts(71)}},
 		{HeartbeatTxn: &HeartbeatTxnResponse{Status: enginepb.ABORTED}},
 		{PushTxn: &PushTxnResponse{Status: enginepb.COMMITTED, CommitTS: mkts(72)}},
+		{PushTxn: &PushTxnResponse{Status: enginepb.STAGING, CommitTS: mkts(73), InFlightKeys: []keys.Key{keys.Key("f")}, StagedEpoch: 2, StagedSequence: 7}},
 		{ResolveIntent: &ResolveIntentResponse{}},
 		{Refresh: &RefreshResponse{}},
 		{Export: &ExportResponse{Records: []ExportRecord{{Key: keys.Key("k"), Value: []byte("v")}, {Key: keys.Key("d"), Deleted: true}}, Resume: keys.Key("r")}},
