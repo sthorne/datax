@@ -2008,6 +2008,18 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A COMMIT no longer reports success for writes it then loses after
+  a multi-range write failed in part.** When a write spanning ranges
+  failed for any reason other than a duplicate key (a write shed under
+  storage overload, a deadline, a routing failure), the part that
+  created the transaction record, or other ranges' parts, could already
+  have applied, but the transaction treated the write as not having
+  happened. After `ROLLBACK TO SAVEPOINT`, a later `COMMIT` took the
+  transaction for read-only and returned success; the record expired
+  about 5 s later and every write was lost. The same failure let a write
+  rolled back to a savepoint become visible at COMMIT, and left a
+  `ROLLBACK`'s intents blocking their keys for about 5 s. Every key of
+  such a write is now tracked, and COMMIT and ROLLBACK end the record.
 - **A range under a steady write load keeps its closed timestamp.**
   A closed-timestamp promise at T now waits only for writes that could
   still land at or below T; writes at current timestamps and

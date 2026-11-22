@@ -472,6 +472,17 @@ For the same reason, a transaction already older than half the expiry
 window (2.5s) forfeits the commit-time parallelism and creates its staged
 record before sending the write batch.
 
+A multi-range write that fails may still have applied in part: the
+anchor sub-batch, and so the record, before a sibling failed, or other
+ranges in parallel while one failed — whatever the error (a duplicate
+key, a write shed under overload, a deadline, a routing failure). Unless
+the gateway knows nothing applied, the coordinator tracks every key of
+the batch as written, so `ROLLBACK TO SAVEPOINT` and the transaction's
+end remove whatever landed, and a batch that was to create the record
+leaves a record that may exist: `COMMIT` and `ROLLBACK` then send their
+`EndTxn` (which writes the record if there is none) instead of treating
+the transaction as read-only.
+
 ### One-phase commits
 
 When a pipelined transaction's **entire** write set — provably so: never
