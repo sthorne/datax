@@ -2020,6 +2020,16 @@ state or the internode protocol does, and an entry below says so.
   rolled back to a savepoint become visible at COMMIT, and left a
   `ROLLBACK`'s intents blocking their keys for about 5 s. Every key of
   such a write is now tracked, and COMMIT and ROLLBACK end the record.
+- **A replica seeded by a preseed snapshot survives a crash on a split
+  store.** The state engine there has no write-ahead log, and the new
+  replica's descriptor reached disk only at the next memtable flush,
+  while the replica was already voting through the raft engine. A crash
+  in that window, which on a quiet store could last hours, left the
+  range counting a voter that would never load again, and with too few
+  voters it lost quorum for good. The store now flushes the state engine
+  once per created replica, before its raft group starts. A store that
+  drops raft messages for a range it holds raft state for now logs a
+  rate-limited warning instead of a debug line.
 - **A range under a steady write load keeps its closed timestamp.**
   A closed-timestamp promise at T now waits only for writes that could
   still land at or below T; writes at current timestamps and

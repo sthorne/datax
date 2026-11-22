@@ -201,6 +201,76 @@ func TestSplitStoreReplay(t *testing.T) {
 	}
 }
 
+// TestSplitStorePreseedSurvivesCrash: a replica seeded by a preseed
+// snapshot on a split store is durable before its raft group starts. The
+// state engine has no WAL, and no raft log on the store re-creates a
+// preseeded replica; if its descriptor were still only in the memtable,
+// a crash would lose a replica the range counts as a voter, and with two
+// voters the range would lose quorum for good.
+func TestSplitStorePreseedSurvivesCrash(t *testing.T) {
+	dirs := []string{t.TempDir(), t.TempDir()}
+	prod := func(c *server.Config) { c.TruncationFlushAfter = 0 } // production default
+	tc := &TestCluster{T: t}
+	n1 := startDiskNode(t, dirs[0], true, "", prod)
+	tc.Nodes = append(tc.Nodes, n1)
+	n2 := startDiskNode(t, dirs[1], false, n1.Addr(), prod)
+	tc.Nodes = append(tc.Nodes, n2)
+	defer tc.StopAll()
+	if n2.EngineMode() != "split" {
+		t.Fatalf("engine mode %q, want split", n2.EngineMode())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	if err := tc.waitForReplication(ctx, 2, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := putRetryAmbiguous(ctx, n1.DB(), testKey("before"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	count := func(s *kvserver.Store) int {
+		c := 0
+		s.VisitReplicas(func(*kvserver.Replica) bool { c++; return true })
+		return c
+	}
+	if c := count(n2.Store()); c == 0 {
+		t.Fatal("n2 holds no replicas after upreplication")
+	}
+
+	// Crash n2: its state engine's memtable is not flushed.
+	storage.TestingSkipFlushOnClose = true
+	tc.StopNode(1)
+	storage.TestingSkipFlushOnClose = false
+
+	n2b := startDiskNode(t, dirs[1], false, "", prod)
+	tc.Nodes[1] = n2b
+	descs, err := tc.ranges(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member := 0
+	for _, d := range descs {
+		if _, ok := d.GetReplica(n2b.Store().NodeID()); ok {
+			member++
+		}
+	}
+	if after := count(n2b.Store()); after < member {
+		t.Fatalf("after the crash n2 loaded %d replicas; descriptors list it in %d ranges", after, member)
+	}
+
+	wctx, wcancel := context.WithTimeout(ctx, 60*time.Second)
+	defer wcancel()
+	for {
+		err = putRetryAmbiguous(wctx, n1.DB(), testKey("after"), []byte("v"))
+		if err == nil || wctx.Err() != nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if err != nil {
+		t.Fatalf("write after n2's restart: %v", err)
+	}
+}
+
 // TestSplitStoreDeferredTruncation (issue #105): on a split store an
 // applied TruncateLog does not delete log entries until the state engine
 // has flushed the applies they cover; after a flush the truncation
