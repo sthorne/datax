@@ -156,6 +156,11 @@ type Session struct {
 	// txnQueried marks a transaction block that has run a statement
 	// against data: SET TRANSACTION SNAPSHOT must come before one.
 	txnQueried bool
+	// implicitBlock marks the open block as implicit (BeginImplicit): the
+	// statements of one multi-statement Query message, or of one
+	// extended-protocol pipeline up to its Sync, which the wire layer
+	// commits or rolls back at that boundary (EndImplicit).
+	implicitBlock bool
 	// cursors are the session's open SQL cursors (cursor.go).
 	cursors map[string]*sqlCursor
 	// preparedSQL are the session's PREPARE'd statements (prepare.go).
@@ -815,6 +820,78 @@ func (s *Session) virtualRows(ctx context.Context, txn *kvclient.Txn, name strin
 
 func (s *Session) State() TxnState { return s.state }
 
+// BeginImplicit opens an implicit transaction block, PostgreSQL's for
+// the statements of a multi-statement simple Query, or of an
+// extended-protocol pipeline up to its Sync: they run in one
+// transaction, as in a block opened by BEGIN, which EndImplicit commits
+// at that boundary or rolls back if any of them failed. Inside it a
+// BEGIN turns the block explicit (it then outlives the boundary), a
+// COMMIT or ROLLBACK ends it early, savepoints are refused, and a
+// statement that cannot run inside a transaction block is refused, as
+// PostgreSQL does. It is a no-op unless the session is idle.
+//
+// A lone statement does not need one: it runs as its own implicit
+// transaction (runImplicit), which, unlike a block, can be re-run
+// transparently on a serialization failure, because nothing of it has
+// reached the client yet.
+func (s *Session) BeginImplicit() {
+	if s.state != StateIdle {
+		return
+	}
+	s.txn = s.db.NewTxn("sql")
+	s.state = StateOpen
+	s.implicitBlock = true
+	s.tempEndTxn()
+	s.txnQueried = false
+	s.txnStartedReadOnly = s.vars.defaultReadOnly
+}
+
+// InImplicit reports whether an implicit transaction block is open.
+func (s *Session) InImplicit() bool { return s.implicitBlock && s.state != StateIdle }
+
+// beginInImplicit is a BEGIN inside an implicit block: as in
+// PostgreSQL, it turns the block explicit, the statements already run in
+// it included, and the block then lives on past the end of the message.
+// BEGIN AS OF SYSTEM TIME pins the block in the past, which it can only
+// do before the block has read or written anything.
+func (s *Session) beginInImplicit(ctx context.Context, t *parser.Begin) (*Result, *Error) {
+	if t.AsOf != nil {
+		if s.txnQueried {
+			return nil, newErrf(CodeActiveTransaction, "BEGIN AS OF SYSTEM TIME must come before any query of its transaction")
+		}
+		ts, serr := s.resolveTxnAsOf(*t.AsOf)
+		if serr != nil {
+			return nil, serr
+		}
+		_ = s.txn.Rollback(ctx)
+		s.txn = s.db.NewHistoricalTxn("sql-asof", ts)
+	}
+	for _, m := range t.Modes {
+		if _, serr := s.execSetVar(ctx, m); serr != nil {
+			return nil, serr
+		}
+	}
+	s.implicitBlock = false
+	return &Result{Tag: "BEGIN"}, nil
+}
+
+// EndImplicit ends the implicit transaction block, if one is open:
+// committed when ok and no statement failed it, rolled back otherwise.
+// The error is the COMMIT's. An explicit block (BEGIN inside the
+// message) is left alone.
+func (s *Session) EndImplicit(ctx context.Context, ok bool) *Error {
+	if !s.implicitBlock {
+		return nil
+	}
+	if s.state == StateOpen && ok {
+		_, serr := s.Execute(ctx, &parser.Commit{}, nil)
+		s.implicitBlock = false
+		return serr
+	}
+	s.rollback(ctx)
+	return nil
+}
+
 // statementTime is now() for the statement in flight: one reading of
 // the clock, so now(), current_timestamp and current_date agree within
 // a statement.
@@ -836,6 +913,7 @@ func (s *Session) Close(ctx context.Context) {
 	s.advisoryClose()
 	s.releaseRowFuncs()
 	s.state = StateIdle
+	s.implicitBlock = false
 	s.tempEndTxn()
 	s.closeTemp()
 }
@@ -951,6 +1029,9 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 
 	switch t := stmt.(type) {
 	case *parser.Begin:
+		if s.state == StateOpen && s.implicitBlock {
+			return s.beginInImplicit(ctx, t)
+		}
 		if s.state == StateOpen {
 			return nil, newErrf(CodeActiveTransaction, "there is already a transaction in progress")
 		}
@@ -1009,6 +1090,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		s.loEndTxn(ctx, err == nil)
 		s.txn = nil
 		s.state = StateIdle
+		s.implicitBlock = false
 		s.endTxnVars()
 		s.endTxnCursors(err == nil)
 		s.advisoryEndTxn()
@@ -1050,7 +1132,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return &Result{Tag: "ROLLBACK"}, nil
 
 	case *parser.Savepoint:
-		if s.state != StateOpen {
+		if s.state != StateOpen || s.implicitBlock {
 			return nil, newErrf(CodeNoActiveTransaction, "SAVEPOINT can only be used in transaction blocks")
 		}
 		if err := s.txn.Savepoint(t.Name); err != nil {
@@ -1061,7 +1143,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return &Result{Tag: "SAVEPOINT"}, nil
 
 	case *parser.ReleaseSavepoint:
-		if s.state != StateOpen {
+		if s.state != StateOpen || s.implicitBlock {
 			return nil, newErrf(CodeNoActiveTransaction, "RELEASE SAVEPOINT can only be used in transaction blocks")
 		}
 		if err := s.txn.ReleaseSavepoint(t.Name); err != nil {
@@ -1072,7 +1154,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 		return &Result{Tag: "RELEASE"}, nil
 
 	case *parser.RollbackToSavepoint:
-		if s.state != StateOpen {
+		if s.state != StateOpen || s.implicitBlock {
 			return nil, newErrf(CodeNoActiveTransaction, "ROLLBACK TO SAVEPOINT can only be used in transaction blocks")
 		}
 		return s.execRollbackToSavepoint(ctx, t.Name)
@@ -1583,6 +1665,7 @@ func (s *Session) rollback(ctx context.Context) {
 	s.tempEndTxn()
 	s.tempTxnDone(false)
 	s.state = StateIdle
+	s.implicitBlock = false
 }
 
 // ddlTouched reports whether the open transaction's DDL changed name.

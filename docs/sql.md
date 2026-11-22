@@ -2175,15 +2175,33 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `IntervalStyle`, `is_superuser`, `server_encoding`,
   `session_authorization`, `standard_conforming_strings`, `TimeZone`,
   with the session's values); then `BackendKeyData` and `ReadyForQuery`.
-- **Simple query** (`Q`): multi-statement strings split on `;`, each executed;
-  results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
+- **Simple query** (`Q`): multi-statement strings split on `;`, each executed
+  in turn, up to the first error. Outside a transaction block a string of
+  several statements is one implicit transaction, PostgreSQL's
+  (`Session.BeginImplicit` before each statement, `EndImplicit` at the
+  end of the message): committed after the last statement, rolled back
+  on an error. It is a block like `BEGIN`'s, flagged implicit: `BEGIN`
+  inside it clears the flag (the block, earlier statements included,
+  becomes explicit and outlives the message), `COMMIT` / `ROLLBACK` end
+  it and the next statement opens another, savepoints are refused, and
+  so are the statements that cannot run inside a block (`25001`). A
+  string of one statement keeps the single-statement path, with its
+  automatic retry (`runImplicit`). Results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).
 - **Extended protocol**: minimal but real, because pgx's default mode prepares
   statements: `Parse` / `Bind` / `Describe` / `Execute` / `Sync` / `Close`.
   Parameters and results in both text and binary formats for every column
   type (int8, float8, bool, text, timestamptz, date, bytea, uuid,
   numeric as PostgreSQL's base-10000 digit groups, jsonb with the
-  version-1 byte). Portal suspension is supported: a row-limited Execute
+  version-1 byte). Outside a block, everything from an Execute to the
+  next Sync is one implicit transaction, committed at the Sync (or at
+  the end of a simple Query that arrives first) and rolled back if a
+  message fails. Before running an Execute outside a block the server
+  reads the next message (`conn.readAhead`): a Sync means the Execute
+  is alone in its pipeline and runs as a single statement, auto-retry
+  included; anything else opens the implicit transaction. A pipeline
+  that ends without a Sync (the connection closes) is rolled back, as in
+  PostgreSQL. Portal suspension is supported: a row-limited Execute
   returns up to that many rows and `PortalSuspended`; re-Execute resumes,
   and portals live to the end of the transaction (destroyed by Sync
   outside one) — JDBC fetch-size loops work. The statement runs once at

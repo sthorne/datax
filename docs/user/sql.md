@@ -1958,7 +1958,26 @@ automatically by the server — DDL included, so autocommit `CREATE`,
 `40001` when two of them change the catalog at once. The server re-runs
 such a statement, with backoff, until it succeeds, its
 `statement_timeout` is about to run out, or it has retried for 30
-seconds. Other transaction tools:
+seconds.
+
+As in PostgreSQL, several statements sent together outside `BEGIN` are
+one **implicit transaction**: the statements of one multi-statement
+query string (`psql -c "INSERT ...; UPDATE ..."`, or a driver's `Exec`
+of a script without parameters), and the statements of one
+extended-protocol pipeline up to its `Sync` (pgx's `SendBatch`, JDBC's
+`executeBatch`). They commit together at the end, or, if one fails,
+none of them does. A `COMMIT` or `ROLLBACK` among them ends the implicit
+transaction early, and the statements after it start another; a `BEGIN`
+among them turns it into a transaction block, the statements before it
+included, which stays open after the query. `SAVEPOINT` is refused in
+an implicit transaction (`25P01`), and so are the statements that
+cannot run inside a transaction block (`25001`: `VACUUM`, `ANALYZE`,
+`CREATE INDEX` on an existing table, the `ALTER TABLE` actions that
+read the rows, `CREATE TABLE ... AS`, `AS OF SYSTEM TIME`, ...): send
+those on their own. An implicit transaction of several statements is
+not retried by the server — results have already gone to the client —
+so it can fail with `40001` like a `BEGIN` block. Other transaction
+tools:
 
 ```sql
 SAVEPOINT sp;  ROLLBACK TO SAVEPOINT sp;  RELEASE SAVEPOINT sp;
@@ -2161,7 +2180,9 @@ The rules are PostgreSQL's:
   with `WARNING: you don't own a lock of type ExclusiveLock` (`01000`).
 - **Transaction locks** (`_xact_`) are released when the transaction
   commits or rolls back, and by `ROLLBACK TO` a savepoint taken before
-  them; outside a transaction block the statement is the transaction.
+  them; outside a transaction block the statement is the transaction
+  (or the implicit transaction of a multi-statement query or a
+  pipeline: see [Transactions and retries](#transactions-and-retries)).
 - **Shared and exclusive.** Any number of sessions may hold a shared
   lock; an exclusive one conflicts with every hold by another session.
   A session's own holds never conflict with each other.

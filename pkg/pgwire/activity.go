@@ -353,6 +353,18 @@ type stmtToken struct {
 	scanned int64
 }
 
+// txnEnded records that the connection's transaction ended between
+// statements (the implicit transaction of a multi-statement query or a
+// pipeline, committed or rolled back at its end).
+func (a *Activity) txnEnded(c *conn) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ca, ok := a.conns[c]; ok && ca.state == stateIdleInTxn {
+		a.setState(ca, stateIdle)
+		ca.txnSince = time.Time{}
+	}
+}
+
 // end records the statement's outcome and the connection's new state.
 func (t *stmtToken) end(rows int64, serr *sql.Error, inTxn bool) {
 	d := time.Since(t.start)

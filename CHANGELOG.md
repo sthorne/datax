@@ -2053,6 +2053,18 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A multi-statement query or a pipeline is one implicit transaction,
+  as in PostgreSQL.** Outside `BEGIN`, each statement of a simple Query
+  with several statements, and each Execute of an extended-protocol
+  pipeline, committed on its own, so `INSERT ...; SELECT 1/0` or a pgx
+  `SendBatch` whose last statement failed left the earlier writes
+  committed. They now run in one implicit transaction, committed at the
+  end of the Query or at the `Sync` and rolled back if a statement
+  fails; `BEGIN`, `COMMIT` and `ROLLBACK` among them follow PostgreSQL's
+  rules. A lone statement (one Execute before its `Sync`) still runs on
+  its own, with the automatic retry. Savepoints and the statements that
+  cannot run inside a transaction block (`25001`) are refused in a
+  multi-statement implicit transaction; send them on their own.
 - **A COMMIT no longer reports success for writes it then loses after
   a multi-range write failed in part.** When a write spanning ranges
   failed for any reason other than a duplicate key (a write shed under

@@ -227,7 +227,7 @@ which do exist: see PG-F-022.
 | PG-X-011 | Snapshot export and import (`pg_export_snapshot`, `SET TRANSACTION SNAPSHOT`; parallel pg_dump) | `42883 unknown function "pg_export_snapshot"` | `AS OF SYSTEM TIME` at a chosen timestamp | P3 | M | V | — |
 | PG-X-012 | Unique keys are checked at the end of an `UPDATE` (so `UPDATE t SET id = id + 1` succeeds where PostgreSQL fails `23505`); a self-referencing `ON UPDATE CASCADE` that overlaps its statement is refused `0A000` | silently different (more permissive) / `0A000` | split the statement | P3 | M | D | — |
 | PG-X-013 | **Transaction-statement leftovers**: `SET TRANSACTION` with both an access mode and an isolation level applies only the access mode (datax is serializable anyway); `COMMIT WORK` / `ROLLBACK WORK` are syntax errors; `BEGIN` inside a block is an error where PostgreSQL warns; read-only refusals of DDL say "DDL" rather than the command; `nextval()` on a temporary sequence is refused in a read-only transaction | `42601`; `25001` | `COMMIT` / `ROLLBACK` | P3 | S | V | — |
-| PG-X-014 | **Advisory-lock leftovers**: the arguments must be constants or parameters (`SELECT pg_try_advisory_lock(id) FROM jobs`, the Que style, is `0A000`); waiters are not served in arrival order; deadlocks between advisory locks are not detected (they end at `lock_timeout` / `statement_timeout`); `pg_locks` lists granted advisory locks only; `_xact_` locks do not span a pgx pipeline's implicit transaction | `0A000 ...`; a timeout instead of `40P01` | lock in a loop over ids | P2 | M | V | — |
+| PG-X-014 | **Advisory-lock leftovers**: the arguments must be constants or parameters (`SELECT pg_try_advisory_lock(id) FROM jobs`, the Que style, is `0A000`); waiters are not served in arrival order; deadlocks between advisory locks are not detected (they end at `lock_timeout` / `statement_timeout`); `pg_locks` lists granted advisory locks only | `0A000 ...`; a timeout instead of `40P01` | lock in a loop over ids | P2 | M | V | — |
 
 ### Security
 
@@ -517,6 +517,7 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| A multi-statement query, and an extended-protocol pipeline up to its `Sync`, are one implicit transaction (a failing statement no longer leaves the earlier ones committed; `_xact_` advisory locks span it, from PG-X-014) | PR (this branch) |
 | Sequences and enum types in any schema: `CREATE SEQUENCE / TYPE s.x`, `SERIAL` and identity in a schema, `SET SCHEMA`, defaults bound to their sequence, schema privileges, the catalogs (was PG-D-035; leftovers are PG-D-037) | PR (this branch) |
 | Schemas: `CREATE` / `DROP` / `ALTER SCHEMA`, objects in any schema, `SET SCHEMA`, `search_path`, schema privileges, schemas in the catalogs (was PG-D-001; leftovers are PG-D-035 and PG-D-036) | PR (this branch) |
 | Temporary tables with `ON COMMIT`, and `UNLOGGED` tables (accepted, durable) (was PG-D-009; leftovers are PG-D-034) | PR (this branch) |
