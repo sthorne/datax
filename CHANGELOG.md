@@ -1173,6 +1173,20 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **The HTTP port no longer holds connections forever.** It bounded
+  only a request's headers (`--auth-timeout`), and Go closes an idle
+  keep-alive connection only at an idle or read timeout, of which it set
+  neither. Anyone who could reach the port, unauthenticated, could hold
+  a connection by sending one request and then nothing, or by trickling
+  a body to `/api/login` (which runs before authentication), and nothing
+  capped how many, so file descriptors and goroutines could be
+  exhausted. Now `--auth-timeout` bounds reading the whole request,
+  body included; an idle keep-alive connection is closed after 2
+  minutes; headers are capped at 64 KiB; and the new `--http-max-conns`
+  (default 512, negative for no cap) closes connections past the cap as
+  they are accepted, counted in the new
+  `datax_http_conns_refused_total`. Responses are not bounded: long
+  polls and pprof profiles run as before.
 - **An Admin RPC can no longer stop a node through its clock.** The
   Admin RPC ratcheted the node's clock to the caller's timestamp before
   authorizing anything, and a timestamp past `--max-offset` exited the
@@ -1555,9 +1569,10 @@ state or the internode protocol does, and an entry below says so.
   no floor, and the flag says so).
   **An authentication deadline** (`--auth-timeout`, default 60 s,
   PostgreSQL's `authentication_timeout`) closes a connection that has
-  not reached ReadyForQuery, wherever in the handshake it stalled; the
-  same setting is the HTTP server's `ReadHeaderTimeout`, which it had
-  none of. **A cap on connections in the pre-authentication state**
+  not reached ReadyForQuery, wherever in the handshake it stalled; on
+  the HTTP port the same setting bounds reading a request, its headers
+  and its body (see "The HTTP port no longer holds connections
+  forever" above). **A cap on connections in the pre-authentication state**
   (`--sql-max-pending-auth`, default 512) refuses at accept, with a
   FATAL 53300 and before anything is allocated for the connection,
   rather than accepting and holding; a client refused mid-SSLRequest
