@@ -1,0 +1,126 @@
+package server
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+// recordSyncs replaces syncFile and syncDir with versions that note what
+// they sync (a file by its base name, a directory as "dir:" plus its base
+// name) and then sync it for real.
+func recordSyncs(t *testing.T) *[]string {
+	t.Helper()
+	var got []string
+	prevFile, prevDir := syncFile, syncDir
+	syncFile = func(f *os.File) error {
+		got = append(got, filepath.Base(f.Name()))
+		return prevFile(f)
+	}
+	syncDir = func(dir string) error {
+		// The order matters: what the directory holds when it is synced
+		// is what the sync makes durable.
+		names, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		entry := "dir:" + filepath.Base(dir)
+		for _, e := range names {
+			if !e.IsDir() {
+				entry += " " + e.Name()
+			}
+		}
+		got = append(got, entry)
+		return prevDir(dir)
+	}
+	t.Cleanup(func() { syncFile, syncDir = prevFile, prevDir })
+	return &got
+}
+
+// TestBackupCommitIsDurable: a backup's manifest is synced before it is
+// renamed into place, and the destination directory is synced once the
+// data files are in it (before the manifest appears) and again once the
+// manifest is. Without that a power loss after "backup written" could
+// leave a manifest naming data files that never reached the disk.
+func TestBackupCommitIsDurable(t *testing.T) {
+	got := recordSyncs(t)
+	dest := filepath.Join(t.TempDir(), "bak")
+	if err := os.Mkdir(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging, err := os.MkdirTemp(dest, ".backup-in-progress-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := []backupTable{{File: backupDataFile(52)}, {File: backupDataFile(53)}}
+	for _, bt := range tables {
+		if err := os.WriteFile(filepath.Join(staging, bt.File), []byte("rows"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moved, err := commitBackup(staging, dest, tables, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moved) != 2 {
+		t.Fatalf("moved %v, want both data files", moved)
+	}
+	f52, f53 := backupDataFile(52), backupDataFile(53)
+	want := []string{
+		backupManifestName,
+		"dir:bak " + f52 + " " + f53,
+		"dir:bak " + backupManifestName + " " + f52 + " " + f53,
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("syncs:\n got %q\nwant %q", *got, want)
+	}
+}
+
+// TestBackupCommitFailedSyncLeavesNoManifest: if the destination cannot
+// be synced after the manifest's rename, the backup is not reported
+// written and no manifest is left to name the data files the caller then
+// removes.
+func TestBackupCommitFailedSyncLeavesNoManifest(t *testing.T) {
+	dest := t.TempDir()
+	staging, err := os.MkdirTemp(dest, ".backup-in-progress-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := []backupTable{{File: backupDataFile(52)}}
+	if err := os.WriteFile(filepath.Join(staging, tables[0].File), []byte("rows"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := syncDir
+	calls := 0
+	syncDir = func(string) error {
+		if calls++; calls == 2 {
+			return errors.New("EIO")
+		}
+		return nil
+	}
+	defer func() { syncDir = prev }()
+	if _, err := commitBackup(staging, dest, tables, []byte(`{}`)); err == nil {
+		t.Fatal("commit succeeded though the directory sync failed")
+	}
+	if _, err := os.Stat(filepath.Join(dest, backupManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("manifest left behind after a failed sync: %v", err)
+	}
+}
+
+// TestMetadataBackupIsDurable: metadata-backup.json is synced before its
+// rename and the data directory after it.
+func TestMetadataBackupIsDurable(t *testing.T) {
+	got := recordSyncs(t)
+	dir := t.TempDir()
+	n := &Node{cfg: Config{Dir: dir}}
+	n.writeMetadataBackup([]byte(`{}`))
+	want := []string{
+		MetadataBackupFile + ".tmp",
+		"dir:" + filepath.Base(dir) + " " + MetadataBackupFile,
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("syncs:\n got %q\nwant %q", *got, want)
+	}
+}

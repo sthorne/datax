@@ -890,7 +890,10 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   beside the manifest only once every table is written: a backup that
   fails removes what it wrote and leaves the destination as it found it,
   and one whose node dies mid-way leaves only that directory (delete it).
-  The directory backup creates is mode 0700 and every file 0600, sealed
+  Every data file and the manifest are fsynced before they are renamed
+  into place, and the destination directory after, so a backup reported
+  written survives a power loss; the node's `metadata-backup.json` is
+  written the same way. The directory backup creates is mode 0700 and every file 0600, sealed
   or not; a destination that already exists keeps its mode. The summary prints per-table record counts and SHA-256
   checksums over the live data. Restore reads only the names a backup
   writes, derived from each table's id, and only a regular file at one

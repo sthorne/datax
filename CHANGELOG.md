@@ -2053,6 +2053,15 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A backup reported written survives a power loss.** Backup data
+  files, the manifest, their renames and the destination directory were
+  never fsynced, nor was `metadata-backup.json`, so a power loss soon
+  after "backup written" could leave a manifest over empty or truncated
+  data files, found only when a restore refused the chain. Each file is
+  now synced before its rename and the directory after, and the backup
+  reports success only then. On a split store the local copy of the
+  peer-unseal setting is also flushed when it changes, so a crash cannot
+  roll "off" back to "on".
 - **A COMMIT no longer reports success for writes it then loses after
   a multi-range write failed in part.** When a write spanning ranges
   failed for any reason other than a duplicate key (a write shed under
