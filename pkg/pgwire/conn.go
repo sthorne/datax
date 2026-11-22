@@ -234,6 +234,12 @@ type conn struct {
 	// skipToSync: an extended-protocol error occurred; ignore messages
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
+	// peeked is a message (or the error receiving it) read ahead of its
+	// turn by an Execute deciding whether it ends its pipeline
+	// (readAhead); run handles it next instead of receiving.
+	peeked    bool
+	peekedMsg pgproto3.FrontendMessage
+	peekedErr error
 	// act is the server's client accounting (nil in unit tests that build
 	// a conn without a server); srv the server (nil likewise).
 	act *Activity
@@ -595,7 +601,13 @@ func (c *conn) run(ctx context.Context) (err error) {
 		if pushing {
 			c.allowPush()
 		}
-		msg, err := c.backend.Receive()
+		var msg pgproto3.FrontendMessage
+		if c.peeked {
+			msg, err = c.peekedMsg, c.peekedErr
+			c.peeked, c.peekedMsg, c.peekedErr = false, nil, nil
+		} else {
+			msg, err = c.backend.Receive()
+		}
 		if err == nil && testingPanicOnMessage != nil {
 			testingPanicOnMessage(msg)
 		}
@@ -646,6 +658,8 @@ func (c *conn) run(ctx context.Context) (err error) {
 		case *pgproto3.FunctionCall:
 			c.skipToSync = false
 			c.handleFunctionCall(ctx, m)
+			// A pipeline's implicit transaction it ran in ends with it.
+			c.endImplicit(ctx, true)
 			if c.session.State() != sql.StateOpen {
 				c.reapPortals()
 			}
@@ -668,6 +682,7 @@ func (c *conn) run(ctx context.Context) (err error) {
 			}
 		case *pgproto3.Execute:
 			if !c.skipToSync {
+				m = c.readAhead(ctx, m)
 				c.handleExecute(ctx, m)
 			}
 		case *pgproto3.Close:
@@ -684,6 +699,9 @@ func (c *conn) run(ctx context.Context) (err error) {
 				c.backend.Send(&pgproto3.CloseComplete{})
 			}
 		case *pgproto3.Sync:
+			// Sync ends the pipeline's implicit transaction: committed,
+			// or rolled back if any of its messages failed.
+			c.endImplicit(ctx, !c.skipToSync)
 			c.skipToSync = false
 			// Portals do not survive the implicit transaction: outside an
 			// explicit BEGIN, Sync ends the cycle and reaps them (inside
@@ -948,17 +966,55 @@ func (c *conn) parse(q string) ([]parser.Statement, error) {
 }
 
 // handleSimpleQuery runs a (possibly multi-statement) simple query.
+//
+// Outside a transaction block the statements of a multi-statement query
+// run as one implicit transaction, PostgreSQL's: committed when the last
+// has run, rolled back if one fails (the rest are not run). A COMMIT or
+// ROLLBACK among them ends that transaction early and the statements
+// after it start another; a BEGIN turns it into a transaction block that
+// outlives the message. One of datax's online statements commits it too,
+// and runs alone (Session.BeginImplicit). A query of one statement runs as its own
+// implicit transaction (Session.Execute), automatically re-run on a
+// serialization failure.
 func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 	stmts, err := c.parse(q)
 	if err != nil {
 		c.sendError(sql.ToSQLError(err))
+		c.endImplicit(ctx, false)
 		return
 	}
 	if len(stmts) == 0 {
 		c.backend.Send(&pgproto3.EmptyQueryResponse{})
+		c.endImplicit(ctx, true)
 		return
 	}
+	ok := c.runSimpleStatements(ctx, q, stmts)
+	c.endImplicit(ctx, ok)
+}
+
+// endImplicit ends the implicit transaction of a simple query or a
+// pipeline, if one is open: committed when ok, else rolled back. A
+// failed COMMIT is reported to the client.
+func (c *conn) endImplicit(ctx context.Context, ok bool) {
+	if !c.session.InImplicit() {
+		return
+	}
+	if serr := c.session.EndImplicit(ctx, ok); serr != nil {
+		c.sendError(serr)
+	}
+	if c.act != nil {
+		c.act.txnEnded(c)
+	}
+}
+
+// runSimpleStatements runs a simple query's statements in order, up to
+// the first that fails, and reports whether all succeeded.
+func (c *conn) runSimpleStatements(ctx context.Context, q string, stmts []parser.Statement) bool {
+	multi := len(stmts) > 1
 	for i, stmt := range stmts {
+		if multi {
+			c.session.BeginImplicit() // no-op inside a block
+		}
 		if cf, ok := stmt.(*parser.CopyFrom); ok {
 			// COPY takes over the message stream, so it may only end a
 			// simple query — running statements after copy mode would need
@@ -966,10 +1022,9 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			if i != len(stmts)-1 {
 				c.sendError(&sql.Error{Code: sql.CodeFeatureNotSupported,
 					Msg: "COPY FROM STDIN must be the last statement of a simple query"})
-				return
+				return false
 			}
-			c.handleCopyIn(ctx, cf)
-			return
+			return c.handleCopyIn(ctx, cf)
 		}
 		res, serr := c.execute(ctx, stmt, q, nil, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			if res.Copy != nil {
@@ -991,10 +1046,44 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 		})
 		if serr != nil {
 			c.sendError(serr)
-			return
+			return false
 		}
 		c.sendComplete(res.Tag)
 	}
+	return true
+}
+
+// readAhead is an Execute's look at the message after it, taken before
+// it runs, outside a transaction block. A Sync next means the Execute is
+// its pipeline's only statement: it runs as its own implicit
+// transaction, which commits with it and is re-run automatically on a
+// serialization failure. Anything else means more of the pipeline may
+// follow, and PostgreSQL runs everything up to the Sync as one implicit
+// transaction: one is opened here for the Sync (or the end of a simple
+// Query) to commit, or for the rollback should a message fail first or
+// the connection end without a Sync. A statement that runs only outside
+// a block (Session.RunsAlone) is not read ahead of: it runs alone, as
+// the first Execute of a pipeline does in PostgreSQL, and the next
+// Execute decides for the rest. The message read ahead is handled
+// next by run. It returns the Execute, copied: reading the next message
+// may reuse the one m points to.
+func (c *conn) readAhead(ctx context.Context, m *pgproto3.Execute) *pgproto3.Execute {
+	if c.session.State() != sql.StateIdle || c.peeked {
+		return m
+	}
+	if pt, ok := c.portals[m.Portal]; ok && pt.res == nil && pt.stmt.stmt != nil && c.session.RunsAlone(ctx, pt.stmt.stmt) {
+		// A statement that runs only outside a block runs on its own,
+		// as the first of a pipeline does in PostgreSQL; the next
+		// Execute opens the implicit transaction for the rest.
+		return m
+	}
+	ex := *m
+	c.peekedMsg, c.peekedErr = c.backend.Receive()
+	c.peeked = true
+	if _, sync := c.peekedMsg.(*pgproto3.Sync); !sync || c.peekedErr != nil {
+		c.session.BeginImplicit()
+	}
+	return &ex
 }
 
 func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {

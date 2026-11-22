@@ -94,14 +94,15 @@ func (r *copyDataReader) drain() {
 }
 
 // handleCopyIn drives one COPY table FROM STDIN exchange end to end. The
-// caller (run's simple-query path) sends ReadyForQuery afterwards.
-func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
+// caller (run's simple-query path) sends ReadyForQuery afterwards. It
+// reports whether the COPY succeeded.
+func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) bool {
 	ci, err := c.session.BeginCopy(ctx, cf)
 	if err != nil {
 		// A client that streamed CopyData optimistically (pgx) is drained
 		// by run()'s silent-discard cases.
 		c.sendError(sql.ToSQLError(err))
-		return
+		return false
 	}
 	cols := ci.Columns()
 	opts := ci.Options()
@@ -115,7 +116,7 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	}
 	c.backend.Send(resp)
 	if err := c.backend.Flush(); err != nil {
-		return
+		return false
 	}
 
 	r := &copyDataReader{backend: c.backend}
@@ -136,13 +137,13 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 		n, ferr := ci.Finish(ctx)
 		if ferr != nil {
 			c.sendError(sql.ToSQLError(ferr))
-			return
+			return false
 		}
 		if c.act != nil {
 			c.act.copied(int64(n))
 		}
 		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("COPY %d", n))})
-		return
+		return true
 	}
 	ci.Abort()
 	var serr *sql.Error
@@ -158,6 +159,7 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	}
 	c.sendError(serr)
 	r.drain()
+	return false
 }
 
 // copyFieldDatum converts a text or CSV field to its column's type. An

@@ -28,6 +28,27 @@ syntax error or `0A000` feature not supported):
 
 ## Things that exist but behave differently
 
+- **A multi-statement query or a pipeline is atomic, except around
+  online DDL.** As in PostgreSQL, the statements of one query string
+  and of one pipeline up to its `Sync` (pgx `SendBatch`) are one
+  implicit transaction: committed together, or not at all if one
+  fails. The exception is datax's online statements, which PostgreSQL
+  runs inside a transaction but datax runs in transactions of its own:
+  `CREATE INDEX` (except on a table created earlier in the same
+  transaction), `ALTER TABLE` with `ADD CONSTRAINT`, `VALIDATE
+  CONSTRAINT`, `SET NOT NULL`, `ALTER COLUMN TYPE`, `ADD COLUMN` with a
+  volatile default, a constraint or `SERIAL`, `SET (...)`, `RESET`,
+  `SPLIT AT`, `UNSPLIT`, `PURGE` or `ROTATE ENCRYPTION KEY`, `CREATE
+  TABLE ... AS`, `ANALYZE`, `SELECT ... AS OF SYSTEM TIME`, the
+  encryption-key statements and `SET CLUSTER SETTING`. One of them
+  commits the statements before it, runs on its own, and the statements
+  after it form a new implicit transaction — so a migration file sent
+  as one `Exec` works, but is not all-or-nothing. Inside `BEGIN` they
+  are refused (`25001`). Statements PostgreSQL itself refuses in a
+  transaction block (`VACUUM`, `CREATE INDEX CONCURRENTLY`, `DROP INDEX
+  CONCURRENTLY`, `DISCARD ALL`) are refused in a multi-statement query
+  too, and run on their own as the first statement of a pipeline, as in
+  PostgreSQL.
 - **Serializable only.** No isolation levels to choose; every transaction
   can fail with `40001` and clients **must** retry
   ([details](sql.md#transactions-and-retries)). Code written for
@@ -344,7 +365,9 @@ syntax error or `0A000` feature not supported):
   failure partway leaves the earlier chunks committed — the error names
   the failing row and how many rows were already committed. Inside
   `BEGIN` it writes in the block's transaction and is atomic with it, as
-  in PostgreSQL (mind the transaction's size for a large load).
+  in PostgreSQL (mind the transaction's size for a large load); so it
+  does as the last statement of a multi-statement query, in that
+  query's implicit transaction.
 - **`ON CONFLICT`** works on the primary key and unique indexes (by
   columns or `ON CONSTRAINT <table>_pkey | <index name>`), with `DO
   NOTHING`, `DO UPDATE SET ... [WHERE]` and `EXCLUDED`; `DO UPDATE` cannot
