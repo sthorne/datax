@@ -2,6 +2,7 @@ package server
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 )
 
@@ -47,4 +48,19 @@ func writeFileSynced(path string, data []byte) error {
 		return err
 	}
 	return f.Close()
+}
+
+// replaceFileSynced replaces path with data (mode 0600) so that a power
+// loss leaves the old content or the new, never a truncated file: the
+// data goes to path+".tmp", which is synced and renamed over path, and
+// then the directory is synced so the rename is durable too.
+func replaceFileSynced(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := writeFileSynced(tmp, data); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }

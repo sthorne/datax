@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/sthorne/datax/pkg/cluster"
+	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
@@ -171,4 +173,47 @@ func TestMetadataBackupWrittenOnlyOnChange(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("a removed backup was not written again: %v", err)
 	}
+}
+
+// TestRootFilesAreDurable: the files a sealed node needs before its
+// store opens (SEAL-IDENTITY) and the metadata backup resealed under a
+// rotated key are synced before they are renamed into place, and the
+// directory after, so a power loss cannot leave either truncated.
+func TestRootFilesAreDurable(t *testing.T) {
+	t.Run("seal identity", func(t *testing.T) {
+		got := recordSyncs(t)
+		dir := t.TempDir()
+		n := &Node{cfg: Config{Dir: dir}, encRoot: &enc.ShareRoot{}, registry: cluster.NewRegistry()}
+		n.registry.Upsert(kvpb.NodeDescriptor{NodeID: 2, Address: "10.0.0.2:26257"})
+		n.writeSealIdentity()
+		want := []string{
+			SealIdentityFile + ".tmp",
+			"dir:" + filepath.Base(dir) + " " + SealIdentityFile,
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("syncs:\n got %q\nwant %q", *got, want)
+		}
+	})
+	t.Run("offline metadata backup reseal", func(t *testing.T) {
+		dir := t.TempDir()
+		oldKey, newKey := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+		sealed, err := enc.Seal(MetadataBackupMagic, oldKey, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, MetadataBackupFile), sealed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := recordSyncs(t)
+		if err := ResealMetadataBackup(dir, oldKey, newKey); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{
+			MetadataBackupFile + ".tmp",
+			"dir:" + filepath.Base(dir) + " " + MetadataBackupFile,
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("syncs:\n got %q\nwant %q", *got, want)
+		}
+	})
 }

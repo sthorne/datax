@@ -98,12 +98,7 @@ func (n *Node) writeSealIdentity() {
 	if prev, err := os.ReadFile(path); err == nil && string(prev) == string(raw) {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Debugf("writing %s: %v", SealIdentityFile, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceFileSynced(path, raw); err != nil {
 		log.Debugf("writing %s: %v", SealIdentityFile, err)
 	}
 }

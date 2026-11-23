@@ -2101,6 +2101,13 @@ state or the internode protocol does, and an entry below says so.
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
   totals, which the health summaries report.
+- **`SEAL-IDENTITY` and a resealed metadata backup survive a power
+  loss.** A node under a share root writes `SEAL-IDENTITY` (where to ask
+  for the key before its store opens), and a store-key rotation, online
+  or offline, reseals `metadata-backup.json`; each was written to a
+  temporary file and renamed with no fsync, so a power loss could leave
+  it empty or truncated under its final name. Each file is now synced
+  before the rename and the data directory after it.
 - **Local copies of the registry and the peer-unseal setting survive a
   crash, and the metadata backup is no longer rewritten every beat.**
   The node keeps the registry in its state engine so a restart can dial
