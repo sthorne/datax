@@ -52,6 +52,10 @@ serves, on that address:
   quorum, undiverse — measured against each range's own target replica
   count, so a database with a placement policy is judged by its policy
   and not by the cluster default; selecting a bucket lists its ranges.
+  A replica on a live node that the node reports in its heartbeat as
+  stopped by a storage failure or never loaded counts as not live, as
+  in the health check, and its range is also listed under **dead
+  replicas**.
   The **failure domains** table is what rack-aware placement is for:
   per locality tier value, the nodes, replicas and leases it holds, and
   what its loss would cost — how many ranges would drop below a

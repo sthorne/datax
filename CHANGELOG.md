@@ -2101,6 +2101,14 @@ state or the internode protocol does, and an entry below says so.
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
   totals, which the health summaries report.
+- **The console's replication view shows dead replicas on live nodes.**
+  The health check counts a replica its live node reports failed or
+  missing as unavailable, but the replication tiles and buckets still
+  read node liveness alone, so a range a replica short, or without
+  quorum, showed as healthy. They now count such replicas as not live,
+  and a new `unavailable_replicas` bucket in `/api/cluster`'s
+  replication section (the console's **dead replicas** tile) lists the
+  ranges that have one.
 - **`/ready`, a readiness check.** `/status` answers 200 whenever the
   HTTP port does, so a load balancer or probe that used it sent clients
   to a node that had not joined yet, whose SQL listener was not up, or
