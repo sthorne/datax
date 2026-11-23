@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/sthorne/datax/pkg/storage/enc"
 )
 
 // recordSyncs replaces syncFile and syncDir with versions that note what
@@ -115,12 +118,57 @@ func TestMetadataBackupIsDurable(t *testing.T) {
 	got := recordSyncs(t)
 	dir := t.TempDir()
 	n := &Node{cfg: Config{Dir: dir}}
-	n.writeMetadataBackup([]byte(`{}`))
+	n.writeMetadataBackup([]byte(`{}`), []byte(`{}`))
 	want := []string{
 		MetadataBackupFile + ".tmp",
 		"dir:" + filepath.Base(dir) + " " + MetadataBackupFile,
 	}
 	if !reflect.DeepEqual(*got, want) {
 		t.Fatalf("syncs:\n got %q\nwant %q", *got, want)
+	}
+}
+
+// TestMetadataBackupWrittenOnlyOnChange: the heartbeat exports every
+// beat, and each write is fsynced, so an export whose content (less the
+// capture time and per-beat registry fields) and key match the last one
+// written leaves the file alone; changed content, a new key or a missing
+// file write it again.
+func TestMetadataBackupWrittenOnlyOnChange(t *testing.T) {
+	got := recordSyncs(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, MetadataBackupFile)
+	n := &Node{cfg: Config{Dir: dir}}
+	read := func() string {
+		t.Helper()
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	n.writeMetadataBackup([]byte(`{"beat":1}`), []byte("v1"))
+	writes := len(*got)
+	if writes == 0 {
+		t.Fatal("the first export did not write")
+	}
+	n.writeMetadataBackup([]byte(`{"beat":2}`), []byte("v1"))
+	if len(*got) != writes || read() != `{"beat":1}` {
+		t.Fatalf("an unchanged export was written again (%d syncs, was %d; file %s)", len(*got), writes, read())
+	}
+	n.writeMetadataBackup([]byte(`{"beat":3}`), []byte("v2"))
+	if read() != `{"beat":3}` {
+		t.Fatalf("a changed export was not written: %s", read())
+	}
+	n.encKey = bytes.Repeat([]byte{7}, 32)
+	n.writeMetadataBackup([]byte(`{"beat":4}`), []byte("v2"))
+	if _, err := enc.Unseal(MetadataBackupMagic, n.encKey, []byte(read())); err != nil {
+		t.Fatalf("a new key did not reseal the backup: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	n.writeMetadataBackup([]byte(`{"beat":5}`), []byte("v2"))
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a removed backup was not written again: %v", err)
 	}
 }

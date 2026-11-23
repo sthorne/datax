@@ -304,15 +304,11 @@ func (n *Node) setPeerUnsealLocal(off bool) {
 	if off {
 		val = "off"
 	}
-	// Flushed on a store with no WAL (as the encryption marker is), so a
+	// Durable (a synced write, or a flush on a store with no WAL), so a
 	// crash cannot roll an "off" back to "on" until the next heartbeat.
 	// It runs only when the setting changes.
-	if err := n.engine.Put(keys.StorePeerUnsealKey(), []byte(val)); err != nil {
+	if err := n.engine.PutDurable(keys.StorePeerUnsealKey(), []byte(val)); err != nil {
 		log.Debugf("recording the peer-unseal setting: %v", err)
-	} else if n.engine.WALDisabled() {
-		if err := n.engine.Flush(); err != nil {
-			log.Debugf("recording the peer-unseal setting: %v", err)
-		}
 	}
 	log.Infof("peer unseal is %s for this cluster", val)
 }

@@ -2101,6 +2101,21 @@ state or the internode protocol does, and an entry below says so.
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
   totals, which the health summaries report.
+- **Local copies of the registry and the peer-unseal setting survive a
+  crash, and the metadata backup is no longer rewritten every beat.**
+  The node keeps the registry in its state engine so a restart can dial
+  its peers before any range has a leader, and a copy of the cluster's
+  peer-unseal setting. Both used an unsynced write, which on a state
+  engine with no WAL reaches disk only at the next memtable flush, so a
+  crash could restart a node with addresses its peers had left, or roll
+  the setting back. The registry is now written durably when a node
+  joins, moves, starts draining or changes binary (a liveness- or
+  load-only beat stays a plain write, and an unchanged one writes
+  nothing); the setting is written durably whenever it changes.
+  `metadata-backup.json`, fsynced on each write since the fix below, was
+  written on every heartbeat; it is now written only when its metadata
+  (less the capture time and per-beat registry figures) or the store key
+  changed, or the file is missing.
 - **A backup reported written survives a power loss.** Backup data
   files, the manifest, their renames and the destination directory were
   never fsynced, nor was `metadata-backup.json`, so a power loss soon

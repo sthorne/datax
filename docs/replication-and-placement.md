@@ -333,11 +333,14 @@ Losing a range's quorum — worst of all range 1's, which carries `/meta`
 addressing, descriptors, and users — normally leaves it permanently
 unavailable. Two tools turn that into a recoverable incident:
 
-- **Metadata export**: every disk-backed node writes
+- **Metadata export**: every disk-backed node exports
   `<dir>/metadata-backup.json` on each heartbeat — decoded `/meta` records,
   table descriptors, the namespace, user credential verifiers, and the node
-  registry — atomically (tmp+rename). `datax debug metadata --dir` prints
-  it, online or offline.
+  registry — atomically (tmp+rename, fsynced). The file is rewritten only
+  when that metadata changed (the registry's per-beat liveness and load
+  figures do not count), when the store key changed, or when it is
+  missing, so `captured_at` is when it last changed, not the last beat.
+  `datax debug metadata --dir` prints it, online or offline.
 - **`datax debug unsafe-recover --dir <dir> [--range N] --yes`**: with the
   node STOPPED, rewrites its range descriptors to single-replica
   membership (its own replica, generation bumped). On restart each
