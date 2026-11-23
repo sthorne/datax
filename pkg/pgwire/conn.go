@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/log"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -531,6 +532,21 @@ func (c *conn) refuseOversized(err error) bool {
 	return true
 }
 
+// refuseMalformed tells the client why its connection ends when err is
+// a message it sent that could not be decoded rather than a broken or
+// closed transport: an unknown message type, an impossible length, or a
+// body pgproto3 refuses (a FunctionCall whose format codes are not 0 or
+// 1, among others). It used to be closed with no word at all.
+func (c *conn) refuseMalformed(err error) {
+	var ne net.Error
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &ne) {
+		return
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sendFatal(sql.CodeInvalidParameter, "invalid frontend message: "+err.Error())
+}
+
 // testingPanicOnMessage, when set, sees every message the message loop
 // receives: a test's way to inject a panic into a connection.
 var testingPanicOnMessage func(pgproto3.FrontendMessage)
@@ -632,6 +648,7 @@ func (c *conn) run(ctx context.Context) (err error) {
 				_ = c.backend.Flush()
 				return nil
 			}
+			c.refuseMalformed(err)
 			return err
 		}
 		switch msg.(type) {
@@ -1634,6 +1651,12 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 	c.backend.Send(&pgproto3.ParseComplete{})
 }
 
+// unsupportedFormatCode is the refusal of a message carrying a format
+// code other than 0 (text) or 1 (binary).
+func unsupportedFormatCode(f int) *sql.Error {
+	return &sql.Error{Code: sql.CodeInvalidParameter, Msg: fmt.Sprintf("unsupported format code: %d", f)}
+}
+
 func (c *conn) handleBind(m *pgproto3.Bind) {
 	p, ok := c.stmts[m.PreparedStatement]
 	if !ok {
@@ -1656,6 +1679,16 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
 			Msg: fmt.Sprintf("bind message has %d result formats but query has %d columns", n, len(p.cols))})
 		return
+	}
+	// A format code is 0 (text) or 1 (binary); anything else is refused,
+	// as PostgreSQL does, rather than read as one or the other.
+	for _, codes := range [][]int16{m.ParameterFormatCodes, m.ResultFormatCodes} {
+		for _, f := range codes {
+			if f != 0 && f != 1 {
+				c.extError(unsupportedFormatCode(int(f)))
+				return
+			}
+		}
 	}
 	paramFormat := func(i int) int16 {
 		switch len(m.ParameterFormatCodes) {

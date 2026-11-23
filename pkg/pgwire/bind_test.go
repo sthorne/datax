@@ -2,14 +2,17 @@ package pgwire
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/sql/vtable"
 )
 
 // Bind-time checks on what a client sends, driven as raw protocol
@@ -126,6 +129,80 @@ func TestBindFormatCodeCounts(t *testing.T) {
 	// The connection, and the server, are still there.
 	if got := bindOutcome(t, fe, q, &pgproto3.Bind{Parameters: params}); got != "" {
 		t.Fatalf("a valid Bind after the refusals answered %q", got)
+	}
+}
+
+// TestBindUnsupportedFormatCode: a format code is 0 (text) or 1
+// (binary); a Bind carrying any other, for a parameter or a result
+// column, is refused with "unsupported format code: N", as PostgreSQL
+// refuses it, where it used to be read as text (a parameter) or binary
+// (a result column).
+func TestBindUnsupportedFormatCode(t *testing.T) {
+	s := startServer(t, ServerOptions{})
+	_, fe := trustConn(t, s)
+	const q = "SELECT $1::text, $2::text"
+	params := [][]byte{[]byte("a"), []byte("b")}
+	for _, c := range []struct {
+		name          string
+		param, result []int16
+		bad           int16
+	}{
+		{"parameter code 2 for all", []int16{2}, nil, 2},
+		{"parameter code 2 for one", []int16{0, 2}, nil, 2},
+		{"negative parameter code", []int16{-1, 0}, nil, -1},
+		{"result code 2 for all", nil, []int16{2}, 2},
+		{"result code 7 for one", nil, []int16{1, 7}, 7},
+	} {
+		got := exchange(t, fe, &pgproto3.Parse{Query: q}, &pgproto3.Bind{ParameterFormatCodes: c.param, Parameters: params, ResultFormatCodes: c.result})
+		if len(got) < 2 {
+			t.Fatalf("%s: no answer to Bind: %v", c.name, got)
+		}
+		e, ok := got[1].(*pgproto3.ErrorResponse)
+		if !ok {
+			t.Errorf("%s: Bind answered %T, want an error", c.name, got[1])
+			continue
+		}
+		if want := fmt.Sprintf("unsupported format code: %d", c.bad); e.Code != "08P01" || e.Message != want {
+			t.Errorf("%s: Bind answered %s %q, want 08P01 %q", c.name, e.Code, e.Message, want)
+		}
+	}
+	if got := bindOutcome(t, fe, q, &pgproto3.Bind{ParameterFormatCodes: []int16{0, 0}, Parameters: params, ResultFormatCodes: []int16{1}}); got != "" {
+		t.Fatalf("a valid Bind after the refusals answered %q", got)
+	}
+}
+
+// TestFunctionCallUnsupportedFormatCode: pgproto3 refuses to decode a
+// fast-path call whose argument or result format code is not 0 or 1, so
+// the call never runs; the connection ends with a FATAL 08P01 saying
+// why, where it used to close with no word at all.
+func TestFunctionCallUnsupportedFormatCode(t *testing.T) {
+	s := startServer(t, ServerOptions{})
+	oid, ok := vtable.ProcOID("lo_close")
+	if !ok {
+		t.Fatal("lo_close has no OID")
+	}
+	fd := binary.BigEndian.AppendUint32(nil, 0)
+	for _, c := range []struct {
+		name   string
+		args   []uint16
+		result uint16
+	}{
+		{"argument code 2", []uint16{2}, 1},
+		{"result code 3", []uint16{1}, 3},
+	} {
+		nc, fe := trustConn(t, s)
+		fe.Send(&pgproto3.FunctionCall{Function: uint32(oid), ArgFormatCodes: c.args, Arguments: [][]byte{fd}, ResultFormatCode: c.result})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatalf("%s: no error before the close: %v", c.name, err)
+		}
+		if e, ok := msg.(*pgproto3.ErrorResponse); !ok || e.Code != "08P01" || e.Severity != "FATAL" || !strings.Contains(e.Message, "FunctionCall") {
+			t.Fatalf("%s: got %#v, want a FATAL 08P01 naming the FunctionCall", c.name, msg)
+		}
+		expectClosed(t, nc, 5*time.Second)
 	}
 }
 
