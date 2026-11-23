@@ -2105,6 +2105,32 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`sum` over `numeric` keeps its inputs' display scale.** A sum of
+  `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
+  the result dropped the declared scale it tracked. It now carries the
+  largest scale among its inputs, as PostgreSQL's numeric addition does.
+  Expression results still render without it.
+- **Float and integer edge cases match PostgreSQL 16.**
+  - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's
+    `rint` does: `round(2.5::float8)` is `2` (was `3`), and
+    `round(-0.5::float8)` is `-0` (was `-1`). `round(x, n)` and
+    `round(numeric)` still round halves away from zero.
+  - `-0.0::float8` (and `-0::float8`) is `-0`, as in PostgreSQL; it was
+    `0`, because the minus folded into a numeric literal that has no
+    negative zero.
+  - An integer literal outside `INT8`'s range is `numeric`, as in
+    PostgreSQL, instead of `42601 invalid number`; `-9223372036854775808`
+    is an `int8`, where it was a syntax error too.
+  - `avg` over `int8` no longer fails with `22003 bigint out of range`
+    when the total passes `int8`: it totals in `numeric`, as it already
+    divided. `sum` over `int8` is still `bigint` (PG-F-029).
+- **SQL `PREPARE` without a type list takes arguments.** `PREPARE s AS
+  SELECT $1::int8 + 1; EXECUTE s(1);` failed with `42601 wrong number of
+  parameters`, because the parameter count came from the declared type
+  list. It is now the highest `$N` the statement references (or the type
+  list's length, if longer), and the undeclared parameters are typed from
+  where they stand, as the protocol-level Parse types them (PG-Q-021,
+  now closed).
 - **Status recovery no longer commits a transaction's earlier writes
   without its final ones.** A pipelined transaction that wrote a key and
   then rewrote it in its final batch, sent in parallel with the STAGING

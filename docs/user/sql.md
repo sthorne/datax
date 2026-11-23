@@ -63,7 +63,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
 | enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; a quoted name keeps its case (`CREATE TYPE "Role"`, `r "Role"`, `::"Role"`), as Prisma writes it, and prints quoted (`format_type`, `'"Role"'::regtype`); described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
 | `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB`, `TSVECTOR` and `TSQUERY` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
-| `DATE` | | |
+| `DATE` | | a calendar day, the years 0000 to 9999 (a value outside is refused). Year 0000 is accepted as the year before 0001, though PostgreSQL has no year 0 and refuses it |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |
 | `UUID` | | |
 | `JSONB` | `JSON` | normalized on write: sorted keys, compact |
@@ -74,7 +74,11 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   `WHERE tag = 'a0eebc99-...'` — and become index bounds.
 - Non-integer numeric literals are **DECIMAL**, as in PostgreSQL: `0.1`
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
-  column converts (correctly rounded).
+  column converts (correctly rounded). So is an integer literal outside
+  `INT8`'s range (`99999999999999999999`).
+- `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
+  does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
+  `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
   operand demotes the expression to float. DECIMAL division, and `AVG`
   of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use
@@ -87,9 +91,11 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored
-  number collide as duplicates). Expression and aggregate *results* are
-  plain DECIMALs and render canonically (`SUM` of `9.90`s can print
-  `19.8`), like PostgreSQL's rule that expressions lose the typmod.
+  number collide as duplicates). Expression results are plain DECIMALs
+  and render canonically (`a + a` of `9.90`s prints `19.8`, where
+  PostgreSQL keeps the scale and prints `19.80`). `SUM` keeps the
+  largest declared scale among its inputs, as PostgreSQL does (`SUM` of
+  `9.90`s prints `19.80`).
 - The other type modifiers — the integer widths, `VARCHAR(n)` /
   `CHAR(n)`, `TIMESTAMP` without time zone, `TIMESTAMP(p)` — apply on
   the same paths, and a column that carries one describes with

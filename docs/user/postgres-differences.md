@@ -125,8 +125,10 @@ syntax error or `0A000` feature not supported):
   as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
   a `TIMESTAMP` stays a `TIMESTAMP`, as `::timestamp` yields one, `GROUPING()` is `INT8`),
   and a bind parameter for a `TIMESTAMP` column describes as
-  `timestamptz` (pass UTC); expression/aggregate results render in
-  canonical form (no declared scale), as in PostgreSQL.
+  `timestamptz` (pass UTC); expression results render in canonical
+  form, without the declared scale PostgreSQL keeps (`a + a` over a
+  `NUMERIC(10,2)` is `19.8`, PostgreSQL's `19.80`), while `sum` keeps
+  its inputs' largest declared scale as PostgreSQL does.
 - **Enums** are append-only (`ADD VALUE BEFORE` / `AFTER`, `RENAME
   VALUE`, `RENAME TO` are refused; `DROP TYPE ... CASCADE` does not
   drop columns), have no arrays, and compare with text by label

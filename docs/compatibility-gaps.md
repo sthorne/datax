@@ -46,8 +46,8 @@ Open gaps by area and priority.
 
 | Area | P1 | P2 | P3 | P4 | Total |
 |---|---:|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 0 | 10 | 12 | 0 | 22 |
-| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
+| [PG: Query language](#query-language) | 0 | 9 | 12 | 0 | 21 |
+| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 11 | 0 | 17 |
 | [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
 | [PG: DDL](#ddl) | 0 | 14 | 9 | 1 | 24 |
 | [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **3** | **69** | **82** | **1** | **155** |
+| **PostgreSQL total** | **3** | **68** | **83** | **1** | **155** |
 | **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
-| **All** | **5** | **93** | **101** | **1** | **200** |
+| **All** | **5** | **92** | **102** | **1** | **200** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -102,7 +102,6 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 | PG-Q-016 | `MERGE` (and PG 17's `MERGE ... RETURNING`, `WHEN NOT MATCHED BY SOURCE`) | `42601 unsupported statement "merge"` | `INSERT ... ON CONFLICT DO UPDATE`; `UPSERT` | P2 | L | V | — |
 | PG-Q-035 | `COPY FROM` `DEFAULT` (16) and `ON_ERROR` (17); `ENCODING` other than UTF8 / SQL_ASCII (no conversion); `FREEZE` is accepted and ignored | `42601`; `0A000` | convert the file to UTF8 first | P3 | S | D | — |
 | PG-Q-020 | `COPY FROM` is not atomic (commits in 128-row / 1 MiB chunks) and is refused inside `BEGIN` | `25001 COPY FROM cannot run inside a transaction block`; silently different on failure (earlier chunks stay) | load into a staging table, then `INSERT ... SELECT` | P2 | L | V | — |
-| PG-Q-021 | SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`; cursors: `DECLARE`, `FETCH`, `MOVE`, `CLOSE`, `WITH HOLD` (psycopg named cursors, some reporting tools) | `42601 unsupported statement "prepare" / "declare"` | protocol-level prepare and portal suspension (both work) | P2 | M | V | — |
 | PG-Q-022 | `EXPLAIN` options (`FORMAT JSON`, `VERBOSE`, `BUFFERS`, `COSTS`, `SETTINGS`, `GENERIC_PLAN`), `EXPLAIN` of `INSERT`/`UPDATE`/`DELETE`, a plan tree | `42601 expected SELECT, VALUES or a parenthesized query, found "format"`; `0A000 EXPLAIN supports table SELECT statements only` | plain `EXPLAIN` / `EXPLAIN ANALYZE` of a `SELECT` (one line per stage) | P2 | M | V | — |
 | PG-Q-036 | Collations other than C / POSIX / default / ucs_basic (`"en_US"`, ICU): text compares bytewise | `42704 collation "x" for encoding "UTF8" does not exist` | sort client-side, or `ORDER BY lower(x)` | P3 | M | D | — |
 | PG-Q-025 | `WITH ... AS [NOT] MATERIALIZED`; `SEARCH` and `CYCLE` clauses of recursive CTEs | `42601 expected "(", found "materialized"`; `42601 unsupported statement "search" / "cycle"` | drop the keyword; track depth by hand | P3 | S | V | — |
@@ -131,6 +130,7 @@ which do exist: see PG-F-022.
 | PG-F-026 | `setseed` (no per-session random generator); `scale(1.50)` is 1, PostgreSQL says 2 | `42883`; silently different | — | P3 | S | D | — |
 | PG-F-027 | Bitwise operators on `int2` / `int4` compute in `int8`: `1 << 31` on an `int4` is 2147483648, PostgreSQL wraps to -2147483648 | silently different | cast the result | P3 | S | D | — |
 | PG-F-028 | `range_agg`, `xmlagg` (no range or xml types) | `42883` | — | P3 | S | D | — |
+| PG-F-029 | `sum` over `int8` (and over any integer expression datax types as `int8`, see PG-F-016) is `bigint`, where PostgreSQL's is `numeric`, so a total beyond `int8` fails. Making it `numeric` waits on two other gaps: numeric → integer assignment casts (`INSERT INTO t (n) SELECT sum(x) FROM u` into an `int8` column would fail with `22P02`), and integer widths through views and derived tables (`sum` of an `int4` view column would become `numeric`). `avg` over `int8` totals in `numeric` and does not overflow | `22003 bigint out of range in sum` | `sum(x::numeric)` | P3 | S | V | — |
 | PG-F-014 | **SQL/JSON**: the `jsonpath` type, `@?`, `@@`, `jsonb_path_query[_array\|_first]`, `jsonb_path_exists`, `jsonb_path_match`; SQL/JSON constructors and query functions `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_TABLE` (17), `JSON_ARRAYAGG` / `JSON_OBJECTAGG` (16), `json_scalar`, `json_serialize` | `42601 unexpected character '@'`; `42883 unknown function "jsonb_path_query"`; `42601 expected ")", found ":"` | `->` / `@>` / `?` | P2 | L | V | — |
 | PG-F-015 | **Size functions return NULL**: `pg_table_size`, `pg_total_relation_size`, `pg_relation_size`, `pg_database_size`; `pg_indexes_size` and `pg_column_size` do not exist | silently different (NULL; psql's `\dt+`, `\l+`, `\di+` show blank sizes); `42883` for the last two | `datax debug` ranges, the console's data view | P2 | M | V | — |
 | PG-F-016 | **Integer typing**: integer literals and `INT4` expressions are `int8` (`pg_typeof(1)` and `pg_typeof(int4_col)` are `int8`), so `2147483647::int4 + 1` is `2147483648` where PostgreSQL raises `22003`; `to_regtype('int4')` and `to_regtype('integer')` return `20` (int8's OID; PostgreSQL returns `integer`) | silently different | cast results; the column's own check still raises `22003` on store | P2 | M | V | — |
@@ -147,7 +147,7 @@ which do exist: see PG-F-022.
 |---|---|---|---|---|---|---|---|
 | PG-T-031 | `json_agg` / `jsonb_agg` render a `timestamptz` in UTC; zone abbreviations are a fixed list (no `timezone_abbreviations`, none DST-dependent); an invalid startup setting is ignored where PostgreSQL ends the connection | silently different | `to_jsonb` per row | P3 | S | D | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
-| PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; years outside 1678–2261; special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'` | `22007 invalid input syntax for type date: "infinity"` (and likewise); a binary-format parameter or COPY field outside the range, PostgreSQL's infinity encodings included, is `22008` | sentinel values; `now()` | P2 | M | V | — |
+| PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; a `date` takes the years 0000 to 9999 and a `timestamp` / `timestamptz` 1678-01-01 to 2261-12-31 (PostgreSQL: 4713 BC to 5874897 AD, and to 294276 AD); special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'`. Year 0000 is a valid `date` (`'0000-01-01'::date`, `make_date(0, 1, 1)`: the proleptic year before 0001), where PostgreSQL, which has no year 0, refuses it with `22008`. A `date` before 1677-09-22 or after 2262-04-11 cast to a timestamp wraps to a wrong instant instead of failing (`'1500-01-01'::date::timestamptz` is `2084-07-20 23:34:33.709552+00`) | `22007 invalid input syntax for type date: "infinity"` (and likewise for BC and five-digit years); a timestamp text outside its range is `22008 timestamp out of range`; a binary-format parameter or COPY field outside these ranges, PostgreSQL's infinity encodings included, is `22008`; year 0000 and the date-to-timestamp wrap are silently different | sentinel values; `now()` | P2 | M | V | — |
 | PG-T-006 | `TIMESTAMP` (without time zone) expressions and casts become `timestamptz`; `date + interval` is `timestamptz` (PostgreSQL: `timestamp`); a bind parameter for a `TIMESTAMP` column describes as `timestamptz` | silently different (wire type) | pass UTC | P2 | M | V | — |
 | PG-T-007 | Arrays: multidimensional (`ARRAY[[1,2],[3,4]]`, `INT8[][]` is one-dimensional), slices `a[1:2]`, arrays in keys or btree indexes, GIN over arrays, arrays of `JSONB`, enums or vectors | `42601 expected value, found "["`; `42601 array slices (v[i:j]) are not supported`; `42601 JSONB[] is not supported`; `42601 arrays of enum type mood are not supported` | `JSONB` arrays | P2 | M | V | — |
 | PG-T-008 | Composite (row) types: `CREATE TYPE ... AS (...)`, row-typed columns, `ROW(...)` values | `42601 CREATE TYPE supports AS ENUM only, found "("` | `JSONB` | P2 | L | V | — |
@@ -517,6 +517,7 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`, also without a type list (parameters counted and typed as the protocol-level Parse does); cursors: `DECLARE` (`WITH HOLD` too), `FETCH`, `MOVE`, `CLOSE` (was PG-Q-021) | PR (this branch) |
 | A multi-statement query, and an extended-protocol pipeline up to its `Sync`, are one implicit transaction (a failing statement no longer leaves the earlier ones committed; `_xact_` advisory locks span it, from PG-X-014), except around datax's online statements (PG-X-006) | PR (this branch) |
 | Sequences and enum types in any schema: `CREATE SEQUENCE / TYPE s.x`, `SERIAL` and identity in a schema, `SET SCHEMA`, defaults bound to their sequence, schema privileges, the catalogs (was PG-D-035; leftovers are PG-D-037) | PR (this branch) |
 | Schemas: `CREATE` / `DROP` / `ALTER SCHEMA`, objects in any schema, `SET SCHEMA`, `search_path`, schema privileges, schemas in the catalogs (was PG-D-001; leftovers are PG-D-035 and PG-D-036) | PR (this branch) |

@@ -276,7 +276,7 @@ func TestAlterColumnType(t *testing.T) {
 	// TEXT → DECIMAL, TEXT → INT8 (validated), INT8 → TEXT.
 	execSQL(t, ctx, s, `ALTER TABLE m ALTER COLUMN d TYPE DECIMAL`)
 	expect(s, `SELECT d FROM m WHERE id = 3`, "3.5")
-	expect(s, `SELECT sum(d) FROM m WHERE id <= 2`, "4")
+	expect(s, `SELECT sum(d) FROM m WHERE id <= 2`, "4.0") // 1.5 + 2.5 keeps the inputs' scale, as in PostgreSQL
 	execSQL(t, ctx, s, `UPDATE m SET note = id::text`)
 	execSQL(t, ctx, s, `ALTER TABLE m ALTER COLUMN note TYPE INT8`)
 	expect(s, `SELECT note + 1 FROM m WHERE id = 3`, "4")
