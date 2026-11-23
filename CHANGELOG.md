@@ -2101,6 +2101,14 @@ state or the internode protocol does, and an entry below says so.
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
   totals, which the health summaries report.
+- **`/ready`, a readiness check.** `/status` answers 200 whenever the
+  HTTP port does, so a load balancer or probe that used it sent clients
+  to a node that had not joined yet, whose SQL listener was not up, or
+  that was draining for a stop. The new `/ready` answers 503 with a
+  reason until the node has joined (its first heartbeat landed) and its
+  SQL listener serves, 200 then, and 503 again once it drains. It needs
+  no credentials and reveals only that. `/status` is unchanged, as the
+  liveness check.
 - **A node started without `--dir` says that its data is in memory.**
   `datax init` and `datax start` still default to an in-memory store,
   but nothing at startup said so, so a service that forgot `--dir`, or

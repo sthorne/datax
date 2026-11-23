@@ -277,6 +277,7 @@ func (n *Node) startHTTP() error {
 		// be resolved, so that case simply shows every key at its prefix.
 		_ = enc.Encode(n.statusSummaryFor(n.keyViewer(req)))
 	})
+	mux.HandleFunc("/ready", n.serveReady)
 	mux.HandleFunc("/api/cluster", n.serveClusterAPI)
 	// Cross-node drill-down: fans out over the internode RPC, so it is
 	// admin-gated (the read-only endpoints above stay open to any
@@ -381,7 +382,7 @@ func (n *Node) startHTTP() error {
 		}()
 	}
 	n.stopper.AddCloser(func() { _ = srv.Close() })
-	log.Infof("node %s serving the dashboard, /metrics, /status and /api/cluster at %s", n.ident.NodeID, n.httpAddr)
+	log.Infof("node %s serving the dashboard, /metrics, /status, /ready and /api/cluster at %s", n.ident.NodeID, n.httpAddr)
 	return nil
 }
 
@@ -438,7 +439,9 @@ func (n *Node) httpAuth(next http.Handler) http.Handler {
 		// so they run ahead of the check (issue #158). They authenticate
 		// their own callers: /api/login verifies the password it is
 		// given, and /api/logout only clears the caller's own cookie.
-		if req.URL.Path == "/api/login" || req.URL.Path == "/api/logout" {
+		// /ready is a probe (ready.go): orchestrators ask it without
+		// credentials, and it reveals only whether the node is ready.
+		if req.URL.Path == "/api/login" || req.URL.Path == "/api/logout" || req.URL.Path == "/ready" {
 			next.ServeHTTP(w, req)
 			return
 		}

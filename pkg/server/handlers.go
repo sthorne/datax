@@ -238,6 +238,8 @@ func (n *Node) publishLiveness(ctx context.Context) {
 	raw, _ := json.Marshal(nd)
 	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 		log.Debugf("liveness heartbeat failed: %v", err)
+	} else {
+		n.joined.Store(true)
 	}
 }
 

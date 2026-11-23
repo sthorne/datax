@@ -206,7 +206,18 @@ serves, on that address:
 - **`/status`** — JSON: this node's identity, locality, and every range it
   holds (leader, applied index, size, QPS, closed timestamp — the newest
   fixed timestamp the replica can serve follower reads at).
-  `datax debug status --url ...` pretty-prints it.
+  `datax debug status --url ...` pretty-prints it. It answers 200
+  whenever the HTTP port does, so it is a liveness check, not a
+  readiness one.
+- **`/ready`** — the readiness check for a load balancer or an
+  orchestrator's probe. `200 {"ready":true}` once the node has joined
+  (a heartbeat of its own reached the registry in range 1, so the
+  cluster answers it), its store is open and its SQL listener, when one
+  is configured, is serving. Before that, and from the moment it begins
+  draining for a stop (SIGTERM, Ctrl-C), `503` with a `reason`. It needs
+  no credentials, in secure mode too, and says nothing beyond that.
+  Send SQL clients to a node only while its `/ready` is 200; restart it
+  on its `/status`.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
   liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges,
   and the `rollup` summed over the live nodes with the count of nodes
