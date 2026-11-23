@@ -1215,6 +1215,17 @@ state or the internode protocol does, and an entry below says so.
   `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
   Snapshot messages from authenticated node peers still exit on a clock
   past `--max-offset`, as documented.
+- **A reply can no longer stop the caller through its clock.** The
+  RPC client ratcheted its clock to every reply's timestamp and exited
+  the process when that timestamp was past `--max-offset`, so a peer
+  whose clock had run away stopped every node that sent it a batch, and
+  whatever answered at an address a `datax debug` command or a joining
+  node dialed could stop that process with one reply. Such a reply now
+  fails the call (Batch, Join, Admin) with "clock synchronization
+  violated", logged as a warning, and leaves the caller's clock
+  unchanged; a Ping reply is still measured, so the offset shows in
+  `datax_clock_offset_seconds`. The server side already refused a Join
+  or Admin call this way.
 - **A Bind with the wrong number of format codes no longer crashes the
   node.** A Bind whose parameter format codes were neither 0, 1 nor one
   per parameter (for example 2 codes for 3 parameters) indexed past
