@@ -1376,6 +1376,12 @@ Rules of the road:
   record that has changed since is left for a fresh recovery. Nothing
   changes for clients. Until finalize recovery ends the record as
   before: an older node would ignore the check.
+- **v26 makes console sessions revocable.** Once it is finalized,
+  root can run `datax debug rotate-session-secret` to revoke every
+  outstanding console session (see
+  [Security → Signing in to the console](security.md#signing-in-to-the-console)).
+  Until finalize the command is refused: an older node would keep
+  accepting the revoked tokens. Nothing else changes.
 - **v23 turns on range-safety checks at apply** (issue #389). Before
   finalize, a node on the new binary already re-checks that a write
   still belongs to its range once it holds its latches, and a split draws

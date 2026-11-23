@@ -3,16 +3,21 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/metrics"
+	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server/ui"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/util/log"
 	"github.com/sthorne/datax/pkg/version"
 )
@@ -24,8 +29,8 @@ import (
 // accepts the cookie as a third way to establish the same principal
 // every downstream check already reads.
 //
-// The token is stateless and signed with a key derived from the
-// cluster's authentication secret (pkg/security/session.go), so any node
+// The token is stateless and signed with a key derived from a secret
+// the cluster shares (sessionKey; pkg/security/session.go), so any node
 // accepts a token any other node minted and no session state is
 // replicated. What the token asserts is identity only: roles are
 // resolved per request from the catalog, so NOLOGIN, DROP ROLE and a
@@ -35,24 +40,101 @@ const (
 	// sessionCookieName is the cookie the console signs in with.
 	sessionCookieName = "datax_session"
 	// sessionTTL bounds a token's life. It is what limits the damage of
-	// a stolen cookie, since a stateless token cannot be revoked; an
-	// operator who needs every outstanding session dead rotates the
-	// cluster's authentication secret.
+	// a stolen cookie that nobody notices; an operator who needs every
+	// outstanding session dead runs `datax debug rotate-session-secret`
+	// (rotateSessionSecret).
 	sessionTTL = 12 * time.Hour
+	// sessionSecretTTL is how long a node trusts its cached copy of the
+	// session secret before reading it again: a rotation stops tokens
+	// signed under the old secret validating on every node within this
+	// long. A node that cannot read the secret once its copy is stale
+	// accepts no token until it can.
+	sessionSecretTTL = 10 * time.Second
 	// loginBodyLimit bounds the credential document.
 	loginBodyLimit = 4 << 10
 )
 
 // sessionKey is the key this node signs and verifies session tokens
-// with, derived from the cluster's shared authentication secret. nil
-// when the secret cannot be read — sessions are then unavailable and
-// the other two doors still work.
+// with: derived from the session secret once a rotation has written one,
+// and from the cluster's shared authentication secret before that (as
+// every node before cluster version v26 derives it, so the tokens are
+// the same). nil when a secret cannot be read — sessions are then
+// unavailable and the other two doors still work.
 func (n *Node) sessionKey(ctx context.Context) []byte {
-	secret := n.mockSecret(ctx)
-	if len(secret) == 0 {
+	secret, ok := n.currentSessionSecret(ctx)
+	if !ok {
 		return nil
 	}
+	if len(secret) == 0 {
+		secret = n.mockSecret(ctx)
+		if len(secret) == 0 {
+			return nil
+		}
+	}
 	return security.DeriveKey(secret, security.SessionKeyPurpose)
+}
+
+// currentSessionSecret returns the session secret (nil when no rotation
+// has written one), from the cache while it is younger than
+// sessionSecretTTL and from KV otherwise. ok is false when the cache is
+// stale and the read fails: the caller must then accept no token, or a
+// node cut off from KV would honour revoked ones indefinitely.
+func (n *Node) currentSessionSecret(ctx context.Context) (secret []byte, ok bool) {
+	n.sessionSecretMu.Lock()
+	defer n.sessionSecretMu.Unlock()
+	if !n.sessionSecretRead.IsZero() && time.Since(n.sessionSecretRead) < sessionSecretTTL {
+		return n.sessionSecret, true
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	raw, err := n.db.Get(ctx, keys.SessionSecretKey())
+	if err != nil {
+		log.Warnf("reading the console's session secret: %v (console sessions are refused on this node until it can be read)", err)
+		return nil, false
+	}
+	n.sessionSecret, n.sessionSecretRead = raw, time.Now()
+	return raw, true
+}
+
+// rotateSessionSecret writes a new session secret, which revokes every
+// outstanding console session: a token signed under the old secret (or,
+// before the first rotation, under the authentication secret) fails
+// verification on this node at once and on every other node within
+// sessionSecretTTL, whose wait it returns after. Root only — the one
+// principal whose session cannot otherwise be cut off, since root cannot
+// be made NOLOGIN — and only from cluster version v26, below which a
+// node never reads the secret. The authentication secret itself is left
+// alone: it also keys the stand-in SCRAM salts of unknown users, and
+// changing those while real users' salts stay put would tell an observer
+// which names exist.
+func (n *Node) rotateSessionSecret(ctx context.Context) error {
+	if n.tlsCfgs != nil {
+		if cn := rpc.PeerCN(ctx); cn != catalog.RootRole {
+			return fmt.Errorf("permission denied: rotate-session-secret may only be run as root (connected as %q)", cn)
+		}
+	}
+	if cv := n.db.ClusterVersion(); cv < version.V26 {
+		return fmt.Errorf("rotate-session-secret needs cluster version %s (the cluster is at %s): finalize the upgrade with `datax debug upgrade` first", version.V26, cv)
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return err
+	}
+	if err := n.db.Put(ctx, keys.SessionSecretKey(), secret); err != nil {
+		return fmt.Errorf("writing the new session secret: %w", err)
+	}
+	n.sessionSecretMu.Lock()
+	n.sessionSecret, n.sessionSecretRead = secret, time.Now()
+	n.sessionSecretMu.Unlock()
+	// Every other node's copy is at most sessionSecretTTL old; once that
+	// has passed (with a margin for a read in flight) none accepts the
+	// revoked tokens, which is what the caller is told.
+	select {
+	case <-time.After(sessionSecretTTL + time.Second):
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("the session secret was rotated, but the wait for every node to adopt it was cut short (they do within %s): %w", sessionSecretTTL, ctx.Err())
+	}
 }
 
 // loginRequest is the POST /api/login body.

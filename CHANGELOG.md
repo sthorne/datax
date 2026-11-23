@@ -1173,6 +1173,20 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **Console sessions can now be revoked.** The docs said rotating the
+  cluster's authentication secret invalidates every console session
+  token, but nothing could rotate it and each node cached the signing
+  key for its whole life, so a stolen cookie (root's, whose sessions
+  cannot be ended by NOLOGIN) stayed valid for its full 12 hours. The new
+  root-only `datax debug rotate-session-secret` writes a new session
+  secret (`keys.SessionSecretKey`); every node re-reads it at least
+  every 10 seconds and refuses tokens while it cannot, and the command
+  returns once that has passed, so every token signed before it fails on
+  every node by then. The authentication secret, which also keys the
+  stand-in SCRAM salts, is left alone. **Cluster version v26:** the
+  command is refused until v26 is finalized, since a v25 node never
+  re-reads the key. Until the first rotation tokens are signed exactly
+  as before.
 - **The HTTP port no longer holds connections forever.** It bounded
   only a request's headers (`--auth-timeout`), and Go closes an idle
   keep-alive connection only at an idle or read timeout, of which it set

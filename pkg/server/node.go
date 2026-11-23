@@ -596,6 +596,13 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// sessionSecret is the console's session secret
+	// (keys.SessionSecretKey; nil when no rotation has written one),
+	// read at sessionSecretRead and re-read once that is older than
+	// sessionSecretTTL, so a rotation reaches every node in bounded time.
+	sessionSecretMu   sync.Mutex
+	sessionSecret     []byte
+	sessionSecretRead time.Time
 	// dbDescs caches the database list the key viewer resolves schema
 	// usage from (viewer.go, issue #259).
 	dbDescs databaseDescsCache
