@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"math"
 	"testing"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -80,5 +81,29 @@ func TestAvgDecimalScale(t *testing.T) {
 		if got := out[0].Text(); got != c.want {
 			t.Errorf("avg%v: got %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestAvgInt8DoesNotOverflow: avg over int8 totals in numeric, as
+// PostgreSQL's int8_avg_accum does, so a total beyond int8 is no error.
+func TestAvgInt8DoesNotOverflow(t *testing.T) {
+	icol := catalog.Column{ID: 1, Name: "x", Type: types.Int}
+	desc := &catalog.TableDescriptor{Name: "t", Columns: []catalog.Column{icol}}
+	in := []types.Datum{types.NewInt(math.MaxInt64), types.NewInt(math.MaxInt64), types.NewInt(1)}
+	specs := []aggSpec{{fn: "AVG", col: icol, argType: types.Int, name: "avg"}}
+	st := newAggState(1)
+	for _, d := range in {
+		if err := st.accumulate(specs, desc, map[catalog.ColumnID]types.Datum{1: d}, nil); err != nil {
+			t.Fatalf("avg: %v", err)
+		}
+	}
+	out, err := st.finish(specs, nil)
+	if err != nil {
+		t.Fatalf("avg: %v", err)
+	}
+	// (2^64 - 1) / 3, exact; at 19 integer digits select_div_scale
+	// asks for no fraction.
+	if want := "6148914691236517205"; out[0].Fam != types.Decimal || out[0].Text() != want {
+		t.Errorf("avg: got %s %q, want DECIMAL %q", out[0].Fam, out[0].Text(), want)
 	}
 }

@@ -698,11 +698,16 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 		case "SUM", "AVG":
 			switch d.Fam {
 			case types.Int:
-				s := st.sumI[i] + d.I
-				if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
-					return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
+				// AVG totals in numeric (sumD), as PostgreSQL's
+				// int8_avg_accum does, so it cannot overflow; only SUM's
+				// bigint total can.
+				if sp.fn == "SUM" {
+					s := st.sumI[i] + d.I
+					if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
+						return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
+					}
+					st.sumI[i] = s
 				}
-				st.sumI[i] = s
 				st.sumD[i] = decimal.Add(st.sumD[i], decimal.FromInt(d.I))
 			case types.Decimal:
 				if f, ok := types.DecimalSpecial(d); ok {

@@ -47,7 +47,7 @@ Open gaps by area and priority.
 | Area | P1 | P2 | P3 | P4 | Total |
 |---|---:|---:|---:|---:|---:|
 | [PG: Query language](#query-language) | 0 | 9 | 12 | 0 | 21 |
-| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
+| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 11 | 0 | 17 |
 | [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
 | [PG: DDL](#ddl) | 0 | 14 | 9 | 1 | 24 |
 | [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **3** | **68** | **82** | **1** | **154** |
+| **PostgreSQL total** | **3** | **68** | **83** | **1** | **155** |
 | **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
-| **All** | **5** | **92** | **101** | **1** | **199** |
+| **All** | **5** | **92** | **102** | **1** | **200** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -130,6 +130,7 @@ which do exist: see PG-F-022.
 | PG-F-026 | `setseed` (no per-session random generator); `scale(1.50)` is 1, PostgreSQL says 2 | `42883`; silently different | — | P3 | S | D | — |
 | PG-F-027 | Bitwise operators on `int2` / `int4` compute in `int8`: `1 << 31` on an `int4` is 2147483648, PostgreSQL wraps to -2147483648 | silently different | cast the result | P3 | S | D | — |
 | PG-F-028 | `range_agg`, `xmlagg` (no range or xml types) | `42883` | — | P3 | S | D | — |
+| PG-F-029 | `sum` over `int8` (and over any integer expression datax types as `int8`, see PG-F-016) is `bigint`, where PostgreSQL's is `numeric`, so a total beyond `int8` fails. Making it `numeric` waits on two other gaps: numeric → integer assignment casts (`INSERT INTO t (n) SELECT sum(x) FROM u` into an `int8` column would fail with `22P02`), and integer widths through views and derived tables (`sum` of an `int4` view column would become `numeric`). `avg` over `int8` totals in `numeric` and does not overflow | `22003 bigint out of range in sum` | `sum(x::numeric)` | P3 | S | V | — |
 | PG-F-014 | **SQL/JSON**: the `jsonpath` type, `@?`, `@@`, `jsonb_path_query[_array\|_first]`, `jsonb_path_exists`, `jsonb_path_match`; SQL/JSON constructors and query functions `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_TABLE` (17), `JSON_ARRAYAGG` / `JSON_OBJECTAGG` (16), `json_scalar`, `json_serialize` | `42601 unexpected character '@'`; `42883 unknown function "jsonb_path_query"`; `42601 expected ")", found ":"` | `->` / `@>` / `?` | P2 | L | V | — |
 | PG-F-015 | **Size functions return NULL**: `pg_table_size`, `pg_total_relation_size`, `pg_relation_size`, `pg_database_size`; `pg_indexes_size` and `pg_column_size` do not exist | silently different (NULL; psql's `\dt+`, `\l+`, `\di+` show blank sizes); `42883` for the last two | `datax debug` ranges, the console's data view | P2 | M | V | — |
 | PG-F-016 | **Integer typing**: integer literals and `INT4` expressions are `int8` (`pg_typeof(1)` and `pg_typeof(int4_col)` are `int8`), so `2147483647::int4 + 1` is `2147483648` where PostgreSQL raises `22003`; `to_regtype('int4')` and `to_regtype('integer')` return `20` (int8's OID; PostgreSQL returns `integer`) | silently different | cast results; the column's own check still raises `22003` on store | P2 | M | V | — |

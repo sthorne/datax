@@ -74,7 +74,11 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   `WHERE tag = 'a0eebc99-...'` — and become index bounds.
 - Non-integer numeric literals are **DECIMAL**, as in PostgreSQL: `0.1`
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
-  column converts (correctly rounded).
+  column converts (correctly rounded). So is an integer literal outside
+  `INT8`'s range (`99999999999999999999`).
+- `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
+  does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
+  `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
   operand demotes the expression to float. DECIMAL division, and `AVG`
   of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use

@@ -113,7 +113,7 @@ Every builtin function, by category, as `SHOW FUNCTIONS` lists them. Signatures 
 - `radians(any) → float8` — Degrees converted to radians. *immutable*
 - `random([any], [any]) → float8` — A random value in [0, 1), fresh per row; random(min, max) one in [min, max]: an integer for integer bounds, else a numeric at the larger of their scales. *volatile*
 - `random_normal([float8], [float8]) → float8` — A normally distributed random value with the given mean (0) and standard deviation (1), fresh per row. *volatile*
-- `round(any, [int8]) → the type of argument 1` — Rounds to the nearest integer, or to the given number of decimal places (halves away from zero); a decimal stays exact. *immutable*
+- `round(any, [int8]) → the type of argument 1` — Rounds to the nearest integer, or to the given number of decimal places (halves away from zero; a lone double precision rounds halves to even, as rint); a decimal stays exact. *immutable*
 - `scale(decimal) → int8` — The number of decimal digits in the fractional part (of the value as datax holds it: without trailing zeros). *immutable*
 - `sign(any) → int8` — -1, 0 or 1 by the argument's sign. *immutable*
 - `sin(any) → float8` — The sine of an angle in radians. *immutable*
