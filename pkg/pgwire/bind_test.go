@@ -134,7 +134,7 @@ func TestBindFormatCodeCounts(t *testing.T) {
 
 // TestBindUnsupportedFormatCode: a format code is 0 (text) or 1
 // (binary); a Bind carrying any other, for a parameter or a result
-// column, is refused with "unsupported format code: N", as PostgreSQL
+// column, is refused with 22023 "unsupported format code: N", as PostgreSQL
 // refuses it, where it used to be read as text (a parameter) or binary
 // (a result column).
 func TestBindUnsupportedFormatCode(t *testing.T) {
@@ -162,7 +162,7 @@ func TestBindUnsupportedFormatCode(t *testing.T) {
 			t.Errorf("%s: Bind answered %T, want an error", c.name, got[1])
 			continue
 		}
-		if want := fmt.Sprintf("unsupported format code: %d", c.bad); e.Code != "08P01" || e.Message != want {
+		if want := fmt.Sprintf("unsupported format code: %d", c.bad); e.Code != "22023" || e.Message != want {
 			t.Errorf("%s: Bind answered %s %q, want 08P01 %q", c.name, e.Code, e.Message, want)
 		}
 	}

@@ -1654,7 +1654,7 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 // unsupportedFormatCode is the refusal of a message carrying a format
 // code other than 0 (text) or 1 (binary).
 func unsupportedFormatCode(f int) *sql.Error {
-	return &sql.Error{Code: sql.CodeInvalidParameter, Msg: fmt.Sprintf("unsupported format code: %d", f)}
+	return &sql.Error{Code: sql.CodeInvalidParameterValue, Msg: fmt.Sprintf("unsupported format code: %d", f)}
 }
 
 func (c *conn) handleBind(m *pgproto3.Bind) {

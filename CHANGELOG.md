@@ -1237,10 +1237,11 @@ state or the internode protocol does, and an entry below says so.
 - **A format code other than text (0) or binary (1) is refused.** A Bind
   carrying parameter or result format code 2 (or any other) was accepted,
   reading the parameter as text and sending the column as binary. It is
-  now refused with `08P01` "unsupported format code: N". A fast-path
-  call with such a code, which pgproto3 cannot decode, used to close the
-  connection without a word; any frontend message the server cannot
-  decode now ends the connection with a FATAL `08P01` saying why.
+  now refused with `22023` "unsupported format code: N", as PostgreSQL
+  does. A fast-path call with such a code, which pgproto3 cannot decode,
+  used to close the connection without a word; any frontend message the
+  server cannot decode now ends the connection with a FATAL `08P01`
+  saying why.
 - **A binary array parameter can no longer exhaust the node's memory.**
   The element count of a binary-format array (a Bind parameter or a
   binary COPY field) sized an allocation before any element was read,
