@@ -46,7 +46,7 @@ Open gaps by area and priority.
 
 | Area | P1 | P2 | P3 | P4 | Total |
 |---|---:|---:|---:|---:|---:|
-| [PG: Query language](#query-language) | 0 | 10 | 12 | 0 | 22 |
+| [PG: Query language](#query-language) | 0 | 9 | 12 | 0 | 21 |
 | [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
 | [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
 | [PG: DDL](#ddl) | 0 | 14 | 9 | 1 | 24 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **3** | **69** | **82** | **1** | **155** |
+| **PostgreSQL total** | **3** | **68** | **82** | **1** | **154** |
 | **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
-| **All** | **5** | **93** | **101** | **1** | **200** |
+| **All** | **5** | **92** | **101** | **1** | **199** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -102,7 +102,6 @@ INT8 PRIMARY KEY, tid INT8, v TEXT)`.
 | PG-Q-016 | `MERGE` (and PG 17's `MERGE ... RETURNING`, `WHEN NOT MATCHED BY SOURCE`) | `42601 unsupported statement "merge"` | `INSERT ... ON CONFLICT DO UPDATE`; `UPSERT` | P2 | L | V | — |
 | PG-Q-035 | `COPY FROM` `DEFAULT` (16) and `ON_ERROR` (17); `ENCODING` other than UTF8 / SQL_ASCII (no conversion); `FREEZE` is accepted and ignored | `42601`; `0A000` | convert the file to UTF8 first | P3 | S | D | — |
 | PG-Q-020 | `COPY FROM` is not atomic (commits in 128-row / 1 MiB chunks) and is refused inside `BEGIN` | `25001 COPY FROM cannot run inside a transaction block`; silently different on failure (earlier chunks stay) | load into a staging table, then `INSERT ... SELECT` | P2 | L | V | — |
-| PG-Q-021 | SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`; cursors: `DECLARE`, `FETCH`, `MOVE`, `CLOSE`, `WITH HOLD` (psycopg named cursors, some reporting tools) | `42601 unsupported statement "prepare" / "declare"` | protocol-level prepare and portal suspension (both work) | P2 | M | V | — |
 | PG-Q-022 | `EXPLAIN` options (`FORMAT JSON`, `VERBOSE`, `BUFFERS`, `COSTS`, `SETTINGS`, `GENERIC_PLAN`), `EXPLAIN` of `INSERT`/`UPDATE`/`DELETE`, a plan tree | `42601 expected SELECT, VALUES or a parenthesized query, found "format"`; `0A000 EXPLAIN supports table SELECT statements only` | plain `EXPLAIN` / `EXPLAIN ANALYZE` of a `SELECT` (one line per stage) | P2 | M | V | — |
 | PG-Q-036 | Collations other than C / POSIX / default / ucs_basic (`"en_US"`, ICU): text compares bytewise | `42704 collation "x" for encoding "UTF8" does not exist` | sort client-side, or `ORDER BY lower(x)` | P3 | M | D | — |
 | PG-Q-025 | `WITH ... AS [NOT] MATERIALIZED`; `SEARCH` and `CYCLE` clauses of recursive CTEs | `42601 expected "(", found "materialized"`; `42601 unsupported statement "search" / "cycle"` | drop the keyword; track depth by hand | P3 | S | V | — |
@@ -517,6 +516,7 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`, also without a type list (parameters counted and typed as the protocol-level Parse does); cursors: `DECLARE` (`WITH HOLD` too), `FETCH`, `MOVE`, `CLOSE` (was PG-Q-021) | PR (this branch) |
 | A multi-statement query, and an extended-protocol pipeline up to its `Sync`, are one implicit transaction (a failing statement no longer leaves the earlier ones committed; `_xact_` advisory locks span it, from PG-X-014), except around datax's online statements (PG-X-006) | PR (this branch) |
 | Sequences and enum types in any schema: `CREATE SEQUENCE / TYPE s.x`, `SERIAL` and identity in a schema, `SET SCHEMA`, defaults bound to their sequence, schema privileges, the catalogs (was PG-D-035; leftovers are PG-D-037) | PR (this branch) |
 | Schemas: `CREATE` / `DROP` / `ALTER SCHEMA`, objects in any schema, `SET SCHEMA`, `search_path`, schema privileges, schemas in the catalogs (was PG-D-001; leftovers are PG-D-035 and PG-D-036) | PR (this branch) |

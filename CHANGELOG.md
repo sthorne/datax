@@ -2068,6 +2068,13 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **SQL `PREPARE` without a type list takes arguments.** `PREPARE s AS
+  SELECT $1::int8 + 1; EXECUTE s(1);` failed with `42601 wrong number of
+  parameters`, because the parameter count came from the declared type
+  list. It is now the highest `$N` the statement references (or the type
+  list's length, if longer), and the undeclared parameters are typed from
+  where they stand, as the protocol-level Parse types them (PG-Q-021,
+  now closed).
 - **Status recovery no longer commits a transaction's earlier writes
   without its final ones.** A pipelined transaction that wrote a key and
   then rewrote it in its final batch, sent in parallel with the STAGING

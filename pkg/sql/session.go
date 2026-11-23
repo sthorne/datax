@@ -1257,7 +1257,7 @@ func (s *Session) Execute(ctx context.Context, stmt parser.Statement, params []t
 	case *parser.Listen, *parser.Unlisten, *parser.Notify:
 		return s.execListenNotify(stmt)
 	case *parser.Prepare:
-		return s.execPrepare(t)
+		return s.execPrepare(ctx, t)
 	case *parser.Deallocate:
 		return s.execDeallocate(t)
 	case *parser.ExecutePrepared:
