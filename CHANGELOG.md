@@ -2101,6 +2101,13 @@ state or the internode protocol does, and an entry below says so.
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
   totals, which the health summaries report.
+- **A node started without `--dir` says that its data is in memory.**
+  `datax init` and `datax start` still default to an in-memory store,
+  but nothing at startup said so, so a service that forgot `--dir`, or
+  whose `--dir=$VAR` was empty, served normally until a restart lost
+  everything. It now prints a warning banner to stderr and logs a
+  warning. The new `--in-memory` flag runs in memory on purpose without
+  the warning; it is refused together with `--dir`.
 - **`SEAL-IDENTITY` and a resealed metadata backup survive a power
   loss.** A node under a share root writes `SEAL-IDENTITY` (where to ask
   for the key before its store opens), and a store-key rotation, online
