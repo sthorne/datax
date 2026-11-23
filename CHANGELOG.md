@@ -11,6 +11,10 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax start --sql-max-message-size`** sets the largest message an
+  authenticated SQL client may send (default 256 MiB, accepted range
+  1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB). The cap existed but
+  could only be changed in code.
 - **`datax_range_latch_wait_seconds{op,outcome}`**: time spent waiting
   for a latch by range-wide operations (`split`, `merge`, `clear_range`,
   `closed_ts`), with outcome `acquired` or `abandoned`. The existing

@@ -133,6 +133,10 @@ type Config struct {
 	// state; past it new connections are refused rather than held (0 =
 	// 512; negative = no cap).
 	SQLMaxPendingAuth int
+	// SQLMaxMessageSize caps one message from an authenticated SQL
+	// client, in bytes (0 = pgwire.DefaultMaxMessageSize, 256 MiB;
+	// negative = no cap).
+	SQLMaxMessageSize int
 	// HTTPMaxConns caps the HTTP port's open connections; past it a new
 	// connection is closed as it is accepted (0 = 512; negative = no
 	// cap).

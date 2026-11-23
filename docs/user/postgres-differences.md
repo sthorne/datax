@@ -617,8 +617,9 @@ in one piece is refused with `54000` (PostgreSQL allows a 1 GB field).
 Well below that a large value is already expensive — it is written,
 replicated and read whole, with no out-of-line storage — so values of
 more than a few MiB belong in large objects. One protocol message from
-a client is capped at 256 MiB (PostgreSQL: 1 GB); a longer one ends
-the connection with a FATAL `08P01`. COPY is not affected: its data
+a client is capped at 256 MiB by default (PostgreSQL: 1 GB; set with
+`--sql-max-message-size`, up to 1 GiB); a longer one ends the
+connection with a FATAL `08P01`. COPY is not affected: its data
 arrives in many messages.
 
 ### Large objects

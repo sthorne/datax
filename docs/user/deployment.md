@@ -308,10 +308,11 @@ losing the store — back it up separately from the data. Details in
 | `--merge-size-threshold` | 16 MiB | size below which a range and its right neighbor are merged back together (negative disables; `datax demo` takes it too — disable it to keep an empty pre-split for a benchmark) |
 | `--lease-shed-factor` | 1.5 | leader-QPS multiple of the cluster mean at which a node sheds hot leases |
 | `--rebalance-bytes-threshold` | 64 MiB | replica-byte spread that triggers byte-weighted replica moves (negative disables) |
+| `--sql-max-message-size` | 256 MiB | largest single message an authenticated SQL client may send (a statement's text, a Bind's parameters, one CopyData chunk), e.g. `64MiB`; a longer one ends the connection with a FATAL `08P01` before its body is allocated. Accepted range 1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB. A value is bounded well below either by the 60 MiB one replicated write carries, so raising it rarely helps; COPY's total size is not limited by it. Before authentication the limit is 10000 bytes regardless |
 
 The defaults are right for almost everyone; see
 [docs/replication-and-placement.md](../replication-and-placement.md) before
-touching them.
+touching the replication ones.
 
 ## Upgrading a running cluster
 
