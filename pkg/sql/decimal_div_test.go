@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
@@ -105,5 +106,42 @@ func TestAvgInt8DoesNotOverflow(t *testing.T) {
 	// asks for no fraction.
 	if want := "6148914691236517205"; out[0].Fam != types.Decimal || out[0].Text() != want {
 		t.Errorf("avg: got %s %q, want DECIMAL %q", out[0].Fam, out[0].Text(), want)
+	}
+}
+
+// TestSumDecimalDisplayScale: sum over numeric keeps the largest display
+// scale among its inputs, as PostgreSQL's numeric addition does, so a
+// sum of NUMERIC(10,2) values prints two decimals ("19.80", not "19.8").
+func TestSumDecimalDisplayScale(t *testing.T) {
+	col := catalog.Column{ID: 1, Name: "x", Type: types.Decimal}
+	desc := &catalog.TableDescriptor{Name: "t", Columns: []catalog.Column{col}}
+	for _, c := range []struct {
+		in   []types.Datum
+		want string
+	}{
+		{[]types.Datum{decWithScale("9.9", 2), decWithScale("9.9", 2)}, "19.80"},
+		{[]types.Datum{decWithScale("1.5", 3), decWithScale("2", 3)}, "3.500"},
+		{[]types.Datum{decWithScale("1", 2), types.NewDecimal("0.125")}, "1.125"},
+		{[]types.Datum{decWithScale("1", 1), types.NewDecimal("2")}, "3.0"},
+		{[]types.Datum{types.NewDecimal("1.5"), types.NewDecimal("2")}, "3.5"},
+	} {
+		specs := []aggSpec{{fn: "SUM", col: col, argType: types.Decimal, name: "sum"}}
+		st := newAggState(1)
+		for _, d := range c.in {
+			if err := st.accumulate(specs, desc, map[catalog.ColumnID]types.Datum{1: d}, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		out, err := st.finish(specs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := out[0].Text(); got != c.want {
+			var in []string
+			for _, d := range c.in {
+				in = append(in, fmt.Sprintf("%s (scale %d)", d.S, d.Dscale))
+			}
+			t.Errorf("sum of %v: got %q, want %q", in, got, c.want)
+		}
 	}
 }

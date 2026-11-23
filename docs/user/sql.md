@@ -91,9 +91,11 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored
-  number collide as duplicates). Expression and aggregate *results* are
-  plain DECIMALs and render canonically (`SUM` of `9.90`s can print
-  `19.8`), like PostgreSQL's rule that expressions lose the typmod.
+  number collide as duplicates). Expression results are plain DECIMALs
+  and render canonically (`a + a` of `9.90`s prints `19.8`, where
+  PostgreSQL keeps the scale and prints `19.80`). `SUM` keeps the
+  largest declared scale among its inputs, as PostgreSQL does (`SUM` of
+  `9.90`s prints `19.80`).
 - The other type modifiers — the integer widths, `VARCHAR(n)` /
   `CHAR(n)`, `TIMESTAMP` without time zone, `TIMESTAMP(p)` — apply on
   the same paths, and a column that carries one describes with

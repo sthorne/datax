@@ -2068,6 +2068,11 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`sum` over `numeric` keeps its inputs' display scale.** A sum of
+  `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
+  the result dropped the declared scale it tracked. It now carries the
+  largest scale among its inputs, as PostgreSQL's numeric addition does.
+  Expression results still render without it.
 - **Float and integer edge cases match PostgreSQL 16.**
   - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's
     `rint` does: `round(2.5::float8)` is `2` (was `3`), and

@@ -800,7 +800,11 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			case sp.argType == types.Int:
 				out[i] = types.NewInt(st.sumI[i])
 			case sp.argType == types.Decimal, sp.argType == types.Unknown:
+				// The display scale is the largest input's, as numeric
+				// addition keeps it in PostgreSQL (a sum of NUMERIC(10,2)
+				// values prints two decimals).
 				out[i] = types.NewDecimal(st.sumD[i].String())
+				out[i].Dscale = st.dscale[i]
 			case sp.argType == types.IntervalFam:
 				out[i] = types.NewInterval(st.sumIv[i])
 			default:
