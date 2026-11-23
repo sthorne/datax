@@ -121,8 +121,14 @@ type NodeDescriptor struct {
 	// all (lost before it reached disk, say), reported once that has
 	// lasted past a grace period. Additive JSON, so no version gate: an
 	// older reader ignores them, and rows from older binaries carry none.
-	FailedReplicas  []base.RangeID `json:"failed_replicas,omitempty"`
-	MissingReplicas []base.RangeID `json:"missing_replicas,omitempty"`
+	// Each list is capped (the lowest range IDs first) so that a node
+	// with thousands of unavailable replicas does not bloat its registry
+	// row; FailedReplicaCount and MissingReplicaCount carry the exact
+	// totals (0 from a binary that predates the cap: use the list length).
+	FailedReplicas      []base.RangeID `json:"failed_replicas,omitempty"`
+	MissingReplicas     []base.RangeID `json:"missing_replicas,omitempty"`
+	FailedReplicaCount  int            `json:"failed_replica_count,omitempty"`
+	MissingReplicaCount int            `json:"missing_replica_count,omitempty"`
 
 	// Load aggregates, refreshed on every heartbeat so the allocator (the
 	// range-1 leader) can weigh load it cannot observe locally. QPS is

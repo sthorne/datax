@@ -129,6 +129,25 @@ func (n *Node) unavailableReplicas() (failed, missing []base.RangeID) {
 	return failed, missing
 }
 
+// maxReportedReplicas caps each replica list a heartbeat carries.
+const maxReportedReplicas = 64
+
+// capReplicaReport returns the first maxReportedReplicas of ids (which
+// are sorted) and the exact count of ids, for the heartbeat row.
+func capReplicaReport(ids []base.RangeID) ([]base.RangeID, int) {
+	n := len(ids)
+	if n > maxReportedReplicas {
+		ids = ids[:maxReportedReplicas:maxReportedReplicas]
+	}
+	return ids, n
+}
+
+// reportedCount is the number of replicas a heartbeat reports in list,
+// whose exact total is count (0 from binaries that predate the cap).
+func reportedCount(list []base.RangeID, count int) int {
+	return max(count, len(list))
+}
+
 // markUnavailable records that node holds no serving replica of the
 // given ranges.
 func markUnavailable(m map[base.NodeID]map[base.RangeID]bool, node base.NodeID, ranges ...[]base.RangeID) {

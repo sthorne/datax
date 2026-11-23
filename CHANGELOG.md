@@ -2096,7 +2096,11 @@ state or the internode protocol does, and an entry below says so.
   `datax_replicas_missing`, and the health check counts them as
   unavailable and raises the new checks `replicas-failed` (critical) and
   `replicas-missing` (warning). Additive heartbeat fields, so no version
-  gate. Dead-node repair still acts on liveness only.
+  gate. Dead-node repair still acts on liveness only. Each list in the
+  heartbeat row holds at most 64 range IDs (the lowest), so a node with
+  thousands of dead replicas does not bloat its row on every heartbeat;
+  `failed_replica_count` and `missing_replica_count` carry the exact
+  totals, which the health summaries report.
 - **A backup reported written survives a power loss.** Backup data
   files, the manifest, their renames and the destination directory were
   never fsynced, nor was `metadata-backup.json`, so a power loss soon

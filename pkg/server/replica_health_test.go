@@ -53,3 +53,30 @@ func TestMissingReplicasAfterGrace(t *testing.T) {
 		t.Fatalf("still missing once loaded or no longer named: %v", missing)
 	}
 }
+
+// TestReplicaReportCapped: a heartbeat lists at most maxReportedReplicas
+// failed or missing replicas, the lowest range IDs, but its count stays
+// exact; a row from a binary without counts reads its list length.
+func TestReplicaReportCapped(t *testing.T) {
+	var ids []base.RangeID
+	for i := 1; i <= 1000; i++ {
+		ids = append(ids, base.RangeID(i))
+	}
+	list, count := capReplicaReport(ids)
+	if len(list) != maxReportedReplicas || list[0] != 1 || list[len(list)-1] != base.RangeID(maxReportedReplicas) {
+		t.Fatalf("capped list: len %d, %v..%v", len(list), list[0], list[len(list)-1])
+	}
+	if count != 1000 {
+		t.Fatalf("count = %d, want 1000", count)
+	}
+	if got := reportedCount(list, count); got != 1000 {
+		t.Fatalf("reportedCount = %d, want 1000", got)
+	}
+	list, count = capReplicaReport(ids[:3])
+	if len(list) != 3 || count != 3 {
+		t.Fatalf("short list: %v, %d", list, count)
+	}
+	if got := reportedCount(ids[:3], 0); got != 3 {
+		t.Fatalf("legacy row: reportedCount = %d, want 3", got)
+	}
+}
