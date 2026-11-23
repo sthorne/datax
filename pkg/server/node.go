@@ -133,6 +133,10 @@ type Config struct {
 	// state; past it new connections are refused rather than held (0 =
 	// 512; negative = no cap).
 	SQLMaxPendingAuth int
+	// SQLMaxMessageSize caps one message from an authenticated SQL
+	// client, in bytes (0 = pgwire.DefaultMaxMessageSize, 256 MiB;
+	// negative = no cap).
+	SQLMaxMessageSize int
 	// HTTPMaxConns caps the HTTP port's open connections; past it a new
 	// connection is closed as it is accepted (0 = 512; negative = no
 	// cap).
@@ -596,6 +600,13 @@ type Node struct {
 	// (keys.AuthSecretKey), read or created on first use and cached.
 	authSecretMu sync.Mutex
 	authSecret   []byte
+	// sessionSecret is the console's session secret
+	// (keys.SessionSecretKey; nil when no rotation has written one),
+	// read at sessionSecretRead and re-read once that is older than
+	// sessionSecretTTL, so a rotation reaches every node in bounded time.
+	sessionSecretMu   sync.Mutex
+	sessionSecret     []byte
+	sessionSecretRead time.Time
 	// dbDescs caches the database list the key viewer resolves schema
 	// usage from (viewer.go, issue #259).
 	dbDescs databaseDescsCache

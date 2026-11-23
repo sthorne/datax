@@ -421,6 +421,15 @@ func NodeRegistrySpan() (Key, Key) {
 // exist (issue #137). Never shown to a client.
 func AuthSecretKey() Key { return systemKey("auth-secret") }
 
+// SessionSecretKey holds the console's session secret: 32 random bytes
+// written by the rotate-session-secret admin op (cluster version v26),
+// from which every node derives the key it signs and verifies console
+// session tokens with. Absent until the first rotation, when the key is
+// derived from AuthSecretKey instead. A new value revokes every token
+// signed under the old one. Like AuthSecretKey, it is outside every span
+// a backup collects and never shown to a client.
+func SessionSecretKey() Key { return systemKey("session-secret") }
+
 // PeerUnsealSettingKey holds the cluster's peer-unseal setting: "off"
 // when running nodes must not hand the root key to a restarting peer
 // (issue #307). Absent means on.

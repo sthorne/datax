@@ -298,7 +298,7 @@ func runDebugStatus(args []string) error {
 
 func runDebug(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|cluster-key|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
+		return fmt.Errorf("usage: datax debug <split|unsplit|merge|purge|ranges|nodes|rebalance|transfer-lease|decommission|upgrade|rotate-session-secret|status|profile|metadata|unsafe-recover|rotate-enc-key|enc-root|cluster-key|seal-status|peer-unseal|reencrypt|reencrypt-status> [flags]")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -394,6 +394,7 @@ func runDebug(args []string) error {
 		req.Version = int(*toNode)
 	case "reencrypt", "reencrypt-status":
 	case "ranges", "nodes":
+	case "rotate-session-secret":
 	default:
 		return fmt.Errorf("unknown debug subcommand %q", sub)
 	}
@@ -479,6 +480,8 @@ func runDebug(args []string) error {
 		fmt.Println("lease transferred")
 	case "upgrade":
 		fmt.Printf("cluster version finalized at v%d\n", resp.ClusterVersion)
+	case "rotate-session-secret":
+		fmt.Println("session secret rotated: every console session signed before now is revoked on every node; sign in again")
 	case "merge":
 		if len(resp.Ranges) == 1 {
 			useTableNames(resp.TableNames)

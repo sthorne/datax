@@ -2107,7 +2107,8 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   anything is allocated for it (a client mid-`SSLRequest` sees that as
   a failed TLS negotiation). A client message is capped at 10000
   bytes until the client has authenticated (the SASL messages are a few
-  hundred) and at 256 MiB after (`pgwire.ServerOptions.MaxMessageSize`;
+  hundred) and at 256 MiB after (`--sql-max-message-size`, 1 MiB to
+  1 GiB; `pgwire.ServerOptions.MaxMessageSize`;
   PostgreSQL's cap is 1 GB, and a datax value is bounded well below
   either by the 60 MiB a replicated write carries). A longer message
   ends the connection with a FATAL `08P01` before its body is

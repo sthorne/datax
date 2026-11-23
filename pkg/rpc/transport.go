@@ -389,7 +389,10 @@ func (t *Transport) Ping(ctx context.Context, to base.NodeID) (rtt, offset time.
 	if err != nil {
 		return 0, 0, err
 	}
-	t.updateClock(resp.Now)
+	// A peer past --max-offset does not move the clock, but the probe
+	// still succeeds: the offset it measures is what reports the peer
+	// (the Pinger logs it and exports datax_clock_offset_seconds).
+	_ = t.updateClock(resp.Now)
 	rtt = time.Duration((t4 - t1) - (resp.SendWall - resp.RecvWall))
 	if rtt < 0 {
 		rtt = 0
@@ -549,7 +552,9 @@ func (t *Transport) SendBatch(ctx context.Context, to base.NodeID, ba *kvpb.Batc
 	if err != nil {
 		return nil, nil, err
 	}
-	t.updateClock(out.Now)
+	if err := t.updateClock(out.Now); err != nil {
+		return nil, nil, err
+	}
 	if len(out.Proto) > 0 {
 		return kvpb.UnmarshalBatchEnvelope(out.Proto)
 	}
@@ -633,7 +638,9 @@ func (t *Transport) Admin(ctx context.Context, to base.NodeID, req, resp any) er
 	if err != nil {
 		return err
 	}
-	t.updateClock(out.Now)
+	if err := t.updateClock(out.Now); err != nil {
+		return err
+	}
 	return json.Unmarshal(out.Json, resp)
 }
 
@@ -662,17 +669,28 @@ func (t *Transport) Call(ctx context.Context, addr string, method string, req, r
 	if err != nil {
 		return err
 	}
-	t.updateClock(out.Now)
+	if err := t.updateClock(out.Now); err != nil {
+		return err
+	}
 	return json.Unmarshal(out.Json, resp)
 }
 
-func (t *Transport) updateClock(now *rpcpb.Hlc) {
+// updateClock ratchets the clock to the timestamp a reply carries. A
+// reply whose clock is past --max-offset fails the call that received it
+// and leaves the clock unchanged, as the server's payload path does for a
+// request: an answer from one peer (or from whatever listens at an
+// address an operator command dialed) must never be able to stop the
+// process. The caller sees an error, as for a reply lost on the network,
+// except for Ping, whose measured offset is what reports such a peer.
+func (t *Transport) updateClock(now *rpcpb.Hlc) error {
 	if now == nil {
-		return
+		return nil
 	}
 	if err := t.clock.Update(hlc.Timestamp{WallTime: now.WallTime, Logical: now.Logical}); err != nil {
-		log.Fatalf("clock synchronization violated: %v", err)
+		log.Warnf("refusing a reply whose clock is too far ahead: %v", err)
+		return fmt.Errorf("clock synchronization violated: %w", err)
 	}
+	return nil
 }
 
 // Close closes all cached connections.

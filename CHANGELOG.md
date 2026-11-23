@@ -11,6 +11,10 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax start --sql-max-message-size`** sets the largest message an
+  authenticated SQL client may send (default 256 MiB, accepted range
+  1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB). The cap existed but
+  could only be changed in code.
 - **`datax_range_latch_wait_seconds{op,outcome}`**: time spent waiting
   for a latch by range-wide operations (`split`, `merge`, `clear_range`,
   `closed_ts`), with outcome `acquired` or `abandoned`. The existing
@@ -1173,6 +1177,20 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **Console sessions can now be revoked.** The docs said rotating the
+  cluster's authentication secret invalidates every console session
+  token, but nothing could rotate it and each node cached the signing
+  key for its whole life, so a stolen cookie (root's, whose sessions
+  cannot be ended by NOLOGIN) stayed valid for its full 12 hours. The new
+  root-only `datax debug rotate-session-secret` writes a new session
+  secret (`keys.SessionSecretKey`); every node re-reads it at least
+  every 10 seconds and refuses tokens while it cannot, and the command
+  returns once that has passed, so every token signed before it fails on
+  every node by then. The authentication secret, which also keys the
+  stand-in SCRAM salts, is left alone. **Cluster version v26:** the
+  command is refused until v26 is finalized, since a v25 node never
+  re-reads the key. Until the first rotation tokens are signed exactly
+  as before.
 - **The HTTP port no longer holds connections forever.** It bounded
   only a request's headers (`--auth-timeout`), and Go closes an idle
   keep-alive connection only at an idle or read timeout, of which it set
@@ -1197,6 +1215,17 @@ state or the internode protocol does, and an entry below says so.
   `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
   Snapshot messages from authenticated node peers still exit on a clock
   past `--max-offset`, as documented.
+- **A reply can no longer stop the caller through its clock.** The
+  RPC client ratcheted its clock to every reply's timestamp and exited
+  the process when that timestamp was past `--max-offset`, so a peer
+  whose clock had run away stopped every node that sent it a batch, and
+  whatever answered at an address a `datax debug` command or a joining
+  node dialed could stop that process with one reply. Such a reply now
+  fails the call (Batch, Join, Admin) with "clock synchronization
+  violated", logged as a warning, and leaves the caller's clock
+  unchanged; a Ping reply is still measured, so the offset shows in
+  `datax_clock_offset_seconds`. The server side already refused a Join
+  or Admin call this way.
 - **A Bind with the wrong number of format codes no longer crashes the
   node.** A Bind whose parameter format codes were neither 0, 1 nor one
   per parameter (for example 2 codes for 3 parameters) indexed past
@@ -1205,6 +1234,14 @@ state or the internode protocol does, and an entry below says so.
   refused with `08P01`. A panic on a connection's goroutine now closes
   only that connection: it is logged at error level with its stack, and
   the client gets a FATAL `XX000`.
+- **A format code other than text (0) or binary (1) is refused.** A Bind
+  carrying parameter or result format code 2 (or any other) was accepted,
+  reading the parameter as text and sending the column as binary. It is
+  now refused with `22023` "unsupported format code: N", as PostgreSQL
+  does. A fast-path call with such a code, which pgproto3 cannot decode,
+  used to close the connection without a word; any frontend message the
+  server cannot decode now ends the connection with a FATAL `08P01`
+  saying why.
 - **A binary array parameter can no longer exhaust the node's memory.**
   The element count of a binary-format array (a Bind parameter or a
   binary COPY field) sized an allocation before any element was read,

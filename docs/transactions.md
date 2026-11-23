@@ -16,7 +16,11 @@ related events always order correctly even with bounded physical clock skew.
   crashes the node — loudly wrong beats silently inconsistent. A Join or
   Admin call with such a timestamp fails instead, and an Admin call without
   the node certificate (an operator's client certificate) never moves the
-  clock.
+  clock. On the calling side, a reply (to a Batch, Join or Admin call)
+  whose clock is past max-offset fails that call and leaves the caller's
+  clock alone, so neither a peer nor whatever answers at an address an
+  operator command dialed can stop the caller; a Ping reply does not move
+  the clock either, and its measured offset is what reports the peer.
 - **Uncertainty**: a reader at `readTS` that sees a value from another node in
   `(readTS, readTS + maxOffset]` cannot know whether that write "really"
   happened before or after it began, so it restarts at a higher timestamp

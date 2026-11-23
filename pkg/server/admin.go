@@ -284,6 +284,12 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	case "upgrade-cluster":
 		return n.serveUpgradeCluster(ctx, req)
 
+	case "rotate-session-secret":
+		if err := n.rotateSessionSecret(ctx); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{}
+
 	case "rebalance":
 		return n.serveRebalance(ctx, req)
 
