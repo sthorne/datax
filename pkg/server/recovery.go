@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -107,7 +108,27 @@ func (n *Node) exportMetadata(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	n.writeMetadataBackup(raw)
+	// What decides whether the backup changed: everything but the capture
+	// time and the registry fields every heartbeat rewrites.
+	bak.CapturedAt = time.Time{}
+	bak.Nodes = cluster.RegistryIdentity(bak.Nodes)
+	content, err := json.Marshal(&bak)
+	if err != nil {
+		return
+	}
+	n.writeMetadataBackup(raw, content)
+}
+
+// metadataBackupDigest identifies a backup by its content (exportMetadata
+// passes it without the per-beat fields) and the key it is sealed under.
+func metadataBackupDigest(content, encKey []byte) [sha256.Size]byte {
+	h := sha256.New()
+	_, _ = h.Write(encKey)
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(content)
+	var d [sha256.Size]byte
+	h.Sum(d[:0])
+	return d
 }
 
 // testingMetadataBackupSealed, when set, runs after writeMetadataBackup
@@ -122,12 +143,24 @@ var testingMetadataBackupSealed func()
 // file written, under exportMu. A rotation swaps the key and then
 // exports, so its export waits out one that took the old key and writes
 // last.
-func (n *Node) writeMetadataBackup(raw []byte) {
+//
+// content is what identifies raw's metadata (exportMetadata leaves out
+// the capture time and per-beat registry fields). The heartbeat exports
+// every beat, and each write is fsynced, so nothing is written while the
+// file is in place and the content and key are those last written.
+func (n *Node) writeMetadataBackup(raw, content []byte) {
 	n.exportMu.Lock()
 	defer n.exportMu.Unlock()
 	n.encKeyMu.Lock()
 	encKey := n.encKey
 	n.encKeyMu.Unlock()
+	digest := metadataBackupDigest(content, encKey)
+	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)
+	if digest == n.exportedDigest {
+		if _, err := os.Stat(final); err == nil {
+			return
+		}
+	}
 	if encKey != nil {
 		var err error
 		if raw, err = enc.Seal(MetadataBackupMagic, encKey, raw); err != nil {
@@ -139,7 +172,6 @@ func (n *Node) writeMetadataBackup(raw []byte) {
 		testingMetadataBackupSealed()
 	}
 	tmp := filepath.Join(n.cfg.Dir, MetadataBackupFile+".tmp")
-	final := filepath.Join(n.cfg.Dir, MetadataBackupFile)
 	// Synced before the rename and the directory after it, so a power
 	// loss leaves the previous export or this one, never a truncated file
 	// under the final name.
@@ -153,7 +185,9 @@ func (n *Node) writeMetadataBackup(raw []byte) {
 	}
 	if err := syncDir(n.cfg.Dir); err != nil {
 		log.Debugf("metadata export: syncing %s: %v", n.cfg.Dir, err)
+		return
 	}
+	n.exportedDigest = digest
 }
 
 // UnsafeRecover rewrites a stopped store's range descriptors to

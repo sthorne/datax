@@ -17,9 +17,14 @@ datax start --dir /var/lib/datax --listen 10.0.0.2:26257 --pg-listen 10.0.0.2:26
 ```
 
 `init` and `start` accept the same flags; `init` additionally bootstraps the
-cluster on first run. Defaults: RPC `:26257`, SQL `:26433`. An empty
-`--dir` runs in-memory (data lost on exit) — fine for tests, not for
-deployment. Node identity lives in the data directory, so a node restarted
+cluster on first run. Defaults: RPC `:26257`, SQL `:26433`. Without
+`--dir` (or with an empty one) the node runs in-memory and its data is
+lost on exit — fine for tests, not for deployment. Such a node prints a
+warning banner to stderr, and a `WARN` log line, at startup, so a
+service file that forgot `--dir` (or whose `--dir=$VAR` expanded to
+nothing) is noticed before its first restart; `--in-memory` asks for an
+in-memory node on purpose and silences the warning (it is refused
+together with `--dir`). Node identity lives in the data directory, so a node restarted
 with the same `--dir` rejoins as itself even if its address changed
 (`--advertise` controls the address other nodes use to reach it, when the
 listen address isn't routable).

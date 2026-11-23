@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -461,6 +462,9 @@ type Node struct {
 	// rotation's swap could write after the rotation's reseal, leaving
 	// the backup under a key the rotation retired until the next beat.
 	exportMu sync.Mutex
+	// exportedDigest identifies the content and key of the metadata
+	// backup last written (metadataBackupDigest); guarded by exportMu.
+	exportedDigest [sha256.Size]byte
 	// encKeyPaths are the key files EncKeyPath named (the one that opened
 	// the store first), consulted after an online rotation to tell the
 	// operator whether a restart would find the new key.
@@ -551,6 +555,9 @@ type Node struct {
 	// shuttingDown is set by Drain: the node is shedding its leases and
 	// SQL connections ahead of a stop, and says so in its heartbeats.
 	shuttingDown atomic.Bool
+	// joined is set once a heartbeat has written this node's registry
+	// row: the readiness check (/ready) waits for it.
+	joined atomic.Bool
 	// sys samples the host (CPU, memory, disk, network, runtime) every
 	// few seconds for the heartbeat summary, /status and /metrics.
 	sys *sysstats.Sampler

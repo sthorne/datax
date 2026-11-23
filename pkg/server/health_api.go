@@ -286,18 +286,23 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				Summary: fmt.Sprintf("n%d has not heartbeated for %s (declared dead after %s)", nd.NodeID, time.Duration(age).Truncate(time.Second), time.Duration(dead))})
 		default:
 			live[nd.NodeID] = true
+			// A peer's lists are capped (capReplicaReport); its counts
+			// are exact.
 			failed, missing := nd.FailedReplicas, nd.MissingReplicas
+			nFailed := reportedCount(failed, nd.FailedReplicaCount)
+			nMissing := reportedCount(missing, nd.MissingReplicaCount)
 			if nd.NodeID == n.ident.NodeID {
 				failed, missing = selfFailed, selfMissing
+				nFailed, nMissing = len(failed), len(missing)
 			}
 			markUnavailable(unavailable, nd.NodeID, failed, missing)
 			if len(failed) > 0 {
 				add(Problem{Severity: SeverityCritical, Check: "replicas-failed", Node: int(nd.NodeID), Range: int64(failed[0]), Section: "nodes",
-					Summary: fmt.Sprintf("n%d has %d replica(s) stopped by a storage failure (e.g. %s): they serve nothing until the node restarts; check its log and disk", nd.NodeID, len(failed), failed[0])})
+					Summary: fmt.Sprintf("n%d has %d replica(s) stopped by a storage failure (e.g. %s): they serve nothing until the node restarts; check its log and disk", nd.NodeID, nFailed, failed[0])})
 			}
 			if len(missing) > 0 {
 				add(Problem{Severity: SeverityWarning, Check: "replicas-missing", Node: int(nd.NodeID), Range: int64(missing[0]), Section: "nodes",
-					Summary: fmt.Sprintf("n%d is a member of %d range(s) it holds no replica of (e.g. %s): it counts toward their quorum but cannot vote", nd.NodeID, len(missing), missing[0])})
+					Summary: fmt.Sprintf("n%d is a member of %d range(s) it holds no replica of (e.g. %s): it counts toward their quorum but cannot vote", nd.NodeID, nMissing, missing[0])})
 			}
 		}
 		if nd.Draining {

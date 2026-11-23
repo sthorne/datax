@@ -3,8 +3,12 @@
 package cluster
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"slices"
 	"sort"
 	"sync"
 
@@ -132,12 +136,56 @@ func Range1Descriptor(nodeIDs []base.NodeID) kvpb.RangeDescriptor {
 // PersistRegistry saves the node registry to a local store key, letting a
 // restarted node reach its peers before any range has a leader (the
 // bootstrap of the bootstrap).
+//
+// The heartbeat calls it every beat, and the rows change every beat
+// (liveness, load). So it writes nothing when the stored copy is the
+// same, a plain Put when only those per-beat fields changed (durable at
+// the next flush or a clean close, as before), and a durable write when
+// what a restart needs to reach its peers changed (RegistryIdentity:
+// a node joined, moved or began draining). On a state engine with no WAL
+// that durable write is a flush, so a crash cannot roll the registry
+// back to addresses the peers have left.
 func PersistRegistry(eng *storage.Engine, nodes []kvpb.NodeDescriptor) error {
 	raw, err := json.Marshal(nodes)
 	if err != nil {
 		return err
 	}
+	prevRaw, err := eng.Get(keys.StoreRegistryKey())
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(prevRaw, raw) {
+		return nil
+	}
+	// Both sides decoded from JSON, so an empty slice and a nil one
+	// compare equal.
+	var prev, cur []kvpb.NodeDescriptor
+	if prevRaw == nil || json.Unmarshal(prevRaw, &prev) != nil || json.Unmarshal(raw, &cur) != nil ||
+		!reflect.DeepEqual(RegistryIdentity(prev), RegistryIdentity(cur)) {
+		return eng.PutDurable(keys.StoreRegistryKey(), raw)
+	}
 	return eng.Put(keys.StoreRegistryKey(), raw)
+}
+
+// RegistryIdentity is the part of the registry rows that changes only
+// when membership does — who the nodes are, where they are reached and
+// placed, whether they are draining, which binary they run — sorted by
+// node, without the fields every heartbeat rewrites (liveness, load,
+// host and SQL figures, latencies, replica reports).
+func RegistryIdentity(nodes []kvpb.NodeDescriptor) []kvpb.NodeDescriptor {
+	out := make([]kvpb.NodeDescriptor, 0, len(nodes))
+	for _, nd := range nodes {
+		out = append(out, kvpb.NodeDescriptor{
+			NodeID:            nd.NodeID,
+			Address:           nd.Address,
+			LocalityAddresses: nd.LocalityAddresses,
+			Locality:          nd.Locality,
+			Draining:          nd.Draining,
+			BinaryVersion:     nd.BinaryVersion,
+		})
+	}
+	slices.SortFunc(out, func(a, b kvpb.NodeDescriptor) int { return cmp.Compare(a.NodeID, b.NodeID) })
+	return out
 }
 
 // LoadPersistedRegistry reads the registry saved by PersistRegistry.

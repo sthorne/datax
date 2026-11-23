@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -98,4 +99,51 @@ func waitFor(t *testing.T, limit time.Duration, what string, cond func() bool) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// TestReplicationViewCountsFailedReplicas: the console's replication
+// section counts a replica its live node reports failed as not live, as
+// the health check does: one of three makes the range under-replicated,
+// two take its quorum, and the range is listed under the dead-replicas
+// overlay. Before, the section read liveness alone and showed the range
+// healthy.
+func TestReplicationViewCountsFailedReplicas(t *testing.T) {
+	tc := startWithHTTP(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	split, err := tc.Nodes[0].DB().AdminSplit(ctx, append(keys.TableDataPrefix(762), "m"...))
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	rid := int64(split.Right.RangeID)
+	waitFor(t, 60*time.Second, "the range on all three nodes", func() bool {
+		for _, n := range tc.Nodes {
+			if _, ok := n.Store().GetReplica(split.Right.RangeID); !ok {
+				return false
+			}
+		}
+		return true
+	})
+	in := func(b replBucket) bool { return slices.Contains(b.Ranges, rid) }
+	addr := tc.Nodes[0].HTTPAddr()
+	waitFor(t, 60*time.Second, "the range healthy", func() bool {
+		return in(clusterReplication(t, addr).Healthy)
+	})
+	fail := func(i int) {
+		r, ok := tc.Nodes[i].Store().GetReplica(split.Right.RangeID)
+		if !ok {
+			t.Fatalf("n%d holds no replica of r%d", i+1, rid)
+		}
+		r.TestingFailReady(errors.New("raft engine commit: input/output error"))
+	}
+	fail(2)
+	waitFor(t, 30*time.Second, "the range under-replicated with a dead replica", func() bool {
+		got := clusterReplication(t, addr)
+		return in(got.Under) && in(got.Unavailable) && !in(got.Healthy)
+	})
+	fail(1)
+	waitFor(t, 30*time.Second, "the range without quorum", func() bool {
+		got := clusterReplication(t, addr)
+		return in(got.NoQuorum) && in(got.Unavailable)
+	})
 }

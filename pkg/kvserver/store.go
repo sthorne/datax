@@ -414,9 +414,15 @@ func (s *Store) LoadReplicas() error {
 	return nil
 }
 
-// CreateReplica creates (and boots) a brand-new replica of a range whose
-// initial membership includes this store. Used at cluster bootstrap and by
-// the split/upreplication paths.
+// CreateReplica writes the descriptor of a brand-new range whose initial
+// membership includes this store, flushes the state engine so the
+// descriptor is durable before the replica can vote, and starts the
+// replica. The server calls it only to create range 1 at cluster
+// bootstrap (bootstrap true); tests use it to stand up ranges. Other
+// replicas are created elsewhere: a split's right-hand side by the split
+// trigger (finishSplit), which a replay of the left-hand side's log
+// re-creates after a crash, and an upreplicated replica by the preseed
+// snapshot (ApplySnapshotStream), which flushes before it starts.
 func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Replica, error) {
 	rep, ok := desc.GetReplica(s.cfg.NodeID)
 	if !ok {

@@ -2133,7 +2133,56 @@ state or the internode protocol does, and an entry below says so.
   `datax_replicas_missing`, and the health check counts them as
   unavailable and raises the new checks `replicas-failed` (critical) and
   `replicas-missing` (warning). Additive heartbeat fields, so no version
-  gate. Dead-node repair still acts on liveness only.
+  gate. Dead-node repair still acts on liveness only. Each list in the
+  heartbeat row holds at most 64 range IDs (the lowest), so a node with
+  thousands of dead replicas does not bloat its row on every heartbeat;
+  `failed_replica_count` and `missing_replica_count` carry the exact
+  totals, which the health summaries report.
+- **The console's replication view shows dead replicas on live nodes.**
+  The health check counts a replica its live node reports failed or
+  missing as unavailable, but the replication tiles and buckets still
+  read node liveness alone, so a range a replica short, or without
+  quorum, showed as healthy. They now count such replicas as not live,
+  and a new `unavailable_replicas` bucket in `/api/cluster`'s
+  replication section (the console's **dead replicas** tile) lists the
+  ranges that have one.
+- **`/ready`, a readiness check.** `/status` answers 200 whenever the
+  HTTP port does, so a load balancer or probe that used it sent clients
+  to a node that had not joined yet, whose SQL listener was not up, or
+  that was draining for a stop. The new `/ready` answers 503 with a
+  reason until the node has joined (its first heartbeat landed) and its
+  SQL listener serves, 200 then, and 503 again once it drains. It needs
+  no credentials and reveals only that. `/status` is unchanged, as the
+  liveness check.
+- **A node started without `--dir` says that its data is in memory.**
+  `datax init` and `datax start` still default to an in-memory store,
+  but nothing at startup said so, so a service that forgot `--dir`, or
+  whose `--dir=$VAR` was empty, served normally until a restart lost
+  everything. It now prints a warning banner to stderr and logs a
+  warning. The new `--in-memory` flag runs in memory on purpose without
+  the warning; it is refused together with `--dir`.
+- **`SEAL-IDENTITY` and a resealed metadata backup survive a power
+  loss.** A node under a share root writes `SEAL-IDENTITY` (where to ask
+  for the key before its store opens), and a store-key rotation, online
+  or offline, reseals `metadata-backup.json`; each was written to a
+  temporary file and renamed with no fsync, so a power loss could leave
+  it empty or truncated under its final name. Each file is now synced
+  before the rename and the data directory after it.
+- **Local copies of the registry and the peer-unseal setting survive a
+  crash, and the metadata backup is no longer rewritten every beat.**
+  The node keeps the registry in its state engine so a restart can dial
+  its peers before any range has a leader, and a copy of the cluster's
+  peer-unseal setting. Both used an unsynced write, which on a state
+  engine with no WAL reaches disk only at the next memtable flush, so a
+  crash could restart a node with addresses its peers had left, or roll
+  the setting back. The registry is now written durably when a node
+  joins, moves, starts draining or changes binary (a liveness- or
+  load-only beat stays a plain write, and an unchanged one writes
+  nothing); the setting is written durably whenever it changes.
+  `metadata-backup.json`, fsynced on each write since the fix below, was
+  written on every heartbeat; it is now written only when its metadata
+  (less the capture time and per-beat registry figures) or the store key
+  changed, or the file is missing.
 - **A backup reported written survives a power loss.** Backup data
   files, the manifest, their renames and the destination directory were
   never fsynced, nor was `metadata-backup.json`, so a power loss soon

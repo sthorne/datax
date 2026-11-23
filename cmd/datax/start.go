@@ -21,6 +21,7 @@ import (
 type serverFlags struct {
 	fs            *flag.FlagSet
 	dir           string
+	inMemory      bool
 	listen        string
 	pgListen      string
 	join          string
@@ -59,7 +60,8 @@ type serverFlags struct {
 
 func newServerFlags(name string) *serverFlags {
 	f := &serverFlags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
-	f.fs.StringVar(&f.dir, "dir", "", "data directory (empty = in-memory, data is lost on exit)")
+	f.fs.StringVar(&f.dir, "dir", "", "data directory (empty = in-memory, data is lost on exit; a warning says so unless --in-memory is given)")
+	f.fs.BoolVar(&f.inMemory, "in-memory", false, "keep all data in memory, lost when the node exits (the default without --dir), without the startup warning; refused together with --dir")
 	f.fs.StringVar(&f.listen, "listen", ":26257", "internode RPC address")
 	f.fs.StringVar(&f.pgListen, "pg-listen", ":26433", "SQL (PostgreSQL protocol) address")
 	f.fs.StringVar(&f.join, "join", "", "RPC address of any existing cluster node")
@@ -119,6 +121,9 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	maxMessage, err := parseMaxMessageSize(f.maxMessage)
 	if err != nil {
 		return server.Config{}, err
+	}
+	if f.inMemory && f.dir != "" {
+		return server.Config{}, fmt.Errorf("--in-memory and --dir are mutually exclusive")
 	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
@@ -231,6 +236,28 @@ func metricsRecordInterval(d time.Duration) time.Duration {
 	return d
 }
 
+// inMemoryWarning is the warning a node with no data directory prints at
+// startup, or "" when it has one or --in-memory says that is meant. An
+// in-memory node is the default (for trying datax out), so a production
+// start that forgot --dir, or whose --dir=$VAR was empty, would
+// otherwise run normally until its first restart lost everything.
+func (f *serverFlags) inMemoryWarning() string {
+	if f.dir != "" || f.inMemory {
+		return ""
+	}
+	return "WARNING: no --dir given: this node keeps ALL its data in memory, and everything it holds is lost when it exits or restarts.\n" +
+		"  For data that must survive, stop it and start again with --dir <path>. To run in memory on purpose, pass --in-memory.\n"
+}
+
+// warnInMemory prints the in-memory warning, if any, to stderr as a
+// banner and to the log.
+func (f *serverFlags) warnInMemory() {
+	if w := f.inMemoryWarning(); w != "" {
+		fmt.Fprint(os.Stderr, "\n"+w+"\n")
+		log.Warnf("running in memory (no --dir): all data is lost when the node exits")
+	}
+}
+
 func runServer(cfg server.Config) error {
 	if (cfg.EncKeyPath != "" || cfg.EncRoot != "") && !cfg.AllowCoreDumps {
 		// Before any key is read: a dump of this process would hold them.
@@ -282,6 +309,7 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	f.warnInMemory()
 	return runServer(cfg)
 }
 
@@ -297,5 +325,6 @@ func runStart(args []string) error {
 	if cfg.Join == "" && cfg.Dir == "" {
 		return fmt.Errorf("--join is required (or use 'datax init' to start a new cluster)")
 	}
+	f.warnInMemory()
 	return runServer(cfg)
 }

@@ -14,6 +14,7 @@ const REPL_BUCKETS = [
   { key: "over_replicated", label: "over-replicated", hint: "more replicas than the target, usually an interrupted rebalance; the allocator trims one per pass", warn: "draining" },
   { key: "no_quorum", label: "no quorum", hint: "fewer than a majority of replicas live: the range cannot serve until nodes return", warn: "down" },
   { key: "undiverse", label: "undiverse", hint: "two replicas share a locality they could spread across; a single failure domain could cost two", warn: "draining" },
+  { key: "unavailable_replicas", label: "dead replicas", hint: "a replica on a live node serves nothing: a storage failure stopped it until the node restarts, or the node never loaded it. It counts as not live, so the range is also under-replicated or without quorum; the node's heartbeat reports it, and nothing repairs it while the node stays up", warn: "down" },
 ];
 
 function renderReplication(d) {
@@ -30,6 +31,8 @@ function renderReplication(d) {
     `measured against each range's target replica count — the cluster default is ${rep.default_replication_factor ?? 3}, ` +
     `and a database with a placement policy is measured against its own (<code>SHOW PLACEMENT</code>). ` +
     `A range is counted once, worst state first: one with no quorum is not also counted as under-replicated. ` +
+    `A replica on a live node that the node reports stopped by a storage failure, or never loaded, counts as not live; ` +
+    `its range is also listed under dead replicas${(rep.unavailable_replicas || {}).count ? " — check that node's log and disk" : ""}. ` +
     `Select a state for its ranges.`);
 
   renderBucketDetail(rep);
