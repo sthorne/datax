@@ -432,7 +432,10 @@ type aggState struct {
 	counts []int64
 	sumI   []int64
 	sumF   []float64
-	sumD   []decimal.Dec    // exact register for DECIMAL SUM/AVG
+	sumD   []decimal.Dec // exact register for DECIMAL SUM/AVG
+	// dscale is the largest display scale among a DECIMAL AVG's inputs
+	// (PostgreSQL's sum carries it into the division's result scale).
+	dscale []int32
 	sumIv  []types.Interval // INTERVAL SUM/AVG
 	// decSpecial is the NaN or infinity a DECIMAL SUM/AVG has taken (0
 	// when none): it decides the result, as in PostgreSQL.
@@ -458,6 +461,7 @@ func newAggState(n int) *aggState {
 		sumI:       make([]int64, n),
 		sumF:       make([]float64, n),
 		sumD:       make([]decimal.Dec, n),
+		dscale:     make([]int32, n),
 		sumIv:      make([]types.Interval, n),
 		decSpecial: make([]float64, n),
 		best:       make([]types.Datum, n),
@@ -694,11 +698,16 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 		case "SUM", "AVG":
 			switch d.Fam {
 			case types.Int:
-				s := st.sumI[i] + d.I
-				if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
-					return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
+				// AVG totals in numeric (sumD), as PostgreSQL's
+				// int8_avg_accum does, so it cannot overflow; only SUM's
+				// bigint total can.
+				if sp.fn == "SUM" {
+					s := st.sumI[i] + d.I
+					if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
+						return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
+					}
+					st.sumI[i] = s
 				}
-				st.sumI[i] = s
 				st.sumD[i] = decimal.Add(st.sumD[i], decimal.FromInt(d.I))
 			case types.Decimal:
 				if f, ok := types.DecimalSpecial(d); ok {
@@ -715,6 +724,7 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 					return newErrf(CodeInternal, "%s: %v", sp.name, err)
 				}
 				st.sumD[i] = decimal.Add(st.sumD[i], v)
+				st.dscale[i] = max(st.dscale[i], v.Scale(), d.Dscale)
 			case types.IntervalFam:
 				st.sumIv[i] = st.sumIv[i].Add(d.IntervalVal())
 			default:
@@ -790,7 +800,11 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			case sp.argType == types.Int:
 				out[i] = types.NewInt(st.sumI[i])
 			case sp.argType == types.Decimal, sp.argType == types.Unknown:
+				// The display scale is the largest input's, as numeric
+				// addition keeps it in PostgreSQL (a sum of NUMERIC(10,2)
+				// values prints two decimals).
 				out[i] = types.NewDecimal(st.sumD[i].String())
+				out[i].Dscale = st.dscale[i]
 			case sp.argType == types.IntervalFam:
 				out[i] = types.NewInterval(st.sumIv[i])
 			default:
@@ -807,11 +821,14 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			case sp.argType == types.IntervalFam:
 				out[i] = types.NewInterval(st.sumIv[i].Scale(1 / float64(st.counts[i])))
 			case sp.argType == types.Decimal || sp.argType == types.Int:
-				q, err := decimal.DivQuantize(st.sumD[i], decimal.FromInt(st.counts[i]), 6)
+				// sum / count through numeric division, as
+				// PostgreSQL's numeric_avg does.
+				sum := st.sumD[i]
+				q, err := divideDecimal(sum, decimal.FromInt(st.counts[i]), max(sum.Scale(), st.dscale[i]), 0)
 				if err != nil {
 					out[i] = types.DNull
 				} else {
-					out[i] = types.NewDecimal(q.String())
+					out[i] = q
 				}
 			default:
 				out[i] = types.NewFloat(st.sumF[i] / float64(st.counts[i]))

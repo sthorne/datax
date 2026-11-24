@@ -177,6 +177,7 @@ func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 		for _, k := range b.kys {
 			if keys.Key(t.mu.txn.Key).Equal(k) {
 				createRecord = true
+				t.mu.recordMaybe = true
 				break
 			}
 		}
@@ -198,51 +199,49 @@ func (t *Txn) runBatchNow(ctx context.Context, b *WriteBatch) error {
 }
 
 // failedBatch settles a write batch that failed with err and returns the
-// error to report. A batch with conditional puts fails as a matter of
-// course (a duplicate key), and when it spans ranges the other ranges'
-// parts may have applied: unless the gateway knows none did, every key
-// is then tracked as written, so that a rollback — to a savepoint or of
-// the whole transaction — removes whatever did apply (removing an intent
-// that is not there is a no-op), and a batch that was to create the
-// record counts it as created (the record's part is sent first, alone,
-// and succeeded if any other part was sent).
+// error to report. When the batch spans ranges, the other ranges' parts
+// may have applied whatever the error — a duplicate key on one range, a
+// write shed under storage overload, a deadline, a routing failure — and
+// a timed-out part may have been proposed: unless the gateway knows none
+// of it applied, every key is tracked as written, so that a rollback — to
+// a savepoint or of the whole transaction — removes whatever did apply
+// (removing an intent that is not there is a no-op), and a batch that was
+// to create the record leaves the transaction with a record that may
+// exist (recordMaybe), which COMMIT and ROLLBACK then end rather than
+// taking the transaction for read-only (mayHaveWritten). A failed
+// conditional put reported by a part other than the record's counts the
+// record as created: the record's part is sent first, alone, and
+// succeeded if any other part was sent.
 //
-// When none of it applied and the batch chose the transaction's anchor
-// (anchorSet: the first key of its first write), the choice is undone: the
-// record was never created, and a later write that does not touch the
-// failed batch's first key would otherwise never create it — its intents
-// would belong to a transaction with no record, which COMMIT, seeing no
-// anchor, would take for read-only and leave unresolved.
+// When none of it applied (a conditional put failed in the only part
+// sent) and the batch chose the transaction's anchor (anchorSet: the first
+// key of its first write), the choice is undone: the record was never
+// created, and a later write that does not touch the failed batch's first
+// key would otherwise never create it.
 func (t *Txn) failedBatch(b *WriteBatch, err error, createRecord, anchorSet bool) error {
 	var kerr *kvpb.Error
-	if !b.HasCPuts() || !errors.As(err, &kerr) || kerr.ConditionFailed == nil {
-		return err
-	}
-	if kerr.ConditionFailed.NoneApplied {
+	condFailed := b.HasCPuts() && errors.As(err, &kerr) && kerr.ConditionFailed != nil
+	if condFailed && kerr.ConditionFailed.NoneApplied {
 		if anchorSet {
 			t.mu.Lock()
 			if !t.mu.anchored {
 				t.mu.txn.Key = nil
+				t.mu.recordMaybe = false
 			}
 			t.mu.Unlock()
 		}
 		return t.conditionFailure(b, kerr)
 	}
+	t.mayHaveWritten(b.kys, createRecord)
+	if !condFailed {
+		return err
+	}
 	t.mu.Lock()
-	if t.mu.writes == nil {
-		t.mu.writes = make(map[string]struct{})
-	}
-	for _, k := range b.kys {
-		t.mu.writes[string(k)] = struct{}{}
-	}
 	anchoredNow := createRecord && !t.mu.anchored
 	if anchoredNow {
 		t.mu.anchored = true
 	}
 	t.mu.Unlock()
-	if anchoredNow {
-		t.startHeartbeat()
-	}
 	return t.conditionFailure(b, kerr)
 }
 

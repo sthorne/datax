@@ -302,3 +302,133 @@ func TestUpgradeV6Databases(t *testing.T) {
 		t.Fatalf("old2 after restart: %+v", r.Rows)
 	}
 }
+
+// finalizeWithin retries the upgrade op until it succeeds or the deadline
+// passes (a just-restarted node's row can lag), returning the last answer.
+func finalizeWithin(t *testing.T, ctx context.Context, addr string, v version.Version, d time.Duration) cluster.AdminResponse {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		resp := adminCall(t, ctx, addr, cluster.AdminRequest{Op: "upgrade-cluster", Version: int(v)})
+		if resp.Error == "" || time.Now().After(deadline) {
+			return resp
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// TestFinalizeRefusedWhileNodeDown: a node that is down on the old binary
+// when the operator finalizes blocks the finalize, named with what to do.
+// And if the cluster version moves past its binary anyway, the node does
+// not restart into it: its peers' version refuses it at re-announce, even
+// though its own store never saw the newer version.
+func TestFinalizeRefusedWhileNodeDown(t *testing.T) {
+	ctx := context.Background()
+	grace := 3 * time.Second
+	asV23 := func(c *server.Config) { c.BinaryVersionOverride = version.V23; c.LivenessGrace = grace }
+	asV24 := func(c *server.Config) { c.LivenessGrace = grace }
+	tc, engines := StartWithEngines(t, 3, asV23)
+	tc.LeaderIndex(1)
+	waitForAdvertisedVersion(t, ctx, tc.Nodes[0].Addr(), []base.NodeID{3}, int(version.V23))
+	tc.StopNode(2) // n3 goes down, still on the v23 binary
+	for i := 0; i < 2; i++ {
+		tc.StopNode(i)
+		tc.RestartNode(i, engines[i], asV24)
+		tc.LeaderIndex(1)
+	}
+	waitForAdvertisedVersion(t, ctx, tc.Nodes[0].Addr(), []base.NodeID{1, 2}, int(version.V24))
+	time.Sleep(2 * grace) // n3 is past the liveness grace: down
+
+	resp := finalizeWithin(t, ctx, tc.Nodes[0].Addr(), version.V24, 5*time.Second)
+	if resp.Error == "" {
+		t.Fatalf("finalize with n3 down on a v23 binary succeeded: %+v", resp)
+	}
+	for _, want := range []string{"n3 (v23, down)", "decommission"} {
+		if !strings.Contains(resp.Error, want) {
+			t.Fatalf("finalize refusal %q does not mention %q", resp.Error, want)
+		}
+	}
+
+	// Defence in depth: move the replicated version past n3's binary
+	// behind the gate's back. The upgraded nodes adopt it; n3's store
+	// still says v23, so only its peers can refuse it.
+	if err := tc.Nodes[0].DB().Put(ctx, keys.ClusterVersionKey(), []byte(strconv.Itoa(int(version.V24)))); err != nil {
+		t.Fatal(err)
+	}
+	waitForStoreVersionMirror(t, engines[0], "24")
+	waitForStoreVersionMirror(t, engines[1], "24")
+	if _, err := tc.RestartNodeErr(2, engines[2], asV23); err == nil || !strings.Contains(err.Error(), "downgrading a node") {
+		t.Fatalf("v23 restart into a v24 cluster: %v", err)
+	}
+	if raw, err := engines[2].Get(keys.StoreClusterVersionKey()); err != nil || string(raw) != "23" {
+		t.Fatalf("refused node's store version mirror = %q, %v; want 23", raw, err)
+	}
+	// The same store comes back on the new binary.
+	n3 := tc.RestartNode(2, engines[2], asV24)
+	deadline := time.Now().Add(20 * time.Second)
+	for n3.ClusterVersion() < version.V24 {
+		if time.Now().After(deadline) {
+			t.Fatalf("n3 on the v24 binary stuck at cluster version %s", n3.ClusterVersion())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestFinalizeRefusedWhileDrainingNodeHoldsReplicas: a draining node still
+// holds and votes on replicas, so on an old binary it blocks finalize until
+// it has drained. Once drained it no longer does; if it is still running
+// when the cluster finalizes, it stops instead of adopting a version above
+// its binary.
+func TestFinalizeRefusedWhileDrainingNodeHoldsReplicas(t *testing.T) {
+	ctx := context.Background()
+	asV23 := func(c *server.Config) { c.BinaryVersionOverride = version.V23 }
+	tc, engines := StartWithEngines(t, 3, asV23)
+	tc.LeaderIndex(1)
+	resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "decommission", NodeID: 3})
+	if resp.Error != "" || !resp.Draining {
+		t.Fatalf("decommission: %+v", resp)
+	}
+	for i := 0; i < 2; i++ {
+		tc.StopNode(i)
+		tc.RestartNode(i, engines[i])
+		tc.LeaderIndex(1)
+	}
+	waitForAdvertisedVersion(t, ctx, tc.Nodes[0].Addr(), []base.NodeID{1, 2}, int(version.V24))
+
+	// With three nodes n3 has nowhere to drain to: it keeps its replicas.
+	resp = finalizeWithin(t, ctx, tc.Nodes[0].Addr(), version.V24, 5*time.Second)
+	if resp.Error == "" {
+		t.Fatalf("finalize with draining n3 on a v23 binary succeeded: %+v", resp)
+	}
+	if !strings.Contains(resp.Error, "n3 (v23, draining") {
+		t.Fatalf("finalize refusal %q does not name draining n3", resp.Error)
+	}
+
+	// A fourth node on the new binary gives n3 somewhere to drain to;
+	// fully drained, it no longer blocks the finalize.
+	tc.AddNode("")
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		st := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "decommission", NodeID: 3})
+		if st.Error == "" && st.RemainingReplicas == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("n3 never drained: %+v", st)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	resp = finalizeWithin(t, ctx, tc.Nodes[0].Addr(), version.V24, 30*time.Second)
+	if resp.Error != "" || resp.ClusterVersion != int(version.V24) {
+		t.Fatalf("finalize after n3 drained: %+v", resp)
+	}
+	// n3, still running its v23 binary, never adopts or persists v24
+	// (two heartbeats is ample for it to have read the new row).
+	time.Sleep(8 * time.Second)
+	if cv := tc.Nodes[2].ClusterVersion(); cv > version.V23 {
+		t.Fatalf("v23 binary running at cluster version %s", cv)
+	}
+	if raw, err := engines[2].Get(keys.StoreClusterVersionKey()); err != nil || string(raw) != "23" {
+		t.Fatalf("v23 node's store version mirror = %q, %v; want 23", raw, err)
+	}
+}

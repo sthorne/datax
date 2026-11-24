@@ -182,6 +182,73 @@ func TestStagingRecoveryAborts(t *testing.T) {
 	}
 }
 
+// TestStagingRecoveryIgnoresEarlierWrites: a transaction writes k1 and k2
+// (flushed), then its final batch rewrites both in parallel with the
+// STAGING EndTxn, and the coordinator dies: the record stages, the
+// rewrites never land. The earlier intents are the transaction's own and
+// sit at or below the staged timestamp, but they are not the staged
+// writes, so status recovery must abort, not commit the earlier writes
+// without the final ones. Once for an earlier statement (a lower
+// sequence) and once for an earlier epoch (before a restart).
+func TestStagingRecoveryIgnoresEarlierWrites(t *testing.T) {
+	tc := Start(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	db := tc.Nodes[0].DB()
+	tc.LeaderIndex(1)
+	if err := db.Put(ctx, append(keys.TableDataPrefix(934).Clone(), "warmup"...), []byte("w")); err != nil {
+		t.Fatal(err)
+	}
+	for i, tt := range []struct {
+		name string
+		// stage moves the transaction from its earlier writes to the
+		// final batch's epoch and sequence.
+		stage func(txn *kvpb.Transaction)
+	}{
+		{"earlier-sequence", func(txn *kvpb.Transaction) { txn.Sequence++ }},
+		{"earlier-epoch", func(txn *kvpb.Transaction) { txn.Restart(db.Clock().Now()) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			prefix := keys.TableDataPrefix(935 + uint64(i))
+			k1 := append(prefix.Clone(), "a"...)
+			k2 := append(prefix.Clone(), "b"...)
+			txn := kvpb.NewTransaction("crashed", 0, db.Clock().Now())
+			txn.Key = k1.Clone()
+			txn.Sequence = 1
+			wba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone(), CreateTxnRecord: true}}
+			wba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: k1.Clone()}, Value: []byte("stmt1")})
+			wba.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: k2.Clone()}, Value: []byte("stmt1")})
+			br, kerr := db.Send(ctx, wba)
+			if kerr != nil {
+				t.Fatal(kerr)
+			}
+			if br.Txn != nil && txn.WriteTimestamp.Less(br.Txn.WriteTimestamp) {
+				t.Fatalf("earlier writes forwarded from %s to %s", txn.WriteTimestamp, br.Txn.WriteTimestamp)
+			}
+			// The final batch's rewrites of k1 and k2 are in flight with
+			// the staged record, but only the EndTxn arrives.
+			tt.stage(txn)
+			eba := &kvpb.BatchRequest{Header: kvpb.BatchHeader{Txn: txn.Clone()}}
+			eba.Add(&kvpb.EndTxnRequest{
+				RequestHeader: kvpb.RequestHeader{Key: k1.Clone()},
+				Commit:        true,
+				IntentKeys:    []keys.Key{k1.Clone(), k2.Clone()},
+				InFlight:      []keys.Key{k1.Clone(), k2.Clone()},
+			})
+			if _, kerr := db.Send(ctx, eba); kerr != nil {
+				t.Fatalf("staging EndTxn: %v", kerr)
+			}
+			reader := db.NewTxn("reader")
+			defer func() { _ = reader.Rollback(ctx) }()
+			for _, k := range []keys.Key{k1, k2} {
+				if v, err := reader.Get(ctx, k); err != nil || v != nil {
+					t.Fatalf("read of %s = %q, %v; want absent: a staged transaction whose final writes never landed was recovered as committed", k, v, err)
+				}
+			}
+		})
+	}
+}
+
 // TestMultiRangePushCommitsAbovePushedWrite: a transaction's write batch
 // spans two ranges, and a read bumps only the FIRST range's timestamp
 // cache above the transaction's timestamp — so only that sub-batch's

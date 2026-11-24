@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -282,6 +283,12 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 
 	case "upgrade-cluster":
 		return n.serveUpgradeCluster(ctx, req)
+
+	case "rotate-session-secret":
+		if err := n.rotateSessionSecret(ctx); err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{}
 
 	case "rebalance":
 		return n.serveRebalance(ctx, req)
@@ -566,8 +573,8 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 	}
 }
 
-// serveUpgradeCluster finalizes a cluster upgrade: once every live,
-// non-draining node runs a binary at or above the target version, the
+// serveUpgradeCluster finalizes a cluster upgrade: once every node that
+// may hold replicas runs a binary at or above the target version, the
 // replicated cluster version advances to it. The version only ever moves
 // forward; repeating the op is idempotent.
 func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest) cluster.AdminResponse {
@@ -579,27 +586,50 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 		return cluster.AdminResponse{Error: fmt.Sprintf(
 			"cannot upgrade to %s: this node's binary supports at most %s", target, n.binaryVersion())}
 	}
-	var stragglers []string
-	for _, nd := range n.liveNodes() {
-		if nd.Draining {
-			continue
+	// The gate reads the registry rows themselves, each written by its
+	// node's own heartbeat, not this node's in-memory copy (an entry there
+	// learned from raft traffic carries no binary version), and every
+	// range descriptor: a node that holds a replica applies the commands
+	// the new version allows, whether it is live, draining or down.
+	start, end := keys.NodeRegistrySpan()
+	rows, err := n.db.Scan(ctx, start, end, 0)
+	if err != nil {
+		return cluster.AdminResponse{Error: fmt.Sprintf("cannot finalize %s: reading the node registry: %v", target, err)}
+	}
+	nodes := make([]kvpb.NodeDescriptor, 0, len(rows))
+	for _, kv := range rows {
+		var nd kvpb.NodeDescriptor
+		if err := json.Unmarshal(kv.Value, &nd); err != nil {
+			return cluster.AdminResponse{Error: fmt.Sprintf("cannot finalize %s: corrupt node registry row %s: %v", target, kv.Key, err)}
 		}
-		bv := version.Version(nd.BinaryVersion)
-		if nd.NodeID == n.ident.NodeID {
-			// Our own registry row may lag a heartbeat; we know our binary.
-			bv = n.binaryVersion()
-		} else if bv == 0 {
-			bv = version.V1
-		}
-		if bv < target {
-			stragglers = append(stragglers, fmt.Sprintf("%s (%s)", nd.NodeID, bv))
+		nodes = append(nodes, nd)
+	}
+	// A member this node knows of whose row is not written yet (it went
+	// down before its first heartbeat landed) counts, with what is known.
+	for _, nd := range n.registry.All() {
+		if !slices.ContainsFunc(nodes, func(r kvpb.NodeDescriptor) bool { return r.NodeID == nd.NodeID }) {
+			nodes = append(nodes, nd)
 		}
 	}
-	if len(stragglers) > 0 {
-		sort.Strings(stragglers)
+	descs, err := n.listRanges(ctx)
+	if err != nil {
+		return cluster.AdminResponse{Error: fmt.Sprintf("cannot finalize %s: listing ranges: %v", target, err)}
+	}
+	now, grace := n.clock.Now().WallTime, int64(n.livenessGrace())
+	blockers := finalizeBlockers(target, n.ident.NodeID, n.binaryVersion(), nodes, descs,
+		func(nd kvpb.NodeDescriptor) bool {
+			seen := nd.LivenessTime
+			if cur, ok := n.registry.Get(nd.NodeID); ok && cur.LivenessTime > seen {
+				seen = cur.LivenessTime
+			}
+			return now-seen < grace
+		})
+	if len(blockers) > 0 {
 		return cluster.AdminResponse{Error: fmt.Sprintf(
-			"cannot finalize %s: live nodes still run older binaries: %s",
-			target, strings.Join(stragglers, ", "))}
+			"cannot finalize %s: nodes still run older binaries: %s. A node that is down counts as "+
+				"running the binary it last reported: restart it on a binary that supports %s, or "+
+				"decommission it (datax debug decommission --node N) and let its replicas move off, then retry",
+			target, strings.Join(blockers, ", "), target)}
 	}
 	cur := n.readClusterVersion(ctx)
 	if cur >= target {
@@ -664,6 +694,76 @@ func (n *Node) serveUpgradeCluster(ctx context.Context, req cluster.AdminRequest
 	log.Infof("cluster version finalized at %s", target)
 	n.events.RecordEnd("upgrade", opID, "ok", "cluster version finalized at %s", target)
 	return cluster.AdminResponse{ClusterVersion: int(target)}
+}
+
+// finalizeBlockers names every node that keeps the cluster from finalizing
+// target: each node in the registry or in a range descriptor whose binary
+// is not known to support target. Only a fully decommissioned node is
+// exempt — draining, with no replica left in any descriptor — since the
+// allocator never places a replica on it again. A node that is down,
+// draining or both still blocks while it holds replicas or may return:
+// were it to restart on its old binary after the finalize, it would
+// apply commands it cannot interpret. A node named by a descriptor but
+// missing from the registry has an unknown binary and blocks too. self's
+// binary is selfBV (its own row may lag a heartbeat). The result is
+// ordered by node ID.
+func finalizeBlockers(target version.Version, self base.NodeID, selfBV version.Version,
+	nodes []kvpb.NodeDescriptor, descs []kvpb.RangeDescriptor, live func(kvpb.NodeDescriptor) bool,
+) []string {
+	replicas := map[base.NodeID]int{}
+	for _, d := range descs {
+		for _, r := range d.Replicas {
+			replicas[r.NodeID]++
+		}
+	}
+	type blocker struct {
+		id   base.NodeID
+		desc string
+	}
+	var out []blocker
+	seen := map[base.NodeID]bool{}
+	for _, nd := range nodes {
+		seen[nd.NodeID] = true
+		held := replicas[nd.NodeID]
+		if nd.Draining && held == 0 && nd.NodeID != self {
+			continue // decommissioned
+		}
+		bv := version.Version(nd.BinaryVersion)
+		if nd.NodeID == self {
+			bv = selfBV
+		} else if bv == 0 {
+			bv = version.V1 // absent: a pre-versioning binary, or unknown
+		}
+		if bv >= target {
+			continue
+		}
+		var state []string
+		if nd.NodeID != self && !live(nd) {
+			state = append(state, "down")
+		}
+		if nd.Draining {
+			state = append(state, fmt.Sprintf("draining, %d replica(s) left", held))
+		}
+		desc := fmt.Sprintf("%s (%s", nd.NodeID, bv)
+		if len(state) > 0 {
+			desc += ", " + strings.Join(state, ", ")
+		}
+		out = append(out, blocker{nd.NodeID, desc + ")"})
+	}
+	for id, held := range replicas {
+		if !seen[id] && id != self {
+			out = append(out, blocker{id, fmt.Sprintf("%s (binary unknown: not in the node registry, holds %d replica(s))", id, held)})
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
+	names := make([]string, len(out))
+	for i, b := range out {
+		names[i] = b.desc
+	}
+	return names
 }
 
 // listRanges reads all range descriptors from the /meta records. The

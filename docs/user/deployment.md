@@ -17,9 +17,14 @@ datax start --dir /var/lib/datax --listen 10.0.0.2:26257 --pg-listen 10.0.0.2:26
 ```
 
 `init` and `start` accept the same flags; `init` additionally bootstraps the
-cluster on first run. Defaults: RPC `:26257`, SQL `:26433`. An empty
-`--dir` runs in-memory (data lost on exit) — fine for tests, not for
-deployment. Node identity lives in the data directory, so a node restarted
+cluster on first run. Defaults: RPC `:26257`, SQL `:26433`. Without
+`--dir` (or with an empty one) the node runs in-memory and its data is
+lost on exit — fine for tests, not for deployment. Such a node prints a
+warning banner to stderr, and a `WARN` log line, at startup, so a
+service file that forgot `--dir` (or whose `--dir=$VAR` expanded to
+nothing) is noticed before its first restart; `--in-memory` asks for an
+in-memory node on purpose and silences the warning (it is refused
+together with `--dir`). Node identity lives in the data directory, so a node restarted
 with the same `--dir` rejoins as itself even if its address changed
 (`--advertise` controls the address other nodes use to reach it, when the
 listen address isn't routable).
@@ -308,10 +313,11 @@ losing the store — back it up separately from the data. Details in
 | `--merge-size-threshold` | 16 MiB | size below which a range and its right neighbor are merged back together (negative disables; `datax demo` takes it too — disable it to keep an empty pre-split for a benchmark) |
 | `--lease-shed-factor` | 1.5 | leader-QPS multiple of the cluster mean at which a node sheds hot leases |
 | `--rebalance-bytes-threshold` | 64 MiB | replica-byte spread that triggers byte-weighted replica moves (negative disables) |
+| `--sql-max-message-size` | 256 MiB | largest single message an authenticated SQL client may send (a statement's text, a Bind's parameters, one CopyData chunk), e.g. `64MiB`; a longer one ends the connection with a FATAL `08P01` before its body is allocated. Accepted range 1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB. A value is bounded well below either by the 60 MiB one replicated write carries, so raising it rarely helps; COPY's total size is not limited by it. Before authentication the limit is 10000 bytes regardless |
 
 The defaults are right for almost everyone; see
 [docs/replication-and-placement.md](../replication-and-placement.md) before
-touching them.
+touching the replication ones.
 
 ## Upgrading a running cluster
 

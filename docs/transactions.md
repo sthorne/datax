@@ -11,9 +11,16 @@ Every node runs an HLC (`pkg/util/hlc`): a `(wallTime, logical)` pair that is
 monotonic on each node and ratcheted by every message received, so causally
 related events always order correctly even with bounded physical clock skew.
 
-- `--max-offset` (default 500ms) bounds tolerated skew. A message from a clock
-  more than max-offset ahead crashes the node — loudly wrong beats silently
-  inconsistent.
+- `--max-offset` (default 500ms) bounds tolerated skew. A Raft, Batch, Ping or
+  Snapshot message from a node peer whose clock is more than max-offset ahead
+  crashes the node — loudly wrong beats silently inconsistent. A Join or
+  Admin call with such a timestamp fails instead, and an Admin call without
+  the node certificate (an operator's client certificate) never moves the
+  clock. On the calling side, a reply (to a Batch, Join or Admin call)
+  whose clock is past max-offset fails that call and leaves the caller's
+  clock alone, so neither a peer nor whatever answers at an address an
+  operator command dialed can stop the caller; a Ping reply does not move
+  the clock either, and its measured offset is what reports the peer.
 - **Uncertainty**: a reader at `readTS` that sees a value from another node in
   `(readTS, readTS + maxOffset]` cannot know whether that write "really"
   happened before or after it began, so it restarts at a higher timestamp
@@ -95,9 +102,11 @@ by txn ID. States: `PENDING → COMMITTED | ABORTED`.
   compare-and-set PENDING→COMMITTED. The moment it applies, every intent the
   transaction wrote anywhere in the cluster is logically committed — readers
   who find those intents will push, discover COMMITTED, and resolve them.
-- After commit the coordinator resolves intents asynchronously and finally
-  deletes the record. If the coordinator dies first, resolution happens lazily
-  via pushes. This is the **crashed-coordinator story**: no intent outlives
+- After commit the coordinator resolves intents asynchronously; it never
+  deletes the record. The finalized record stays until GC reclaims it once
+  it is older than the GC TTL (`enumerateGarbageTxnRecords`; a committed
+  record's write set is resolved first). If the coordinator dies first,
+  resolution happens lazily via pushes. This is the **crashed-coordinator story**: no intent outlives
   its record's authority, and expiry guarantees progress.
 - A **commit that fails** — the refresh it needed failed, its deadline had
   passed, a pusher had aborted it — aborts the record and resolves the
@@ -460,6 +469,36 @@ record COMMITTED; any missing → ABORTED. Recovery and the coordinator's
 own finalize are idempotent and commute. GC never reclaims `STAGING`
 records.
 
+"Present" means the staged write itself, not any intent of the
+transaction. The coordinator sends the in-flight batch with the staged
+record's own epoch and sequence, and a push of a `STAGING` record
+returns them (`PushTxnResponse.StagedEpoch`, `StagedSequence`); the
+probe counts an intent only at that epoch and at that sequence or above
+(`stagedWritePresent`). An earlier write of the transaction to the same
+key, from an earlier statement (a lower sequence) or an earlier epoch,
+also sits at or below the staged timestamp, and counting it would commit
+the earlier statement without the final one if the final batch never
+landed. Such an intent counts as missing, and the prevention read keeps
+the final write from landing beneath it: a final write still in flight
+from a live coordinator lands above the staged timestamp, the
+coordinator settles classically, and its finalize finds the record
+ABORTED and reports the error. A push answered by a leaseholder from
+before these fields carries sequence 0 (a parallel commit always stages
+at 1 or above); the probe then matches on the transaction ID alone, as
+before, so a mixed-version cluster is no less safe than the old binary
+and never leaves a record unrecoverable.
+
+From cluster version v25 the `RecoverTxn` also names the staged record
+it verified (`StagedTS`, `StagedEpoch`, `StagedSequence`), and the
+record is finalized only if it is still staged at exactly those. A
+transaction that re-staged in between, at a new epoch or timestamp with
+a new in-flight set, keeps its record `STAGING` for a fresh recovery
+instead of being finalized on a verdict about the old one. The fields
+are sent only once v25 is finalized: a v24 replica would drop them and
+finalize what a v25 replica refuses, and the replicas of the record's
+range would diverge. Below v25, `RecoverTxn` finalizes whatever is
+staged, as before.
+
 On the write-only kv workload (implicit UPDATEs), the shorter
 intent-hold window roughly triples committed throughput.
 
@@ -471,6 +510,17 @@ transaction's birth (`MinTimestamp`) and could poison the record ABORTED.
 For the same reason, a transaction already older than half the expiry
 window (2.5s) forfeits the commit-time parallelism and creates its staged
 record before sending the write batch.
+
+A multi-range write that fails may still have applied in part: the
+anchor sub-batch, and so the record, before a sibling failed, or other
+ranges in parallel while one failed — whatever the error (a duplicate
+key, a write shed under overload, a deadline, a routing failure). Unless
+the gateway knows nothing applied, the coordinator tracks every key of
+the batch as written, so `ROLLBACK TO SAVEPOINT` and the transaction's
+end remove whatever landed, and a batch that was to create the record
+leaves a record that may exist: `COMMIT` and `ROLLBACK` then send their
+`EndTxn` (which writes the record if there is none) instead of treating
+the transaction as read-only.
 
 ### One-phase commits
 

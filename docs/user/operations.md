@@ -52,6 +52,10 @@ serves, on that address:
   quorum, undiverse — measured against each range's own target replica
   count, so a database with a placement policy is judged by its policy
   and not by the cluster default; selecting a bucket lists its ranges.
+  A replica on a live node that the node reports in its heartbeat as
+  stopped by a storage failure or never loaded counts as not live, as
+  in the health check, and its range is also listed under **dead
+  replicas**.
   The **failure domains** table is what rack-aware placement is for:
   per locality tier value, the nodes, replicas and leases it holds, and
   what its loss would cost — how many ranges would drop below a
@@ -206,7 +210,18 @@ serves, on that address:
 - **`/status`** — JSON: this node's identity, locality, and every range it
   holds (leader, applied index, size, QPS, closed timestamp — the newest
   fixed timestamp the replica can serve follower reads at).
-  `datax debug status --url ...` pretty-prints it.
+  `datax debug status --url ...` pretty-prints it. It answers 200
+  whenever the HTTP port does, so it is a liveness check, not a
+  readiness one.
+- **`/ready`** — the readiness check for a load balancer or an
+  orchestrator's probe. `200 {"ready":true}` once the node has joined
+  (a heartbeat of its own reached the registry in range 1, so the
+  cluster answers it), its store is open and its SQL listener, when one
+  is configured, is serving. Before that, and from the moment it begins
+  draining for a stop (SIGTERM, Ctrl-C), `503` with a `reason`. It needs
+  no credentials, in secure mode too, and says nothing beyond that.
+  Send SQL clients to a node only while its `/ready` is 200; restart it
+  on its `/status`.
 - **`/api/cluster`** — JSON: the whole cluster as this node sees it (node
   liveness, heartbeat age, leader QPS/counts, replica bytes, hot ranges,
   and the `rollup` summed over the live nodes with the count of nodes
@@ -330,8 +345,10 @@ dashboard row links to:
 | `node-draining` | info | a decommission is in progress (nodes) |
 | `mixed-binaries` | warning | nodes run different binary versions (nodes) |
 | `upgrade-unfinalized` | warning | every node runs a newer binary than the cluster version; `datax admin upgrade` has not been run (nodes) |
-| `quorum-lost` | critical | a range has fewer live replicas than a majority; it cannot serve until a node returns (ranges) |
-| `under-replicated` | warning | a range has fewer live replicas than its replication factor (ranges) |
+| `replicas-failed` | critical | a live node has replicas whose raft group a storage failure stopped (a raft-engine write error such as ENOSPC or EIO, a failed apply); they serve nothing until the node restarts, and the node keeps heartbeating, so dead-node repair does not replace them. Check the node's log and disk, then restart it (nodes) |
+| `replicas-missing` | warning | a live node has been named in a range's descriptor for over a minute with no replica of the range loaded (one lost in a crash, say); it counts toward the range's quorum but cannot vote (nodes) |
+| `quorum-lost` | critical | a range has fewer serving replicas than a majority; it cannot serve until a node returns (ranges). A serving replica is one on a live node that the node does not report failed or missing |
+| `under-replicated` | warning | a range has fewer serving replicas than its replication factor (ranges) |
 | `diversity` | warning | a range's replicas share a locality tier they could spread across (ranges) |
 | `placement-unsatisfiable` | critical | a range names a database placement policy that no live node satisfies; the data stays where it is until such a node joins (ranges) |
 | `placement-misplaced` | warning | a range holds a replica outside its database's placement policy; the allocator moves them home one per pass (ranges) |
@@ -509,6 +526,8 @@ Full list: scrape `/metrics`. The load-bearing ones:
 | `datax_txn_pushes_total` vs `datax_txn_commits_total` | ratio climbing well above 1 | transactions are queueing behind each other's locks; each push is a blocked transaction asking the holder's record whether it has finished |
 | `datax_cert_expiry_seconds{kind,subject}` | under 30 days (2592000), urgently under 7 (604800) | a TLS certificate is running out: `kind=ca` takes the whole cluster with it, `kind=node` takes that node off the internode and SQL listeners, `kind=client` stops one identity authenticating. Absent on an insecure cluster, which has nothing to expire |
 | `datax_dead_node_repairs_total` | any change | a node was declared dead and its replicas re-homed |
+| `datax_replicas_failed` | above 0 | replicas on this node were stopped by a storage failure (ENOSPC, EIO) and serve nothing until it restarts; the node still heartbeats, so nothing repairs them (health check `replicas-failed`) |
+| `datax_replicas_missing` | above 0 | ranges whose descriptor has named this node for over a minute with no replica loaded here (health check `replicas-missing`) |
 | `datax_placement_replicas_moved_total` | rising long after an `ALTER DATABASE ... SET` | replicas are still being moved onto nodes their database's placement policy admits; it should stop once the ranges converge, and `datax_health_problems{check="placement-unsatisfiable"}` says it never will (see [region-restricted replication](sql.md#region-restricted-replication)) |
 | `datax_row_ttl_lag_seconds` | far above the 30s pass interval for long | expired rows are waiting to be deleted: the row expiry job is behind or stopped (see [Row expiry](#row-expiry)); `datax_row_ttl_rows_blocked_total` rising says foreign keys are holding rows |
 | `datax_consistency_failures_total` | **any change — page someone** | a replica's checksum diverged: replicated-state corruption (requires the sweep: `--consistency-interval`) |
@@ -890,7 +909,10 @@ datax backup  --addr 10.0.0.1:26257 --dest /backups/2026-08-31-noon \
   beside the manifest only once every table is written: a backup that
   fails removes what it wrote and leaves the destination as it found it,
   and one whose node dies mid-way leaves only that directory (delete it).
-  The directory backup creates is mode 0700 and every file 0600, sealed
+  Every data file and the manifest are fsynced before they are renamed
+  into place, and the destination directory after, so a backup reported
+  written survives a power loss; the node's `metadata-backup.json` is
+  written the same way. The directory backup creates is mode 0700 and every file 0600, sealed
   or not; a destination that already exists keeps its mode. The summary prints per-table record counts and SHA-256
   checksums over the live data. Restore reads only the names a backup
   writes, derived from each table's id, and only a regular file at one
@@ -1332,12 +1354,22 @@ Rules of the road:
   mixed-version clusters are supported for the duration of the roll.
 - **After finalize there is no downgrade.** A node restarted on an older
   binary refuses to start ("downgrading a node after the cluster upgrade
-  was finalized is not supported"); a too-old binary is also refused at
-  join time.
+  was finalized is not supported"), including a node that was down
+  during the finalize (its peers tell it the version); a too-old binary
+  is also refused at join time. A running node on an older binary that
+  sees the version finalized past it stops serving rather than run at
+  it.
 - Finalize is deliberate, not automatic: verify the upgraded cluster looks
   healthy first, because finalize is the point of no return.
 - `datax debug upgrade` names any node still on the old binary instead of
-  finalizing — nothing to time or coordinate.
+  finalizing — nothing to time or coordinate. That counts **every** node
+  that may hold replicas, not only the live ones: a node that is down
+  counts as running the binary it last reported, and a draining node
+  counts until no replica is left on it. For a node that is down, either
+  bring it back on the new binary or decommission it (`datax debug
+  decommission --node N`) and let its replicas move off (a dead node's
+  replicas move once it is declared dead); a fully decommissioned node
+  no longer blocks finalize.
 - **v13 needs one more rolling restart after finalize**: each node's next
   start migrates its store to the split layout (the raft log on its own
   engine under `--dir/raft`, the state engine without a WAL; see
@@ -1353,6 +1385,18 @@ Rules of the road:
   Errors are the same as before. Until finalize a node on the new
   binary reads the keys first, as before: an older node does not know
   the conditional put.
+- **v25 makes transaction status recovery check the record it ends.**
+  Once it is finalized, the request that ends the recovery of a
+  crashed parallel commit names the staged record it checked, and a
+  record that has changed since is left for a fresh recovery. Nothing
+  changes for clients. Until finalize recovery ends the record as
+  before: an older node would ignore the check.
+- **v26 makes console sessions revocable.** Once it is finalized,
+  root can run `datax debug rotate-session-secret` to revoke every
+  outstanding console session (see
+  [Security → Signing in to the console](security.md#signing-in-to-the-console)).
+  Until finalize the command is refused: an older node would keep
+  accepting the revoked tokens. Nothing else changes.
 - **v23 turns on range-safety checks at apply** (issue #389). Before
   finalize, a node on the new binary already re-checks that a write
   still belongs to its range once it holds its latches, and a split draws
@@ -1417,6 +1461,19 @@ Nothing to do for the data: after a liveness timeout the cluster declares
 the node dead and re-replicates its ranges onto survivors
 (`datax_dead_node_repairs_total` ticks). Restarting the node with its data
 directory intact rejoins it as itself — even on a new address.
+
+A node can also lose replicas while it stays up: a storage failure
+(a full disk, an I/O error) stops each affected replica's raft group
+until the node restarts, and a replica that never reached disk before a
+crash is not loaded at all. The node keeps heartbeating, so dead-node
+repair leaves those replicas alone, but it reports them: the health
+checks `replicas-failed` and `replicas-missing`, the gauges
+`datax_replicas_failed` and `datax_replicas_missing`, and
+`quorum-lost` / `under-replicated` count them as unavailable. Fix the
+disk and restart the node. A replica still missing after the restart
+does not come back on its own: decommission the node so its ranges are
+re-replicated elsewhere, or use `unsafe-recover` below if quorum is
+gone.
 
 **Quorum loss** (2 of 3 replicas gone) makes affected ranges unavailable.
 The last resort, on a **stopped** surviving node, discards the lost

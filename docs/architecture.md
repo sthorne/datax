@@ -101,7 +101,9 @@ These are the load-bearing rules; tests assert them.
    own closed timestamps), which is linearizable *at that timestamp* by
    construction.
 3. **Clocks**: every RPC carries an HLC timestamp; receivers ratchet their
-   clock. A remote clock further than `--max-offset` ahead is a fatal error.
+   clock. A node peer's clock further than `--max-offset` ahead is a fatal
+   error on Raft, Batch, Ping and Snapshot messages; a Join or Admin call
+   with one fails instead, and a non-node Admin caller never moves the clock.
    Reads treat values in `(readTS, readTS+maxOffset]` as uncertain and restart.
 4. **Intents**: an intent is never resolved except according to its
    transaction record's state. Readers/writers who find an abandoned intent

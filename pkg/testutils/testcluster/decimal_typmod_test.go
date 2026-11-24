@@ -24,7 +24,7 @@ func expectCode(t *testing.T, ctx context.Context, conn *pgx.Conn, q, code strin
 }
 
 // TestDecimalTypmodOverPgwire: DECIMAL(p,s) is enforced — values rescale
-// to the declared scale (round-half-even) on every ingest path, integer
+// to the declared scale (halves away from zero) on every ingest path, integer
 // overflow is SQLSTATE 22003, and stored values render with the fixed
 // declared scale in both wire formats. Issue #39.
 func TestDecimalTypmodOverPgwire(t *testing.T) {
@@ -68,8 +68,8 @@ func TestDecimalTypmodOverPgwire(t *testing.T) {
 		want string
 	}{
 		{1, "9.90"},  // padded
-		{2, "1.00"},  // 1.005 ties to even
-		{3, "1.02"},  // 1.015 ties to even
+		{2, "1.01"},  // 1.005: half away from zero
+		{3, "1.02"},  // 1.015: half away from zero
 		{4, "-2.50"}, // negative padded
 		{6, "1234.57"} /* binary param rescaled */} {
 		var got string
@@ -144,7 +144,7 @@ func TestDecimalTypmodOverPgwire(t *testing.T) {
 		t.Fatalf("insert with default: %v", err)
 	}
 	var fee string
-	if err := sconn.QueryRow(ctx, `SELECT fee FROM prices WHERE id = 7`).Scan(&fee); err != nil || fee != "0.12" {
+	if err := sconn.QueryRow(ctx, `SELECT fee FROM prices WHERE id = 7`).Scan(&fee); err != nil || fee != "0.13" {
 		t.Fatalf("default fee: %q, %v", fee, err)
 	}
 	expectCode(t, ctx, conn, `CREATE TABLE bad (id INT8 PRIMARY KEY, d DECIMAL(3,2) DEFAULT 99)`, "22003")
@@ -240,4 +240,174 @@ func TestDecimalTypmodKeysAndCopy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "22003") && !strings.Contains(err.Error(), "overflow") {
 		t.Fatalf("copy overflow: %v", err)
 	}
+}
+
+// TestDecimalTypmodRoundsHalfAwayFromZero: a value stored into
+// DECIMAL(p,s) rounds halves away from zero, as PostgreSQL does and as
+// the ::decimal(p,s) cast already did: 1.005 → 1.01 (not 1.00), 2.5 → 3
+// (not 2), -1.005 → -1.01, on every write path.
+func TestDecimalTypmodRoundsHalfAwayFromZero(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	scfg, _ := pgx.ParseConfig(pgURL(tc, 0))
+	scfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	sconn, err := pgx.ConnectConfig(ctx, scfg)
+	if err != nil {
+		t.Fatalf("simple connect: %v", err)
+	}
+	defer func() { _ = sconn.Close(ctx) }()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	text := func(q string) string {
+		t.Helper()
+		var s string
+		if err := sconn.QueryRow(ctx, q).Scan(&s); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return s
+	}
+
+	exec(`CREATE TABLE r (id INT8 PRIMARY KEY, amt DECIMAL(10,2), n DECIMAL(5,0))`)
+	// Literals, a text literal, a text parameter and a binary parameter.
+	exec(`INSERT INTO r VALUES (1, 1.005, 2.5), (2, -1.005, -2.5), (3, '1.005', '0.5')`)
+	exec(`INSERT INTO r VALUES ($1, $2, $3)`, int64(4), "1.005", "3.5")
+	exec(`INSERT INTO r VALUES ($1, $2, $3)`, int64(5),
+		pgtype.Numeric{Int: big.NewInt(-1005), Exp: -3, Valid: true},
+		pgtype.Numeric{Int: big.NewInt(-5), Exp: -1, Valid: true})
+	// An explicitly prepared statement (simple protocol, where its $n
+	// are its own and not the outer statement's).
+	for _, q := range []string{`PREPARE ins(int8, numeric, numeric) AS INSERT INTO r VALUES ($1, $2, $3)`, `EXECUTE ins(6, 2.675, 1.5)`} {
+		if _, err := sconn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	// UPDATE and ON CONFLICT DO UPDATE.
+	exec(`INSERT INTO r VALUES (7, 0, 0)`)
+	exec(`UPDATE r SET amt = 1.115, n = 4.5 WHERE id = 7`)
+	exec(`INSERT INTO r VALUES (8, 0, 0)`)
+	exec(`INSERT INTO r VALUES (8, -2.345, -6.5) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt, n = excluded.n`)
+	// COPY.
+	if _, err := conn.CopyFrom(ctx, pgx.Identifier{"r"}, []string{"id", "amt", "n"},
+		pgx.CopyFromRows([][]any{{int64(9),
+			pgtype.Numeric{Int: big.NewInt(1005), Exp: -3, Valid: true},
+			pgtype.Numeric{Int: big.NewInt(25), Exp: -1, Valid: true}}})); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	for _, c := range []struct {
+		id      string
+		amt, n  string
+		comment string
+	}{
+		{"1", "1.01", "3", "literal (half-even gave 1.00, 2)"},
+		{"2", "-1.01", "-3", "negative literal"},
+		{"3", "1.01", "1", "text literal"},
+		{"4", "1.01", "4", "text parameter"},
+		{"5", "-1.01", "-1", "binary parameter"},
+		{"6", "2.68", "2", "PREPARE / EXECUTE"},
+		{"7", "1.12", "5", "UPDATE"},
+		{"8", "-2.35", "-7", "ON CONFLICT DO UPDATE"},
+		{"9", "1.01", "3", "COPY"},
+	} {
+		got := text(`SELECT amt::text || '|' || n::text FROM r WHERE id = ` + c.id)
+		if want := c.amt + "|" + c.n; got != want {
+			t.Errorf("id %s (%s): got %s, want %s", c.id, c.comment, got, want)
+		}
+	}
+
+	// The cast agrees with the stored value.
+	if got := text(`SELECT 1.005::decimal(10,2)::text || '|' || (-1.005)::decimal(10,2)::text || '|' || 2.5::decimal(5,0)::text`); got != "1.01|-1.01|3" {
+		t.Errorf("cast: got %s, want 1.01|-1.01|3", got)
+	}
+	if got := text(`SELECT count(*)::text FROM r WHERE id = 1 AND amt = 1.005::decimal(10,2)`); got != "1" {
+		t.Errorf("stored value differs from the cast: count %s", got)
+	}
+}
+
+// TestAlterColumnTypeNarrowsDecimalScale: ALTER COLUMN ... TYPE
+// DECIMAL(p,s) with a smaller scale rounds the stored values like every
+// other write into the column (halves away from zero), not just checks
+// them, and a value that no longer fits fails with 22003 and leaves the
+// table as it was. Expected values are PostgreSQL 16's.
+func TestAlterColumnTypeNarrowsDecimalScale(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	scfg, _ := pgx.ParseConfig(pgURL(tc, 0))
+	scfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol // text results
+	conn, err := pgx.ConnectConfig(ctx, scfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	exec := func(q string) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	rows := func(q string) string {
+		t.Helper()
+		rs, err := conn.Query(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		var out []string
+		for rs.Next() {
+			var s string
+			if err := rs.Scan(&s); err != nil {
+				t.Fatalf("%s: %v", q, err)
+			}
+			out = append(out, s)
+		}
+		if err := rs.Err(); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return strings.Join(out, ";")
+	}
+
+	exec(`CREATE TABLE nar (id INT8 PRIMARY KEY, c DECIMAL(10,3), a DECIMAL(10,3)[], b NUMERIC)`)
+	exec(`INSERT INTO nar VALUES (1, 1.005, '{1.005,-2.125}', 1.005), (2, 2.125, NULL, -2.125), (3, -1.005, NULL, NULL)`)
+	exec(`ALTER TABLE nar ALTER COLUMN c TYPE DECIMAL(10,2)`)
+	exec(`ALTER TABLE nar ALTER COLUMN a TYPE DECIMAL(10,2)[]`)
+	exec(`ALTER TABLE nar ALTER COLUMN b TYPE DECIMAL(10,2)`)
+	want := "1|1.01|{1.01,-2.13}|1.01;2|2.13|NULL|-2.13;3|-1.01|NULL|NULL"
+	if got := rows(`SELECT id::text || '|' || c::text || '|' || coalesce(a::text, 'NULL') || '|' || coalesce(b::text, 'NULL') FROM nar ORDER BY id`); got != want {
+		t.Errorf("after narrowing: got %s, want %s", got, want)
+	}
+	// The stored value is the rounded one, not just its display.
+	if got := rows(`SELECT id::text FROM nar WHERE c = 1.01 OR c = 2.13 OR c = -1.01 ORDER BY id`); got != "1;2;3" {
+		t.Errorf("stored values: rows matching the rounded values: %s", got)
+	}
+
+	// Overflow on narrowing, before and only after rounding: 22003.
+	exec(`CREATE TABLE nov (id INT8 PRIMARY KEY, c DECIMAL(10,3))`)
+	exec(`INSERT INTO nov VALUES (1, 12.345)`)
+	exec(`INSERT INTO nov VALUES (2, 99.995)`)
+	expectCode(t, ctx, conn, `ALTER TABLE nov ALTER COLUMN c TYPE DECIMAL(4,2)`, "22003")
+	exec(`DELETE FROM nov WHERE id = 2`)
+	exec(`INSERT INTO nov VALUES (3, 123.4)`)
+	expectCode(t, ctx, conn, `ALTER TABLE nov ALTER COLUMN c TYPE DECIMAL(4,2)`, "22003")
+	if got := rows(`SELECT c::text FROM nov ORDER BY id`); got != "12.345;123.400" {
+		t.Errorf("after a failed ALTER: got %s, want 12.345;123.400", got)
+	}
+
+	// Narrowing an array's element type checks every element too (it
+	// was a descriptor-only change that kept values the new type
+	// cannot hold).
+	exec(`CREATE TABLE narr (id INT8 PRIMARY KEY, v VARCHAR(10)[], i INT8[])`)
+	exec(`INSERT INTO narr VALUES (1, '{abcdef}', '{70000}')`)
+	expectCode(t, ctx, conn, `ALTER TABLE narr ALTER COLUMN v TYPE VARCHAR(3)[]`, "22001")
+	expectCode(t, ctx, conn, `ALTER TABLE narr ALTER COLUMN i TYPE INT2[]`, "22003")
 }

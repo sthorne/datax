@@ -68,7 +68,7 @@ func TestAggregates(t *testing.T) {
 
 	res := execSQL(t, ctx, s, `SELECT COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM m`)
 	r := res.Rows[0]
-	if r[0].I != 4 || r[1].I != 3 || r[2].I != 60 || r[3].Fam != types.Decimal || r[3].Text() != "20" || r[4].I != 10 || r[5].I != 30 {
+	if r[0].I != 4 || r[1].I != 3 || r[2].I != 60 || r[3].Fam != types.Decimal || r[3].Text() != "20.0000000000000000" || r[4].I != 10 || r[5].I != 30 {
 		t.Fatalf("aggregates: %+v", r)
 	}
 	res = execSQL(t, ctx, s, `SELECT SUM(f), MIN(s), MAX(s) FROM m`)

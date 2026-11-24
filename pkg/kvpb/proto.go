@@ -301,9 +301,12 @@ func requestUnionToProto(u RequestUnion) (*rpcpb.RequestUnion, error) {
 		}}
 	case *RecoverTxnRequest:
 		out.Value = &rpcpb.RequestUnion_RecoverTxn{RecoverTxn: &rpcpb.RecoverTxnRequest{
-			Header: reqHeaderToProto(r.RequestHeader),
-			TxnId:  uuidToProto(r.TxnID),
-			Commit: r.Commit,
+			Header:         reqHeaderToProto(r.RequestHeader),
+			TxnId:          uuidToProto(r.TxnID),
+			Commit:         r.Commit,
+			StagedEpoch:    r.StagedEpoch,
+			StagedSequence: r.StagedSequence,
+			StagedTs:       tsToProto(r.StagedTS),
 		}}
 	case *RefreshRequest:
 		out.Value = &rpcpb.RequestUnion_Refresh{Refresh: &rpcpb.RefreshRequest{Header: reqHeaderToProto(r.RequestHeader), FromTs: tsToProto(r.FromTS)}}
@@ -443,9 +446,12 @@ func requestUnionFromProto(p *rpcpb.RequestUnion) (RequestUnion, error) {
 			return u, err
 		}
 		u.RecoverTxn = &RecoverTxnRequest{
-			RequestHeader: reqHeaderFromProto(v.RecoverTxn.Header),
-			TxnID:         id,
-			Commit:        v.RecoverTxn.Commit,
+			RequestHeader:  reqHeaderFromProto(v.RecoverTxn.Header),
+			TxnID:          id,
+			Commit:         v.RecoverTxn.Commit,
+			StagedTS:       tsFromProto(v.RecoverTxn.StagedTs),
+			StagedEpoch:    v.RecoverTxn.StagedEpoch,
+			StagedSequence: v.RecoverTxn.StagedSequence,
 		}
 	case *rpcpb.RequestUnion_Refresh:
 		u.Refresh = &RefreshRequest{RequestHeader: reqHeaderFromProto(v.Refresh.Header), FromTS: tsFromProto(v.Refresh.FromTs)}
@@ -597,12 +603,14 @@ func responseUnionToProto(u ResponseUnion) *rpcpb.ResponseUnion {
 		out.Value = &rpcpb.ResponseUnion_HeartbeatTxn{HeartbeatTxn: &rpcpb.HeartbeatTxnResponse{Status: int32(u.HeartbeatTxn.Status)}}
 	case u.PushTxn != nil:
 		out.Value = &rpcpb.ResponseUnion_PushTxn{PushTxn: &rpcpb.PushTxnResponse{
-			Status:        int32(u.PushTxn.Status),
-			CommitTs:      tsToProto(u.PushTxn.CommitTS),
-			WaitingFor:    uuidToProto(u.PushTxn.WaitingFor),
-			WaitingForKey: u.PushTxn.WaitingForKey,
-			Priority:      u.PushTxn.Priority,
-			InFlightKeys:  keysToProto(u.PushTxn.InFlightKeys),
+			Status:         int32(u.PushTxn.Status),
+			CommitTs:       tsToProto(u.PushTxn.CommitTS),
+			WaitingFor:     uuidToProto(u.PushTxn.WaitingFor),
+			WaitingForKey:  u.PushTxn.WaitingForKey,
+			Priority:       u.PushTxn.Priority,
+			InFlightKeys:   keysToProto(u.PushTxn.InFlightKeys),
+			StagedEpoch:    u.PushTxn.StagedEpoch,
+			StagedSequence: u.PushTxn.StagedSequence,
 		}}
 	case u.ResolveIntent != nil:
 		out.Value = &rpcpb.ResponseUnion_ResolveIntent{ResolveIntent: &rpcpb.ResolveIntentResponse{}}
@@ -695,12 +703,14 @@ func responseUnionFromProto(p *rpcpb.ResponseUnion) (ResponseUnion, error) {
 			return u, err
 		}
 		u.PushTxn = &PushTxnResponse{
-			Status:        enginepb.TxnStatus(v.PushTxn.Status),
-			CommitTS:      tsFromProto(v.PushTxn.CommitTs),
-			WaitingFor:    waitingFor,
-			WaitingForKey: v.PushTxn.WaitingForKey,
-			Priority:      v.PushTxn.Priority,
-			InFlightKeys:  keysFromProto(v.PushTxn.InFlightKeys),
+			Status:         enginepb.TxnStatus(v.PushTxn.Status),
+			CommitTS:       tsFromProto(v.PushTxn.CommitTs),
+			WaitingFor:     waitingFor,
+			WaitingForKey:  v.PushTxn.WaitingForKey,
+			Priority:       v.PushTxn.Priority,
+			InFlightKeys:   keysFromProto(v.PushTxn.InFlightKeys),
+			StagedEpoch:    v.PushTxn.StagedEpoch,
+			StagedSequence: v.PushTxn.StagedSequence,
 		}
 	case *rpcpb.ResponseUnion_ResolveIntent:
 		u.ResolveIntent = &ResolveIntentResponse{}

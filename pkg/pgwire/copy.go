@@ -39,6 +39,8 @@ type copyDataReader struct {
 	buf     []byte // unread remainder of scratch
 	scratch []byte // owned copy of the latest CopyData payload
 	done    bool
+	// err is the failed receive that ended the stream, if one did.
+	err error
 }
 
 func (r *copyDataReader) Read(p []byte) (int, error) {
@@ -48,7 +50,7 @@ func (r *copyDataReader) Read(p []byte) (int, error) {
 		}
 		msg, err := r.backend.Receive()
 		if err != nil {
-			r.done = true
+			r.done, r.err = true, err
 			return 0, err
 		}
 		switch m := msg.(type) {
@@ -81,7 +83,7 @@ func (r *copyDataReader) drain() {
 	for !r.done {
 		msg, err := r.backend.Receive()
 		if err != nil {
-			r.done = true
+			r.done, r.err = true, err
 			return
 		}
 		switch msg.(type) {
@@ -92,14 +94,15 @@ func (r *copyDataReader) drain() {
 }
 
 // handleCopyIn drives one COPY table FROM STDIN exchange end to end. The
-// caller (run's simple-query path) sends ReadyForQuery afterwards.
-func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
+// caller (run's simple-query path) sends ReadyForQuery afterwards. It
+// reports whether the COPY succeeded.
+func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) bool {
 	ci, err := c.session.BeginCopy(ctx, cf)
 	if err != nil {
 		// A client that streamed CopyData optimistically (pgx) is drained
 		// by run()'s silent-discard cases.
 		c.sendError(sql.ToSQLError(err))
-		return
+		return false
 	}
 	cols := ci.Columns()
 	opts := ci.Options()
@@ -113,10 +116,13 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	}
 	c.backend.Send(resp)
 	if err := c.backend.Flush(); err != nil {
-		return
+		return false
 	}
 
 	r := &copyDataReader{backend: c.backend}
+	// A CopyData over the message size cap ends the connection, once the
+	// COPY has been failed: the stream cannot be resynchronized.
+	defer func() { c.refuseOversized(r.err) }()
 	br := bufio.NewReaderSize(r, 64<<10)
 	var derr error
 	switch opts.Format {
@@ -131,13 +137,13 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 		n, ferr := ci.Finish(ctx)
 		if ferr != nil {
 			c.sendError(sql.ToSQLError(ferr))
-			return
+			return false
 		}
 		if c.act != nil {
 			c.act.copied(int64(n))
 		}
 		c.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("COPY %d", n))})
-		return
+		return true
 	}
 	ci.Abort()
 	var serr *sql.Error
@@ -153,6 +159,7 @@ func (c *conn) handleCopyIn(ctx context.Context, cf *parser.CopyFrom) {
 	}
 	c.sendError(serr)
 	r.drain()
+	return false
 }
 
 // copyFieldDatum converts a text or CSV field to its column's type. An
@@ -567,13 +574,13 @@ func copyBinaryLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols 
 			if flen < 0 {
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "negative field length %d", flen)
 			}
-			raw := make([]byte, flen)
-			if _, err := io.ReadFull(br, raw); err != nil {
+			raw, err := readCopyField(br, int(flen))
+			if err != nil {
 				return rowFmtErr(ci, sql.CodeBadCopyFormat, "reading field data: %v", err)
 			}
 			d, derr := decodeBinaryParam(raw, cols[i].Type)
 			if derr != nil {
-				return rowFmtErr(ci, sql.CodeInvalidTextRepresentation, "column %q: %v", cols[i].Name, derr)
+				return rowFmtErr(ci, binaryErrCode(derr, sql.CodeInvalidTextRepresentation), "column %q: %v", cols[i].Name, derr)
 			}
 			vals[i] = d
 		}
@@ -581,4 +588,33 @@ func copyBinaryLoop(ctx context.Context, ci *sql.CopyIn, br *bufio.Reader, cols 
 			return err
 		}
 	}
+}
+
+// copyFieldChunk is the most a binary COPY field's buffer is sized
+// to on the strength of its declared length alone.
+const copyFieldChunk = 64 << 10
+
+// readCopyField reads a binary COPY field of the declared length n. The
+// length is the client's word: a field up to copyFieldChunk is read
+// into a buffer of that size, a longer one into a buffer that grows
+// with the bytes that actually arrive, so a 4-byte length declaring
+// 2 GiB costs memory only as the data is sent.
+func readCopyField(r io.Reader, n int) ([]byte, error) {
+	if n <= copyFieldChunk {
+		raw := make([]byte, n)
+		if _, err := io.ReadFull(r, raw); err != nil {
+			return nil, err
+		}
+		return raw, nil
+	}
+	var b bytes.Buffer
+	b.Grow(copyFieldChunk)
+	got, err := io.CopyN(&b, r, int64(n))
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("%w after %d of %d bytes", err, got, n)
+	}
+	return b.Bytes(), nil
 }

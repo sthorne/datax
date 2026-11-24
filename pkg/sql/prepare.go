@@ -24,10 +24,18 @@ const (
 type preparedSQL struct {
 	stmt  parser.Statement
 	types []string
+	// nParams is how many arguments EXECUTE takes: the highest $N the
+	// statement references, or the declared type list's length if
+	// longer, as in PostgreSQL.
+	nParams int
+	// inferred are the families of the parameters past the declared
+	// ones, inferred from where they stand as the protocol-level Parse
+	// does (Unknown: nothing types it; the argument is kept as given).
+	inferred []types.Family
 }
 
 // execPrepare runs PREPARE.
-func (s *Session) execPrepare(t *parser.Prepare) (*Result, *Error) {
+func (s *Session) execPrepare(ctx context.Context, t *parser.Prepare) (*Result, *Error) {
 	if _, ok := s.preparedSQL[t.Name]; ok {
 		return nil, newErrf(CodeDuplicatePreparedStatement, "prepared statement %q already exists", t.Name)
 	}
@@ -35,10 +43,18 @@ func (s *Session) execPrepare(t *parser.Prepare) (*Result, *Error) {
 	case *parser.Prepare, *parser.ExecutePrepared, *parser.Deallocate:
 		return nil, newErrf(CodeSyntaxError, "syntax error at or near %q", "PREPARE")
 	}
+	ps := &preparedSQL{stmt: t.Stmt, types: t.Types, nParams: max(parser.CountParams(t.Stmt), len(t.Types))}
+	if ps.nParams > len(t.Types) {
+		fams, serr := s.PlanParams(ctx, t.Stmt)
+		if serr != nil {
+			return nil, serr
+		}
+		ps.inferred = fams
+	}
 	if s.preparedSQL == nil {
 		s.preparedSQL = map[string]*preparedSQL{}
 	}
-	s.preparedSQL[t.Name] = &preparedSQL{stmt: t.Stmt, types: t.Types}
+	s.preparedSQL[t.Name] = ps
 	return &Result{Tag: "PREPARE"}, nil
 }
 
@@ -56,13 +72,14 @@ func (s *Session) execDeallocate(t *parser.Deallocate) (*Result, *Error) {
 }
 
 // executePrepared resolves EXECUTE's statement and parameter values:
-// each argument a constant expression, cast to its declared type.
+// each argument a constant expression, cast to its declared type (or,
+// for a parameter declared with no type, the one PREPARE inferred).
 func (s *Session) executePrepared(t *parser.ExecutePrepared, params []types.Datum) (parser.Statement, []types.Datum, *Error) {
 	ps, ok := s.preparedSQL[t.Name]
 	if !ok {
 		return nil, nil, newErrf(CodeInvalidSQLStatementName, "prepared statement %q does not exist", t.Name)
 	}
-	if len(ps.types) != len(t.Args) {
+	if ps.nParams != len(t.Args) {
 		return nil, nil, newErrf(CodeSyntaxError, "wrong number of parameters for prepared statement %q", t.Name)
 	}
 	vals := make([]types.Datum, len(t.Args))
@@ -71,8 +88,15 @@ func (s *Session) executePrepared(t *parser.ExecutePrepared, params []types.Datu
 		if err != nil {
 			return nil, nil, ToSQLError(err)
 		}
-		typ := strings.TrimPrefix(ps.types[i], "pg_catalog.")
-		if fam, perr := types.ParseType(typ); perr == nil && !d.Null && d.Fam != fam {
+		fam := types.Unknown
+		if i < len(ps.types) {
+			if f, perr := types.ParseType(strings.TrimPrefix(ps.types[i], "pg_catalog.")); perr == nil {
+				fam = f
+			}
+		} else if i < len(ps.inferred) {
+			fam = ps.inferred[i]
+		}
+		if fam != types.Unknown && !d.Null && d.Fam != fam {
 			c, cerr := d.Coerce(fam)
 			if cerr != nil {
 				return nil, nil, newErrf(CodeInvalidTextRepresentation, "parameter $%d of prepared statement %q: %v", i+1, t.Name, cerr)

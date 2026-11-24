@@ -111,7 +111,7 @@ func init() {
 			return i64(0), nil
 		}})
 	register(&Builtin{Name: "round", Args: []types.Family{Any, types.Int}, MinArgs: 1, Ret: Any, SameAsArg: 0, Category: catMath,
-		Doc: "Rounds to the nearest integer, or to the given number of decimal places (halves away from zero); a decimal stays exact.",
+		Doc: "Rounds to the nearest integer, or to the given number of decimal places (halves away from zero; a lone double precision rounds halves to even, as rint); a decimal stays exact.",
 		Fn:  func(a []types.Datum) (types.Datum, error) { return roundTo(a, false) }})
 	register(&Builtin{Name: "trunc", Args: []types.Family{Any, types.Int}, MinArgs: 1, Ret: Any, SameAsArg: 0, Category: catMath,
 		Doc: "Truncates toward zero, to an integer or to the given number of decimal places.",
@@ -291,9 +291,14 @@ func roundTo(a []types.Datum, truncate bool) (types.Datum, error) {
 			p = 1 / math.Pow10(int(-scale))
 		}
 		v := d.F * p
-		if truncate {
+		switch {
+		case truncate:
 			v = math.Trunc(v)
-		} else {
+		case len(a) == 1:
+			// round(double precision) is rint: halves to even, as in
+			// PostgreSQL (round(2.5) = 2, round(-0.5) = -0).
+			v = math.RoundToEven(v)
+		default:
 			v = math.Round(v)
 		}
 		return f64(v / p), nil

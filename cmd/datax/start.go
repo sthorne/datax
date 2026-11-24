@@ -21,6 +21,7 @@ import (
 type serverFlags struct {
 	fs            *flag.FlagSet
 	dir           string
+	inMemory      bool
 	listen        string
 	pgListen      string
 	join          string
@@ -49,6 +50,8 @@ type serverFlags struct {
 	slowStmt      time.Duration
 	authTimeout   time.Duration
 	maxPending    int
+	maxMessage    string
+	httpMaxConns  int
 	keyCacheKeys  int
 	metricsRecord time.Duration
 	auditTable    bool
@@ -57,7 +60,8 @@ type serverFlags struct {
 
 func newServerFlags(name string) *serverFlags {
 	f := &serverFlags{fs: flag.NewFlagSet(name, flag.ContinueOnError)}
-	f.fs.StringVar(&f.dir, "dir", "", "data directory (empty = in-memory, data is lost on exit)")
+	f.fs.StringVar(&f.dir, "dir", "", "data directory (empty = in-memory, data is lost on exit; a warning says so unless --in-memory is given)")
+	f.fs.BoolVar(&f.inMemory, "in-memory", false, "keep all data in memory, lost when the node exits (the default without --dir), without the startup warning; refused together with --dir")
 	f.fs.StringVar(&f.listen, "listen", ":26257", "internode RPC address")
 	f.fs.StringVar(&f.pgListen, "pg-listen", ":26433", "SQL (PostgreSQL protocol) address")
 	f.fs.StringVar(&f.join, "join", "", "RPC address of any existing cluster node")
@@ -85,9 +89,11 @@ func newServerFlags(name string) *serverFlags {
 	f.fs.Int64Var(&f.bytesThr, "rebalance-bytes-threshold", 0, "replica-byte spread that triggers byte-weighted replica moves (0 = default 64 MiB, negative = disabled)")
 	f.fs.DurationVar(&f.consistInt, "consistency-interval", 0, "pace of the replica consistency sweep, one led range per interval (0 = disabled)")
 	f.fs.DurationVar(&f.slowStmt, "slow-statement-threshold", 0, "SQL statements slower than this are kept for the dashboard's slow list (0 = default 500ms)")
-	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication, HTTP request headers) before it is closed (0 = default 60s, negative = never)")
+	f.fs.DurationVar(&f.authTimeout, "auth-timeout", 0, "how long an unauthenticated connection has to complete its handshake (SQL startup and authentication; on the HTTP port, a request's headers, and separately its body) before it is closed (0 = default 60s, negative = never)")
+	f.fs.IntVar(&f.httpMaxConns, "http-max-conns", 0, "maximum open connections to the HTTP port; past it new connections are closed as they are accepted rather than held (0 = default 512, negative = no cap). Idle keep-alive connections are closed after 2 minutes")
 	f.fs.IntVar(&f.keyCacheKeys, "key-cache-keys", 0, "named keys (a sealed table's, a tenant's, the key service's) this node keeps unwrapped at once, the least recently used dropped beyond it (0 = default 10000, negative = no bound); size it above the tenants a node serves within ten seconds")
 	f.fs.IntVar(&f.maxPending, "sql-max-pending-auth", 0, "maximum SQL connections in the pre-authentication state; past it new connections are refused rather than held (0 = default 512, negative = no cap). Also the widest burst of concurrent password guesses one address can land at once, every one of which is charged: raising it past 600 lengthens how long a guessing address is held afterwards, and removing it removes that bound")
+	f.fs.StringVar(&f.maxMessage, "sql-max-message-size", "", "largest message an authenticated SQL client may send (a statement's text, a Bind's parameters, one CopyData chunk), e.g. 64MiB or 1GiB; a longer one ends the connection with a FATAL 08P01 (default 256MiB; between 1MiB and 1GiB, PostgreSQL's own limit). Before authentication the limit is 10000 bytes whatever this says")
 	f.fs.DurationVar(&f.metricsRecord, "metrics-record-interval", 10*time.Second, "how often this node records its metrics into the datax_metrics table (0 disables recording)")
 	f.fs.BoolVar(&f.auditTable, "audit-table", true, "also write this node's audit records to the datax_audit table (false: they are in its log only)")
 	f.fs.DurationVar(&f.drainTimeout, "drain-timeout", server.DefaultDrainTimeout, "on SIGTERM or Ctrl-C, how long to spend handing leases to peers and letting SQL connections finish before stopping (0 stops at once)")
@@ -112,6 +118,13 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 	if err != nil {
 		return server.Config{}, fmt.Errorf("--cache-size: %v", err)
 	}
+	maxMessage, err := parseMaxMessageSize(f.maxMessage)
+	if err != nil {
+		return server.Config{}, err
+	}
+	if f.inMemory && f.dir != "" {
+		return server.Config{}, fmt.Errorf("--in-memory and --dir are mutually exclusive")
+	}
 	log.SetVerbose(f.verbose)
 	return server.Config{
 		StorageProfile:           prof,
@@ -130,6 +143,8 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		SlowStatementThreshold:   f.slowStmt,
 		AuthTimeout:              f.authTimeout,
 		SQLMaxPendingAuth:        f.maxPending,
+		SQLMaxMessageSize:        maxMessage,
+		HTTPMaxConns:             f.httpMaxConns,
 		KeyCacheMaxKeys:          f.keyCacheKeys,
 		MetricsRecordInterval:    metricsRecordInterval(f.metricsRecord),
 		AuditFlushInterval:       auditFlushInterval(f.auditTable),
@@ -148,6 +163,32 @@ func (f *serverFlags) config(bootstrap bool) (server.Config, error) {
 		RootPassword:             f.rootPw,
 		HTTPListen:               f.httpListen,
 	}, nil
+}
+
+// Bounds of --sql-max-message-size. Below a megabyte, ordinary
+// statements and the CopyData chunks drivers send (pgx cuts at 64 KiB)
+// start to fail; above 1 GiB is past PostgreSQL's own limit
+// (PQ_LARGE_MESSAGE_LIMIT), which no client expects to need.
+const (
+	minSQLMaxMessageSize = 1 << 20
+	maxSQLMaxMessageSize = 1 << 30
+)
+
+// parseMaxMessageSize reads --sql-max-message-size: "" is the default (0
+// in the config, which the SQL server reads as
+// pgwire.DefaultMaxMessageSize).
+func parseMaxMessageSize(s string) (int, error) {
+	if strings.TrimSpace(s) == "" {
+		return 0, nil
+	}
+	n, err := parseBytes(s)
+	if err != nil {
+		return 0, fmt.Errorf("--sql-max-message-size: %v", err)
+	}
+	if n < minSQLMaxMessageSize || n > maxSQLMaxMessageSize {
+		return 0, fmt.Errorf("--sql-max-message-size: %s is outside the accepted range, 1MiB to 1GiB", s)
+	}
+	return int(n), nil
 }
 
 // parseBytes reads a byte count with an optional unit: 1073741824, 1GiB,
@@ -193,6 +234,28 @@ func metricsRecordInterval(d time.Duration) time.Duration {
 		return -1
 	}
 	return d
+}
+
+// inMemoryWarning is the warning a node with no data directory prints at
+// startup, or "" when it has one or --in-memory says that is meant. An
+// in-memory node is the default (for trying datax out), so a production
+// start that forgot --dir, or whose --dir=$VAR was empty, would
+// otherwise run normally until its first restart lost everything.
+func (f *serverFlags) inMemoryWarning() string {
+	if f.dir != "" || f.inMemory {
+		return ""
+	}
+	return "WARNING: no --dir given: this node keeps ALL its data in memory, and everything it holds is lost when it exits or restarts.\n" +
+		"  For data that must survive, stop it and start again with --dir <path>. To run in memory on purpose, pass --in-memory.\n"
+}
+
+// warnInMemory prints the in-memory warning, if any, to stderr as a
+// banner and to the log.
+func (f *serverFlags) warnInMemory() {
+	if w := f.inMemoryWarning(); w != "" {
+		fmt.Fprint(os.Stderr, "\n"+w+"\n")
+		log.Warnf("running in memory (no --dir): all data is lost when the node exits")
+	}
 }
 
 func runServer(cfg server.Config) error {
@@ -246,6 +309,7 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
+	f.warnInMemory()
 	return runServer(cfg)
 }
 
@@ -261,5 +325,6 @@ func runStart(args []string) error {
 	if cfg.Join == "" && cfg.Dir == "" {
 		return fmt.Errorf("--join is required (or use 'datax init' to start a new cluster)")
 	}
+	f.warnInMemory()
 	return runServer(cfg)
 }

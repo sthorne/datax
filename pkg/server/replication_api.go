@@ -87,6 +87,13 @@ type ClusterReplication struct {
 	Over      ReplicationBucket `json:"over_replicated"`
 	NoQuorum  ReplicationBucket `json:"no_quorum"`
 	Undiverse ReplicationBucket `json:"undiverse"`
+	// Unavailable: ranges with a replica on a live node that serves
+	// nothing — stopped by a storage failure until the node restarts, or
+	// missing (named by the descriptor, never loaded) — as the nodes
+	// report in their heartbeats (replica_health.go). Such a replica
+	// counts as not live above, so these ranges are also under-replicated
+	// or without quorum; like Undiverse this is an overlay, not a state.
+	Unavailable ReplicationBucket `json:"unavailable_replicas"`
 	// Domains are the failure domains in use, ordered by tier as the
 	// localities declare them (region before rack) and then by value.
 	Domains []ReplicationDomain `json:"domains,omitempty"`
@@ -116,6 +123,25 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 			locOf[cn.NodeID] = nd.Locality
 			if len(nd.Locality.Tiers) == 0 {
 				out.Unlocalized++
+			}
+		}
+	}
+
+	// Replicas a live node reports it cannot serve (failed) or does not
+	// hold (missing) are not live, as in the health check: this node's
+	// own read now, its peers' from their last heartbeat (lists capped
+	// at maxReportedReplicas each).
+	unavailable := map[base.NodeID]map[base.RangeID]bool{}
+	selfFailed, selfMissing := n.unavailableReplicas()
+	for _, cn := range nodes {
+		nid := base.NodeID(cn.NodeID)
+		switch {
+		case !cn.Live:
+		case nid == n.ident.NodeID:
+			markUnavailable(unavailable, nid, selfFailed, selfMissing)
+		default:
+			if nd, ok := n.registry.Get(nid); ok {
+				markUnavailable(unavailable, nid, nd.FailedReplicas, nd.MissingReplicas)
 			}
 		}
 	}
@@ -161,11 +187,15 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 		want := n.placementOf(d).ReplicasOr(base.DefaultReplicationFactor)
 		total, liveReps := len(d.Replicas), 0
 		seenLoc := map[string]bool{}
-		dup := false
+		dup, dead := false, false
 		for _, rep := range d.Replicas {
 			nid := int(rep.NodeID)
 			if live[nid] {
-				liveReps++
+				if unavailable[rep.NodeID][d.RangeID] {
+					dead = true
+				} else {
+					liveReps++
+				}
 			}
 			l := locOf[nid].String()
 			if l != "" {
@@ -192,6 +222,9 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 		}
 		if dup {
 			out.Undiverse.add(id)
+		}
+		if dead {
+			out.Unavailable.add(id)
 		}
 		// What the loss of each domain would cost this range: the
 		// replicas outside it must still be a majority of the whole.

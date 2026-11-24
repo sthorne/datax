@@ -11,6 +11,10 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **`datax start --sql-max-message-size`** sets the largest message an
+  authenticated SQL client may send (default 256 MiB, accepted range
+  1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB). The cap existed but
+  could only be changed in code.
 - **`datax_range_latch_wait_seconds{op,outcome}`**: time spent waiting
   for a latch by range-wide operations (`split`, `merge`, `clear_range`,
   `closed_ts`), with outcome `acquired` or `abandoned`. The existing
@@ -1173,6 +1177,98 @@ state or the internode protocol does, and an entry below says so.
   `42P01`).
 
 ### Security
+- **Console sessions can now be revoked.** The docs said rotating the
+  cluster's authentication secret invalidates every console session
+  token, but nothing could rotate it and each node cached the signing
+  key for its whole life, so a stolen cookie (root's, whose sessions
+  cannot be ended by NOLOGIN) stayed valid for its full 12 hours. The new
+  root-only `datax debug rotate-session-secret` writes a new session
+  secret (`keys.SessionSecretKey`); every node re-reads it at least
+  every 10 seconds and refuses tokens while it cannot, and the command
+  returns once that has passed, so every token signed before it fails on
+  every node by then. The authentication secret, which also keys the
+  stand-in SCRAM salts, is left alone. **Cluster version v26:** the
+  command is refused until v26 is finalized, since a v25 node never
+  re-reads the key. Until the first rotation tokens are signed exactly
+  as before.
+- **The HTTP port no longer holds connections forever.** It bounded
+  only a request's headers (`--auth-timeout`), and Go closes an idle
+  keep-alive connection only at an idle or read timeout, of which it set
+  neither. Anyone who could reach the port, unauthenticated, could hold
+  a connection by sending one request and then nothing, or by trickling
+  a body to `/api/login` (which runs before authentication), and nothing
+  capped how many, so file descriptors and goroutines could be
+  exhausted. Now `--auth-timeout` bounds reading the whole request,
+  body included; an idle keep-alive connection is closed after 2
+  minutes; headers are capped at 64 KiB; and the new `--http-max-conns`
+  (default 512, negative for no cap) closes connections past the cap as
+  they are accepted, counted in the new
+  `datax_http_conns_refused_total`. Responses are not bounded: long
+  polls and pprof profiles run as before.
+- **An Admin RPC can no longer stop a node through its clock.** The
+  Admin RPC ratcheted the node's clock to the caller's timestamp before
+  authorizing anything, and a timestamp past `--max-offset` exited the
+  process, so any client certificate (or anyone, on an insecure cluster)
+  could stop a node, sealed or not, with one call. A caller without the
+  node certificate no longer moves the clock at all, and a Join or Admin
+  call whose timestamp is past `--max-offset` now fails with
+  `FailedPrecondition` instead of exiting. Raft, Batch, Ping and
+  Snapshot messages from authenticated node peers still exit on a clock
+  past `--max-offset`, as documented.
+- **A reply can no longer stop the caller through its clock.** The
+  RPC client ratcheted its clock to every reply's timestamp and exited
+  the process when that timestamp was past `--max-offset`, so a peer
+  whose clock had run away stopped every node that sent it a batch, and
+  whatever answered at an address a `datax debug` command or a joining
+  node dialed could stop that process with one reply. Such a reply now
+  fails the call (Batch, Join, Admin) with "clock synchronization
+  violated", logged as a warning, and leaves the caller's clock
+  unchanged; a Ping reply is still measured, so the offset shows in
+  `datax_clock_offset_seconds`. The server side already refused a Join
+  or Admin call this way.
+- **A Bind with the wrong number of format codes no longer crashes the
+  node.** A Bind whose parameter format codes were neither 0, 1 nor one
+  per parameter (for example 2 codes for 3 parameters) indexed past
+  the end of the list. The panic took the whole process down. Such a
+  Bind, and one with a wrong count of result format codes, is now
+  refused with `08P01`. A panic on a connection's goroutine now closes
+  only that connection: it is logged at error level with its stack, and
+  the client gets a FATAL `XX000`.
+- **A format code other than text (0) or binary (1) is refused.** A Bind
+  carrying parameter or result format code 2 (or any other) was accepted,
+  reading the parameter as text and sending the column as binary. It is
+  now refused with `22023` "unsupported format code: N", as PostgreSQL
+  does. A fast-path call with such a code, which pgproto3 cannot decode,
+  used to close the connection without a word; any frontend message the
+  server cannot decode now ends the connection with a FATAL `08P01`
+  saying why.
+- **A binary array parameter can no longer exhaust the node's memory.**
+  The element count of a binary-format array (a Bind parameter or a
+  binary COPY field) sized an allocation before any element was read,
+  so a 20-byte `int8[]` declaring 0xF0000000 elements had the runtime
+  ask for about 480 GB and the process died. A count the value's bytes
+  cannot hold is now refused with `22P03`. A binary COPY field's buffer
+  likewise grows with the data that arrives instead of being sized by
+  the field's declared length.
+- **Client messages are capped, before authentication most of all.**
+  The server allocated the whole body a message header declared before
+  reading any of it, and set no cap. So a client that had sent only a
+  StartupMessage could cost about 2 GiB per connection with a 5-byte
+  header (`p` and a length of 0x7ffffff0). A message is now capped at
+  10000 bytes until the client has authenticated, and at 256 MiB after
+  (`ServerOptions.MaxMessageSize`; PostgreSQL's cap is 1 GB). A longer
+  message ends the connection with a FATAL `08P01` before its body is
+  allocated. COPY is unaffected: the cap is per CopyData message.
+- **Binary datetime parameters no longer wrap silently.** A binary
+  timestamp, date, interval or time (a Bind parameter or a binary COPY
+  field) was converted with no range check. The year 2400 was stored as
+  1815, timestamptz infinity as 1999-12-31, date infinity as
+  5881610-07-11, and an interval of 2^62 µs as `00:00:00`. A value
+  outside what the text input accepts is now refused with `22008`, as
+  the text path refuses it: timestamps 1678-01-01 to 2261-12-31, dates
+  0000-01-01 to 9999-12-31, times 00:00 to 24:00, and intervals whose
+  microseconds fit in nanoseconds. PostgreSQL's infinity encodings are
+  refused the same way, with a message naming them (PG-T-005).
 - **A client can no longer call another session's per-row closure.**
   A `set_config` whose arguments read the row (pg_dump's
   `set_config(name, ...) FROM pg_settings`) runs through a closure the
@@ -1510,9 +1606,10 @@ state or the internode protocol does, and an entry below says so.
   no floor, and the flag says so).
   **An authentication deadline** (`--auth-timeout`, default 60 s,
   PostgreSQL's `authentication_timeout`) closes a connection that has
-  not reached ReadyForQuery, wherever in the handshake it stalled; the
-  same setting is the HTTP server's `ReadHeaderTimeout`, which it had
-  none of. **A cap on connections in the pre-authentication state**
+  not reached ReadyForQuery, wherever in the handshake it stalled; on
+  the HTTP port the same setting bounds reading a request, its headers
+  and its body (see "The HTTP port no longer holds connections
+  forever" above). **A cap on connections in the pre-authentication state**
   (`--sql-max-pending-auth`, default 512) refuses at accept, with a
   FATAL 53300 and before anything is allocated for the connection,
   rather than accepting and holding; a client refused mid-SSLRequest
@@ -2008,6 +2105,204 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **`sum` over `numeric` keeps its inputs' display scale.** A sum of
+  `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
+  the result dropped the declared scale it tracked. It now carries the
+  largest scale among its inputs, as PostgreSQL's numeric addition does.
+  Expression results still render without it.
+- **Float and integer edge cases match PostgreSQL 16.**
+  - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's
+    `rint` does: `round(2.5::float8)` is `2` (was `3`), and
+    `round(-0.5::float8)` is `-0` (was `-1`). `round(x, n)` and
+    `round(numeric)` still round halves away from zero.
+  - `-0.0::float8` (and `-0::float8`) is `-0`, as in PostgreSQL; it was
+    `0`, because the minus folded into a numeric literal that has no
+    negative zero.
+  - An integer literal outside `INT8`'s range is `numeric`, as in
+    PostgreSQL, instead of `42601 invalid number`; `-9223372036854775808`
+    is an `int8`, where it was a syntax error too.
+  - `avg` over `int8` no longer fails with `22003 bigint out of range`
+    when the total passes `int8`: it totals in `numeric`, as it already
+    divided. `sum` over `int8` is still `bigint` (PG-F-029).
+- **SQL `PREPARE` without a type list takes arguments.** `PREPARE s AS
+  SELECT $1::int8 + 1; EXECUTE s(1);` failed with `42601 wrong number of
+  parameters`, because the parameter count came from the declared type
+  list. It is now the highest `$N` the statement references (or the type
+  list's length, if longer), and the undeclared parameters are typed from
+  where they stand, as the protocol-level Parse types them (PG-Q-021,
+  now closed).
+- **Status recovery no longer commits a transaction's earlier writes
+  without its final ones.** A pipelined transaction that wrote a key and
+  then rewrote it in its final batch, sent in parallel with the STAGING
+  commit record, could be recovered as committed with the earlier value
+  if the final batch never landed (the coordinator crashed, or the batch
+  failed and the cleanup abort failed too): the probe counted any intent
+  of the transaction as the staged write. It now counts only an intent
+  at the staged record's epoch and at its sequence or above, which a
+  push of the record reports; earlier-epoch intents left by a restart no
+  longer fool it either. **Cluster version v25:** once finalized, the
+  `RecoverTxn` that ends recovery also names the staged record it
+  checked, and a record that re-staged in between is left for a fresh
+  recovery. Before the finalize recovery finalizes as before; with a
+  leaseholder on the old binary the probe matches on the transaction ID
+  as before.
+- **Health sees replicas that a live node cannot serve.** A raft-engine
+  write error (ENOSPC, EIO) or a failed apply stops a replica's group
+  until the node restarts, but the replica stayed in the store map with
+  only a log line, and a replica lost before it reached disk is never
+  loaded. Either way the node kept heartbeating, so `quorum-lost` and
+  `under-replicated`, computed from liveness alone, said nothing while a
+  range ran a replica short or had no quorum. Each node now reports such
+  replicas in its heartbeat (failed ones at once, ranges whose
+  descriptor has named it for over a minute with no replica loaded as
+  missing), exports them as the new gauges `datax_replicas_failed` and
+  `datax_replicas_missing`, and the health check counts them as
+  unavailable and raises the new checks `replicas-failed` (critical) and
+  `replicas-missing` (warning). Additive heartbeat fields, so no version
+  gate. Dead-node repair still acts on liveness only. Each list in the
+  heartbeat row holds at most 64 range IDs (the lowest), so a node with
+  thousands of dead replicas does not bloat its row on every heartbeat;
+  `failed_replica_count` and `missing_replica_count` carry the exact
+  totals, which the health summaries report.
+- **The console's replication view shows dead replicas on live nodes.**
+  The health check counts a replica its live node reports failed or
+  missing as unavailable, but the replication tiles and buckets still
+  read node liveness alone, so a range a replica short, or without
+  quorum, showed as healthy. They now count such replicas as not live,
+  and a new `unavailable_replicas` bucket in `/api/cluster`'s
+  replication section (the console's **dead replicas** tile) lists the
+  ranges that have one.
+- **`/ready`, a readiness check.** `/status` answers 200 whenever the
+  HTTP port does, so a load balancer or probe that used it sent clients
+  to a node that had not joined yet, whose SQL listener was not up, or
+  that was draining for a stop. The new `/ready` answers 503 with a
+  reason until the node has joined (its first heartbeat landed) and its
+  SQL listener serves, 200 then, and 503 again once it drains. It needs
+  no credentials and reveals only that. `/status` is unchanged, as the
+  liveness check.
+- **A node started without `--dir` says that its data is in memory.**
+  `datax init` and `datax start` still default to an in-memory store,
+  but nothing at startup said so, so a service that forgot `--dir`, or
+  whose `--dir=$VAR` was empty, served normally until a restart lost
+  everything. It now prints a warning banner to stderr and logs a
+  warning. The new `--in-memory` flag runs in memory on purpose without
+  the warning; it is refused together with `--dir`.
+- **`SEAL-IDENTITY` and a resealed metadata backup survive a power
+  loss.** A node under a share root writes `SEAL-IDENTITY` (where to ask
+  for the key before its store opens), and a store-key rotation, online
+  or offline, reseals `metadata-backup.json`; each was written to a
+  temporary file and renamed with no fsync, so a power loss could leave
+  it empty or truncated under its final name. Each file is now synced
+  before the rename and the data directory after it.
+- **Local copies of the registry and the peer-unseal setting survive a
+  crash, and the metadata backup is no longer rewritten every beat.**
+  The node keeps the registry in its state engine so a restart can dial
+  its peers before any range has a leader, and a copy of the cluster's
+  peer-unseal setting. Both used an unsynced write, which on a state
+  engine with no WAL reaches disk only at the next memtable flush, so a
+  crash could restart a node with addresses its peers had left, or roll
+  the setting back. The registry is now written durably when a node
+  joins, moves, starts draining or changes binary (a liveness- or
+  load-only beat stays a plain write, and an unchanged one writes
+  nothing); the setting is written durably whenever it changes.
+  `metadata-backup.json`, fsynced on each write since the fix below, was
+  written on every heartbeat; it is now written only when its metadata
+  (less the capture time and per-beat registry figures) or the store key
+  changed, or the file is missing.
+- **A backup reported written survives a power loss.** Backup data
+  files, the manifest, their renames and the destination directory were
+  never fsynced, nor was `metadata-backup.json`, so a power loss soon
+  after "backup written" could leave a manifest over empty or truncated
+  data files, found only when a restore refused the chain. Each file is
+  now synced before its rename and the directory after, and the backup
+  reports success only then. On a split store the local copy of the
+  peer-unseal setting is also flushed when it changes, so a crash cannot
+  roll "off" back to "on".
+- **A multi-statement query or a pipeline is one implicit transaction,
+  as in PostgreSQL.** Outside `BEGIN`, each statement of a simple Query
+  with several statements, and each Execute of an extended-protocol
+  pipeline, committed on its own, so `INSERT ...; SELECT 1/0` or a pgx
+  `SendBatch` whose last statement failed left the earlier writes
+  committed. They now run in one implicit transaction, committed at the
+  end of the Query or at the `Sync` and rolled back if a statement
+  fails; `BEGIN`, `COMMIT` and `ROLLBACK` among them follow PostgreSQL's
+  rules. A lone statement (one Execute before its `Sync`) still runs on
+  its own, with the automatic retry. Savepoints, and the statements
+  PostgreSQL refuses in a transaction block (`VACUUM`, `CREATE INDEX
+  CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `DISCARD ALL`: `25001`), are
+  refused in a multi-statement implicit transaction. datax's online
+  statements (`CREATE INDEX` on an existing table, the `ALTER TABLE`
+  actions that read the rows, `CREATE TABLE ... AS`, `ANALYZE`, `AS OF
+  SYSTEM TIME`, ...) commit the statements before them and run on their
+  own, so a migration file sent as one `Exec` keeps working.
+- **A COMMIT no longer reports success for writes it then loses after
+  a multi-range write failed in part.** When a write spanning ranges
+  failed for any reason other than a duplicate key (a write shed under
+  storage overload, a deadline, a routing failure), the part that
+  created the transaction record, or other ranges' parts, could already
+  have applied, but the transaction treated the write as not having
+  happened. After `ROLLBACK TO SAVEPOINT`, a later `COMMIT` took the
+  transaction for read-only and returned success; the record expired
+  about 5 s later and every write was lost. The same failure let a write
+  rolled back to a savepoint become visible at COMMIT, and left a
+  `ROLLBACK`'s intents blocking their keys for about 5 s. Every key of
+  such a write is now tracked, and COMMIT and ROLLBACK end the record.
+- **A replica seeded by a preseed snapshot survives a crash on a split
+  store.** The state engine there has no write-ahead log, and the new
+  replica's descriptor reached disk only at the next memtable flush,
+  while the replica was already voting through the raft engine. A crash
+  in that window, which on a quiet store could last hours, left the
+  range counting a voter that would never load again, and with too few
+  voters it lost quorum for good. The store now flushes the state engine
+  once per created replica, before its raft group starts. A store that
+  drops raft messages for a range it holds raft state for now logs a
+  rate-limited warning instead of a debug line.
+- **Finalizing an upgrade no longer ignores nodes that are down or
+  draining.** `datax debug upgrade` checked only live, non-draining
+  nodes, so a node down (or decommissioning) on the old binary could
+  come back, or keep serving, under the new cluster version: it failed
+  to apply commands it did not know, skipped the write and moved on, and
+  its replicas diverged. Finalize now refuses while any node that may
+  hold replicas is not known to run the new binary (every registry row
+  except fully decommissioned nodes, and every node in a range
+  descriptor), and names each one with what to do: restart it on the
+  new binary or decommission it. A node also never runs above its
+  binary's version: one restarting into a newer cluster is refused at
+  re-announce or join, and a running one that sees the version pass it
+  stops serving, never adopting or persisting the version.
+- **`ALTER COLUMN ... TYPE DECIMAL(p,s)` rounds the stored values.**
+  Narrowing a DECIMAL column's scale checked each value against the new
+  type but stored it unrounded, so after `ALTER COLUMN c TYPE
+  DECIMAL(10,2)` a row holding `1.005` still held and showed `1.005`
+  (PostgreSQL: `1.01`), and `c = 1.01` did not match it. The rewrite now
+  rounds like every other write into the column (halves away from
+  zero), and a value that no longer fits is `22003`. Narrowing the
+  element type of an array column (`DECIMAL(10,3)[]` to
+  `DECIMAL(10,2)[]`, `VARCHAR(10)[]` to `VARCHAR(3)[]`, `INT8[]` to
+  `INT2[]`) was a descriptor-only change that kept values the new type
+  cannot hold; it is now the online rewrite, which rounds or checks
+  every element.
+- **Numeric division and `avg` keep PostgreSQL's precision.** DECIMAL
+  `/` and `avg` over DECIMAL or integer columns rounded to a fixed 6
+  fractional digits, half to even, so `0.0000005::numeric / 1` gave
+  `0`, `1::numeric / 3` gave `0.333333` (PostgreSQL:
+  `0.33333333333333333333`) and a filter such as `WHERE x / y > 1e-7`
+  silently dropped rows. Both now use PostgreSQL's result scale (at
+  least 16 significant digits and at least either operand's scale, at
+  most 1000), round halves away from zero, and show the result at that
+  scale with PostgreSQL's trailing zeros, in text and binary.
+- **`DECIMAL(p,s)` columns round halves away from zero, as PostgreSQL
+  does.** A value written to a `DECIMAL(p,s)` / `NUMERIC(p,s)` column
+  rounded half to even, so `1.005` into `DECIMAL(10,2)` stored `1.00`
+  and `2.5` into `DECIMAL(5,0)` stored `2` (PostgreSQL: `1.01` and
+  `3`), while `SELECT 1.005::decimal(10,2)` already gave `1.01`. Every
+  write path (INSERT, UPDATE, ON CONFLICT, COPY, text input, prepared
+  parameters, column defaults) now rounds like the cast; negative
+  values round away from zero too (`-1.005` → `-1.01`). This changes
+  the stored value of new writes only: rows already stored keep the
+  value they were rounded to, and a value that ties now may land on a
+  different primary or unique key than an identical value written
+  before the upgrade.
 - **A range under a steady write load keeps its closed timestamp.**
   A closed-timestamp promise at T now waits only for writes that could
   still land at or below T; writes at current timestamps and

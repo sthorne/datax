@@ -125,6 +125,9 @@ func (n *Node) serveReannounce(req cluster.JoinRequest) cluster.JoinResponse {
 		ClusterID: n.ident.ClusterID,
 		NodeID:    req.NodeID,
 		Nodes:     n.registry.All(),
+		// This node's last observed version (KV-free): an announcer on a
+		// binary older than it refuses to start.
+		ClusterVersion: int(n.clusterVersion.Load()),
 	}
 	if r1, ok := n.store.GetReplica(1); ok {
 		resp.Range1 = r1.Desc()
@@ -177,6 +180,7 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		}
 		n.mirrorClusterVersion(hctx)
 		n.auditEncryptionCutover(hctx)
+		n.refreshMissingReplicas(hctx)
 		cancel()
 	}
 }
@@ -228,9 +232,14 @@ func (n *Node) publishLiveness(ctx context.Context) {
 	if n.sqlServer() != nil {
 		nd.SQL = n.sqlServer().Activity().Summary()
 	}
+	failed, missing := n.unavailableReplicas()
+	nd.FailedReplicas, nd.FailedReplicaCount = capReplicaReport(failed)
+	nd.MissingReplicas, nd.MissingReplicaCount = capReplicaReport(missing)
 	raw, _ := json.Marshal(nd)
 	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 		log.Debugf("liveness heartbeat failed: %v", err)
+	} else {
+		n.joined.Store(true)
 	}
 }
 
@@ -252,7 +261,10 @@ func (n *Node) readClusterVersion(ctx context.Context) version.Version {
 
 // mirrorClusterVersion refreshes the in-memory cluster version from the
 // replicated row and persists a store-local copy when it advances, so the
-// startup downgrade gate can read it before quorum.
+// startup downgrade gate can read it before quorum. A version above what
+// this binary supports is never adopted or persisted: the node stops
+// serving instead, since its replicas would misapply the commands that
+// version allows.
 func (n *Node) mirrorClusterVersion(ctx context.Context) {
 	raw, err := n.db.Get(ctx, keys.ClusterVersionKey())
 	if err != nil || raw == nil {
@@ -264,6 +276,15 @@ func (n *Node) mirrorClusterVersion(ctx context.Context) {
 		return
 	}
 	if int64(v) <= n.clusterVersion.Load() {
+		return
+	}
+	if bv := n.binaryVersion(); version.Version(v) > bv {
+		if n.versionRefused.CompareAndSwap(false, true) {
+			msg := tooNewVersionError(version.Version(v), bv, "the replicated cluster version row").Error()
+			log.Errorf("%s; this node stops serving", msg)
+			n.events.Record("upgrade", "refused to run above this binary's version: %s", msg)
+			go n.Stop()
+		}
 		return
 	}
 	n.clusterVersion.Store(int64(v))

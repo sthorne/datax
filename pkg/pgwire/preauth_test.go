@@ -370,6 +370,14 @@ func TestBudgetIsChargedOnFailureAndRefundedOnSuccess(t *testing.T) {
 // whether the server accepted the password.
 func scramLogin(t *testing.T, nc net.Conn, user, password string) bool {
 	t.Helper()
+	_, ok := scramLoginFE(t, nc, user, password)
+	return ok
+}
+
+// scramLoginFE is scramLogin, also returning the Frontend it read with
+// (which may hold the server's next messages buffered).
+func scramLoginFE(t *testing.T, nc net.Conn, user, password string) (*pgproto3.Frontend, bool) {
+	t.Helper()
 	fe, msg := startSCRAM(t, nc, user)
 	if _, ok := msg.(*pgproto3.AuthenticationSASL); !ok {
 		t.Fatalf("expected the SASL advertisement, got %T", msg)
@@ -402,9 +410,9 @@ func scramLogin(t *testing.T, nc net.Conn, user, password string) bool {
 		}
 		switch msg.(type) {
 		case *pgproto3.AuthenticationOk:
-			return true
+			return fe, true
 		case *pgproto3.ErrorResponse:
-			return false
+			return fe, false
 		}
 	}
 }

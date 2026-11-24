@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"github.com/sthorne/datax/pkg/metrics"
 	"github.com/sthorne/datax/pkg/util/log"
+	"io"
 	"math"
 	"net"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -233,6 +235,12 @@ type conn struct {
 	// skipToSync: an extended-protocol error occurred; ignore messages
 	// until Sync (PostgreSQL protocol rule).
 	skipToSync bool
+	// peeked is a message (or the error receiving it) read ahead of its
+	// turn by an Execute deciding whether it ends its pipeline
+	// (readAhead); run handles it next instead of receiving.
+	peeked    bool
+	peekedMsg pgproto3.FrontendMessage
+	peekedErr error
 	// act is the server's client accounting (nil in unit tests that build
 	// a conn without a server); srv the server (nil likewise).
 	act *Activity
@@ -422,11 +430,19 @@ func (c *conn) execute(ctx context.Context, stmt parser.Statement, text string, 
 	return res, serr
 }
 
+// newPreAuthBackend is a backend on nc with the pre-authentication
+// message size cap; startup lifts it once the client has authenticated.
+func newPreAuthBackend(nc net.Conn) *pgproto3.Backend {
+	be := pgproto3.NewBackend(nc, nc)
+	be.SetMaxBodyLen(maxPreAuthMessageSize)
+	return be
+}
+
 func newConn(nc net.Conn, db *kvclient.DB, cat *catalog.Accessor, opts ServerOptions) *conn {
 	session := sql.NewSession(db, cat)
 	session.SetStreaming(true)
 	c := &conn{
-		backend:  pgproto3.NewBackend(nc, nc),
+		backend:  newPreAuthBackend(nc),
 		nc:       nc,
 		session:  session,
 		opts:     opts,
@@ -467,6 +483,74 @@ func isLoopbackAddr(a net.Addr) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// Client message size caps (the body after the type byte and length).
+// pgproto3 allocates a message's declared length before it reads a byte
+// of the body, so without a cap 5 bytes from anyone who can open a
+// socket ('p' and a length of 0x7ffffff0) cost 2 GiB.
+const (
+	// maxPreAuthMessageSize bounds every message read before
+	// authentication completes. The SASL messages are a few hundred
+	// bytes; 10000 is PostgreSQL's MAX_STARTUP_PACKET_LENGTH, the bound
+	// pgproto3 itself applies to the startup packet (which is read by
+	// ReceiveStartupMessage, not under this cap).
+	maxPreAuthMessageSize = 10000
+	// DefaultMaxMessageSize bounds a message once the connection is
+	// authenticated. PostgreSQL's bound is 1 GB, its largest field; a
+	// datax value is bounded by what one replicated write carries
+	// (60 MiB to a range), so 256 MiB leaves room for such a value in a
+	// statement's text, hex-encoded (twice its size), with plenty to
+	// spare. COPY streams its data in CopyData messages that drivers cut
+	// at 64 KiB (pgx) or a row (psql), so its total size is unbounded.
+	DefaultMaxMessageSize = 256 << 20
+)
+
+// maxMessageSize is the post-authentication cap in force (0 = none).
+func (c *conn) maxMessageSize() int {
+	switch {
+	case c.opts.MaxMessageSize < 0:
+		return 0
+	case c.opts.MaxMessageSize == 0:
+		return DefaultMaxMessageSize
+	}
+	return c.opts.MaxMessageSize
+}
+
+// refuseOversized ends the connection when err is a message over the
+// size cap and reports whether it was: the client is told with a FATAL
+// 08P01 (protocol_violation, as PostgreSQL reports an invalid message
+// length) and the socket is closed. pgproto3 has read only the header,
+// so the stream is at an unknown point and nothing more can be read.
+func (c *conn) refuseOversized(err error) bool {
+	var tooLong *pgproto3.ExceededMaxBodyLenErr
+	if !errors.As(err, &tooLong) {
+		return false
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sendFatal(sql.CodeInvalidParameter, fmt.Sprintf("invalid message length: %d bytes exceeds the limit of %d",
+		tooLong.ActualBodyLen, tooLong.MaxExpectedBodyLen))
+	_ = c.nc.Close()
+	return true
+}
+
+// refuseMalformed tells the client why its connection ends when err is
+// a message it sent that could not be decoded rather than a broken or
+// closed transport: an unknown message type, an impossible length, or a
+// body pgproto3 refuses (a FunctionCall whose format codes are not 0 or
+// 1, among others). It used to be closed with no word at all.
+func (c *conn) refuseMalformed(err error) {
+	var ne net.Error
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &ne) {
+		return
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+	c.sendFatal(sql.CodeInvalidParameter, "invalid frontend message: "+err.Error())
+}
+
+// testingPanicOnMessage, when set, sees every message the message loop
+// receives: a test's way to inject a panic into a connection.
+var testingPanicOnMessage func(pgproto3.FrontendMessage)
+
 // errCancelServed ends a connection that carried a CancelRequest: it
 // never authenticates and carries nothing else, so it does not go on to
 // the message loop (where it would sit, unauthenticated and now past its
@@ -484,13 +568,29 @@ func (c *conn) authTimeout() time.Duration {
 	return c.opts.AuthTimeout
 }
 
-func (c *conn) run(ctx context.Context) error {
+func (c *conn) run(ctx context.Context) (err error) {
 	defer close(c.done)
 	if c.listener != nil {
 		defer c.listener.Close()
 	}
 	defer c.session.Close(context.Background())
 	defer c.reapPortals() // streams first: their transactions are the session's
+	// A panic on this connection's goroutine ends this connection, not
+	// the node: it is logged at error level with its stack (the evidence
+	// of the bug underneath), the client is told with a FATAL XX000 when
+	// the socket still takes it, and the deferred cleanup above runs as
+	// for any other end.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("panic on pgwire connection %s (recovered; the connection is closed): %v\n%s", c.nc.RemoteAddr(), r, debug.Stack())
+			_ = c.nc.SetWriteDeadline(time.Now().Add(time.Second))
+			c.backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: sql.CodeInternal,
+				Message: fmt.Sprintf("internal error: %v", r)})
+			_ = c.backend.Flush()
+			_ = c.nc.Close()
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	if err := c.startup(ctx); err != nil {
 		if errors.Is(err, errCancelServed) {
 			return nil
@@ -517,7 +617,16 @@ func (c *conn) run(ctx context.Context) error {
 		if pushing {
 			c.allowPush()
 		}
-		msg, err := c.backend.Receive()
+		var msg pgproto3.FrontendMessage
+		if c.peeked {
+			msg, err = c.peekedMsg, c.peekedErr
+			c.peeked, c.peekedMsg, c.peekedErr = false, nil, nil
+		} else {
+			msg, err = c.backend.Receive()
+		}
+		if err == nil && testingPanicOnMessage != nil {
+			testingPanicOnMessage(msg)
+		}
 		if idleArmed {
 			_ = c.nc.SetReadDeadline(time.Time{})
 		}
@@ -526,6 +635,9 @@ func (c *conn) run(ctx context.Context) error {
 			return err
 		}
 		if err != nil {
+			if c.refuseOversized(err) {
+				return err
+			}
 			if goodbye && boundary && isTimeout(err) {
 				c.goodbye() // woken by drain, not a broken connection
 				return nil
@@ -536,6 +648,7 @@ func (c *conn) run(ctx context.Context) error {
 				_ = c.backend.Flush()
 				return nil
 			}
+			c.refuseMalformed(err)
 			return err
 		}
 		switch msg.(type) {
@@ -562,6 +675,8 @@ func (c *conn) run(ctx context.Context) error {
 		case *pgproto3.FunctionCall:
 			c.skipToSync = false
 			c.handleFunctionCall(ctx, m)
+			// A pipeline's implicit transaction it ran in ends with it.
+			c.endImplicit(ctx, true)
 			if c.session.State() != sql.StateOpen {
 				c.reapPortals()
 			}
@@ -584,6 +699,7 @@ func (c *conn) run(ctx context.Context) error {
 			}
 		case *pgproto3.Execute:
 			if !c.skipToSync {
+				m = c.readAhead(ctx, m)
 				c.handleExecute(ctx, m)
 			}
 		case *pgproto3.Close:
@@ -600,6 +716,9 @@ func (c *conn) run(ctx context.Context) error {
 				c.backend.Send(&pgproto3.CloseComplete{})
 			}
 		case *pgproto3.Sync:
+			// Sync ends the pipeline's implicit transaction: committed,
+			// or rolled back if any of its messages failed.
+			c.endImplicit(ctx, !c.skipToSync)
 			c.skipToSync = false
 			// Portals do not survive the implicit transaction: outside an
 			// explicit BEGIN, Sync ends the cycle and reaps them (inside
@@ -650,6 +769,9 @@ func (c *conn) startup(ctx context.Context) error {
 	err := c.handleStartup(ctx)
 	_ = c.nc.SetDeadline(time.Time{})
 	c.authDeadline = time.Time{}
+	if err == nil {
+		c.backend.SetMaxBodyLen(c.maxMessageSize())
+	}
 	if err != nil && isTimeout(err) {
 		metrics.SQLPreAuthClosed.WithLabelValues(metrics.PreAuthHandshakeTimeout).Inc()
 		log.Audit("sql-preauth-closed", "remote", c.nc.RemoteAddr().String(), "cause", metrics.PreAuthHandshakeTimeout)
@@ -675,7 +797,7 @@ func (c *conn) handleStartup(ctx context.Context) error {
 					return err
 				}
 				c.nc = tc
-				c.backend = pgproto3.NewBackend(tc, tc)
+				c.backend = newPreAuthBackend(tc)
 				c.tlsDone = true
 				c.session.SetTransport(true, isLoopbackAddr(tc.RemoteAddr()))
 				continue
@@ -861,17 +983,55 @@ func (c *conn) parse(q string) ([]parser.Statement, error) {
 }
 
 // handleSimpleQuery runs a (possibly multi-statement) simple query.
+//
+// Outside a transaction block the statements of a multi-statement query
+// run as one implicit transaction, PostgreSQL's: committed when the last
+// has run, rolled back if one fails (the rest are not run). A COMMIT or
+// ROLLBACK among them ends that transaction early and the statements
+// after it start another; a BEGIN turns it into a transaction block that
+// outlives the message. One of datax's online statements commits it too,
+// and runs alone (Session.BeginImplicit). A query of one statement runs as its own
+// implicit transaction (Session.Execute), automatically re-run on a
+// serialization failure.
 func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 	stmts, err := c.parse(q)
 	if err != nil {
 		c.sendError(sql.ToSQLError(err))
+		c.endImplicit(ctx, false)
 		return
 	}
 	if len(stmts) == 0 {
 		c.backend.Send(&pgproto3.EmptyQueryResponse{})
+		c.endImplicit(ctx, true)
 		return
 	}
+	ok := c.runSimpleStatements(ctx, q, stmts)
+	c.endImplicit(ctx, ok)
+}
+
+// endImplicit ends the implicit transaction of a simple query or a
+// pipeline, if one is open: committed when ok, else rolled back. A
+// failed COMMIT is reported to the client.
+func (c *conn) endImplicit(ctx context.Context, ok bool) {
+	if !c.session.InImplicit() {
+		return
+	}
+	if serr := c.session.EndImplicit(ctx, ok); serr != nil {
+		c.sendError(serr)
+	}
+	if c.act != nil {
+		c.act.txnEnded(c)
+	}
+}
+
+// runSimpleStatements runs a simple query's statements in order, up to
+// the first that fails, and reports whether all succeeded.
+func (c *conn) runSimpleStatements(ctx context.Context, q string, stmts []parser.Statement) bool {
+	multi := len(stmts) > 1
 	for i, stmt := range stmts {
+		if multi {
+			c.session.BeginImplicit() // no-op inside a block
+		}
 		if cf, ok := stmt.(*parser.CopyFrom); ok {
 			// COPY takes over the message stream, so it may only end a
 			// simple query — running statements after copy mode would need
@@ -879,10 +1039,9 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 			if i != len(stmts)-1 {
 				c.sendError(&sql.Error{Code: sql.CodeFeatureNotSupported,
 					Msg: "COPY FROM STDIN must be the last statement of a simple query"})
-				return
+				return false
 			}
-			c.handleCopyIn(ctx, cf)
-			return
+			return c.handleCopyIn(ctx, cf)
 		}
 		res, serr := c.execute(ctx, stmt, q, nil, nil, func(ctx context.Context, res *sql.Result) (int64, *sql.Error) {
 			if res.Copy != nil {
@@ -904,10 +1063,44 @@ func (c *conn) handleSimpleQuery(ctx context.Context, q string) {
 		})
 		if serr != nil {
 			c.sendError(serr)
-			return
+			return false
 		}
 		c.sendComplete(res.Tag)
 	}
+	return true
+}
+
+// readAhead is an Execute's look at the message after it, taken before
+// it runs, outside a transaction block. A Sync next means the Execute is
+// its pipeline's only statement: it runs as its own implicit
+// transaction, which commits with it and is re-run automatically on a
+// serialization failure. Anything else means more of the pipeline may
+// follow, and PostgreSQL runs everything up to the Sync as one implicit
+// transaction: one is opened here for the Sync (or the end of a simple
+// Query) to commit, or for the rollback should a message fail first or
+// the connection end without a Sync. A statement that runs only outside
+// a block (Session.RunsAlone) is not read ahead of: it runs alone, as
+// the first Execute of a pipeline does in PostgreSQL, and the next
+// Execute decides for the rest. The message read ahead is handled
+// next by run. It returns the Execute, copied: reading the next message
+// may reuse the one m points to.
+func (c *conn) readAhead(ctx context.Context, m *pgproto3.Execute) *pgproto3.Execute {
+	if c.session.State() != sql.StateIdle || c.peeked {
+		return m
+	}
+	if pt, ok := c.portals[m.Portal]; ok && pt.res == nil && pt.stmt.stmt != nil && c.session.RunsAlone(ctx, pt.stmt.stmt) {
+		// A statement that runs only outside a block runs on its own,
+		// as the first of a pipeline does in PostgreSQL; the next
+		// Execute opens the implicit transaction for the rest.
+		return m
+	}
+	ex := *m
+	c.peekedMsg, c.peekedErr = c.backend.Receive()
+	c.peeked = true
+	if _, sync := c.peekedMsg.(*pgproto3.Sync); !sync || c.peekedErr != nil {
+		c.session.BeginImplicit()
+	}
+	return &ex
 }
 
 func rowDescription(cols []sql.ResultColumn) *pgproto3.RowDescription {
@@ -1206,6 +1399,14 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 	}
 	n := binary.BigEndian.Uint32(raw[:4])
 	raw = raw[8:]
+	// Every element takes at least its 4-byte length, so a count the
+	// rest of the value cannot hold is refused before it sizes anything:
+	// a 20-byte value declaring 0xF0000000 elements used to ask the
+	// runtime for hundreds of gigabytes and kill the process.
+	if uint64(n) > uint64(len(raw)/4) {
+		return types.Datum{}, &sql.Error{Code: sql.CodeInvalidBinaryRepresentation,
+			Msg: fmt.Sprintf("binary array declares %d elements in %d bytes", n, len(raw))}
+	}
 	elems := make([]types.Datum, 0, n)
 	for i := uint32(0); i < n; i++ {
 		if len(raw) < 4 {
@@ -1228,6 +1429,45 @@ func decodeBinaryArray(raw []byte, fam types.Family) (types.Datum, error) {
 		elems = append(elems, d)
 	}
 	return types.NewArray(elem, elems), nil
+}
+
+// The range a binary datetime parameter may hold: what the text input
+// accepts, refused outside with 22008 rather than wrapped. A timestamp
+// is Unix nanoseconds in an int64, the years 1678 to 2261 (as
+// types.ParseTimestamp refuses outside them); a date the years 0000 to
+// 9999 that types.ParseDate reads. Timestamp bounds are microseconds
+// from PostgreSQL's epoch (as sent), date bounds days from the Unix
+// epoch (as stored).
+var (
+	minBinaryTimestamp = time.Date(1678, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros
+	maxBinaryTimestamp = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro() - pgEpochOffsetMicros // exclusive
+	minBinaryDate      = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400
+	maxBinaryDate      = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC).Unix() / 86400
+)
+
+// datetimeOverflow is the 22008 (datetime_field_overflow) for a binary
+// datetime parameter outside what datax represents. PostgreSQL encodes
+// infinity as the type's extreme value; datax has no infinite datetimes
+// (the text 'infinity' is refused too), so it is named in the message.
+func datetimeOverflow(typ string, infinite bool) *sql.Error {
+	msg := typ + " out of range"
+	if infinite {
+		msg = fmt.Sprintf("%s: infinite %s values are not supported", msg, typ)
+	}
+	return &sql.Error{Code: codeDatetimeOverflow, Msg: msg}
+}
+
+// codeDatetimeOverflow is PostgreSQL's datetime_field_overflow.
+const codeDatetimeOverflow = "22008"
+
+// binaryErrCode is the SQLSTATE for a binary decode failure: the
+// decoder's own when it gave one (*sql.Error), def otherwise.
+func binaryErrCode(err error, def string) string {
+	var serr *sql.Error
+	if errors.As(err, &serr) && serr.Code != "" {
+		return serr.Code
+	}
+	return def
 }
 
 // decodeBinaryParam decodes a binary-format parameter of a known type.
@@ -1270,13 +1510,21 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		return types.Datum{}, fmt.Errorf("bad binary bool length %d", len(raw))
 	case types.Timestamp:
 		if len(raw) == 8 {
-			micros := int64(binary.BigEndian.Uint64(raw)) + pgEpochOffsetMicros
-			return types.NewTimestamp(micros * 1000), nil
+			pgMicros := int64(binary.BigEndian.Uint64(raw))
+			if pgMicros < minBinaryTimestamp || pgMicros >= maxBinaryTimestamp {
+				return types.Datum{}, datetimeOverflow("timestamp", pgMicros == math.MinInt64 || pgMicros == math.MaxInt64)
+			}
+			return types.NewTimestamp((pgMicros + pgEpochOffsetMicros) * 1000), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary timestamptz length %d", len(raw))
 	case types.Date:
 		if len(raw) == 4 {
-			return types.NewDate(int64(int32(binary.BigEndian.Uint32(raw))) + pgEpochOffsetDays), nil
+			pgDays := int32(binary.BigEndian.Uint32(raw))
+			days := int64(pgDays) + pgEpochOffsetDays
+			if days < minBinaryDate || days > maxBinaryDate {
+				return types.Datum{}, datetimeOverflow("date", pgDays == math.MinInt32 || pgDays == math.MaxInt32)
+			}
+			return types.NewDate(days), nil
 		}
 		return types.Datum{}, fmt.Errorf("bad binary date length %d", len(raw))
 	case types.Bytes:
@@ -1315,8 +1563,12 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 16 {
 			return types.Datum{}, fmt.Errorf("bad binary interval length %d", len(raw))
 		}
+		micros := int64(binary.BigEndian.Uint64(raw[:8]))
+		if micros > math.MaxInt64/1000 || micros < math.MinInt64/1000 {
+			return types.Datum{}, datetimeOverflow("interval", micros == math.MinInt64 || micros == math.MaxInt64)
+		}
 		return types.NewInterval(types.Interval{
-			Nanos:  int64(binary.BigEndian.Uint64(raw[:8])) * 1000,
+			Nanos:  micros * 1000,
 			Days:   int64(int32(binary.BigEndian.Uint32(raw[8:12]))),
 			Months: int64(int32(binary.BigEndian.Uint32(raw[12:16]))),
 		}), nil
@@ -1324,7 +1576,11 @@ func decodeBinaryParam(raw []byte, fam types.Family) (types.Datum, error) {
 		if len(raw) != 8 {
 			return types.Datum{}, fmt.Errorf("bad binary time length %d", len(raw))
 		}
-		return types.NewTime(int64(binary.BigEndian.Uint64(raw)) * 1000), nil
+		micros := int64(binary.BigEndian.Uint64(raw))
+		if micros < 0 || micros > types.NanosPerDay/1000 {
+			return types.Datum{}, datetimeOverflow("time", false)
+		}
+		return types.NewTime(micros * 1000), nil
 	case types.Vector:
 		stored, err := vector.DecodeBinary(raw)
 		if err != nil {
@@ -1395,6 +1651,12 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 	c.backend.Send(&pgproto3.ParseComplete{})
 }
 
+// unsupportedFormatCode is the refusal of a message carrying a format
+// code other than 0 (text) or 1 (binary).
+func unsupportedFormatCode(f int) *sql.Error {
+	return &sql.Error{Code: sql.CodeInvalidParameterValue, Msg: fmt.Sprintf("unsupported format code: %d", f)}
+}
+
 func (c *conn) handleBind(m *pgproto3.Bind) {
 	p, ok := c.stmts[m.PreparedStatement]
 	if !ok {
@@ -1405,6 +1667,28 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
 			Msg: fmt.Sprintf("bind supplies %d parameters, statement needs %d", len(m.Parameters), p.nParams)})
 		return
+	}
+	// A format-code list holds no code (all text), one (for every item)
+	// or one per item; pgproto3 decodes whatever count the client sent.
+	if n := len(m.ParameterFormatCodes); n > 1 && n != len(m.Parameters) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d parameter formats but %d parameters", n, len(m.Parameters))})
+		return
+	}
+	if n := len(m.ResultFormatCodes); n > 1 && n != len(p.cols) {
+		c.extError(&sql.Error{Code: sql.CodeInvalidParameter,
+			Msg: fmt.Sprintf("bind message has %d result formats but query has %d columns", n, len(p.cols))})
+		return
+	}
+	// A format code is 0 (text) or 1 (binary); anything else is refused,
+	// as PostgreSQL does, rather than read as one or the other.
+	for _, codes := range [][]int16{m.ParameterFormatCodes, m.ResultFormatCodes} {
+		for _, f := range codes {
+			if f != 0 && f != 1 {
+				c.extError(unsupportedFormatCode(int(f)))
+				return
+			}
+		}
 	}
 	paramFormat := func(i int) int16 {
 		switch len(m.ParameterFormatCodes) {
@@ -1434,7 +1718,7 @@ func (c *conn) handleBind(m *pgproto3.Bind) {
 		}
 		d, err := decodeBinaryParam(raw, fam)
 		if err != nil {
-			c.extError(&sql.Error{Code: sql.CodeInvalidBinaryRepresentation, Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
+			c.extError(&sql.Error{Code: binaryErrCode(err, sql.CodeInvalidBinaryRepresentation), Msg: fmt.Sprintf("parameter $%d: %v", i+1, err)})
 			return
 		}
 		params[i] = d

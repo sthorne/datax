@@ -202,12 +202,7 @@ func (n *Node) resealMetadataBackup(oldKey, newKey []byte) {
 		log.Debugf("metadata backup reseal: %v", err)
 		return
 	}
-	tmp := final + ".tmp"
-	if err := os.WriteFile(tmp, sealed, 0o600); err != nil {
-		log.Debugf("metadata backup reseal: %v", err)
-		return
-	}
-	if err := os.Rename(tmp, final); err != nil {
+	if err := replaceFileSynced(final, sealed); err != nil {
 		log.Debugf("metadata backup reseal: %v", err)
 	}
 }
@@ -326,10 +321,7 @@ func ResealMetadataBackup(dir string, oldKey, newKey []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(bakPath+".tmp", sealed, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(bakPath+".tmp", bakPath)
+	return replaceFileSynced(bakPath, sealed)
 }
 
 // holdStoreKey moves the store key this start resolved into memory kept

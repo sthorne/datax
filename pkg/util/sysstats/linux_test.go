@@ -56,7 +56,11 @@ func TestLinuxHostFigures(t *testing.T) {
 		return 1 << 40, 1 << 39, dev, true
 	}
 	r := &linuxReader{procRoot: fixtureProc(t, "stat", "dev"), diskstats: "testdata/diskstats", statfs: fakeStatfs}
-	s := &Sampler{dir: "/store", start: time.Now(), host: r}
+	// A fixed clock: the rates below divide by the elapsed time, so the
+	// real time between the two samples (long on a loaded machine) must
+	// not leak into them.
+	clock := time.Now()
+	s := &Sampler{dir: "/store", start: clock, host: r, now: func() time.Time { return clock }}
 	first := s.Sample()
 	if first.Load1 != 0.5 || first.Load5 != 0.25 || first.Load15 != 0.1 {
 		t.Fatalf("load: %+v", first)
@@ -81,9 +85,7 @@ func TestLinuxHostFigures(t *testing.T) {
 	// Advance the counters and pretend one second passed.
 	r.procRoot = fixtureProc(t, "stat2", "dev2")
 	r.diskstats = "testdata/diskstats2"
-	s.mu.Lock()
-	s.prev.at = s.prev.at.Add(-time.Second)
-	s.mu.Unlock()
+	clock = clock.Add(time.Second)
 	second := s.Sample()
 
 	// CPU: busy went from 1550 to 2350 jiffies (+800) of a total that went

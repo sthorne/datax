@@ -39,6 +39,9 @@ func (n *Node) serveDecommission(ctx context.Context, req cluster.AdminRequest) 
 			Locality:          n.cfg.Locality,
 			LivenessTime:      n.clock.Now().WallTime,
 			Draining:          n.draining.Load(),
+			// Keep the binary version the heartbeat publishes: finalize
+			// reads a row without one as a v1 binary.
+			BinaryVersion: int(n.binaryVersion()),
 		}
 		raw, _ := json.Marshal(nd)
 		if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {

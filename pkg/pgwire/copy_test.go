@@ -3,8 +3,11 @@ package pgwire
 import (
 	"bufio"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 func TestDecodeTextField(t *testing.T) {
@@ -127,5 +130,36 @@ func TestCopyOptionsDecode(t *testing.T) {
 		if got := strings.Join(splitTextLine(c.line, c.delim), " / "); got != c.want {
 			t.Errorf("splitTextLine(%q, %q) = %q, want %q", c.line, c.delim, got, c.want)
 		}
+	}
+}
+
+// TestReadCopyFieldSizesByData: a binary COPY field's buffer grows with
+// the bytes that arrive, not with the length the field declares; a
+// 4-byte length of 2 GiB followed by nothing used to allocate 2 GiB.
+func TestReadCopyFieldSizesByData(t *testing.T) {
+	data := strings.Repeat("x", 3*copyFieldChunk)
+	for _, n := range []int{0, 5, copyFieldChunk, copyFieldChunk + 1, len(data)} {
+		got, err := readCopyField(strings.NewReader(data), n)
+		if err != nil || string(got) != data[:n] {
+			t.Fatalf("readCopyField(%d) = %d bytes, %v", n, len(got), err)
+		}
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := readCopyField(strings.NewReader("short"), 1<<31-1); err == nil {
+		t.Fatal("a field longer than its data was read")
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 64<<20 {
+		t.Fatalf("a 2 GiB declared field with 5 bytes of data allocated %d bytes", got)
+	}
+}
+
+// TestDecodeBinaryArrayCount: the decoder serves Bind and binary COPY
+// alike; an element count the value's bytes cannot hold is 22P03.
+func TestDecodeBinaryArrayCount(t *testing.T) {
+	_, err := decodeBinaryParam(binaryArray(oidInt8, 0xF0000000, nil), types.ArrayOf(types.Int))
+	if got := binaryErrCode(err, ""); got != "22P03" {
+		t.Fatalf("a 20-byte array declaring 0xF0000000 elements: %v (code %q)", err, got)
 	}
 }

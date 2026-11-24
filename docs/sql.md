@@ -108,13 +108,20 @@ SHOW STATS FOR t
 - DECIMAL is exact arbitrary-precision arithmetic (`math/big` coefficient
   × 10^exp). Non-integer numeric literals are DECIMAL, as in PostgreSQL —
   `0.1` survives to a DECIMAL column unrounded, and `SUM`/`AVG` over
-  DECIMAL stay exact where float64 breaks (`AVG` quantizes to 6 fractional
-  digits, round-half-even). Int operands mix exactly; a FLOAT8 operand
+  DECIMAL stay exact where float64 breaks. Division and `AVG` (sum ÷
+  count) take PostgreSQL's `select_div_scale` result scale — at least 16
+  significant digits (the quotient's weight estimated in base-10000
+  digits, as numeric.c does), at least either operand's display scale,
+  within [0, 1000] — rounded half away from zero, and the datum carries
+  that scale as its display-only `Dscale`, so the text shows PostgreSQL's
+  trailing zeros (`1::numeric / 3` → `0.33333333333333333333`). Int
+  operands mix exactly; a FLOAT8 operand
   demotes the expression to float. Float→Decimal coercion is rejected —
   cast through text if you really mean it.
 - `DECIMAL(p,s)` is enforced at the two row-completion choke points every
   write funnels through (insert-row build — INSERT, COPY, defaults — and
-  the UPDATE SET loop): values quantize to scale `s` round-half-even,
+  the UPDATE SET loop): values round to scale `s` with halves away from zero (PostgreSQL's
+  rule, and the `::numeric(p,s)` cast's),
   then overflow past `p−s` integer digits is SQLSTATE `22003` (checked
   after rounding, so `9.999` into `DECIMAL(3,2)` rounds to `10.00` and
   then overflows — PostgreSQL order). Quantization happens before key
@@ -2098,7 +2105,15 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   stalled; and past `--sql-max-pending-auth` (512) connections still in
   startup, a new one is refused at accept with a FATAL `53300` before
   anything is allocated for it (a client mid-`SSLRequest` sees that as
-  a failed TLS negotiation).
+  a failed TLS negotiation). A client message is capped at 10000
+  bytes until the client has authenticated (the SASL messages are a few
+  hundred) and at 256 MiB after (`--sql-max-message-size`, 1 MiB to
+  1 GiB; `pgwire.ServerOptions.MaxMessageSize`;
+  PostgreSQL's cap is 1 GB, and a datax value is bounded well below
+  either by the 60 MiB a replicated write carries). A longer message
+  ends the connection with a FATAL `08P01` before its body is
+  allocated. The cap is per message: COPY data streams in CopyData
+  messages of any number.
   `CREATE USER / ALTER USER ... PASSWORD / DROP USER` manage credentials;
   `--root-password` seeds root's at startup. Authorization: `root` is
   all-powerful; members of the **admin role** (`GRANT ADMIN TO user`,
@@ -2167,15 +2182,42 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   `IntervalStyle`, `is_superuser`, `server_encoding`,
   `session_authorization`, `standard_conforming_strings`, `TimeZone`,
   with the session's values); then `BackendKeyData` and `ReadyForQuery`.
-- **Simple query** (`Q`): multi-statement strings split on `;`, each executed;
-  results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
+- **Simple query** (`Q`): multi-statement strings split on `;`, each executed
+  in turn, up to the first error. Outside a transaction block a string of
+  several statements is one implicit transaction, PostgreSQL's
+  (`Session.BeginImplicit` before each statement, `EndImplicit` at the
+  end of the message): committed after the last statement, rolled back
+  on an error. It is a block like `BEGIN`'s, flagged implicit: `BEGIN`
+  inside it clears the flag (the block, earlier statements included,
+  becomes explicit and outlives the message), `COMMIT` / `ROLLBACK` end
+  it and the next statement opens another, savepoints are refused, and
+  so are the statements PostgreSQL refuses in a block
+  (`refusedInBlock`: `25001`). datax's online statements
+  (`onlineOutsideBlock`: CREATE INDEX on a table the block did not
+  create, the online ALTER TABLE actions, CREATE TABLE AS, ANALYZE, AS
+  OF SYSTEM TIME, key statements) are refused only in an explicit
+  block: in an implicit one, `Session.Execute` commits the block so far
+  and runs the statement alone, and the next statement opens a new
+  block. A
+  string of one statement keeps the single-statement path, with its
+  automatic retry (`runImplicit`). Results as `RowDescription` → `DataRow`* → `CommandComplete`, values in text
   format encoded via `pgtype` (OIDs: int8=20, float8=701, text=25, bool=16).
 - **Extended protocol**: minimal but real, because pgx's default mode prepares
   statements: `Parse` / `Bind` / `Describe` / `Execute` / `Sync` / `Close`.
   Parameters and results in both text and binary formats for every column
   type (int8, float8, bool, text, timestamptz, date, bytea, uuid,
   numeric as PostgreSQL's base-10000 digit groups, jsonb with the
-  version-1 byte). Portal suspension is supported: a row-limited Execute
+  version-1 byte). Outside a block, everything from an Execute to the
+  next Sync is one implicit transaction, committed at the Sync (or at
+  the end of a simple Query that arrives first) and rolled back if a
+  message fails. Before running an Execute outside a block the server
+  reads the next message (`conn.readAhead`): a Sync means the Execute
+  is alone in its pipeline and runs as a single statement, auto-retry
+  included; anything else opens the implicit transaction. A statement
+  that runs only outside a block (`Session.RunsAlone`) never opens it:
+  as the first Execute of a pipeline it runs alone, as in PostgreSQL. A pipeline
+  that ends without a Sync (the connection closes) is rolled back, as in
+  PostgreSQL. Portal suspension is supported: a row-limited Execute
   returns up to that many rows and `PortalSuspended`; re-Execute resumes,
   and portals live to the end of the transaction (destroyed by Sync
   outside one) — JDBC fetch-size loops work. The statement runs once at

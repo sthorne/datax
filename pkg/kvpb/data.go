@@ -112,6 +112,24 @@ type NodeDescriptor struct {
 	// heartbeat lands) conservatively reads as version 1.
 	BinaryVersion int `json:"binary_version,omitempty"`
 
+	// FailedReplicas and MissingReplicas are the ranges for which this
+	// live node holds no serving replica although their descriptors name
+	// it, re-asserted on every heartbeat so the health check does not
+	// count them as live. Failed: the replica's group was stopped by a
+	// failure (a raft engine write error, a failed apply) and serves
+	// nothing until the node restarts. Missing: no replica is loaded at
+	// all (lost before it reached disk, say), reported once that has
+	// lasted past a grace period. Additive JSON, so no version gate: an
+	// older reader ignores them, and rows from older binaries carry none.
+	// Each list is capped (the lowest range IDs first) so that a node
+	// with thousands of unavailable replicas does not bloat its registry
+	// row; FailedReplicaCount and MissingReplicaCount carry the exact
+	// totals (0 from a binary that predates the cap: use the list length).
+	FailedReplicas      []base.RangeID `json:"failed_replicas,omitempty"`
+	MissingReplicas     []base.RangeID `json:"missing_replicas,omitempty"`
+	FailedReplicaCount  int            `json:"failed_replica_count,omitempty"`
+	MissingReplicaCount int            `json:"missing_replica_count,omitempty"`
+
 	// Load aggregates, refreshed on every heartbeat so the allocator (the
 	// range-1 leader) can weigh load it cannot observe locally. QPS is
 	// leader-local and resets on leadership changes, so these are

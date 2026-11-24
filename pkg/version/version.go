@@ -430,9 +430,32 @@ const (
 	// batch; a replica evaluates a conditional put it is sent whatever
 	// cluster version it has heard of.
 	V24 Version = 24
+	// V25 makes status recovery of a parallel commit check that the
+	// staged record it finalizes is the one it verified: the
+	// kvpb.RecoverTxnRequest fields staged_ts, staged_epoch and
+	// staged_sequence. A replica given them finalizes the record only if
+	// it is still staged at exactly that timestamp, epoch and sequence,
+	// and otherwise leaves it as is. A v24 replica drops the fields and
+	// would finalize it, so the replicas of the record's range would
+	// diverge: a recoverer sets them only once the cluster has finalized
+	// v25 (rule 4). Below v25 recovery finalizes as before. (The probe
+	// itself, which counts only intents at the staged epoch and
+	// sequence, is the recoverer's own decision and needs no gate.)
+	V25 Version = 25
+	// V26 introduces the console's session secret (keys.SessionSecretKey)
+	// and the root-only rotate-session-secret admin op that writes it,
+	// revoking every outstanding console session. A node at v26 signs
+	// and verifies session tokens under that secret once it exists, and
+	// re-reads it at least every server.sessionSecretTTL; a v25 node
+	// never reads it and caches the key it derives from the
+	// authentication secret for its whole life, so it would go on
+	// accepting the revoked tokens. The op is therefore refused until
+	// finalize (rule 4). Until a rotation writes the key, a v26 node
+	// signs exactly as a v25 one does: the token format is unchanged.
+	V26 Version = 26
 
 	// Current is the newest cluster version this binary can run.
-	Current = V24
+	Current = V26
 	// MinSupported is the oldest cluster version this binary can join.
 	// The support window is adjacent versions only: operators upgrade
 	// one major version at a time.

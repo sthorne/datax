@@ -38,7 +38,7 @@ func TestMetadataBackupRotationWritesLast(t *testing.T) {
 	wg.Add(1)
 	go func() { // the heartbeat's export, under key1
 		defer wg.Done()
-		n.writeMetadataBackup([]byte(`{"from":"heartbeat"}`))
+		n.writeMetadataBackup([]byte(`{"from":"heartbeat"}`), []byte("heartbeat"))
 	}()
 	<-parked
 
@@ -49,7 +49,7 @@ func TestMetadataBackupRotationWritesLast(t *testing.T) {
 	rotated := make(chan struct{})
 	go func() {
 		defer close(rotated)
-		n.writeMetadataBackup([]byte(`{"from":"rotation"}`))
+		n.writeMetadataBackup([]byte(`{"from":"rotation"}`), []byte("rotation"))
 	}()
 	// Give the rotation's export the chance to finish ahead of the parked
 	// one, which is what it did before the fix.
@@ -82,7 +82,7 @@ func TestMetadataBackupResealedWithoutExport(t *testing.T) {
 	key2 := bytes.Repeat([]byte{2}, 32)
 	dir := t.TempDir()
 	n := &Node{cfg: Config{Dir: dir}, encKey: key1}
-	n.writeMetadataBackup([]byte(`{"from":"heartbeat"}`))
+	n.writeMetadataBackup([]byte(`{"from":"heartbeat"}`), []byte("heartbeat"))
 
 	n.encKeyMu.Lock()
 	n.encKey = key2

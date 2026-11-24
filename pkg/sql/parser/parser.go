@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -6904,15 +6905,22 @@ func (p *parser) parseValueExpr() (Expr, error) {
 			}
 			e.Lit = &d
 		} else {
-			i, err := strconv.ParseInt(t.text, 10, 64)
-			if err != nil {
-				return e, p.errf("invalid number %q", t.text)
-			}
+			txt := t.text
 			if neg {
-				i = -i
+				txt = "-" + txt
 			}
-			d := types.NewInt(i)
-			e.Lit = &d
+			if i, err := strconv.ParseInt(txt, 10, 64); err == nil {
+				d := types.NewInt(i)
+				e.Lit = &d
+			} else {
+				// An integer literal beyond int8 is numeric, as in
+				// PostgreSQL.
+				d, derr := types.ParseDecimal(txt)
+				if !errors.Is(err, strconv.ErrRange) || derr != nil {
+					return e, p.errf("invalid number %q", t.text)
+				}
+				e.Lit = &d
+			}
 		}
 	case tkString:
 		p.i++
@@ -6952,7 +6960,44 @@ func (p *parser) parseValueExpr() (Expr, error) {
 	// type may be qualified (pg_catalog.regclass) and casts may chain.
 	// A regclass cast is kept: it resolves a table name (a literal) or
 	// renders one (an OID column).
-	return p.applyCasts(e)
+	lit := e.Lit
+	e, err := p.applyCasts(e)
+	if err != nil {
+		return e, err
+	}
+	if neg && litIsZero(lit) {
+		negZeroFloat(&e)
+	}
+	return e, nil
+}
+
+// litIsZero reports a numeric literal equal to zero.
+func litIsZero(d *types.Datum) bool {
+	switch d.Fam {
+	case types.Int:
+		return d.I == 0
+	case types.Decimal:
+		v, err := d.DecimalVal()
+		return err == nil && v.Sign() == 0
+	}
+	return false
+}
+
+// negZeroFloat keeps the sign of a negated zero cast to a float
+// (-0.0::float8 is -(0.0::float8), which is -0 in PostgreSQL); the
+// literal folded the minus into a number that has no negative zero.
+func negZeroFloat(e *Expr) {
+	for e.Left != nil {
+		e = e.Left
+	}
+	if e.Lit == nil || e.Cast == "" {
+		return
+	}
+	name := strings.TrimPrefix(strings.ToLower(e.Cast), "pg_catalog.")
+	if fam, err := types.ParseType(name); (err == nil && fam == types.Float) || name == "double precision" {
+		d := types.NewFloat(math.Copysign(0, -1))
+		e.Lit = &d
+	}
 }
 
 // parseCasts reads a chain of ::type casts.
