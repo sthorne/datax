@@ -457,7 +457,16 @@ Publication is made safe by the same machinery ordinary reads use: the
 leader takes a whole-range **shared latch** (draining in-flight writes,
 whose exclusive latches are held until they apply — invariant L1), bumps
 the timestamp-cache floor to T (every later write is forwarded above it),
-releases, and proposes. A split hands the parent's closed timestamp to the
+releases, and proposes. The latch is a barrier at T: it drains only the
+writes that could still land at or below T — a batch whose read
+timestamp is at or below T, an intent resolution committing at or below
+T, and any write whose lowest timestamp is not known (an aborting
+resolution, a savepoint rollback, GC) — and lets the rest pass in both
+directions: writes above T, since a write's timestamp only moves up, and
+transaction-record operations, which write no MVCC version. As T trails now by the lag, ordinary
+writes neither delay the promise nor wait for it; before, a range taking
+a steady stream of wide write batches always had one in flight, and its
+promise waited out its five-second deadline and was skipped. A split hands the parent's closed timestamp to the
 new right-hand range so nothing can write beneath reads the parent already
 served on that span.
 

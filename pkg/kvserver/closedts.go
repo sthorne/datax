@@ -31,10 +31,17 @@ import (
 //
 // Publication correctness on the leader (nothing may sneak beneath T):
 //
-//  1. Acquire a whole-range SHARED latch. Writes hold exclusive latches
-//     from their timestamp-cache check until they apply (invariant L1),
-//     so acquisition drains every in-flight write — their log entries
-//     precede the closed-ts command — while readers are undisturbed.
+//  1. Acquire a whole-range SHARED latch, a barrier at T
+//     (closedTSBarrier). Writes hold exclusive latches from their
+//     timestamp-cache check until they apply (invariant L1), so
+//     acquisition drains every in-flight write that could land at or
+//     below T — their log entries precede the closed-ts command — while
+//     readers are undisturbed. A write whose latch carries a write
+//     timestamp above T is not drained, and does not wait for the
+//     barrier: its timestamp only moves up, so it lands above T wherever
+//     its entry falls in the log. Without that, a range with a write in
+//     flight at every instant (wide batches from many clients) never
+//     drained, and its promise timed out round after round.
 //  2. Bump the timestamp-cache floor to T under the latch. Every write
 //     checked afterwards is forwarded above T (transactional writes get
 //     pushed, non-transactional ones bounced — the standard machinery).
@@ -197,7 +204,7 @@ func (r *Replica) registerClosedTimestamp(ctx context.Context, target hlc.Timest
 	}); err != nil || st.RaftState != raft.StateLeader {
 		return
 	}
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchShared)
+	guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{wholeRangeSpan}, latchShared, closedTSBarrier(target))
 	if gerr != nil {
 		return
 	}
@@ -299,7 +306,7 @@ func (r *Replica) publishClosedTimestampSide(ctx context.Context, target hlc.Tim
 	if !ok || st.RaftState != raft.StateLeader {
 		return nil
 	}
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchShared)
+	guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{wholeRangeSpan}, latchShared, closedTSBarrier(target))
 	if gerr != nil {
 		return gerr
 	}
@@ -356,7 +363,7 @@ func (r *Replica) acceptClosedTimestamp(hb RaftHeartbeat) bool {
 func (r *Replica) publishClosedTimestamp(ctx context.Context, target hlc.Timestamp) error {
 	// Step 1: drain in-flight writes (they hold exclusive latches until
 	// applied); readers share fine.
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchShared)
+	guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{wholeRangeSpan}, latchShared, closedTSBarrier(target))
 	if gerr != nil {
 		return gerr
 	}

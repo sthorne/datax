@@ -460,7 +460,7 @@ func (r *Replica) adminMerge(ctx context.Context, honorSticky bool) (*kvpb.Admin
 
 	// Phase 2: the replicated merge on the LHS, serialized against all LHS
 	// traffic like a split.
-	guard, gerr := r.latches.Acquire(ctx, []latchSpan{wholeRangeSpan}, latchExclusive)
+	guard, gerr := r.latches.AcquireOpts(ctx, []latchSpan{wholeRangeSpan}, latchExclusive, latchOpts{fair: true, op: "merge"})
 	if gerr != nil {
 		return abandon(kvpb.NewError(gerr))
 	}

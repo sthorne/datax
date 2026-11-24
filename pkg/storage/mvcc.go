@@ -755,6 +755,8 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 	var intents []Intent
 	var bytes int64
 	var curStart []byte // cur's metadata key, copied off the iterator per row
+	var keyBuf []byte   // cur, decoded into one buffer reused for every row
+	var rowBuf scanArena
 	skippedBefore := 0
 	if opts.SkipLocked != nil {
 		skippedBefore = len(*opts.SkipLocked)
@@ -762,11 +764,12 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 
 	ok := it.SeekLT(upper)
 	for ok {
-		userKey, vts, err := DecodeMVCCKey(it.Key())
+		userKey, vts, err := decodeMVCCKeyAppend(keyBuf[:0], it.Key())
 		if err != nil {
 			return ScanResult{}, err
 		}
-		cur := keys.Key(userKey) // DecodeMVCCKey allocated it: ours to keep
+		keyBuf = userKey
+		cur := keys.Key(userKey) // borrowed: keyBuf is rewritten by the next row
 		curStart = appendMetaKeyOf(curStart[:0], it.Key(), vts)
 		if !stepToKeyStart(it, curStart) {
 			break // unreachable: an engine key of cur was just observed
@@ -776,16 +779,24 @@ func MVCCReverseScan(r Reader, start, end keys.Key, ts hlc.Timestamp, max int64,
 			return ScanResult{}, err
 		}
 		if found && len(intents) == 0 {
-			value := append([]byte(nil), data...)
-			res.KVs = append(res.KVs, KeyValue{Key: cur, Value: value})
-			bytes += int64(len(cur) + len(value))
+			// Copied off keyBuf and the iterator into the scan's own
+			// chunks, as MVCCScan does.
+			kv := rowBuf.alloc(len(cur) + len(data))
+			n := copy(kv, cur)
+			copy(kv[n:], data)
+			row := KeyValue{Key: keys.Key(kv[:n:n])}
+			if len(data) > 0 {
+				row.Value = kv[n:]
+			}
+			res.KVs = append(res.KVs, row)
+			bytes += int64(len(cur) + len(data))
 			if max > 0 && int64(len(res.KVs)) == max || opts.TargetBytes > 0 && bytes >= opts.TargetBytes {
-				res.Resume = cur
+				res.Resume = append(make(keys.Key, 0, len(cur)), cur...) // non-nil even when empty
 				return res, nil
 			}
 		}
 		if opts.SkipLocked != nil && len(*opts.SkipLocked)-skippedBefore >= maxSkippedPerScan {
-			res.Resume = cur
+			res.Resume = append(make(keys.Key, 0, len(cur)), cur...) // non-nil even when empty
 			return res, nil
 		}
 		ok = stepBeforeKey(it, curStart)

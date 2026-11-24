@@ -341,3 +341,168 @@ func TestRestoredSchemasReachCachedSessions(t *testing.T) {
 	schemaWant(t, ctx, r, `SELECT current_schema()`, "root")
 	schemaWant(t, ctx, r, `SELECT v FROM t`, "restored")
 }
+
+// TestSchemaTableMissFollowsDDL: under a search path that names a schema
+// before public (app, public), an unqualified name of a public table is
+// first looked up in app, and the gateway's schema set answers that miss
+// from its cache. Every change that files a table under app's name —
+// CREATE TABLE and CREATE VIEW, ALTER TABLE ... RENAME TO, ALTER TABLE
+// ... SET SCHEMA, from a session on the other node or on the same one —
+// is seen by the next statement of every session — whether or not
+// another schema holds the name too — as are CREATE, DROP
+// and ALTER SCHEMA (RENAME, OWNER) and GRANT and REVOKE of USAGE on app;
+// a transaction resolves through its own change, and a change rolled
+// back leaves no trace. The same holds for "$user" naming a role that
+// has its own schema.
+func TestSchemaTableMissFollowsDDL(t *testing.T) {
+	// A renewal every two seconds: a gateway that had not adopted a
+	// change by its drain would show the old answer for that long.
+	tc := StartWithOptions(t, 2, func(cfg *server.Config) { cfg.DescLeaseTTL = 6 * time.Second })
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
+	root0 := pgConn(t, ctx, tc, 0)
+	for _, stmt := range []string{
+		`CREATE USER tm_dan`,
+		`CREATE TABLE t (v TEXT)`, `INSERT INTO t VALUES ('public')`,
+		`GRANT SELECT ON t TO tm_dan`,
+	} {
+		mustExec(t, ctx, root0, stmt)
+	}
+	root1 := pgConn(t, ctx, tc, 1)
+	other0 := pgConn(t, ctx, tc, 0)
+	dan1 := userConnOn(t, ctx, tc, 1, "tm_dan")
+	sessions := []*pgx.Conn{root0, root1, other0}
+	for _, c := range append(sessions, dan1) {
+		mustExec(t, ctx, c, `SET search_path = app, public`)
+	}
+	// want: every root session reads s from t.
+	want := func(s string) {
+		t.Helper()
+		for _, c := range sessions {
+			schemaWant(t, ctx, c, `SELECT v FROM t`, s)
+		}
+	}
+	want("public") // app does not exist yet
+
+	// CREATE SCHEMA on node 1: the path's schema now exists, holding no t.
+	mustExec(t, ctx, root1, `CREATE SCHEMA app`)
+	want("public")
+	schemaWant(t, ctx, other0, `SELECT current_schema()`, "app")
+
+	// CREATE TABLE on node 0: every session finds app.t at once.
+	mustExec(t, ctx, root0, `CREATE TABLE app.t (v TEXT)`)
+	mustExec(t, ctx, root0, `INSERT INTO app.t VALUES ('app')`)
+	want("app")
+	mustExec(t, ctx, root1, `DROP TABLE app.t`)
+	want("public")
+
+	// CREATE VIEW, from the other session on node 0.
+	mustExec(t, ctx, other0, `CREATE VIEW app.t AS SELECT 'view' AS v`)
+	want("view")
+	mustExec(t, ctx, root1, `DROP VIEW app.t`)
+	want("public")
+
+	// ALTER TABLE ... RENAME TO into the name, on node 1.
+	mustExec(t, ctx, root1, `CREATE TABLE app.t2 (v TEXT)`)
+	mustExec(t, ctx, root1, `INSERT INTO app.t2 VALUES ('renamed')`)
+	want("public")
+	mustExec(t, ctx, root1, `ALTER TABLE app.t2 RENAME TO t`)
+	want("renamed")
+	mustExec(t, ctx, root0, `DROP TABLE app.t`)
+	want("public")
+
+	// ALTER TABLE ... SET SCHEMA into app, on node 0.
+	mustExec(t, ctx, root0, `CREATE SCHEMA other`)
+	mustExec(t, ctx, root0, `CREATE TABLE other.t (v TEXT)`)
+	mustExec(t, ctx, root0, `INSERT INTO other.t VALUES ('moved')`)
+	want("public")
+	mustExec(t, ctx, root0, `ALTER TABLE other.t SET SCHEMA app`)
+	want("moved")
+
+	// A name only app holds: no drain, and every session finds it, its
+	// lookup reading what the set may not hold yet. Then public files the
+	// name too, and app's table still comes first everywhere; renamed in
+	// app to a name public holds, and back.
+	mustExec(t, ctx, root0, `CREATE TABLE app.u (v TEXT)`)
+	mustExec(t, ctx, root0, `INSERT INTO app.u VALUES ('app u')`)
+	for _, c := range sessions {
+		schemaWant(t, ctx, c, `SELECT v FROM u`, "app u")
+	}
+	mustExec(t, ctx, root1, `CREATE TABLE public.u (v TEXT)`)
+	mustExec(t, ctx, root1, `INSERT INTO public.u VALUES ('public u')`)
+	for _, c := range sessions {
+		schemaWant(t, ctx, c, `SELECT v FROM u`, "app u")
+	}
+	mustExec(t, ctx, root0, `CREATE TABLE app.w (v TEXT)`)
+	mustExec(t, ctx, root0, `INSERT INTO app.w VALUES ('app w')`)
+	mustExec(t, ctx, root1, `ALTER TABLE app.u RENAME TO u_old`)
+	for _, c := range sessions {
+		schemaWant(t, ctx, c, `SELECT v FROM u`, "public u")
+	}
+	mustExec(t, ctx, root1, `ALTER TABLE app.w RENAME TO u`)
+	for _, c := range sessions {
+		schemaWant(t, ctx, c, `SELECT v FROM u`, "app w")
+	}
+
+	// ALTER SCHEMA RENAME away and back, on node 1.
+	mustExec(t, ctx, root1, `ALTER SCHEMA app RENAME TO app_away`)
+	want("public")
+	mustExec(t, ctx, root1, `ALTER SCHEMA app_away RENAME TO app`)
+	want("moved")
+
+	// Privileges: without USAGE on app, tm_dan's path skips it; a grant,
+	// a revoke and an ownership change on node 0 each reach node 1.
+	mustExec(t, ctx, root0, `GRANT SELECT ON app.t TO tm_dan`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "public")
+	mustExec(t, ctx, root0, `GRANT USAGE ON SCHEMA app TO tm_dan`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "moved")
+	mustExec(t, ctx, root0, `REVOKE USAGE ON SCHEMA app FROM tm_dan`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "public")
+	mustExec(t, ctx, root0, `ALTER SCHEMA app OWNER TO tm_dan`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "moved")
+	mustExec(t, ctx, root0, `ALTER SCHEMA app OWNER TO root`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "public")
+
+	// DROP SCHEMA on node 0.
+	mustExec(t, ctx, root0, `DROP SCHEMA app CASCADE`)
+	want("public")
+	mustExec(t, ctx, root0, `CREATE SCHEMA app`)
+	want("public")
+
+	// Created in a transaction on node 1: it resolves through its own
+	// table; the others once it commits.
+	mustExec(t, ctx, root1, `BEGIN`)
+	mustExec(t, ctx, root1, `CREATE TABLE app.t (v TEXT)`)
+	mustExec(t, ctx, root1, `INSERT INTO app.t VALUES ('in txn')`)
+	schemaWant(t, ctx, root1, `SELECT v FROM t`, "in txn")
+	schemaWant(t, ctx, root0, `SELECT v FROM t`, "public") // not committed
+	mustExec(t, ctx, root1, `COMMIT`)
+	want("in txn")
+	mustExec(t, ctx, root1, `DROP TABLE app.t`)
+	want("public")
+
+	// Created in a transaction that rolls back, and behind a savepoint
+	// rolled back to: no trace.
+	mustExec(t, ctx, root0, `BEGIN`)
+	mustExec(t, ctx, root0, `CREATE TABLE app.t (v TEXT)`)
+	schemaWant(t, ctx, root0, `SELECT count(*)::TEXT FROM t`, "0")
+	mustExec(t, ctx, root0, `ROLLBACK`)
+	want("public")
+	mustExec(t, ctx, root1, `BEGIN`)
+	mustExec(t, ctx, root1, `SAVEPOINT sp`)
+	mustExec(t, ctx, root1, `CREATE TABLE app.t (v TEXT)`)
+	mustExec(t, ctx, root1, `ROLLBACK TO SAVEPOINT sp`)
+	schemaWant(t, ctx, root1, `SELECT v FROM t`, "public")
+	mustExec(t, ctx, root1, `COMMIT`)
+	want("public")
+
+	// "$user": tm_dan's own schema, on the default path, holds no t until
+	// a table is created there from the other node.
+	mustExec(t, ctx, root0, `CREATE SCHEMA tm_dan AUTHORIZATION tm_dan`)
+	mustExec(t, ctx, dan1, `RESET search_path`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "public")
+	dan0 := userConnOn(t, ctx, tc, 0, "tm_dan")
+	mustExec(t, ctx, dan0, `CREATE TABLE tm_dan.t (v TEXT)`)
+	mustExec(t, ctx, dan0, `INSERT INTO t VALUES ('dan''s')`)
+	schemaWant(t, ctx, dan1, `SELECT v FROM t`, "dan's")
+}

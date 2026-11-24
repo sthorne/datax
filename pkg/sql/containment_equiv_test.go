@@ -404,8 +404,10 @@ func BenchmarkJSONBContainsScanRow(b *testing.B) {
 		b.Run(c.name+"/after", func(b *testing.B) {
 			b.ReportAllocs()
 			it := &scanIter{desc: desc, where: where}
+			row := map[catalog.ColumnID]types.Datum{}
 			for i := 0; i < b.N; i++ {
-				row, err := decodeRowInto(ctx, nil, desc, key, val, nil, it.spare)
+				clear(row)
+				row, err := decodeRowInto(ctx, nil, desc, key, val, nil, row)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -413,8 +415,6 @@ func BenchmarkJSONBContainsScanRow(b *testing.B) {
 				if err != nil || ok != want {
 					b.Fatal("wrong answer")
 				}
-				it.keep(fetchedRow{key: key, row: row}, ok)
-				it.buf = it.buf[:0]
 			}
 		})
 	}

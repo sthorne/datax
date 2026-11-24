@@ -184,7 +184,18 @@ table, so once `CREATE`, `DROP` or `ALTER SCHEMA`, or a `GRANT` / `REVOKE`
 on a schema, returns, every gateway resolves through the new set
 (`pkg/sql/catalog/schemacache.go`). The `"$user"` lookup of the default
 path, nearly always a miss, is answered from memory, as is a schema named
-on the path or in a qualified name. A historical transaction, and one
+on the path or in a qualified name. The set also lists the name entries
+of the tables and views filed in those schemas, so a table of public
+behind another schema of the path (`SET search_path = app, public`, or a
+role with a schema of its own name) is not first looked up in that
+schema with a read: a lookup that finds the name nowhere reads the
+entries the set answered for before it reports the table missing, so
+the set need only be current for a name that two schemas hold. A
+`CREATE` or `ALTER ... RENAME TO` that files a table or view under a
+name another schema of the database holds too, and every `ALTER ... SET
+SCHEMA` of a table, change the schema generation and drain like a schema
+change; a table created under a name of its own does not wait for a
+drain. A historical transaction, and one
 that has itself changed the database's schemas, read the schema names in
 the transaction instead; so does the resolution of where an object is
 created (`ResolveTarget`), so that a concurrent `DROP SCHEMA` conflicts

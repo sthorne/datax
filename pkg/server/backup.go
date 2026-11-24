@@ -1441,11 +1441,6 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 				}
 			}
 		}
-		for _, dbID := range schemaDBs {
-			if err := catalog.BumpSchemaGen(ctx, txn, dbID); err != nil {
-				return err
-			}
-		}
 		for _, kv := range final.Sequences {
 			wb.Put(keys.Key(kv.Key), kv.Value)
 			if id, ok := catalog.SequenceIDOfKey(keys.Key(kv.Key)); ok && id > maxID {
@@ -1479,11 +1474,20 @@ func (n *Node) RunRestoreOpts(ctx context.Context, opts RestoreOptions) (_ *clus
 				// Under its schema's entry when it has one (the name itself
 				// in public).
 				wb.Put(keys.TableNamespaceKey(d.DatabaseID, catalog.SchemaNamespaceName(d.SchemaID, t.Name)), []byte(fmt.Sprintf("%d", t.ID)))
+				if d.SchemaID != 0 && !slices.Contains(schemaDBs, d.DatabaseID) {
+					// The schema sets cache the tables filed in schemas.
+					schemaDBs = append(schemaDBs, d.DatabaseID)
+				}
 			} else {
 				wb.Put(keys.NamespaceKey(t.Name), []byte(fmt.Sprintf("%d", t.ID)))
 			}
 			if t.ID > maxID && !catalog.IsSystemTableID(t.ID) {
 				maxID = t.ID
+			}
+		}
+		for _, dbID := range schemaDBs {
+			if err := catalog.BumpSchemaGen(ctx, txn, dbID); err != nil {
+				return err
 			}
 		}
 		for _, kv := range final.Users {

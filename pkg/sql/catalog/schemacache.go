@@ -21,6 +21,21 @@ import (
 // database's whole schema set — every schema's name and descriptor,
 // read in one transaction — and holds a lease on it, as it does on a
 // table descriptor (lease.go), so a miss is answered from memory too.
+// The set also holds the name entries of the tables filed in those
+// schemas: under a path such as (app, public), or "$user" naming a role
+// that has its own schema, every unqualified name of a public table is
+// first looked up in the schema before it, and that miss too is answered
+// from the set rather than read (schemaSet.tableAbsent). Such an answer
+// is trusted only when a schema later on the path then holds the name:
+// a lookup that finds the name nowhere reads the entries it skipped
+// before it reports the table missing. So the set needs to be current
+// only for a name that two schemas hold — that one shadows the other —
+// and a transaction that files a table or view under a name that
+// another schema of its database holds too (CREATE, ALTER ... RENAME
+// TO; bumpSchemaGenIfShared), or moves one between schemas (ALTER ...
+// SET SCHEMA), changes the schema generation like a schema change, and
+// drains. A table created under a name of its own, the common case,
+// does not wait for the drain.
 //
 // The set is versioned by the database's schema generation
 // (keys.SchemaGenKey), which every transaction that changes the
@@ -28,8 +43,9 @@ import (
 // OWNER), GRANT and REVOKE on a schema (USAGE decides whether a schema
 // of the path is searched: Resolution.CanUse is asked of the cached
 // descriptor), DROP OWNED and REASSIGN OWNED through them, DROP DATABASE
-// of a database with schemas, and a restore that writes schemas. The
-// rules are the table leases' own:
+// of a database with schemas, a restore that writes schemas or tables
+// in them, and the table changes above. The rules are the table leases'
+// own:
 //
 //   - The set and this gateway's lease record (keys.SchemaLeaseKey: the
 //     generation and an expiration) are read and written in ONE
@@ -79,11 +95,54 @@ import (
 // the leases on the tables themselves.
 
 // schemaSet is one database's schemas other than public, by name, at a
-// schema generation. Immutable once built: lookups share it, so the
-// descriptors in it must not be modified.
+// schema generation, with the name entries of the tables filed in them.
+// Immutable once built: lookups share it, so the descriptors in it must
+// not be modified.
 type schemaSet struct {
 	gen    uint64
 	byName map[string]*SchemaDescriptor
+	// tables holds the name entries (SchemaNamespaceName) of every table
+	// and view in the schemas of byName, so that resolving a name through
+	// a schema of the path that has no such table — a table of public
+	// behind it — is answered without a read; nil when the database has
+	// too many to cache, and a miss is then read in the transaction.
+	tables map[string]struct{}
+}
+
+// tableAbsent reports whether the set answers that schema schemaID
+// (not public) holds no table under name entry entry.
+func (s *schemaSet) tableAbsent(schemaID uint64, entry string) bool {
+	if s == nil || s.tables == nil || schemaID == 0 {
+		return false
+	}
+	_, ok := s.tables[entry]
+	return !ok
+}
+
+// maxCachedSchemaTables bounds the table name entries a schema set
+// caches: a database with more tables outside public than this caches
+// none, and a table lookup that misses in a schema reads the catalog.
+const maxCachedSchemaTables = 10000
+
+// listSchemaTableEntries reads the name entries of the tables of
+// database dbID filed in a schema other than public, or nil when there
+// are more than maxCachedSchemaTables.
+func listSchemaTableEntries(ctx context.Context, txn *kvclient.Txn, dbID uint64) (map[string]struct{}, error) {
+	lo, hi := keys.TableNamespacePrefixSpan(dbID, schemaMarker)
+	rows, err := txn.Scan(ctx, lo, hi, maxCachedSchemaTables+1)
+	if err != nil || len(rows) > maxCachedSchemaTables {
+		return nil, err
+	}
+	base, _ := keys.TableNamespaceSpan(dbID)
+	out := make(map[string]struct{}, len(rows))
+	for _, kv := range rows {
+		_, entry, err := encoding.DecodeString(kv.Key[len(base):])
+		if err != nil {
+			return nil, nil // not answerable: misses are read in the transaction
+		}
+		out[entry] = struct{}{}
+	}
+	return out, nil
 }
 
 // cachedSchemaSet is a leased schema set: it may be used until
@@ -114,6 +173,50 @@ func bumpSchemaGen(ctx context.Context, txn *kvclient.Txn, dbID uint64) error {
 		return err
 	}
 	return txn.Put(ctx, keys.SchemaGenKey(dbID), []byte(strconv.FormatUint(gen+1, 10)))
+}
+
+// bumpSchemaGenIfShared bumps database dbID's schema generation, in the
+// transaction that files a table or view under name in schema schemaID
+// (0: public), when a table or view of the same name is filed in another
+// schema of the database (schemacache.go: the schema sets must then
+// hold both). It reads those name entries in txn, so a transaction
+// filing the other one concurrently conflicts with this one.
+func bumpSchemaGenIfShared(ctx context.Context, txn *kvclient.Txn, dbID, schemaID uint64, name string, isDefault bool) error {
+	if dbID == 0 {
+		return nil // before the migration: no schemas
+	}
+	lo, hi := keys.SchemaNamespaceSpan(dbID)
+	rows, err := txn.Scan(ctx, lo, hi, 0)
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	ks := make([]keys.Key, 0, len(rows)+2)
+	if schemaID != 0 {
+		ks = append(ks, keys.TableNamespaceKey(dbID, name))
+		if isDefault {
+			ks = append(ks, keys.NamespaceKey(name))
+		}
+	}
+	for _, kv := range rows {
+		id, err := strconv.ParseUint(string(kv.Value), 10, 64)
+		if err != nil || id == schemaID {
+			continue
+		}
+		ks = append(ks, keys.TableNamespaceKey(dbID, SchemaNamespaceName(id, name)))
+	}
+	if len(ks) == 0 {
+		return nil
+	}
+	vals, err := txn.GetBatch(ctx, ks)
+	if err != nil {
+		return err
+	}
+	for _, v := range vals {
+		if v != nil {
+			return bumpSchemaGen(ctx, txn, dbID)
+		}
+	}
+	return nil
 }
 
 // BumpSchemaGen is bumpSchemaGen for a writer of schema keys outside
@@ -213,6 +316,13 @@ func (a *Accessor) acquireSchemaLease(ctx context.Context, dbID uint64, wait, us
 		for _, sd := range schemas {
 			byName[sd.Name] = sd
 		}
+		// No table can be filed under a schema when there is none.
+		tables := map[string]struct{}{}
+		if len(schemas) > 0 {
+			if tables, err = listSchemaTableEntries(ctx, txn, dbID); err != nil {
+				return err
+			}
+		}
 		e := a.clock.Now().WallTime + a.ttl.Nanoseconds()
 		raw, err := json.Marshal(descLease{Version: gen, Expiration: e})
 		if err != nil {
@@ -226,7 +336,7 @@ func (a *Accessor) acquireSchemaLease(ctx context.Context, dbID uint64, wait, us
 		if err := txn.RunBatch(ctx, &wb); err != nil {
 			return err
 		}
-		set, exp = &schemaSet{gen: gen, byName: byName}, e
+		set, exp = &schemaSet{gen: gen, byName: byName, tables: tables}, e
 		a.mu.Lock()
 		if a.schemaAdopting == nil {
 			a.schemaAdopting = make(map[uint64]uint64)
@@ -258,6 +368,16 @@ func (a *Accessor) acquireSchemaLease(ctx context.Context, dbID uint64, wait, us
 	}
 	a.schemaSets[dbID] = entry
 	return set, nil
+}
+
+// refreshSchemaSet re-leases database dbID's schema set at once, unless
+// a lease transaction on it is already running: a lookup found a table
+// the set said a schema did not hold, one created since under a name no
+// other schema holds, which does not change the generation (see above).
+func (a *Accessor) refreshSchemaSet(ctx context.Context, dbID uint64) {
+	if _, err := a.acquireSchemaLease(ctx, dbID, false, true); err != nil {
+		log.Debugf("re-leasing the schemas of database %d: %v", dbID, err)
+	}
 }
 
 // renewSchemaSets gives up the leases of the schema sets no statement

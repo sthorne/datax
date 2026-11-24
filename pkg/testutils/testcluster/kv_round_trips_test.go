@@ -66,6 +66,9 @@ type roundTripShape struct {
 	// the regression is fixed.
 	knownExtra *knownExtra
 	extras     int
+	// searchPath, when set, is the session's search_path while the shape
+	// runs (reset after it).
+	searchPath string
 }
 
 // observedBatch is one batch the gateway routed: its methods and keys.
@@ -143,6 +146,9 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 		`CREATE TABLE rt (k INT8 PRIMARY KEY, v INT8, s TEXT)`,
 		`CREATE INDEX rt_s ON rt (s)`,
 		`INSERT INTO rt SELECT g, g, 's' || g::TEXT FROM generate_series(1, 100) AS g`,
+		`CREATE SCHEMA myschema`,
+		`CREATE TABLE myschema.ms (k INT8 PRIMARY KEY, v INT8)`,
+		`INSERT INTO myschema.ms SELECT g, g FROM generate_series(1, 100) AS g`,
 	} {
 		if _, err := ext.Exec(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -150,6 +156,7 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 	}
 
 	multiRow := int64(200000)
+	spKey := int64(300000) // fresh keys for the search_path INSERTs, over both protocols
 	one := func(f func(i int) []any) func(i int) [][]any {
 		return func(i int) [][]any { return [][]any{f(i)} }
 	}
@@ -216,6 +223,37 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 			// returns.
 			batches: 5, requests: 5,
 		},
+		// A schema other than public on the search path: resolving an
+		// unqualified name looks myschema up by name, whether the table is
+		// found there or (missing there) in public.
+		{
+			name:    "point SELECT, table in a search_path schema",
+			stmts:   []string{`SELECT v FROM ms WHERE k = $1`},
+			args:    one(func(i int) []any { return []any{int64(1 + i%50)} }),
+			batches: 1, requests: 1,
+			searchPath: "myschema, public",
+		},
+		{
+			name:    "point SELECT, table in public behind a search_path schema",
+			stmts:   []string{`SELECT v FROM rt WHERE k = $1`},
+			args:    one(func(i int) []any { return []any{int64(1 + i%50)} }),
+			batches: 1, requests: 1,
+			searchPath: "myschema, public",
+		},
+		{
+			name:    "point INSERT, table in a search_path schema",
+			stmts:   []string{`INSERT INTO ms VALUES ($1, 0)`},
+			args:    one(func(int) []any { spKey++; return []any{spKey} }),
+			batches: 1, requests: 2, onePhase: true,
+			searchPath: "myschema, public",
+		},
+		{
+			name:    "point INSERT, table in public behind a search_path schema",
+			stmts:   []string{`INSERT INTO rt VALUES ($1, 0, 'sp')`},
+			args:    one(func(int) []any { spKey++; return []any{spKey} }),
+			batches: 1, requests: 3, onePhase: true,
+			searchPath: "myschema, public",
+		},
 		{
 			name:    "SELECT 1", // no KV at all
 			stmts:   []string{`SELECT 1`},
@@ -255,6 +293,16 @@ func testKVRoundTrips(t *testing.T, nodes int) {
 							t.Fatalf("%s %v: %v", q, a, err)
 						}
 					}
+				}
+				if sh.searchPath != "" {
+					if _, err := proto.conn.Exec(ctx, "SET search_path = "+sh.searchPath); err != nil {
+						t.Fatal(err)
+					}
+					defer func() {
+						if _, err := proto.conn.Exec(ctx, "RESET search_path"); err != nil {
+							t.Error(err)
+						}
+					}()
 				}
 				i := 0
 				for ; i < warmup; i++ {

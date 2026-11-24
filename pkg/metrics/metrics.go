@@ -164,6 +164,11 @@ var (
 		Help:    "Time a request waited for a conflicting in-flight request's latch before it could proceed (requests that waited at all).",
 		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
 	})
+	RangeLatchWait = promauto.With(Registry).NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "datax_range_latch_wait_seconds",
+		Help:    "Time a range-wide operation (op: split, merge, clear_range, closed_ts) waited for in-flight requests' latches, by outcome: acquired, or abandoned when its deadline passed. These waits are background work, also counted in datax_latch_wait_seconds when acquired.",
+		Buckets: prometheus.ExponentialBuckets(0.00001, 4, 10), // 10µs .. ~2.6s
+	}, []string{"op", "outcome"})
 	RaftHeartbeatsCoalesced = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_heartbeats_coalesced_total", Help: "Raft heartbeats and responses carried inside coalesced per-node envelopes (cluster v12).",
 	})

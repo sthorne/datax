@@ -1298,7 +1298,12 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 	if err != nil {
 		return nil, err
 	}
+	skipped := false
 	for _, c := range cands {
+		if c.noTable {
+			skipped = true
+			continue
+		}
 		d, err := a.lookupEntry(ctx, txn, c.dbID, c.entry, c.isDefault)
 		if err == nil {
 			return d, nil
@@ -1306,6 +1311,26 @@ func (a *Accessor) LookupIn(ctx context.Context, txn *kvclient.Txn, db, name str
 		var nf *ErrTableNotFound
 		if !errors.As(err, &nf) {
 			return nil, err
+		}
+	}
+	if skipped {
+		// Found nowhere: the schema set's word that a schema holds no
+		// such table is not trusted for a name no other schema holds
+		// (schemacache.go), so the entries it answered for are read.
+		for _, c := range cands {
+			if !c.noTable {
+				continue
+			}
+			d, err := a.lookupEntry(ctx, txn, c.dbID, c.entry, c.isDefault)
+			if err == nil {
+				// The set is behind: the next statement need not read.
+				a.refreshSchemaSet(ctx, c.dbID)
+				return d, nil
+			}
+			var nf *ErrTableNotFound
+			if !errors.As(err, &nf) {
+				return nil, err
+			}
 		}
 	}
 	return nil, &ErrTableNotFound{Name: displayName(name)}
@@ -1708,6 +1733,13 @@ func (a *Accessor) Create(ctx context.Context, txn *kvclient.Txn, d *TableDescri
 	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, d.namespaceName()), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
 	}
+	if d.Temp == nil && !IsSystemTableID(d.ID) {
+		// A name another schema holds too: the schema sets must see both
+		// (schemacache.go).
+		if err := bumpSchemaGenIfShared(ctx, txn, d.DatabaseID, d.SchemaID, d.Name, a.isDefaultID(d.DatabaseID)); err != nil {
+			return err
+		}
+	}
 	a.Invalidate(d.Name)
 	return nil
 }
@@ -1823,6 +1855,12 @@ func (a *Accessor) RenameTable(ctx context.Context, txn *kvclient.Txn, d *TableD
 	}
 	if err := txn.Put(ctx, namespaceKey(d.DatabaseID, newEntry), []byte(strconv.FormatUint(d.ID, 10))); err != nil {
 		return err
+	}
+	if d.Temp == nil {
+		// As Create.
+		if err := bumpSchemaGenIfShared(ctx, txn, d.DatabaseID, d.SchemaID, newName, a.isDefaultID(d.DatabaseID)); err != nil {
+			return err
+		}
 	}
 	d.Name = newName
 	if err := a.Update(ctx, txn, d); err != nil {

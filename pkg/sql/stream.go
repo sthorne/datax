@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
@@ -302,12 +303,10 @@ type scanIter struct {
 	// memo keeps what the filter computes once per statement.
 	memo whereMemo
 	// need, when set, is the set of columns the filter and projection
-	// read: the only ones decoded.
-	need func(catalog.ColumnID) bool
-	// spare is the row map of the last row the filter rejected, cleared
-	// for the next row to decode into (a scan that is not plain; a plain
-	// one decodes every row into scratch or dense).
-	spare map[catalog.ColumnID]types.Datum
+	// read: the only ones decoded. With a filter, need2, when set, is
+	// the columns kept that the filter does not read: need is then the
+	// filter's alone, and need2 is decoded only for a row that matched.
+	need, need2 func(catalog.ColumnID) bool
 
 	spans   []keySpan // spans still to scan (per shard bucket when fanned)
 	cur     keySpan   // the span in progress
@@ -318,22 +317,35 @@ type scanIter struct {
 	fetchLimit int64
 	yielded    int64
 
-	buf  []fetchedRow
 	bpos int
-	// plain marks a select list of bare columns (no expression): a
-	// plain scan projects each row as soon as it is decoded and matched,
-	// into out (bpos then indexes out), so it decodes every row into one
-	// reused row instead of a map per row, and allocates the projected
-	// rows a chunk at a time. A select list with an expression keeps
-	// the map per row and projects lazily (an expression is evaluated
-	// only for the rows the client pulls).
-	plain bool
-	// scratch (when there is a filter, which reads a map) or dense is
-	// the row a plain scan decodes each row into.
+	// Every row is decoded into one reused row, scratch (when there is
+	// a filter, which reads a map) or dense, and, when it matches, the
+	// columns kept (keep) are copied out of it into out, a row of
+	// keep's length allocated a chunk at a time from slab; bpos indexes
+	// out.
+	//
+	// plain marks a select list of bare columns (no expression): keep
+	// is the select list's columns, and a row of out is the output row.
+	// A select list with an expression keeps the columns the select
+	// list reads and projects each row from them when the client pulls
+	// it (an expression is evaluated only for the rows pulled, as
+	// before), into a row of pslab.
+	plain   bool
+	keep    []catalog.ColumnID
 	scratch map[catalog.ColumnID]types.Datum
-	dense   *denseRow
-	out     [][]types.Datum
-	slab    []types.Datum
+	// borrowing, when set, decodes into scratch the TEXT columns only a
+	// text-search filter reads as views of the row value instead of
+	// copies (tsBorrowCols); clone marks the columns of keep that are
+	// borrowed, copied as a matching row is kept.
+	borrowing *borrowingRow
+	clone     []bool
+	dense     *denseRow
+	out       [][]types.Datum
+	slab      []types.Datum
+	pslab     []types.Datum
+	// env is the environment the select list's expressions are
+	// evaluated in, over the kept row being projected.
+	env keptEnv
 	// pageSize is the next page's row count (doubling to streamPageMax).
 	pageSize int64
 	// index marks an index scan: pages of entries whose primary rows are
@@ -344,17 +356,6 @@ type scanIter struct {
 // nextRow yields the next matching row, projected through the select
 // list.
 func (it *scanIter) nextRow(ctx context.Context) ([]types.Datum, bool, error) {
-	if !it.plain {
-		fr, ok, err := it.next(ctx)
-		if err != nil || !ok {
-			return nil, false, err
-		}
-		out, err := it.project(fr)
-		if err != nil {
-			return nil, false, err
-		}
-		return out, true, nil
-	}
 	for {
 		if it.fetchLimit > 0 && it.yielded >= it.fetchLimit {
 			return nil, false, nil
@@ -364,6 +365,13 @@ func (it *scanIter) nextRow(ctx context.Context) ([]types.Datum, bool, error) {
 			it.out[it.bpos] = nil
 			it.bpos++
 			it.yielded++
+			if !it.plain {
+				out, err := it.project(r)
+				if err != nil {
+					return nil, false, err
+				}
+				r = out
+			}
 			return r, true, nil
 		}
 		more, err := it.fill(ctx)
@@ -376,33 +384,10 @@ func (it *scanIter) nextRow(ctx context.Context) ([]types.Datum, bool, error) {
 	}
 }
 
-// next yields the next matching row (a scan that is not plain).
-func (it *scanIter) next(ctx context.Context) (fetchedRow, bool, error) {
-	for {
-		if it.fetchLimit > 0 && it.yielded >= it.fetchLimit {
-			return fetchedRow{}, false, nil
-		}
-		if it.bpos < len(it.buf) {
-			fr := it.buf[it.bpos]
-			it.buf[it.bpos] = fetchedRow{}
-			it.bpos++
-			it.yielded++
-			return fr, true, nil
-		}
-		more, err := it.fill(ctx)
-		if err != nil {
-			return fetchedRow{}, false, err
-		}
-		if !more {
-			return fetchedRow{}, false, nil
-		}
-	}
-}
-
 // fill fetches the next page into buf; false when every span is done.
 func (it *scanIter) fill(ctx context.Context) (bool, error) {
-	it.buf, it.out, it.bpos = it.buf[:0], it.out[:0], 0
-	for len(it.buf) == 0 && len(it.out) == 0 {
+	it.out, it.bpos = it.out[:0], 0
+	for len(it.out) == 0 {
 		if !it.active {
 			if len(it.spans) == 0 {
 				return false, nil
@@ -455,35 +440,10 @@ func (it *scanIter) fill(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// keep buffers a row the filter matched; a rejected row's map is
-// cleared and decoded into next (the filter holds on to nothing of it).
-func (it *scanIter) keep(fr fetchedRow, match bool) {
-	if match {
-		it.buf = append(it.buf, fr)
-		it.spare = nil
-		return
-	}
-	clear(fr.row)
-	it.spare = fr.row
-}
-
 // accept decodes one fetched row and, when it matches the filter,
-// buffers it: projected into out on a plain scan, as its map otherwise.
-// left is how many rows of the page remain, this one included (it
-// sizes the next chunk of projected rows).
+// copies the columns kept into out. left is how many rows of the page
+// remain, this one included (it sizes the next chunk of rows).
 func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left int) error {
-	if !it.plain {
-		row, err := decodeRowInto(ctx, it.s.rowSealer(), it.desc, key, raw, it.need, it.spare)
-		if err != nil {
-			return err
-		}
-		match, err := matchesWhereMemo(it.where, it.desc, row, it.params, &it.memo)
-		if err != nil {
-			return err
-		}
-		it.keep(fetchedRow{key: key, row: row}, match)
-		return nil
-	}
 	var row rowenc.RowSink
 	switch {
 	case it.dense != nil:
@@ -492,6 +452,9 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 	case it.scratch != nil:
 		clear(it.scratch)
 		row = rowenc.MapRow(it.scratch)
+		if it.borrowing != nil {
+			row = it.borrowing
+		}
 	default:
 		// No filter to evaluate (it reads a map): the row by column
 		// position, when the column IDs index one.
@@ -503,9 +466,17 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 		} else {
 			it.scratch = make(map[catalog.ColumnID]types.Datum, len(it.desc.Columns))
 			row = rowenc.MapRow(it.scratch)
+			if it.borrowing != nil {
+				it.borrowing.MapRow = it.scratch
+				row = it.borrowing
+			}
 		}
 	}
-	if err := decodeFullRowInto(ctx, it.s.rowSealer(), it.desc, key, raw, it.need, row); err != nil {
+	value, err := it.s.rowSealer().OpenValue(ctx, it.desc, key, raw)
+	if err != nil {
+		return err
+	}
+	if err := decodeOpenedRowInto(it.desc, key, value, it.need, row); err != nil {
 		return err
 	}
 	if it.scratch != nil {
@@ -513,26 +484,67 @@ func (it *scanIter) accept(ctx context.Context, key keys.Key, raw []byte, left i
 		if err != nil || !match {
 			return err
 		}
+		if it.need2 != nil {
+			if err := decodeOpenedColsInto(it.desc, value, it.need2, rowenc.MapRow(it.scratch)); err != nil {
+				return err
+			}
+		}
 	}
-	n := len(it.proj)
-	if len(it.slab) < n {
-		// A chunk of projected rows at a time: one allocation for many
-		// rows, never more than the page can still fill. Each row is
-		// capped at its own length, so an append to one never runs into
-		// the next.
-		it.slab = make([]types.Datum, n*min(left, plainChunkRows))
-	}
-	out := it.slab[:n:n]
-	it.slab = it.slab[n:]
-	for i := range it.proj {
-		d, ok := row.GetCol(it.proj[i].col.ID)
+	out := chunkRow(&it.slab, len(it.keep), left)
+	for i, id := range it.keep {
+		d, ok := row.GetCol(id)
 		if !ok {
 			d = types.DNull
+		}
+		if it.clone != nil && it.clone[i] && !d.Null {
+			// A borrowed view of the row value: the kept row gets its own.
+			d.S = strings.Clone(d.S)
 		}
 		out[i] = d
 	}
 	it.out = append(it.out, out)
 	return nil
+}
+
+// chunkRow carves a row of n datums off *slab, refilling it with a
+// chunk of rows at a time: one allocation for many rows, never more
+// than the page can still fill (left rows). Each row is capped at its
+// own length, so an append to one never runs into the next.
+func chunkRow(slab *[]types.Datum, n, left int) []types.Datum {
+	if len(*slab) < n {
+		*slab = make([]types.Datum, n*min(left, plainChunkRows))
+	}
+	out := (*slab)[:n:n]
+	*slab = (*slab)[n:]
+	return out
+}
+
+// keptEnv is the environment a scan evaluates its select list in: the
+// columns it kept of a row (ids, vals), read by name as tableEnv reads
+// a row map, a column not kept reading as NULL (as an absent one
+// does). The scan passes a pointer to its own, so evaluating boxes
+// nothing per row.
+type keptEnv struct {
+	desc *catalog.TableDescriptor
+	ids  []catalog.ColumnID
+	vals []types.Datum
+}
+
+func (e *keptEnv) col(name string) (types.Datum, error) {
+	col, ok := e.desc.Col(name)
+	if !ok {
+		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
+	}
+	return e.get(col.ID), nil
+}
+
+func (e *keptEnv) get(id catalog.ColumnID) types.Datum {
+	for i, k := range e.ids {
+		if k == id {
+			return e.vals[i]
+		}
+	}
+	return types.DNull
 }
 
 // denseRow is a decoded row held by column position (the descriptor's
@@ -617,24 +629,24 @@ func (it *scanIter) fillIndexPage(ctx context.Context, kvs []kvpb.KeyValue) erro
 	})
 }
 
-// project renders a fetched row through the select list.
-func (it *scanIter) project(fr fetchedRow) ([]types.Datum, error) {
-	out := make([]types.Datum, len(it.proj))
+// project renders a kept row (the columns of keep) through the select
+// list, into a row of pslab.
+func (it *scanIter) project(kept []types.Datum) ([]types.Datum, error) {
+	left := len(it.out) - it.bpos + 1
+	out := chunkRow(&it.pslab, len(it.proj), left)
+	it.env.vals = kept
 	for i, p := range it.proj {
 		if p.expr != nil {
-			d, err := evalExpr(*p.expr, it.desc, fr.row, it.params)
+			d, err := evalExprEnv(*p.expr, &it.env, it.params)
 			if err != nil {
 				return nil, err
 			}
 			out[i] = conformTo(d, p.col.Type)
 			continue
 		}
-		d, ok := fr.row[p.col.ID]
-		if !ok {
-			d = types.DNull
-		}
-		out[i] = d
+		out[i] = it.env.get(p.col.ID)
 	}
+	it.env.vals = nil
 	return out, nil
 }
 
@@ -655,13 +667,8 @@ func (s *Session) streamable(top bool, desc *catalog.TableDescriptor, plan acces
 
 // newScanStream builds the streaming result for a scan-shaped select.
 func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor, plan accessPlan, t *parser.Select, proj []projCol, where []parser.Comparison, params []types.Datum, fetchLimit int64) (*Result, error) {
-	it := &scanIter{s: s, txn: txn, desc: desc, plan: plan, where: where, params: params, proj: proj, reverse: plan.reverse, fetchLimit: fetchLimit, plain: true}
-	for _, p := range proj {
-		if p.expr != nil {
-			it.plain = false
-		}
-	}
-	it.need = scanNeededCols(desc, proj, where)
+	it := &scanIter{s: s, txn: txn, desc: desc, plan: plan, where: where, params: params, proj: proj, reverse: plan.reverse, fetchLimit: fetchLimit}
+	it.prepare()
 	switch plan.kind {
 	case planIndexScan:
 		prefix, err := rowenc.EncodeIndexPrefix(desc, plan.idx, plan.idxVals)
@@ -696,6 +703,38 @@ func (s *Session) newScanStream(txn *kvclient.Txn, desc *catalog.TableDescriptor
 	}
 	res.Stream.cols = res.Columns
 	return res, nil
+}
+
+// prepare settles, from the table, select list and filter, what the
+// scan decodes of each row and in what order, what it keeps of a row
+// that matches, and what it may borrow.
+func (it *scanIter) prepare() {
+	desc, proj, where := it.desc, it.proj, it.where
+	it.plain = true
+	for _, p := range proj {
+		if p.expr != nil {
+			it.plain = false
+		}
+	}
+	it.need = scanNeededCols(desc, proj, where)
+	it.keep = scanKeptCols(desc, proj)
+	if len(where) > 0 {
+		if need, need2 := filterFirstCols(desc, where, it.keep); need2 != nil {
+			it.need, it.need2 = need, need2
+		}
+		if borrow := tsBorrowCols(desc, where); len(borrow) > 0 {
+			it.borrowing = &borrowingRow{borrow: borrow}
+			for i, id := range it.keep {
+				if borrow[id] {
+					if it.clone == nil {
+						it.clone = make([]bool, len(it.keep))
+					}
+					it.clone[i] = true
+				}
+			}
+		}
+	}
+	it.env = keptEnv{desc: desc, ids: it.keep}
 }
 
 // indexID is the index this stream reads through: the plan's secondary
@@ -812,4 +851,110 @@ func formatMemory(n int64) string {
 		return fmt.Sprintf("%dkB", n>>10)
 	}
 	return fmt.Sprintf("%dB", n)
+}
+
+// scanKeptCols is the columns a scan keeps of each matching row: the
+// select list's own on a plain scan (in order, repeats included), else
+// those its expressions and bare columns read, or every column when
+// that cannot be told.
+func scanKeptCols(desc *catalog.TableDescriptor, proj []projCol) []catalog.ColumnID {
+	plain := true
+	for _, p := range proj {
+		if p.expr != nil {
+			plain = false
+		}
+	}
+	var keep []catalog.ColumnID
+	if plain {
+		for _, p := range proj {
+			keep = append(keep, p.col.ID)
+		}
+		return keep
+	}
+	read := map[catalog.ColumnID]bool{}
+	all := !projReadCols(desc, proj, read)
+	for i := range desc.Columns {
+		if id := desc.Columns[i].ID; all || read[id] {
+			keep = append(keep, id)
+		}
+	}
+	return keep
+}
+
+// filterFirstCols splits a filtered scan's decoding in two: need, the
+// columns the filter reads, decoded for every row, and need2, the
+// columns kept (keep) that it does not read, decoded only for the rows
+// it matches, so a row the filter rejects costs nothing for them. need2
+// is nil when there is no such column, or the filter's columns cannot
+// be told.
+func filterFirstCols(desc *catalog.TableDescriptor, where []parser.Comparison, keep []catalog.ColumnID) (need, need2 func(catalog.ColumnID) bool) {
+	filt := map[catalog.ColumnID]bool{}
+	if !whereReadCols(desc, where, filt) {
+		return nil, nil
+	}
+	rest := map[catalog.ColumnID]bool{}
+	for _, id := range keep {
+		if !filt[id] && !desc.IsPKCol(id) {
+			rest[id] = true
+		}
+	}
+	if len(rest) == 0 {
+		return nil, nil
+	}
+	return func(id catalog.ColumnID) bool { return filt[id] }, func(id catalog.ColumnID) bool { return rest[id] }
+}
+
+// borrowingRow is a scan's reused row map, taking the TEXT columns in
+// borrow as views of the row value (rowenc.BorrowingSink).
+type borrowingRow struct {
+	rowenc.MapRow
+	borrow map[catalog.ColumnID]bool
+}
+
+// BorrowsCol reports whether column id is borrowed.
+func (r *borrowingRow) BorrowsCol(id catalog.ColumnID) bool { return r.borrow[id] }
+
+// tsBorrowCols returns the TEXT columns a filter reads only as the text
+// of a top-level `to_tsvector(config, column) @@ query` conjunct, which
+// the scan may decode as views of the stored row value: the fused
+// match (tsMatchFused) reads the text and keeps nothing of it, and no
+// other conjunct, nor the configuration or query of any, reads the
+// column. Nil when there is none, or the filter's columns cannot be
+// told.
+func tsBorrowCols(desc *catalog.TableDescriptor, where []parser.Comparison) map[catalog.ColumnID]bool {
+	cand := map[catalog.ColumnID]bool{}
+	other := map[catalog.ColumnID]bool{}
+	for i := range where {
+		c := &where[i]
+		if tsVectorMatchCall(c) {
+			arg := &c.Expr.Args[1]
+			if col, ok := desc.Col(arg.Column); ok && col.Type == types.String && bareColumnRef(arg) {
+				cand[col.ID] = true
+				if !exprReadCols(desc, &c.Expr.Args[0], other) || !exprReadCols(desc, &c.Value, other) {
+					return nil
+				}
+				continue
+			}
+		}
+		if !whereReadCols(desc, where[i:i+1], other) {
+			return nil
+		}
+	}
+	for id := range cand {
+		if other[id] {
+			delete(cand, id)
+		}
+	}
+	if len(cand) == 0 {
+		return nil
+	}
+	return cand
+}
+
+// bareColumnRef reports whether an expression is a column's value and
+// nothing more.
+func bareColumnRef(e *parser.Expr) bool {
+	return e.Column != "" && len(e.Path) == 0 && e.Func == "" && len(e.Args) == 0 && e.BinOp == "" &&
+		e.Left == nil && e.Right == nil && e.Case == nil && e.Cmp == nil && e.Sub == nil && e.Cast == "" &&
+		e.Lit == nil && e.Param == 0 && e.Window == nil && e.Agg == nil && !e.IsDefault
 }
