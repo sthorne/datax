@@ -916,7 +916,7 @@ func (s *Session) onlineOutsideBlock(ctx context.Context, stmt parser.Statement)
 	case *parser.Analyze:
 		return true
 	case *parser.Select:
-		return t.AsOf != "" || t.AsOfMaxStaleness != "" || t.AsOfMinTimestamp != ""
+		return t.AsOf != "" || t.AsOfMaxStaleness != "" || t.AsOfMinTimestamp != "" || callsSealFunc(t)
 	case *parser.ShowClusterSetting:
 		return false
 	}
