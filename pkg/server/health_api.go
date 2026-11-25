@@ -3,7 +3,9 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -271,8 +273,9 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 	// Replicas a live node reports holding but not serving (failed), or
 	// not holding at all (missing): they count as unavailable below, as a
 	// dead node's do. This node's own are read now, not from its last
-	// heartbeat (replica_health.go).
-	unavailable := map[base.NodeID]map[base.RangeID]bool{}
+	// heartbeat; a peer whose heartbeat lists are capped short of its
+	// counts is asked for the rest (replica_health.go).
+	var liveIDs []base.NodeID
 	selfFailed, selfMissing := n.unavailableReplicas()
 	for _, nd := range nodes {
 		byID[nd.NodeID] = nd
@@ -286,6 +289,7 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				Summary: fmt.Sprintf("n%d has not heartbeated for %s (declared dead after %s)", nd.NodeID, time.Duration(age).Truncate(time.Second), time.Duration(dead))})
 		default:
 			live[nd.NodeID] = true
+			liveIDs = append(liveIDs, nd.NodeID)
 			// A peer's lists are capped (capReplicaReport); its counts
 			// are exact.
 			failed, missing := nd.FailedReplicas, nd.MissingReplicas
@@ -295,7 +299,6 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				failed, missing = selfFailed, selfMissing
 				nFailed, nMissing = len(failed), len(missing)
 			}
-			markUnavailable(unavailable, nd.NodeID, failed, missing)
 			if len(failed) > 0 {
 				add(Problem{Severity: SeverityCritical, Check: "replicas-failed", Node: int(nd.NodeID), Range: int64(failed[0]), Section: "nodes",
 					Summary: fmt.Sprintf("n%d has %d replica(s) stopped by a storage failure (e.g. %s): they serve nothing until the node restarts; check its log and disk", nd.NodeID, nFailed, failed[0])})
@@ -332,6 +335,14 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 			Summary: fmt.Sprintf("every node runs protocol v%d but the cluster version is v%d: run `datax debug upgrade` to finalize (until then binaries can roll back)", minBinary, cv)})
 	}
 
+	faults := n.replicaFaults(req.Context(), liveIDs)
+	for _, id := range slices.Sorted(maps.Keys(faults.unreached)) {
+		nd := byID[id]
+		add(Problem{Severity: SeverityWarning, Check: "replicas-unverified", Node: int(id), Section: "nodes",
+			Summary: fmt.Sprintf("n%d reports %d failed and %d missing replica(s), more than its heartbeat lists, and did not answer for the rest (%v): its replicas of ranges above %s may not serve",
+				id, reportedCount(nd.FailedReplicas, nd.FailedReplicaCount), reportedCount(nd.MissingReplicas, nd.MissingReplicaCount), faults.unreached[id], faults.unknownAbove[id])})
+	}
+
 	// Ranges: replication, quorum, diversity.
 	doc.Checks++
 	if descs, _, err := n.clusterRanges(req.Context()); err == nil {
@@ -339,8 +350,8 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		for _, nd := range nodes {
 			localities[nd.Locality.String()] = true
 		}
-		under, noQuorum, undiverse := 0, 0, 0
-		var underEx, quorumEx, divEx base.RangeID
+		under, noQuorum, undiverse, unknown := 0, 0, 0, 0
+		var underEx, quorumEx, divEx, unknownEx base.RangeID
 		// Placement (issue #176): a range whose replicas sit outside the
 		// policy its database names, and a policy no live node can
 		// satisfy — the allocator leaves that data where it is rather
@@ -376,11 +387,18 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 					}
 				}
 			}
-			liveReps, seen := 0, map[string]bool{}
+			liveReps, unknownReps, seen := 0, 0, map[string]bool{}
 			dup := false
 			for _, rep := range d.Replicas {
-				if live[rep.NodeID] && !unavailable[rep.NodeID][d.RangeID] {
-					liveReps++
+				if live[rep.NodeID] {
+					switch down, unk := faults.state(rep.NodeID, d.RangeID); {
+					case down:
+					case unk:
+						unknownReps++
+						liveReps++
+					default:
+						liveReps++
+					}
 				}
 				if nd, ok := byID[rep.NodeID]; ok {
 					loc := nd.Locality.String()
@@ -391,10 +409,14 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 				}
 			}
 			want := policy.ReplicasOr(base.DefaultReplicationFactor)
-			if liveReps*2 <= len(d.Replicas) {
+			switch state, known := classifyUncertain(liveReps, unknownReps, len(d.Replicas), want); {
+			case !known:
+				unknown++
+				unknownEx = d.RangeID
+			case state == replNoQuorum:
 				noQuorum++
 				quorumEx = d.RangeID
-			} else if len(d.Replicas) < want || liveReps < want {
+			case state == replUnder:
 				under++
 				underEx = d.RangeID
 			}
@@ -410,6 +432,10 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		if under > 0 {
 			add(Problem{Severity: SeverityWarning, Check: "under-replicated", Range: int64(underEx), Section: "cluster-ranges",
 				Summary: fmt.Sprintf("%d range(s) have fewer than %d live replicas (e.g. %s); the allocator repairs them as nodes allow", under, base.DefaultReplicationFactor, underEx)})
+		}
+		if unknown > 0 {
+			add(Problem{Severity: SeverityWarning, Check: "replication-unknown", Range: int64(unknownEx), Section: "cluster-ranges",
+				Summary: fmt.Sprintf("%d range(s) may be under-replicated or without quorum (e.g. %s), depending on replicas whose node did not answer (replicas-unverified): counted as neither", unknown, unknownEx)})
 		}
 		if undiverse > 0 {
 			add(Problem{Severity: SeverityWarning, Check: "diversity", Range: int64(divEx), Section: "cluster-ranges",

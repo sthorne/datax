@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"sort"
 	"strconv"
 	"time"
@@ -20,7 +21,9 @@ import (
 // All of it comes from data the serving node already has: the range
 // descriptors from the /meta scan behind /api/cluster, and the node
 // registry's localities and liveness. No fan-out, so it costs a
-// partitioned node's console nothing.
+// partitioned node's console nothing — except that a live node whose
+// heartbeat lists of failed and missing replicas are capped short of its
+// counts is asked for the rest (replica_health.go), within a timeout.
 //
 // It is computed here rather than in the page because it is a JSON
 // contract every node must agree on: two nodes reading the same
@@ -94,6 +97,12 @@ type ClusterReplication struct {
 	// counts as not live above, so these ranges are also under-replicated
 	// or without quorum; like Undiverse this is an overlay, not a state.
 	Unavailable ReplicationBucket `json:"unavailable_replicas"`
+	// Unknown: ranges whose state depends on replicas no one could
+	// confirm — a live node's heartbeat lists fell short of its counts
+	// and it did not answer when asked for the rest — such that they
+	// would be one state if those replicas serve and another if not. A
+	// state like Healthy, not an overlay: such a range is in no other.
+	Unknown ReplicationBucket `json:"unknown"`
 	// Domains are the failure domains in use, ordered by tier as the
 	// localities declare them (region before rack) and then by value.
 	Domains []ReplicationDomain `json:"domains,omitempty"`
@@ -111,7 +120,7 @@ type ClusterReplication struct {
 
 // replicationStatus computes the section from the cluster's range
 // descriptors and the node registry.
-func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNode) ClusterReplication {
+func (n *Node) replicationStatus(ctx context.Context, descs []kvpb.RangeDescriptor, nodes []ClusterNode) ClusterReplication {
 	out := ClusterReplication{DefaultFactor: base.DefaultReplicationFactor}
 	live := map[int]bool{}
 	byNode := map[int]ClusterNode{}
@@ -129,22 +138,15 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 
 	// Replicas a live node reports it cannot serve (failed) or does not
 	// hold (missing) are not live, as in the health check: this node's
-	// own read now, its peers' from their last heartbeat (lists capped
-	// at maxReportedReplicas each).
-	unavailable := map[base.NodeID]map[base.RangeID]bool{}
-	selfFailed, selfMissing := n.unavailableReplicas()
+	// own read now, its peers' from their last heartbeat, or asked of the
+	// peer when its heartbeat lists are capped short of its counts.
+	var liveIDs []base.NodeID
 	for _, cn := range nodes {
-		nid := base.NodeID(cn.NodeID)
-		switch {
-		case !cn.Live:
-		case nid == n.ident.NodeID:
-			markUnavailable(unavailable, nid, selfFailed, selfMissing)
-		default:
-			if nd, ok := n.registry.Get(nid); ok {
-				markUnavailable(unavailable, nid, nd.FailedReplicas, nd.MissingReplicas)
-			}
+		if cn.Live {
+			liveIDs = append(liveIDs, base.NodeID(cn.NodeID))
 		}
 	}
+	faults := n.replicaFaults(ctx, liveIDs)
 
 	// The tiers in use, outermost first, in the order the localities
 	// declare them — a cluster using region/zone/rack answers "lose a
@@ -185,15 +187,19 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 	for _, d := range descs {
 		id := int64(d.RangeID)
 		want := n.placementOf(d).ReplicasOr(base.DefaultReplicationFactor)
-		total, liveReps := len(d.Replicas), 0
+		total, liveReps, unknownReps := len(d.Replicas), 0, 0
 		seenLoc := map[string]bool{}
 		dup, dead := false, false
 		for _, rep := range d.Replicas {
 			nid := int(rep.NodeID)
 			if live[nid] {
-				if unavailable[rep.NodeID][d.RangeID] {
+				switch down, unk := faults.state(rep.NodeID, d.RangeID); {
+				case down:
 					dead = true
-				} else {
+				case unk:
+					unknownReps++
+					liveReps++
+				default:
 					liveReps++
 				}
 			}
@@ -210,12 +216,14 @@ func (n *Node) replicationStatus(descs []kvpb.RangeDescriptor, nodes []ClusterNo
 				}
 			}
 		}
-		switch {
-		case liveReps*2 <= total:
+		switch state, known := classifyUncertain(liveReps, unknownReps, total, want); {
+		case !known:
+			out.Unknown.add(id)
+		case state == replNoQuorum:
 			out.NoQuorum.add(id)
-		case liveReps < want || total < want:
+		case state == replUnder:
 			out.Under.add(id)
-		case total > want:
+		case state == replOver:
 			out.Over.add(id)
 		default:
 			out.Healthy.add(id)

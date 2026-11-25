@@ -348,6 +348,10 @@ type Config struct {
 	// handler returns. Lets a test hold a handler inside the node while
 	// it stops (issue #324).
 	TestingAdminHook func(ctx context.Context, op string) (done func())
+	// TestingMaxReportedReplicas, when positive, lowers the cap on each
+	// replica list this node's heartbeat carries (maxReportedReplicas),
+	// so a test can overflow it with a handful of failed replicas.
+	TestingMaxReportedReplicas int
 	// TestingBeforeEngineClose runs in the shutdown closer just before
 	// the node closes the engines it opened (issue #324).
 	TestingBeforeEngineClose func()

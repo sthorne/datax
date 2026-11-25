@@ -70,7 +70,9 @@ func (s *Session) resolveTxnAsOf(c parser.AsOfClause) (hlc.Timestamp, *Error) {
 func resolveMinTimestamp(operand string, now, localClosed hlc.Timestamp) (hlc.Timestamp, error) {
 	var nanos int64
 	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
-		nanos = t.UnixNano()
+		if nanos, err = types.TimeNanos(t); err != nil {
+			return hlc.Timestamp{}, err
+		}
 	} else if n, err := types.ParseTimestamp(operand); err == nil {
 		nanos = n
 	} else {

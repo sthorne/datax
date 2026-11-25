@@ -59,7 +59,7 @@ func TestSplitAt(t *testing.T) {
 	}
 	// Idempotent: a boundary that already exists is fine.
 	execSQL(t, ctx, s, `ALTER TABLE sp SPLIT AT VALUES (10)`)
-	if r := execSQL(t, ctx, s, `SELECT count(*), sum(v) FROM sp`); r.Rows[0][0].I != 40 || r.Rows[0][1].I != 780 {
+	if r := execSQL(t, ctx, s, `SELECT count(*), sum(v) FROM sp`); r.Rows[0][0].I != 40 || r.Rows[0][1].Text() != "780" { // sum(int8) is numeric
 		t.Fatalf("rows across the boundaries: %+v", r.Rows)
 	}
 	execSQL(t, ctx, s, `INSERT INTO sp VALUES (10, 'a', 1), (20, 'x', 2), (25, 'z', 3)`)

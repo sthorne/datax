@@ -345,7 +345,7 @@ func TestSplitAtIsSticky(t *testing.T) {
 	if res := execSQL(t, ctx, s, `ALTER TABLE st UNSPLIT ALL`); res.Tag != "ALTER TABLE 0" {
 		t.Fatalf("unsplit all with nothing to release: %+v", res)
 	}
-	if r := execSQL(t, ctx, s, `SELECT count(*), sum(v) FROM st`); r.Rows[0][0].I != 4 || r.Rows[0][1].I != 10 {
+	if r := execSQL(t, ctx, s, `SELECT count(*), sum(v) FROM st`); r.Rows[0][0].I != 4 || r.Rows[0][1].Text() != "10" { // sum(int8) is numeric
 		t.Fatalf("rows after the merges: %+v", r.Rows)
 	}
 	execSQL(t, ctx, s, `ALTER TABLE IF EXISTS nope UNSPLIT ALL`)

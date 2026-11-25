@@ -91,7 +91,11 @@ type aggSpec struct {
 	col  catalog.Column // the plain-column argument (zero otherwise)
 	arg  *parser.Expr   // the expression argument (nil for a column or *)
 	// argType is the argument's family (the column's, or inferred).
-	argType  types.Family
+	argType types.Family
+	// intWidth is an INT argument's integer width (2, 4 or 8; 0 is 8):
+	// sum over int2 / int4 is bigint, over int8 numeric, as in
+	// PostgreSQL. See intExprWidth.
+	intWidth int32
 	extra    []parser.Expr // string_agg's separator, jsonb_object_agg's value
 	distinct bool
 	filter   []parser.Comparison
@@ -135,9 +139,15 @@ func resolveAggSpec(desc *catalog.TableDescriptor, se parser.SelectExpr) (aggSpe
 		if !ok {
 			return sp, newErrf(CodeUndefinedColumn, "column %q does not exist", se.AggCol)
 		}
-		sp.col, sp.argType = col, col.Type
+		sp.col, sp.argType, sp.intWidth = col, col.Type, col.IntWidth()
 	case se.AggArg != nil:
 		sp.arg, sp.argType = se.AggArg, exprFamily(*se.AggArg, colType)
+		sp.intWidth = intExprWidth(*se.AggArg, func(n string) int32 {
+			if c, ok := desc.Col(stripQualifier(n)); ok {
+				return c.IntWidth()
+			}
+			return 8
+		})
 	default:
 		return sp, newErrf(CodeSyntaxError, "%s() requires an argument", se.Agg)
 	}
@@ -395,7 +405,7 @@ func (sp aggSpec) resultType() types.Family {
 		}
 		return types.Float
 	case "SUM":
-		if sp.argType == types.Unknown {
+		if sp.argType == types.Unknown || sp.sumIntAsNumeric() {
 			return types.Decimal
 		}
 		return sp.argType
@@ -425,6 +435,73 @@ func (sp aggSpec) resultType() types.Family {
 		return types.String
 	}
 	return sp.argType
+}
+
+// sumIntAsNumeric reports a SUM over int8 (PostgreSQL's int8_sum), which
+// is numeric: an int8 total can overflow. A SUM over int2 or int4 is
+// bigint.
+func (sp aggSpec) sumIntAsNumeric() bool {
+	return sp.fn == "SUM" && sp.argType == types.Int && (sp.intWidth == 0 || sp.intWidth == 8)
+}
+
+// intExprWidth is the integer width (2, 4 or 8) PostgreSQL gives an
+// integer-valued expression, as far as datax can tell: a literal that
+// fits in int4 is int4, a column has its declared width, a cast to
+// int2 / int4 / int8 has that width, arithmetic and CASE / COALESCE /
+// GREATEST / LEAST / NULLIF take the widest operand's. Anything else
+// (a function, a parameter, a subquery) is int8. A NULL literal is 0,
+// which defers to the other operands.
+func intExprWidth(e parser.Expr, colWidth func(name string) int32) int32 {
+	w := int32(8)
+	switch {
+	case e.Left != nil:
+		w = intExprWidth(*e.Left, colWidth)
+	case e.Lit != nil:
+		switch {
+		case e.Lit.Null:
+			w = 0
+		case e.Lit.Fam == types.Int && e.Lit.I >= math.MinInt32 && e.Lit.I <= math.MaxInt32:
+			w = 4
+		}
+	case e.Column != "" && len(e.Path) == 0:
+		w = colWidth(e.Column)
+	case e.Case != nil:
+		w = 0
+		for _, wh := range e.Case.Whens {
+			w = max(w, intExprWidth(wh.Result, colWidth))
+		}
+		if e.Case.Else != nil {
+			w = max(w, intExprWidth(*e.Case.Else, colWidth))
+		}
+	case e.Func == "coalesce" || e.Func == "greatest" || e.Func == "least":
+		w = 0
+		for _, a := range e.Args {
+			w = max(w, intExprWidth(a, colWidth))
+		}
+	case e.Func == "nullif" && len(e.Args) == 2:
+		w = intExprWidth(e.Args[0], colWidth)
+	}
+	if e.BinOp != "" && e.Right != nil {
+		switch e.BinOp {
+		case "+", "-", "*", "/", "%", "&", "|", "#":
+			w = max(w, intExprWidth(*e.Right, colWidth))
+		case "<<", ">>":
+			// A shift keeps its left operand's type.
+		default:
+			w = 8
+		}
+	}
+	if e.Cast != "" {
+		switch strings.TrimPrefix(strings.ToLower(e.Cast), "pg_catalog.") {
+		case "int2", "smallint":
+			w = 2
+		case "int4", "int", "integer":
+			w = 4
+		default:
+			w = 8
+		}
+	}
+	return w
 }
 
 // aggState is the streaming accumulator for one group's aggregates.
@@ -698,10 +775,11 @@ func (st *aggState) accumulate(specs []aggSpec, desc *catalog.TableDescriptor, r
 		case "SUM", "AVG":
 			switch d.Fam {
 			case types.Int:
-				// AVG totals in numeric (sumD), as PostgreSQL's
-				// int8_avg_accum does, so it cannot overflow; only SUM's
-				// bigint total can.
-				if sp.fn == "SUM" {
+				// AVG, and SUM over int8, total in numeric (sumD), as
+				// PostgreSQL's int8_avg_accum does, so they cannot
+				// overflow; only the bigint total of a SUM over int2 /
+				// int4 can.
+				if sp.fn == "SUM" && !sp.sumIntAsNumeric() {
 					s := st.sumI[i] + d.I
 					if (s > st.sumI[i]) != (d.I > 0) && d.I != 0 {
 						return newErrf(CodeNumericValueOutOfRange, "bigint out of range in %s", strings.ToLower(sp.fn))
@@ -797,9 +875,9 @@ func (st *aggState) finish(specs []aggSpec, params []types.Datum) ([]types.Datum
 			switch {
 			case st.counts[i] == 0:
 				out[i] = types.DNull
-			case sp.argType == types.Int:
+			case sp.argType == types.Int && !sp.sumIntAsNumeric():
 				out[i] = types.NewInt(st.sumI[i])
-			case sp.argType == types.Decimal, sp.argType == types.Unknown:
+			case sp.argType == types.Decimal, sp.argType == types.Unknown, sp.argType == types.Int:
 				// The display scale is the largest input's, as numeric
 				// addition keeps it in PostgreSQL (a sum of NUMERIC(10,2)
 				// values prints two decimals).

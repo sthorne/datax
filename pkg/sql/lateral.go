@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -221,7 +222,7 @@ func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []jo
 		}
 		matched := 0
 		for _, r := range cands {
-			if !onPairsMatch(jr, on, r) {
+			if !onPairsMatch(jr, on, r, s.zone()) {
 				continue
 			}
 			ext := jr.extend(r)
@@ -256,15 +257,16 @@ func (s *Session) joinLateral(ctx context.Context, txn *kvclient.Txn, sides []jo
 
 // onPairsMatch reports whether a candidate row of the joined side
 // satisfies the level's ON equalities against the partial row (SQL
-// equality: NULL matches nothing).
-func onPairsMatch(jr joinedRow, on []onPair, r map[catalog.ColumnID]types.Datum) bool {
+// equality: NULL matches nothing), a date against a timestamp with time
+// zone at its midnight in loc (the session's zone; nil: UTC).
+func onPairsMatch(jr joinedRow, on []onPair, r map[catalog.ColumnID]types.Datum, loc *time.Location) bool {
 	for _, p := range on {
 		l := jr.datum(joinRef{side: p.leftSide, col: p.leftCol})
 		rv, ok := r[p.rightCol.ID]
 		if !ok || l.Null || rv.Null {
 			return false
 		}
-		if match, err := compareDatums(l, "=", rv); err != nil || !match {
+		if match, err := compareDatumsIn(l, "=", rv, loc); err != nil || !match {
 			return false
 		}
 	}

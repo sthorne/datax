@@ -164,12 +164,13 @@ func TestJoinAggregates(t *testing.T) {
 	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
 	nwaySchema(t, ctx, s)
 
-	// SUM per customer, ordered by the aggregate's result name.
+	// SUM per customer, ordered by the aggregate's result name (numeric:
+	// orders.total is INT8).
 	res := execSQL(t, ctx, s, `SELECT c.name, SUM(o.total) AS spent FROM customers c
 		JOIN orders o ON o.customer_id = c.id
 		GROUP BY c.name ORDER BY spent DESC`)
-	if len(res.Rows) != 2 || res.Rows[0][0].S != "ann" || res.Rows[0][1].I != 120 ||
-		res.Rows[1][0].S != "bob" || res.Rows[1][1].I != 30 {
+	if len(res.Rows) != 2 || res.Rows[0][0].S != "ann" || res.Rows[0][1].Text() != "120" ||
+		res.Rows[1][0].S != "bob" || res.Rows[1][1].Text() != "30" {
 		t.Fatalf("grouped join: %+v", res.Rows)
 	}
 	if res.Columns[0].Name != "name" || res.Columns[1].Name != "spent" {

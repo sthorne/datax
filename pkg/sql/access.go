@@ -142,7 +142,7 @@ func pkInPoints(desc *catalog.TableDescriptor, where []parser.Comparison, params
 				continue // matches nothing
 			}
 			lit := d
-			vals, ok, err := pkPointValues(desc, append(eqs, parser.Comparison{Column: cmp.Column, Op: "=", Value: parser.Expr{Lit: &lit}}), params)
+			vals, ok, err := pkPointValues(desc, append(eqs, parser.Comparison{Column: cmp.Column, Op: "=", Value: parser.Expr{Lit: &lit}, Zone: cmp.Zone}), params)
 			if err != nil {
 				return nil, false, err
 			}
@@ -289,7 +289,7 @@ func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Exp
 	switch cmp.Op {
 	case "=", "<", "<=", ">", ">=":
 		fam := exprFamily(e, colType)
-		if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil && fam != types.Unknown && !d.Null {
+		if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil && fam != types.Unknown && !d.Null && !dateVsTimestamp(d.Fam, fam) {
 			if d, cerr := d.Coerce(fam); cerr == nil {
 				pc.d, pc.usable, pc.exprFam = d, true, fam
 			}
@@ -299,6 +299,35 @@ func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Exp
 		pc.slot = ""
 	}
 	return pc
+}
+
+// boundValue is a conjunct's value as a key of column col, for a point
+// or a span: the value coerced to the column's type. A date against a
+// timestamp column is its midnight, in the conjunct's zone for a
+// timestamp with time zone, as the comparison promotes it
+// (types.CompareIn); a date outside the timestamp range bounds nothing
+// and is left to the filter, which orders it before or after every
+// row. ok is false when the value cannot bound the column.
+func boundValue(col catalog.Column, cmp parser.Comparison, d types.Datum) (types.Datum, bool) {
+	if !d.Null && d.Fam == types.Date && col.Type == types.Timestamp {
+		n, err := types.DateNanos(d.I)
+		if err != nil {
+			return d, false
+		}
+		if !col.NoTZ && cmp.Zone != nil {
+			n = types.WallInZone(n, cmp.Zone)
+		}
+		return types.NewTimestamp(n), true
+	}
+	out, cerr := coerceColumn(col, d)
+	return out, cerr == nil
+}
+
+// dateVsTimestamp reports a date and a timestamp, either way round:
+// the comparison promotes the date itself (types.CompareIn), in the
+// session's zone, so it is not coerced to the other side first.
+func dateVsTimestamp(a, b types.Family) bool {
+	return a == types.Date && b == types.Timestamp || a == types.Timestamp && b == types.Date
 }
 
 // scanCandidate is one possible constrained scan while ranking paths.
@@ -500,7 +529,7 @@ func pickPlanMode(desc *catalog.TableDescriptor, st *catalog.TableStatistics, wh
 			// reference on the right-hand side) is simply unusable for
 			// bounds; the post-fetch filter evaluates it per row.
 			if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil {
-				if d, cerr := coerceColumn(col, d); cerr == nil && !d.Null {
+				if d, ok := boundValue(col, cmp, d); ok && !d.Null {
 					pc.d, pc.usable = d, true
 				}
 			}

@@ -952,16 +952,22 @@ func (s *Session) splitExpiration(e parser.Expr, params []types.Datum) (int64, e
 	case d.Fam == types.Timestamp:
 		until = d.I
 	case d.Fam == types.Date:
-		until = d.I * int64(24*time.Hour)
+		if until, err = types.DateNanos(d.I); err != nil {
+			return 0, newErrf(CodeDatetimeFieldOverflow, "SPLIT AT: the expiration: %v", err)
+		}
 	case d.Fam == types.IntervalFam:
-		until = d.IntervalVal().AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+		if until, err = types.TimeNanos(d.IntervalVal().AddTo(time.Unix(0, now).UTC(), 1)); err != nil {
+			return 0, newErrf(CodeDatetimeFieldOverflow, "SPLIT AT: the expiration: %v", err)
+		}
 	case d.Fam == types.String:
 		if until, err = types.ParseTimestamp(d.S); err != nil {
 			iv, ierr := types.ParseInterval(d.S)
 			if ierr != nil {
 				return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration %q is neither a timestamp nor an interval", d.S)
 			}
-			until = iv.AddTo(time.Unix(0, now).UTC(), 1).UnixNano()
+			if until, err = types.TimeNanos(iv.AddTo(time.Unix(0, now).UTC(), 1)); err != nil {
+				return 0, newErrf(CodeDatetimeFieldOverflow, "SPLIT AT: the expiration: %v", err)
+			}
 		}
 	default:
 		return 0, newErrf(CodeInvalidParameterValue, "SPLIT AT: the expiration must be a timestamp or an interval, not %s", d.Fam)
@@ -1224,7 +1230,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := coerceColumn(target[i], d)
+			d, cerr := assignColumn(target[i], d)
 			if cerr != nil {
 				return nil, cerr
 			}
@@ -1530,7 +1536,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := coerceColumn(col, d)
+		d, cerr := assignColumn(col, d)
 		if cerr != nil {
 			return false, nil, cerr
 		}
@@ -2312,8 +2318,8 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		if err != nil {
 			continue // row-dependent value (column RHS): not a point bound
 		}
-		d, cerr := coerceColumn(col, d)
-		if cerr != nil {
+		d, ok = boundValue(col, cmp, d)
+		if !ok {
 			return nil, false, nil // un-coercible: cannot match anything via point path; fall to scan
 		}
 		if d.Null {
@@ -3232,7 +3238,7 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 					return nil, err
 				}
 			}
-			d, cerr := coerceColumn(col, d)
+			d, cerr := assignColumn(col, d)
 			if cerr != nil {
 				return nil, cerr
 			}

@@ -1,6 +1,10 @@
 package sql
 
 import (
+	"errors"
+	"math"
+
+	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -70,9 +74,62 @@ func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 	}
 	out, err := d.Coerce(col.Type)
 	if err != nil {
+		if errors.Is(err, types.ErrTimestampRange) {
+			return d, newErrf(CodeDatetimeFieldOverflow, "column %q: %v", col.Name, err)
+		}
 		return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
 	}
 	return out, nil
+}
+
+// assignColumn brings a value to its column's family for storing it:
+// coerceColumn plus PostgreSQL's assignment casts (pg_cast castcontext
+// 'a') that datax's implicit coercion does not make. A numeric value
+// into an integer column rounds half away from zero (2.5 → 3, -2.5 →
+// -3), a float8 value rounds half to even (rint: 2.5 → 2), and either
+// out of the column's range fails with 22003 "smallint / integer /
+// bigint out of range" (a numeric NaN or infinity with 0A000). INSERT
+// (VALUES and SELECT), UPDATE and ON CONFLICT DO UPDATE store through
+// it; comparisons keep coerceColumn, so WHERE id = 1.5 never matches
+// id 2. (float8 into numeric, also an assignment cast in PostgreSQL,
+// is still refused: datax's float → numeric conversion keeps the
+// shortest exact digits, PostgreSQL's rounds to 15.)
+func assignColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
+	if d.Null {
+		return coerceColumn(col, d)
+	}
+	switch {
+	case col.Type == types.Int && (d.Fam == types.Decimal || d.Fam == types.Float):
+		name, cast, limit := "bigint", "int8", float64(0)
+		switch col.IntWidth() {
+		case 2:
+			name, cast, limit = "smallint", "int2", math.MaxInt16
+		case 4:
+			name, cast, limit = "integer", "int4", math.MaxInt32
+		}
+		if d.Fam == types.Float {
+			// dtoi2 / dtoi4 / dtoi8: rint, then the range check
+			// (NaN and the infinities are out of range).
+			f := math.RoundToEven(d.F)
+			if math.IsNaN(f) || (limit > 0 && (f < -limit-1 || f > limit)) ||
+				(limit == 0 && (f < math.MinInt64 || f >= math.MaxInt64)) {
+				return d, newErrf(CodeNumericValueOutOfRange, "%s out of range", name)
+			}
+			return types.NewInt(int64(f)), nil
+		}
+		v, err := builtins.Cast(d, cast)
+		if err != nil {
+			serr := ToSQLError(builtinErr(err))
+			if serr.Code == CodeNumericValueOutOfRange {
+				// numeric_int2 / numeric_int4 name the target type even
+				// when the value is past bigint too.
+				serr = newErrf(CodeNumericValueOutOfRange, "%s out of range", name)
+			}
+			return d, serr
+		}
+		return v, nil
+	}
+	return coerceColumn(col, d)
 }
 
 // pureWidening reports whether changing a column's declared type from

@@ -13,13 +13,17 @@ const REPL_BUCKETS = [
   { key: "under_replicated", label: "under-replicated", hint: "fewer live replicas than the target; the allocator repairs them as nodes allow", warn: "draining" },
   { key: "over_replicated", label: "over-replicated", hint: "more replicas than the target, usually an interrupted rebalance; the allocator trims one per pass", warn: "draining" },
   { key: "no_quorum", label: "no quorum", hint: "fewer than a majority of replicas live: the range cannot serve until nodes return", warn: "down" },
+  { key: "unknown", label: "unknown", hint: "whether the range is a replica short cannot be told: a live node reports more failed or missing replicas than its heartbeat lists, and did not answer when asked for the rest. Counted in no other state; see the node's replicas-unverified problem", warn: "draining", onlyIfAny: true },
   { key: "undiverse", label: "undiverse", hint: "two replicas share a locality they could spread across; a single failure domain could cost two", warn: "draining" },
   { key: "unavailable_replicas", label: "dead replicas", hint: "a replica on a live node serves nothing: a storage failure stopped it until the node restarts, or the node never loaded it. It counts as not live, so the range is also under-replicated or without quorum; the node's heartbeat reports it, and nothing repairs it while the node stays up", warn: "down" },
 ];
 
 function renderReplication(d) {
   const rep = d.replication || {};
-  renderTiles(document.getElementById("repl-tiles"), REPL_BUCKETS.map(b => {
+  // A tile marked onlyIfAny is shown only while it counts something:
+  // "unknown" is a fault of the status itself, not a state worth a
+  // standing zero.
+  renderTiles(document.getElementById("repl-tiles"), REPL_BUCKETS.filter(b => !b.onlyIfAny || (rep[b.key] || {}).count).map(b => {
     const n = (rep[b.key] || {}).count || 0;
     const cls = n > 0 && b.warn ? ` ${b.warn}` : "";
     const open = openBucket === b.key;
@@ -33,6 +37,9 @@ function renderReplication(d) {
     `A range is counted once, worst state first: one with no quorum is not also counted as under-replicated. ` +
     `A replica on a live node that the node reports stopped by a storage failure, or never loaded, counts as not live; ` +
     `its range is also listed under dead replicas${(rep.unavailable_replicas || {}).count ? " — check that node's log and disk" : ""}. ` +
+    ((rep.unknown || {}).count
+      ? `${rep.unknown.count} range(s) are unknown: a node did not answer for the replicas its heartbeat could not list, and they would be in a different state depending on whether those serve. `
+      : "") +
     `Select a state for its ranges.`);
 
   renderBucketDetail(rep);

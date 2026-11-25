@@ -269,6 +269,32 @@ var (
 	ErrTimestampRange = errors.New("timestamp out of range")
 )
 
+// The dates whose midnight is a timestamp: [minTimestampDay,
+// maxTimestampDay), as days since the Unix epoch.
+var (
+	minTimestampDay = minTimestamp.Unix() / 86400
+	maxTimestampDay = maxTimestamp.Unix() / 86400
+)
+
+// DateNanos is the timestamp of a date's midnight (UTC nanoseconds of
+// the wall clock), or ErrTimestampRange for a date outside the
+// timestamp range: days times a day's nanoseconds would wrap int64.
+func DateNanos(days int64) (int64, error) {
+	if days < minTimestampDay || days >= maxTimestampDay {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
+	}
+	return days * NanosPerDay, nil
+}
+
+// TimeNanos is t as UTC Unix nanoseconds, or ErrTimestampRange when t
+// is outside the timestamp range (time.UnixNano would wrap).
+func TimeNanos(t time.Time) (int64, error) {
+	if t.Before(minTimestamp) || !t.Before(maxTimestamp) {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, t.UTC().Format("2006-01-02 15:04:05"))
+	}
+	return t.UnixNano(), nil
+}
+
 // ParseTimestamp parses a timestamp string to UTC Unix nanoseconds (a
 // text without an offset is UTC; ParseTimestampIn reads it in a zone).
 func ParseTimestamp(s string) (int64, error) { return ParseTimestampIn(s, nil) }
@@ -525,7 +551,11 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		}
 		return NewDate(days), nil
 	case d.Fam == Date && target == Timestamp:
-		return NewTimestamp(d.I * 86400 * 1e9), nil
+		n, err := DateNanos(d.I)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimestamp(n), nil
 	case d.Fam == String && target == Bytes:
 		b, err := ParseBytes(d.S)
 		if err != nil {
@@ -593,10 +623,25 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 }
 
 // Compare returns -1/0/1; comparing with NULL or across incomparable types
-// returns an error (callers treat NULL comparisons as "no match").
-func (d Datum) Compare(o Datum) (int, error) {
+// returns an error (callers treat NULL comparisons as "no match"). A
+// date against a timestamp with time zone promotes the date to its UTC
+// midnight; CompareIn takes the session's zone.
+func (d Datum) Compare(o Datum) (int, error) { return d.CompareIn(o, nil) }
+
+// CompareIn is Compare under the session's TimeZone (nil: UTC), which
+// decides only where a date falls against a timestamp with time zone:
+// at its midnight in loc, as PostgreSQL's date_cmp_timestamptz promotes
+// it. Against a timestamp without time zone a date is its wall-clock
+// midnight whatever the zone.
+func (d Datum) CompareIn(o Datum, loc *time.Location) (int, error) {
 	if d.Null || o.Null {
 		return 0, fmt.Errorf("NULL comparison")
+	}
+	switch {
+	case d.Fam == Date && o.Fam == Timestamp:
+		return compareDateTimestamp(d.I, o, loc), nil
+	case d.Fam == Timestamp && o.Fam == Date:
+		return -compareDateTimestamp(o.I, d, loc), nil
 	}
 	if d.Fam == Int && o.Fam == Float {
 		return cmpFloat(float64(d.I), o.F), nil
@@ -701,6 +746,24 @@ func (d Datum) Compare(o Datum) (int, error) {
 		return vector.Compare(vector.Decode(d.S), vector.Decode(o.S)), nil
 	}
 	return 0, fmt.Errorf("cannot compare %s values", d.Fam)
+}
+
+// compareDateTimestamp orders a date (days since the epoch) against a
+// timestamp. A date outside the timestamp range has no midnight to
+// compare, but it is still before (or after) every timestamp, as in
+// PostgreSQL's date_cmp_timestamp.
+func compareDateTimestamp(days int64, ts Datum, loc *time.Location) int {
+	switch {
+	case days < minTimestampDay:
+		return -1
+	case days >= maxTimestampDay:
+		return 1
+	}
+	n := days * NanosPerDay
+	if !ts.NoTZ && loc != nil && loc != time.UTC {
+		n = WallInZone(n, loc)
+	}
+	return cmpInt(n, ts.I)
 }
 
 // liftDecimal lifts a numeric datum to decimal (float via its shortest

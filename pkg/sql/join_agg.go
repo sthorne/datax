@@ -31,6 +31,7 @@ func groupedJoinDesc(sides []joinSide) (*catalog.TableDescriptor, []joinRef) {
 		for _, c := range js.desc.VisibleColumns() {
 			desc.Columns = append(desc.Columns, catalog.Column{
 				ID: id, Name: js.alias + "." + c.Name, Type: c.Type,
+				Width: c.Width, // picks sum's result type (bigint or numeric)
 			})
 			refs = append(refs, joinRef{side: i, col: c})
 			id++

@@ -236,6 +236,13 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 					cols[i].Type = unifyFamily(cols[i].Type, mc[i].Type)
 				}
 			}
+			for i := range cols {
+				ci := make([]ResultColumn, len(memberCols))
+				for mi, mc := range memberCols {
+					ci[mi] = mc[i]
+				}
+				cols[i].Width = unifyWidth(cols[i].Type, ci)
+			}
 			return cols, nil
 		}
 		if t.Derived != nil || t.FuncTable != nil {
