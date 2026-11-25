@@ -82,8 +82,15 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   zero (`2.5` → `3`), a `FLOAT8` halves to even (`2.5::float8` → `2`),
   and a value outside the column's range is `22003` (`smallint out of
   range`). A comparison does not round: `WHERE n = 7.5` matches no
-  integer. A `FLOAT8` value into a DECIMAL column is refused (`22P02`);
-  cast it (`x::numeric`).
+  integer. A `FLOAT8` value into a DECIMAL column converts as
+  `x::numeric` does, then takes the column's scale. A DECIMAL[] or
+  `FLOAT8[]` value into an integer array column (and a `FLOAT8[]` into
+  a DECIMAL[] one) converts element by element by the same rules;
+  `NULL` elements stay `NULL`.
+- `x::numeric` of a `FLOAT8` keeps 15 significant digits, as
+  PostgreSQL's does: `(0.1::float8 + 0.2::float8)::numeric` is `0.3`,
+  `(1::float8 / 3)::numeric` is `0.333333333333333`. `NaN` and the
+  infinities become DECIMAL's `NaN` and `Infinity` / `-Infinity`.
 - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
   does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
   `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).

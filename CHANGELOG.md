@@ -2105,6 +2105,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A `float8` value stores into a `numeric` column, and `float8::numeric`
+  keeps 15 significant digits**, as in PostgreSQL (was PG-T-033). An
+  `INSERT`, `INSERT ... SELECT`, `UPDATE` or `ON CONFLICT DO UPDATE`
+  storing one failed with `22P02 cannot use FLOAT8 value as DECIMAL`; it
+  now converts as `float8_numeric` does and the column's scale rounds it.
+  The cast printed the float's shortest exact digits
+  (`(0.1::float8 + 0.2::float8)::numeric` was `0.30000000000000004`); it
+  is now `0.3`. `numeric[]` and `float8[]` values store into `int2[]` /
+  `int4[]` / `int8[]` (and `float8[]` into `numeric[]`) columns element
+  by element with the scalar assignment casts, where each was `22P02`.
 - **A date outside the timestamp range is refused, not wrapped, when it
   becomes a timestamp.** `'1500-01-01'::date::timestamptz` returned
   `2084-07-20 23:34:33.709552+00`: the date's midnight overflowed the
@@ -2146,9 +2156,10 @@ state or the internode protocol does, and an entry below says so.
   a view, a `WITH` query or a subquery in `FROM` was described as
   `int8` (OID 20), and a view's `pg_attribute` and
   `information_schema.columns` rows said `bigint`; they now carry
-  `int2` / `int4` as in PostgreSQL (the catalog rows of a view created
-  before this say `bigint` until it is recreated; its results are
-  described right). A set operation's integer column is its
+  `int2` / `int4` as in PostgreSQL. A view created by an older binary,
+  whose stored columns say `int8`, describes the same way without being
+  recreated: the catalogs derive its integer widths from its query. A
+  set operation's integer column is its
   widest member's: `int2 UNION int8` took the first member's width and
   described as `int2`, whatever the values; it is now `int8`.
 - **`sum` over `int8` is `numeric`**, as in PostgreSQL, so a total past

@@ -91,14 +91,36 @@ func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 // bigint out of range" (a numeric NaN or infinity with 0A000). INSERT
 // (VALUES and SELECT), UPDATE and ON CONFLICT DO UPDATE store through
 // it; comparisons keep coerceColumn, so WHERE id = 1.5 never matches
-// id 2. (float8 into numeric, also an assignment cast in PostgreSQL,
-// is still refused: datax's float → numeric conversion keeps the
-// shortest exact digits, PostgreSQL's rounds to 15.)
+// id 2. A float8 value into a numeric column converts as float8::numeric
+// does (float8_numeric: 15 significant digits; NaN and the infinities
+// are numeric's), and the column's typmod then rounds it. An array value
+// into an array column converts element by element with the same casts
+// (numeric[] / float8[] into an integer array, float8[] into numeric[]);
+// NULL elements stay NULL.
 func assignColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 	if d.Null {
 		return coerceColumn(col, d)
 	}
+	if col.Type.IsArray() && d.Fam.IsArray() && assignCasts(col.Type.Elem(), d.Fam.Elem()) {
+		elem := col
+		elem.Type = col.Type.Elem()
+		out := make([]types.Datum, len(d.A))
+		for i, e := range d.A {
+			v, err := assignColumn(elem, e)
+			if err != nil {
+				return d, err
+			}
+			out[i] = v
+		}
+		return types.NewArray(elem.Type, out), nil
+	}
 	switch {
+	case col.Type == types.Decimal && d.Fam == types.Float:
+		v, err := builtins.Cast(d, "numeric")
+		if err != nil {
+			return d, ToSQLError(builtinErr(err))
+		}
+		return v, nil
 	case col.Type == types.Int && (d.Fam == types.Decimal || d.Fam == types.Float):
 		name, cast, limit := "bigint", "int8", float64(0)
 		switch col.IntWidth() {
@@ -130,6 +152,19 @@ func assignColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 		return v, nil
 	}
 	return coerceColumn(col, d)
+}
+
+// assignCasts reports whether storing a value of family from into a
+// column of family to takes one of assignColumn's assignment casts
+// rather than the implicit coercion.
+func assignCasts(to, from types.Family) bool {
+	switch to {
+	case types.Int:
+		return from == types.Decimal || from == types.Float
+	case types.Decimal:
+		return from == types.Float
+	}
+	return false
 }
 
 // pureWidening reports whether changing a column's declared type from

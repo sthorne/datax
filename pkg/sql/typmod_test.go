@@ -77,6 +77,7 @@ func TestAssignColumn(t *testing.T) {
 	int4 := catalog.Column{Name: "b", Type: types.Int, Width: 4}
 	int8 := catalog.Column{Name: "c", Type: types.Int}
 	num := catalog.Column{Name: "n", Type: types.Decimal}
+	tenth, fifth := 0.1, 0.2 // at run time: a constant 0.1 + 0.2 folds exactly
 	for _, c := range []struct {
 		col  catalog.Column
 		in   types.Datum
@@ -98,7 +99,10 @@ func TestAssignColumn(t *testing.T) {
 		{int8, types.NewFloat(math.Inf(1)), "bigint out of range", CodeNumericValueOutOfRange},
 		{int8, types.NewDecimal("9223372036854775807.5"), "bigint out of range", CodeNumericValueOutOfRange},
 		{int4, types.NewDecimal("NaN"), "cannot convert NaN to integer", CodeFeatureNotSupported},
-		{num, types.NewFloat(1.5), `column "n": cannot use FLOAT8 value as DECIMAL`, CodeInvalidTextRepresentation},
+		{num, types.NewFloat(1.5), "1.5", ""},
+		{num, types.NewFloat(tenth + fifth), "0.3", ""},
+		{num, types.NewFloat(math.NaN()), "NaN", ""},
+		{num, types.NewFloat(math.Inf(-1)), "-Infinity", ""},
 		{num, types.NewInt(7), "7", ""},
 		{int8, types.NewString("12"), "12", ""},
 		{int8, types.DNull, "NULL", ""},
@@ -120,6 +124,69 @@ func TestAssignColumn(t *testing.T) {
 		}
 		if text != c.want || (!got.Null && got.Fam != c.col.Type) {
 			t.Errorf("%s ← %s: %s %q, want %q", c.col.TypeSQL(), c.in.Text(), got.Fam, text, c.want)
+		}
+	}
+}
+
+// TestAssignColumnArrays: a numeric[] or float8[] value stored into an
+// int2[] / int4[] / int8[] column converts element by element with the
+// scalar assignment casts (numeric half away from zero, float8 rint,
+// 22003 out of the element type's range), and a float8[] into a
+// numeric[] column with float8_numeric's 15 digits; NULL elements stay
+// NULL. Before, each was 22P02 "cannot use DECIMAL[] value as INT8[]".
+func TestAssignColumnArrays(t *testing.T) {
+	int2s := catalog.Column{Name: "a", Type: types.ArrayOf(types.Int), Width: 2}
+	int4s := catalog.Column{Name: "b", Type: types.ArrayOf(types.Int), Width: 4}
+	int8s := catalog.Column{Name: "c", Type: types.ArrayOf(types.Int)}
+	nums := catalog.Column{Name: "n", Type: types.ArrayOf(types.Decimal)}
+	dec := func(s ...string) types.Datum {
+		out := make([]types.Datum, len(s))
+		for i, v := range s {
+			if v == "NULL" {
+				out[i] = types.DNull
+				continue
+			}
+			out[i] = types.NewDecimal(v)
+		}
+		return types.NewArray(types.Decimal, out)
+	}
+	flt := func(f ...float64) types.Datum {
+		out := make([]types.Datum, len(f))
+		for i, v := range f {
+			out[i] = types.NewFloat(v)
+		}
+		return types.NewArray(types.Float, out)
+	}
+	tenth, fifth := 0.1, 0.2
+	for _, c := range []struct {
+		col  catalog.Column
+		in   types.Datum
+		want string
+		code string
+	}{
+		{int4s, dec("1.5", "2.4", "-2.5"), "{2,2,-3}", ""},
+		{int8s, dec("1.5", "NULL"), "{2,NULL}", ""},
+		{int4s, flt(1.5, 2.5, -0.5), "{2,2,0}", ""},
+		{int2s, dec("32767.5"), "smallint out of range", CodeNumericValueOutOfRange},
+		{int4s, flt(3e9), "integer out of range", CodeNumericValueOutOfRange},
+		{int8s, flt(math.NaN()), "bigint out of range", CodeNumericValueOutOfRange},
+		{int4s, dec("NaN"), "cannot convert NaN to integer", CodeFeatureNotSupported},
+		{nums, flt(tenth+fifth, 2.5), "{0.3,2.5}", ""},
+		{int8s, types.NewArray(types.Int, []types.Datum{types.NewInt(1)}), "{1}", ""},
+	} {
+		got, err := assignColumn(c.col, c.in)
+		if c.code != "" {
+			if err == nil || err.Code != c.code || err.Msg != c.want {
+				t.Errorf("%s ← %s: %v, want %s %q", c.col.TypeSQL(), c.in.Text(), err, c.code, c.want)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s ← %s: %v", c.col.TypeSQL(), c.in.Text(), err)
+			continue
+		}
+		if got.Text() != c.want || got.Fam != c.col.Type {
+			t.Errorf("%s ← %s: %s %q, want %q", c.col.TypeSQL(), c.in.Text(), got.Fam, got.Text(), c.want)
 		}
 	}
 }
