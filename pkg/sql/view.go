@@ -175,13 +175,13 @@ func viewMember(d *catalog.TableDescriptor, bare string) (parser.CTE, error) {
 // withViewWidths returns d with its integer columns' widths as its
 // query gives them, for the catalogs to describe. A view created before
 // views kept integer widths (#401) stored every integer column as int8
-// (width 0); a view created since stores the width, so for one its
-// query is planned again only when it has an int8 column, and the
-// answer is the stored one. The descriptor is left as it is (d itself
-// is returned) when nothing changes or the query no longer plans; it is
-// never written back.
+// (width 0). A view created or replaced since stores the widths and is
+// marked ViewIntWidths, so it is described as stored; an unmarked view
+// with an int8 or int8[] column has its query planned again. The
+// descriptor is left as it is (d itself is returned) when nothing
+// changes or the query no longer plans; it is never written back.
 func (s *Session) withViewWidths(ctx context.Context, d *catalog.TableDescriptor) *catalog.TableDescriptor {
-	if !d.IsView() || d.Virtual != "" {
+	if !d.IsView() || d.Virtual != "" || d.ViewIntWidths {
 		return d
 	}
 	stale := false
@@ -538,6 +538,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			nd := existing.Clone()
 			nd.Columns, nd.NextColumnID = columns, catalog.ColumnID(len(columns)+1)
 			nd.ViewQuery, nd.ViewDepends, nd.ViewSearchPath, nd.ViewBindings = t.Text, deps, viewPath, bindings
+			nd.ViewIntWidths = true
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
@@ -553,7 +554,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	desc := &catalog.TableDescriptor{
 		Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
-		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, Owner: s.user,
+		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, ViewIntWidths: true, Owner: s.user,
 	}
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err

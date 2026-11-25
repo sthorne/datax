@@ -879,6 +879,12 @@ type TableDescriptor struct {
 	// view's relations at creation). Empty for a view made before
 	// schemas, whose names resolve through public.
 	ViewBindings map[string]uint64 `json:"view_bindings,omitempty"`
+	// ViewIntWidths records that the view's integer columns carry their
+	// width (int2, int4 or int8), as every view created or replaced
+	// since views kept integer widths does. Without it, a view's int8
+	// columns may be ones an older binary stored for any integer width,
+	// and the catalogs plan its query again to describe them.
+	ViewIntWidths bool `json:"view_int_widths,omitempty"`
 }
 
 // RestoredRowsBand is one band of RestoredRows.

@@ -33,7 +33,7 @@ func TestIntegerWidthOfOldView(t *testing.T) {
 	execSQL(t, ctx, s, `CREATE VIEW owcat AS SELECT attrelid, attnum FROM pg_attribute`)
 
 	// Rewrite both descriptors as an older binary stored them: integer
-	// columns without a width.
+	// columns without a width, and no ViewIntWidths mark.
 	acc := catalog.NewAccessor()
 	if err := tc.Nodes[0].DB().RunTxn(ctx, "old-view", func(ctx context.Context, txn *kvclient.Txn) error {
 		for _, name := range []string{"owv", "owv2", "owcat"} {
@@ -45,6 +45,7 @@ func TestIntegerWidthOfOldView(t *testing.T) {
 			for i := range c.Columns {
 				c.Columns[i].Width = 0
 			}
+			c.ViewIntWidths = false
 			if err := acc.Update(ctx, txn, c); err != nil {
 				return err
 			}
