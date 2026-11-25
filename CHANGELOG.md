@@ -2105,6 +2105,32 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A date outside the timestamp range is refused, not wrapped, when it
+  becomes a timestamp.** `'1500-01-01'::date::timestamptz` returned
+  `2084-07-20 23:34:33.709552+00`: the date's midnight overflowed the
+  int64 nanoseconds a timestamp holds. A cast, an assignment to a
+  timestamp column, `date + time`, `date ± interval`, `date - timestamp`,
+  `date_trunc`, `AT TIME ZONE` and `generate_series` over such a date
+  are now `22008 timestamp out of range`, and so is a computed timestamp
+  beyond 1678 to 2261 (`timestamptz + interval`, `to_timestamp`,
+  `make_timestamp`, `SPLIT AT ... WITH EXPIRATION`). An `AS OF SYSTEM
+  TIME` or `with_min_timestamp` timestamp outside the range is refused
+  instead of read at a wrapped time (PG-T-005).
+- **A date compares with a timestamp.** `date = timestamptz` (and `<>`,
+  `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, joins) failed with `XX000
+  cannot compare DATE with TIMESTAMPTZ`, and a date against a
+  `timestamptz` column was read at UTC midnight. As in PostgreSQL the
+  date is now promoted to its midnight — in the session's `TimeZone`
+  against a `timestamptz`, as wall time against a `timestamp` — in
+  filters, index and primary-key spans, joins and subqueries; a date
+  outside the timestamp range is before or after every timestamp.
+- **The functions of sealed tables in a multi-statement query or a
+  pipeline.** `datax_rotate_tenant_key`, `datax_destroy_old_key_versions`,
+  `datax_remove_tenant_rows` and `datax_destroy_tenant_key` failed with
+  `25001` in the implicit transaction of a multi-statement query or a
+  pipeline. Called in a `SELECT`'s select list they now commit the
+  statements before them and run alone, as the online statements do
+  (PG-X-006); inside `BEGIN` they are still refused.
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the

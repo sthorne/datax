@@ -212,6 +212,22 @@ func TestSealJobs(t *testing.T) {
 			t.Fatalf("after the explicit destruction: %v", got)
 		}
 		sameStrings(t, "nothing more to destroy", queryStrings(t, ctx, conn, `SELECT datax_destroy_old_key_versions('rot')`), "0")
+
+		// In a multi-statement query or a pipeline the call commits the
+		// implicit transaction so far and runs alone; the statements
+		// after it are another implicit transaction (PG-X-006).
+		sealExec(t, ctx, conn, `CREATE TABLE rot_block (id INT8 PRIMARY KEY)`)
+		sealExec(t, ctx, conn, `INSERT INTO rot_block VALUES (1); SELECT datax_destroy_old_key_versions('rot'); INSERT INTO rot_block VALUES (2)`)
+		b := &pgx.Batch{}
+		b.Queue(`INSERT INTO rot_block VALUES (3)`)
+		b.Queue(`SELECT datax_destroy_old_key_versions('rot')`)
+		b.Queue(`INSERT INTO rot_block VALUES (4)`)
+		if err := conn.SendBatch(ctx, b).Close(); err != nil {
+			t.Fatalf("a pipeline calling datax_destroy_old_key_versions: %v", err)
+		}
+		sameStrings(t, "around the calls", queryStrings(t, ctx, conn, `SELECT id FROM rot_block ORDER BY id`), "1", "2", "3", "4")
+		wantSQLErr(t, ctx, conn, `BEGIN; SELECT datax_destroy_old_key_versions('rot')`, "25001", "transaction block")
+		sealExec(t, ctx, conn, `ROLLBACK`)
 	})
 
 	t.Run("early destruction makes rows unreadable", func(t *testing.T) {

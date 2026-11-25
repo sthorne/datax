@@ -258,3 +258,75 @@ func TestImplicitTransactionBoundaries(t *testing.T) {
 		t.Errorf("batch committed %q, want 1,2", g)
 	}
 }
+
+// TestSealFunctionsEndImplicitBlock: the functions of sealed tables
+// that work in transactions of their own (datax_rotate_tenant_key,
+// datax_destroy_old_key_versions, datax_remove_tenant_rows,
+// datax_destroy_tenant_key), called in a SELECT's select list, are
+// online statements like CREATE INDEX (PG-X-006): in a multi-statement
+// simple Query or a pipeline the implicit transaction so far commits,
+// the statement runs alone, and the statements after it are another
+// implicit transaction. In an explicit block they are refused (25001).
+// The calls here name a table that is not sealed, so each fails with
+// its own error once it has run — not with 25001, as each did in an
+// implicit block before.
+func TestSealFunctionsEndImplicitBlock(t *testing.T) {
+	tc := Start(t, 1)
+	r := dialRaw(t, tc)
+	query := func(q string) pipeOutcome { return r.cycle(&pgproto3.Query{String: q}) }
+	if got := query(`CREATE TABLE plain (tenant INT8, id INT8, PRIMARY KEY (tenant, id)); CREATE TABLE pipe (id INT8 PRIMARY KEY)`); len(got.errs) != 0 {
+		t.Fatalf("setup: %+v", got)
+	}
+	ids := func() string {
+		t.Helper()
+		got := query(`SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM pipe; DELETE FROM pipe`)
+		if len(got.errs) != 0 || len(got.rows) != 1 {
+			t.Fatalf("reading pipe: %+v", got)
+		}
+		return got.rows[0]
+	}
+	check := func(what string, got pipeOutcome, errs string, status byte, want string) {
+		t.Helper()
+		if g := strings.Join(got.errs, ","); g != errs {
+			t.Errorf("%s: errors %q, want %q", what, g, errs)
+		}
+		if got.status != status {
+			t.Errorf("%s: ReadyForQuery %q, want %q", what, got.status, status)
+		}
+		if g := ids(); g != want {
+			t.Errorf("%s: rows %q, want %q", what, g, want)
+		}
+	}
+	for _, c := range []struct{ call, code string }{
+		{`datax_rotate_tenant_key('plain', 1)`, "42809"},
+		{`datax_destroy_old_key_versions('plain')`, "55000"},
+		{`datax_remove_tenant_rows('plain', 1)`, "42809"},
+		{`datax_destroy_tenant_key('plain', 1)`, "42809"},
+	} {
+		sel := "SELECT " + c.call
+		check(c.call+" alone", query(sel), c.code, 'I', "")
+		// The insert before the call commits; the call fails on its
+		// own, and the rest of the message is not run.
+		check(c.call+", simple, after an insert", query("INSERT INTO pipe VALUES (1); "+sel+"; INSERT INTO pipe VALUES (2)"), c.code, 'I', "1")
+		check(c.call+", pipeline, after an insert", r.cycle(pipeline("INSERT INTO pipe VALUES (1)", sel, "INSERT INTO pipe VALUES (2)")...), c.code, 'I', "1")
+		check(c.call+", pipeline, first", r.cycle(pipeline(sel, "INSERT INTO pipe VALUES (1)")...), c.code, 'I', "")
+		// A NULL argument returns NULL before the function does
+		// anything, so the call succeeds alone and the statements after
+		// it are a new implicit transaction, rolled back by its error.
+		null := "SELECT " + strings.Replace(c.call, "'plain'", "NULL", 1)
+		check(c.call+", simple, NULL argument, then a failing block",
+			query("INSERT INTO pipe VALUES (1); "+null+"; INSERT INTO pipe VALUES (2); SELECT 1/0"), "22012", 'I', "1")
+		check(c.call+", pipeline, NULL argument, then a failing block",
+			r.cycle(pipeline("INSERT INTO pipe VALUES (1)", null, "INSERT INTO pipe VALUES (2)", "SELECT 1/0")...), "22012", 'I', "1")
+		check(c.call+", simple, NULL argument, then a block",
+			query("INSERT INTO pipe VALUES (1); "+null+"; INSERT INTO pipe VALUES (2)"), "", 'I', "1,2")
+		// In an explicit block, BEGIN inside an implicit one included:
+		// 25001, as before.
+		check(c.call+", in a block", then(query("BEGIN; INSERT INTO pipe VALUES (1); "+sel), query("ROLLBACK")), "25001", 'I', "")
+		check(c.call+", after BEGIN in an implicit block", then(query("INSERT INTO pipe VALUES (1); BEGIN; "+sel), query("ROLLBACK")), "25001", 'I', "")
+		check(c.call+", pipeline, in a block", then(r.cycle(pipeline("BEGIN", "INSERT INTO pipe VALUES (1)", sel)...), query("ROLLBACK")), "25001", 'I', "")
+		// A call deeper in the statement is not an online statement:
+		// refused in an implicit block, which rolls back.
+		check(c.call+", in a subquery", query("INSERT INTO pipe VALUES (1); SELECT (SELECT "+c.call+")"), "25001", 'I', "")
+	}
+}

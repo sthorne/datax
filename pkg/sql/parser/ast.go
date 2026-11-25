@@ -123,6 +123,10 @@ type Comparison struct {
 	// three-valued logic because WHERE keeps only TRUE); scalar subqueries
 	// may appear inside OR, IN and EXISTS subqueries may not.
 	Or [][]Comparison `json:"or,omitempty"`
+	// Zone is set by the session, never parsed: the TimeZone (when it
+	// is not UTC) at whose midnight a date compares with a timestamp
+	// with time zone.
+	Zone *time.Location `json:"-"`
 }
 
 type ColumnDef struct {

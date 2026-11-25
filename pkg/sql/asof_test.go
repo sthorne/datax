@@ -61,3 +61,19 @@ func TestResolveMinTimestamp(t *testing.T) {
 		t.Fatalf("follower_read_timestamp(): %v %v", ts, err)
 	}
 }
+
+// TestAsOfOutOfRange (PG-T-005): an RFC 3339 timestamp outside the
+// int64-nanosecond range is refused by AS OF SYSTEM TIME and
+// with_min_timestamp, not read at the instant its nanoseconds wrap to
+// (2400-01-01 used to read as of 1815).
+func TestAsOfOutOfRange(t *testing.T) {
+	now := hlc.Timestamp{WallTime: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC).UnixNano()}
+	for _, bad := range []string{"2400-01-01T00:00:00Z", "1500-01-01T00:00:00Z"} {
+		if ts, err := resolveAsOf(bad, now); err == nil {
+			t.Errorf("AS OF SYSTEM TIME %q: read at %v", bad, time.Unix(0, ts.WallTime).UTC())
+		}
+		if ts, err := resolveMinTimestamp(bad, now, hlc.Timestamp{}); err == nil {
+			t.Errorf("with_min_timestamp(%q): read at %v", bad, time.Unix(0, ts.WallTime).UTC())
+		}
+	}
+}

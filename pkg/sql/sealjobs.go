@@ -79,6 +79,26 @@ func init() {
 	}
 }
 
+// callsSealFunc reports a SELECT whose select list calls one of
+// sealFuncs (SELECT datax_rotate_tenant_key('t', 'acme')): such a
+// statement works in transactions of its own, so it is one of the
+// online statements (onlineOutsideBlock) that end an implicit block and
+// run alone. A call deeper in the statement — in a subquery, a WITH
+// member, the FROM or WHERE clause — is not seen here, and is refused
+// in any block, an implicit one included (25001).
+func callsSealFunc(t *parser.Select) bool {
+	if t.Union != nil {
+		return false
+	}
+	isSeal := func(x parser.Expr) bool { return sealFuncs[x.Func] }
+	for _, se := range t.Exprs {
+		if exprHas(se.Expr, isSeal) {
+			return true
+		}
+	}
+	return false
+}
+
 // evalSealFunc runs one call of a function of sealFuncs.
 func (s *Session) evalSealFunc(ctx context.Context, txn *kvclient.Txn, name string, args []types.Datum) (types.Datum, error) {
 	switch name {

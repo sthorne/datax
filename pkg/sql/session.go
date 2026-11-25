@@ -44,7 +44,11 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 		return now.AddNanos(-FollowerReadLag.Nanoseconds()), nil
 	}
 	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
-		ts := hlc.Timestamp{WallTime: t.UnixNano()}
+		nanos, err := types.TimeNanos(t)
+		if err != nil {
+			return hlc.Timestamp{}, err
+		}
+		ts := hlc.Timestamp{WallTime: nanos}
 		if !ts.Less(now) {
 			return hlc.Timestamp{}, fmt.Errorf("timestamp %q is not in the past", operand)
 		}
@@ -912,7 +916,7 @@ func (s *Session) onlineOutsideBlock(ctx context.Context, stmt parser.Statement)
 	case *parser.Analyze:
 		return true
 	case *parser.Select:
-		return t.AsOf != "" || t.AsOfMaxStaleness != "" || t.AsOfMinTimestamp != ""
+		return t.AsOf != "" || t.AsOfMaxStaleness != "" || t.AsOfMinTimestamp != "" || callsSealFunc(t)
 	case *parser.ShowClusterSetting:
 		return false
 	}
@@ -1940,6 +1944,9 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 // does not parse is 22P02, any other type 42883 (no such operator), as
 // in PostgreSQL.
 func coerceCmpValue(op string, v types.Datum, fam types.Family) (types.Datum, error) {
+	if dateVsTimestamp(v.Fam, fam) {
+		return v, nil // the comparison promotes the date (CompareIn)
+	}
 	c, err := v.Coerce(fam)
 	if err == nil {
 		return c, nil
@@ -2446,7 +2453,7 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 			return false, nil // NULL comparisons never match
 		}
 		if !plainCmpOp(cmp.Op) {
-			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+			ok, err := applyCmpOpIn(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -2468,7 +2475,7 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 		} else if rhs, err = coerceCmpValue(cmp.Op, rhs, cmpType); err != nil {
 			return false, err
 		}
-		c, err := lhs.Compare(rhs)
+		c, err := lhs.CompareIn(rhs, cmp.Zone)
 		if err != nil {
 			return false, nil
 		}
@@ -2630,7 +2637,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 					return false, err
 				}
 				if !lhs.Null && !v.Null {
-					if c, err := lhs.Compare(v); err == nil && c == 0 {
+					if c, err := lhs.CompareIn(v, cmp.Zone); err == nil && c == 0 {
 						found = true
 						break
 					}
@@ -2660,7 +2667,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 		if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 			return false, nil
 		}
-		ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+		ok, err := applyCmpOpIn(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 		if err != nil || !ok {
 			return false, nil
 		}
@@ -2734,7 +2741,7 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 				sawNull = true
 				continue
 			}
-			if c, err := lhs.Compare(v); err == nil && c == 0 {
+			if c, err := lhs.CompareIn(v, cmp.Zone); err == nil && c == 0 {
 				return cmp.Op == "IN", false, nil
 			}
 		}
@@ -2759,7 +2766,7 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 	if lhs.Null || rhs.Null {
 		return false, true, nil
 	}
-	ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+	ok, err := applyCmpOpIn(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 	if err != nil {
 		return false, false, err
 	}
@@ -2888,7 +2895,7 @@ func boolTest(op string, d types.Datum) (bool, error) {
 func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
 	distinct := lhs.Null != rhs.Null
 	if !lhs.Null && !rhs.Null {
-		if rhs.Fam != lhs.Fam {
+		if rhs.Fam != lhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
 			if c, err := rhs.Coerce(lhs.Fam); err == nil {
 				rhs = c
 			}
@@ -2931,6 +2938,13 @@ func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
 // applyCmpOpEsc is applyCmpOp with a pattern's ESCAPE character ("" =
 // backslash, parser.NoEscape = none).
 func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
+	return applyCmpOpIn(op, lhs, rhs, escape, nil)
+}
+
+// applyCmpOpIn is applyCmpOpEsc under the session's TimeZone (nil:
+// UTC), at whose midnight a date compares with a timestamp with time
+// zone.
+func applyCmpOpIn(op string, lhs, rhs types.Datum, escape string, loc *time.Location) (bool, error) {
 	switch op {
 	case "~", "!~", "~*", "!~*":
 		// Compiled as the regexp_* functions compile a pattern: the
@@ -2976,12 +2990,12 @@ func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error)
 		ok, _, err := quantCmp3(op, lhs, rhs, escape)
 		return ok, err
 	}
-	if lhs.Fam != rhs.Fam {
+	if lhs.Fam != rhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
 		if c, err := rhs.Coerce(lhs.Fam); err == nil {
 			rhs = c
 		}
 	}
-	c, err := lhs.Compare(rhs)
+	c, err := lhs.CompareIn(rhs, loc)
 	if err != nil {
 		return false, err
 	}
@@ -3245,7 +3259,7 @@ func matchesIn(cmp parser.Comparison, cmpType types.Family, lhs types.Datum, des
 		if cerr != nil {
 			return false, cerr
 		}
-		if c, err := lhs.Compare(d); err == nil && c == 0 {
+		if c, err := lhs.CompareIn(d, cmp.Zone); err == nil && c == 0 {
 			matched = true
 			break
 		}

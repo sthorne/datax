@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"errors"
+
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -70,6 +72,9 @@ func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 	}
 	out, err := d.Coerce(col.Type)
 	if err != nil {
+		if errors.Is(err, types.ErrTimestampRange) {
+			return d, newErrf(CodeDatetimeFieldOverflow, "column %q: %v", col.Name, err)
+		}
 		return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
 	}
 	return out, nil

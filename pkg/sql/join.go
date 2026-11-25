@@ -375,7 +375,7 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			if (lhs.Null || rhs.Null) && !quantDecides(cmp.Op, lhs, rhs) {
 				return false, nil
 			}
-			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+			ok, err := applyCmpOpIn(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 			if err != nil || !ok {
 				return false, nil
 			}
@@ -452,7 +452,7 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 			return false, nil
 		}
 		if !plainCmpOp(cmp.Op) {
-			ok, err := applyCmpOpEsc(cmp.Op, lhs, rhs, cmp.Escape)
+			ok, err := applyCmpOpIn(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -468,7 +468,7 @@ func evalJoinWhere(sides []joinSide, where []parser.Comparison, jr joinedRow, pa
 		if cerr != nil {
 			return false, cerr
 		}
-		c, err := lhs.Compare(rhs)
+		c, err := lhs.CompareIn(rhs, cmp.Zone)
 		if err != nil {
 			return false, nil
 		}
@@ -858,7 +858,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 					}
 					lit := d
 					synth = append(synth, parser.Comparison{
-						Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
+						Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit}, Zone: s.zone(),
 					})
 				}
 				matches = nil
@@ -1221,7 +1221,7 @@ func (s *Session) explainJoin(ctx context.Context, txn *kvclient.Txn, baseDesc *
 		for _, p := range append(ons[k-1][:len(ons[k-1]):len(ons[k-1])], keys[k-1].pairs...) {
 			lit := types.Datum{Fam: p.rightCol.Type}
 			synth = append(synth, parser.Comparison{
-				Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit},
+				Column: p.rightCol.Name, Op: "=", Value: parser.Expr{Lit: &lit}, Zone: s.zone(),
 			})
 		}
 		synth, _, err := s.securedWhere(ctx, txn, sides[k].desc, synth, catalog.PolicySelect)

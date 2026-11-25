@@ -517,7 +517,12 @@ SELECT datax_destroy_tenant_key('items', $1);   -- crypto-shred one tenant
   id — only after every gateway has stopped using it (the key lease,
   10 seconds). It needs ownership of the table or the admin role
   (`42501`), takes constants or parameters (`0A000` for a column), and
-  is refused inside a transaction block (`25001`). The tenant is given as
+  is refused inside a transaction block (`25001`). Called in the select
+  list of a `SELECT` in a multi-statement query or a pipeline, it ends
+  the implicit transaction so far and runs alone, as the online
+  statements do (PG-X-006), and so do the other functions of sealed
+  tables below; a call deeper in the statement (a subquery, a `WITH`
+  member, `WHERE`) is refused there (`25001`). The tenant is given as
   a value of the tenant column, or as text that converts to one
   (`22P02` if it does not). Calling it again for a destroyed tenant
   destroys and purges again and returns the same id; a tenant that never
@@ -2195,7 +2200,8 @@ one; `datax_sql_plan_cache_hits_total` / `_misses_total` /
   (`refusedInBlock`: `25001`). datax's online statements
   (`onlineOutsideBlock`: CREATE INDEX on a table the block did not
   create, the online ALTER TABLE actions, CREATE TABLE AS, ANALYZE, AS
-  OF SYSTEM TIME, key statements) are refused only in an explicit
+  OF SYSTEM TIME, key statements, a SELECT whose select list calls one
+  of the functions of sealed tables, `callsSealFunc`) are refused only in an explicit
   block: in an implicit one, `Session.Execute` commits the block so far
   and runs the statement alone, and the next statement opens a new
   block. A

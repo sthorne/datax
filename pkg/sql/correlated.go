@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -981,7 +982,7 @@ func substituteConds(conds []parser.Comparison, node *scopeNode, row map[catalog
 			if err != nil {
 				return nil, err
 			}
-			match, err := compareDatums(lhs, cmp.Op, rhs)
+			match, err := compareDatumsIn(lhs, cmp.Op, rhs, cmp.Zone)
 			if err != nil {
 				return nil, err
 			}
@@ -1062,6 +1063,13 @@ func constOp(b bool) string {
 // (NULL never matches). Values of types that do not compare are 42883,
 // as in PostgreSQL, never XX000.
 func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
+	return compareDatumsIn(l, op, r, nil)
+}
+
+// compareDatumsIn is compareDatums under the session's TimeZone (nil:
+// UTC), at whose midnight a date compares with a timestamp with time
+// zone.
+func compareDatumsIn(l types.Datum, op string, r types.Datum, loc *time.Location) (bool, error) {
 	if (l.Null || r.Null) && !quantDecides(op, l, r) {
 		return false, nil
 	}
@@ -1077,7 +1085,7 @@ func compareDatums(l types.Datum, op string, r types.Datum) (bool, error) {
 			return false, err
 		}
 	}
-	c, err := l.Compare(r)
+	c, err := l.CompareIn(r, loc)
 	if err != nil {
 		return false, newErrf(CodeUndefinedFunction, "operator does not exist: %s %s %s", pgTypeName(l.Fam), op, pgTypeName(r.Fam))
 	}

@@ -40,7 +40,12 @@ syntax error or `0A000` feature not supported):
   volatile default, a constraint or `SERIAL`, `SET (...)`, `RESET`,
   `SPLIT AT`, `UNSPLIT`, `PURGE` or `ROTATE ENCRYPTION KEY`, `CREATE
   TABLE ... AS`, `ANALYZE`, `SELECT ... AS OF SYSTEM TIME`, the
-  encryption-key statements and `SET CLUSTER SETTING`. One of them
+  encryption-key statements, `SET CLUSTER SETTING`, and a `SELECT`
+  whose select list calls `datax_rotate_tenant_key`,
+  `datax_destroy_old_key_versions`, `datax_remove_tenant_rows` or
+  `datax_destroy_tenant_key` (a call deeper in the statement — a
+  subquery, a `WITH` member, `WHERE` — is refused with `25001` in a
+  multi-statement query or pipeline too). One of them
   commits the statements before it, runs on its own, and the statements
   after it form a new implicit transaction — so a migration file sent
   as one `Exec` works, but is not all-or-nothing. Inside `BEGIN` they
