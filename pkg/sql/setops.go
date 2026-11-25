@@ -80,6 +80,13 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 			cols[i].Type = unifyFamily(cols[i].Type, res.Columns[i].Type)
 		}
 	}
+	for i := range cols {
+		ci := make([]ResultColumn, len(members))
+		for mi, res := range members {
+			ci[mi] = res.Columns[i]
+		}
+		cols[i].Width = unifyWidth(cols[i].Type, ci)
+	}
 	for mi, res := range members {
 		for i := range cols {
 			if res.Columns[i].Type == cols[i].Type {
@@ -233,6 +240,35 @@ func columnIndex(cols []ResultColumn, name string) int {
 		}
 	}
 	return -1
+}
+
+// unifyWidth is the integer width (2, 4, 0 = 8) of a set operation's
+// output column whose members' columns are cols, once their families
+// have met at fam: the widest member's (int2 UNION int8 is int8, as in
+// PostgreSQL), a member of unknown type (NULL) deferring; 0 when fam is
+// not an integer type or a member's family differs from it.
+func unifyWidth(fam types.Family, cols []ResultColumn) int32 {
+	if fam != types.Int && fam != types.ArrayOf(types.Int) {
+		return 0
+	}
+	w := int32(-1)
+	for _, c := range cols {
+		switch {
+		case c.Type == types.Unknown:
+			continue
+		case c.Type != fam:
+			return 0
+		}
+		cw := c.Width
+		if cw != 2 && cw != 4 {
+			cw = 8
+		}
+		w = max(w, cw)
+	}
+	if w == 8 || w < 0 {
+		return 0
+	}
+	return w
 }
 
 // unifyFamily is the type two set-operation members' columns meet at:

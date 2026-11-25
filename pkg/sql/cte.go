@@ -58,7 +58,8 @@ func relationDesc(name string, cols []ResultColumn, rename []string) (*catalog.T
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		out = append(out, catalog.Column{ID: catalog.ColumnID(i + 1), Name: cname, Type: typ})
+		// An integer column keeps its width (int2 / int4 / int8).
+		out = append(out, catalog.Column{ID: catalog.ColumnID(i + 1), Name: cname, Type: typ, Width: rc.Width})
 	}
 	ord := catalog.Column{ID: catalog.ColumnID(len(out) + 1), Name: "_ord", Type: types.Int, NotNull: true, Hidden: true}
 	out = append(out, ord)

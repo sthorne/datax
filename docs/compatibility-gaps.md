@@ -47,8 +47,8 @@ Open gaps by area and priority.
 | Area | P1 | P2 | P3 | P4 | Total |
 |---|---:|---:|---:|---:|---:|
 | [PG: Query language](#query-language) | 0 | 9 | 12 | 0 | 21 |
-| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 11 | 0 | 17 |
-| [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
+| [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 10 | 0 | 16 |
+| [PG: Types](#types) | 0 | 9 | 18 | 0 | 27 |
 | [PG: DDL](#ddl) | 0 | 14 | 9 | 1 | 24 |
 | [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 0 | 12 |
@@ -130,7 +130,6 @@ which do exist: see PG-F-022.
 | PG-F-026 | `setseed` (no per-session random generator); `scale(1.50)` is 1, PostgreSQL says 2 | `42883`; silently different | — | P3 | S | D | — |
 | PG-F-027 | Bitwise operators on `int2` / `int4` compute in `int8`: `1 << 31` on an `int4` is 2147483648, PostgreSQL wraps to -2147483648 | silently different | cast the result | P3 | S | D | — |
 | PG-F-028 | `range_agg`, `xmlagg` (no range or xml types) | `42883` | — | P3 | S | D | — |
-| PG-F-029 | `sum` over `int8` (and over any integer expression datax types as `int8`, see PG-F-016) is `bigint`, where PostgreSQL's is `numeric`, so a total beyond `int8` fails. Making it `numeric` waits on two other gaps: numeric → integer assignment casts (`INSERT INTO t (n) SELECT sum(x) FROM u` into an `int8` column would fail with `22P02`), and integer widths through views and derived tables (`sum` of an `int4` view column would become `numeric`). `avg` over `int8` totals in `numeric` and does not overflow | `22003 bigint out of range in sum` | `sum(x::numeric)` | P3 | S | V | — |
 | PG-F-014 | **SQL/JSON**: the `jsonpath` type, `@?`, `@@`, `jsonb_path_query[_array\|_first]`, `jsonb_path_exists`, `jsonb_path_match`; SQL/JSON constructors and query functions `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_TABLE` (17), `JSON_ARRAYAGG` / `JSON_OBJECTAGG` (16), `json_scalar`, `json_serialize` | `42601 unexpected character '@'`; `42883 unknown function "jsonb_path_query"`; `42601 expected ")", found ":"` | `->` / `@>` / `?` | P2 | L | V | — |
 | PG-F-015 | **Size functions return NULL**: `pg_table_size`, `pg_total_relation_size`, `pg_relation_size`, `pg_database_size`; `pg_indexes_size` and `pg_column_size` do not exist | silently different (NULL; psql's `\dt+`, `\l+`, `\di+` show blank sizes); `42883` for the last two | `datax debug` ranges, the console's data view | P2 | M | V | — |
 | PG-F-016 | **Integer typing**: integer literals and `INT4` expressions are `int8` (`pg_typeof(1)` and `pg_typeof(int4_col)` are `int8`), so `2147483647::int4 + 1` is `2147483648` where PostgreSQL raises `22003`; `to_regtype('int4')` and `to_regtype('integer')` return `20` (int8's OID; PostgreSQL returns `integer`) | silently different | cast results; the column's own check still raises `22003` on store | P2 | M | V | — |
@@ -146,6 +145,7 @@ which do exist: see PG-F-022.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-T-031 | `json_agg` / `jsonb_agg` render a `timestamptz` in UTC; zone abbreviations are a fixed list (no `timezone_abbreviations`, none DST-dependent); an invalid startup setting is ignored where PostgreSQL ends the connection | silently different | `to_jsonb` per row | P3 | S | D | — |
+| PG-T-033 | `float8` into a `numeric` column, an assignment cast in PostgreSQL, is refused (numeric and float8 into an integer column convert); and datax's `float8` → `numeric` cast keeps the shortest exact digits (`(0.1::float8 + 0.2::float8)::numeric` is `0.30000000000000004`) where PostgreSQL's rounds to 15 significant digits (`0.3`) | `22P02 column "n": cannot use FLOAT8 value as DECIMAL`; the cast silently different | `x::numeric`, `round(x::numeric, n)` | P3 | S | D | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
 | PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; a `date` takes the years 0000 to 9999 and a `timestamp` / `timestamptz` 1678-01-01 to 2261-12-31 (PostgreSQL: 4713 BC to 5874897 AD, and to 294276 AD); special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'`. Year 0000 is a valid `date` (`'0000-01-01'::date`, `make_date(0, 1, 1)`: the proleptic year before 0001), where PostgreSQL, which has no year 0, refuses it with `22008`. A `date` outside the timestamp range cannot become a timestamp: a cast, an assignment to a timestamp column, `date + time`, `date ± interval`, `date - timestamp`, `date_trunc`, `AT TIME ZONE` or `generate_series` over it is `22008 timestamp out of range` (PostgreSQL computes it), as is a computed timestamp beyond the range (`timestamptz + interval`, `to_timestamp`, `make_timestamp`). Compared with a timestamp, such a date is before (or after) every timestamp, as in PostgreSQL | `22007 invalid input syntax for type date: "infinity"` (and likewise for BC and five-digit years); a timestamp text outside its range, or a date or computed timestamp that would leave it, is `22008 timestamp out of range`; a binary-format parameter or COPY field outside these ranges, PostgreSQL's infinity encodings included, is `22008`; year 0000 is silently different | sentinel values; `now()` | P2 | M | V | — |
 | PG-T-006 | `TIMESTAMP` (without time zone) expressions and casts become `timestamptz`; `date + interval` is `timestamptz` (PostgreSQL: `timestamp`); a bind parameter for a `TIMESTAMP` column describes as `timestamptz` | silently different (wire type) | pass UTC | P2 | M | V | — |
@@ -517,6 +517,7 @@ carried several).
 
 | Closed gap | PR / issue |
 |---|---|
+| `sum` over `int8` is `numeric` (`bigint` over `int2` / `int4`), with the two gaps it waited on: numeric and `float8` values store into integer columns (assignment casts), and integer widths survive views, CTEs, derived tables and set operations (was PG-F-029) | PR (this branch) |
 | SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`, also without a type list (parameters counted and typed as the protocol-level Parse does); cursors: `DECLARE` (`WITH HOLD` too), `FETCH`, `MOVE`, `CLOSE` (was PG-Q-021) | PR (this branch) |
 | A multi-statement query, and an extended-protocol pipeline up to its `Sync`, are one implicit transaction (a failing statement no longer leaves the earlier ones committed; `_xact_` advisory locks span it, from PG-X-014), except around datax's online statements (PG-X-006) | PR (this branch) |
 | Sequences and enum types in any schema: `CREATE SEQUENCE / TYPE s.x`, `SERIAL` and identity in a schema, `SET SCHEMA`, defaults bound to their sequence, schema privileges, the catalogs (was PG-D-035; leftovers are PG-D-037) | PR (this branch) |

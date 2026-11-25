@@ -2131,6 +2131,33 @@ state or the internode protocol does, and an entry below says so.
   pipeline. Called in a `SELECT`'s select list they now commit the
   statements before them and run alone, as the online statements do
   (PG-X-006); inside `BEGIN` they are still refused.
+- **A numeric or float8 value stores into an integer column**, as
+  PostgreSQL's assignment casts allow: `INSERT INTO t (n) VALUES (2.5)`,
+  `INSERT ... SELECT avg(x)`, `UPDATE t SET n = n * 1.1` and `ON CONFLICT
+  DO UPDATE SET n = excluded.price` into an `INT2` / `INT4` / `INT8`
+  column failed with `22P02 cannot use DECIMAL value as INT8`. A numeric
+  rounds half away from zero (`2.5` → `3`), a float8 half to even
+  (`2.5::float8` → `2`, PostgreSQL's `rint`), and a value outside the
+  column's range is `22003 smallint / integer / bigint out of range` (a
+  numeric `NaN` `0A000`). Comparisons are unchanged: `WHERE n = 7.5`
+  matches no integer.
+- **Integer columns keep their width through views, CTEs, derived
+  tables and set operations.** An `INT2` or `INT4` column read through
+  a view, a `WITH` query or a subquery in `FROM` was described as
+  `int8` (OID 20), and a view's `pg_attribute` and
+  `information_schema.columns` rows said `bigint`; they now carry
+  `int2` / `int4` as in PostgreSQL (the catalog rows of a view created
+  before this say `bigint` until it is recreated; its results are
+  described right). A set operation's integer column is its
+  widest member's: `int2 UNION int8` took the first member's width and
+  described as `int2`, whatever the values; it is now `int8`.
+- **`sum` over `int8` is `numeric`**, as in PostgreSQL, so a total past
+  the `int8` range is exact instead of `22003 bigint out of range in
+  sum` (was PG-F-029). `sum` over `int2` and `int4` — and over integer
+  literals, `CASE ... THEN 1 ELSE 0 END` and casts to `int4` — stays
+  `bigint`. A query that divides it changes with it, as in PostgreSQL:
+  `sum(int8_col) / count(*)` is a numeric division (`21.0000000000000000`,
+  was `21`).
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sthorne/datax/pkg/metrics"
@@ -97,6 +98,8 @@ func rlsTryRows(ctx context.Context, conn *pgx.Conn, query string, args ...any) 
 			switch x := v.(type) {
 			case [16]byte:
 				parts[i] = fmt.Sprintf("%x-%x-%x-%x-%x", x[0:4], x[4:6], x[6:8], x[8:10], x[10:16])
+			case pgtype.Numeric: // sum(int8), for one
+				parts[i] = numericString(x)
 			default:
 				parts[i] = fmt.Sprint(v)
 			}

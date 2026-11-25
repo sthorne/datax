@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -394,8 +395,9 @@ func TestTableRestoreIntoALiveCluster(t *testing.T) {
 	if transfers.Load() == before {
 		t.Fatal("no transfer committed while the restores ran")
 	}
-	if total := execSQL(t, ctx, s, `SELECT SUM(balance) FROM accounts`).Rows[0][0].I; total != nAccounts*1000 {
-		t.Fatalf("accounts total %d after the restores, want %d", total, nAccounts*1000)
+	// SUM over the INT8 balance is numeric.
+	if total := execSQL(t, ctx, s, `SELECT SUM(balance) FROM accounts`).Rows[0][0].Text(); total != strconv.Itoa(nAccounts*1000) {
+		t.Fatalf("accounts total %s after the restores, want %d", total, nAccounts*1000)
 	}
 	dirAfter := t.TempDir()
 	sumAfter, err := tc.Nodes[0].RunBackup(ctx, dirAfter, "", false, false)

@@ -1609,6 +1609,9 @@ func derivedDesc(alias string, cols []ResultColumn) *catalog.TableDescriptor {
 	for i, rc := range cols {
 		desc.Columns = append(desc.Columns, catalog.Column{
 			ID: catalog.ColumnID(i + 1), Name: strings.ToLower(rc.Name), Type: rc.Type,
+			// An integer column keeps its width (int2 / int4 / int8),
+			// as PostgreSQL's subquery output columns do.
+			Width: rc.Width,
 		})
 	}
 	return desc

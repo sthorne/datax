@@ -405,6 +405,10 @@ func (wp *windowPlan) windowTypes(cols []ResultColumn) error {
 		return newErrf(CodeInternal, "window plan lost its hidden columns")
 	}
 	desc := derivedDesc("", cols)
+	for i := range desc.Columns {
+		// An argument's integer width picks sum's result type.
+		desc.Columns[i].Width = cols[i].Width
+	}
 	hiddenName := func(h int) string { return fmt.Sprintf("__w%d", h) }
 	for i := range wp.items {
 		it := &wp.items[i]
