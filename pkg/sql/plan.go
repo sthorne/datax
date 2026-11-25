@@ -65,7 +65,10 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) bool {
+		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) (types.Family, bool) {
+			c, ok := desc.Col(stripQualifier(n))
+			return c.Type, ok
+		}, func(n string) bool {
 			c, ok := desc.Col(stripQualifier(n))
 			return ok && c.NoTZ
 		})
@@ -198,8 +201,9 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 		}
 		if t.Union != nil {
 			// A set operation's output is named by its head and typed by
-			// unifying every member (the numeric families lift, anything
-			// else meets as text); a VALUES list's as execution types it
+			// unifying every member (the numeric families lift, a date
+			// and a timestamp meet at timestamp, anything else meets as
+			// text); a VALUES list's as execution types it
 			// (resolveValuesTypes).
 			head := *t
 			head.Union, head.OrderBy, head.Limit, head.Offset = nil, nil, -1, 0
@@ -220,6 +224,15 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 					return nil, newErrf(CodeSyntaxError, "each set operation member must have the same number of columns")
 				}
 				asts, memberCols = append(asts, m), append(memberCols, mc)
+			}
+			for i := range cols {
+				ci := make([]ResultColumn, len(memberCols))
+				for mi, mc := range memberCols {
+					ci[mi] = mc[i]
+				}
+				if noTZ, ok := setOpDates(ci); ok {
+					cols[i].NoTZ = noTZ
+				}
 			}
 			if valuesList(asts) {
 				for i := range cols {
@@ -310,7 +323,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						fam = sc[0].Type
 					}
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil)})
 			}
 			return cols, nil
 		}

@@ -462,7 +462,8 @@ syntax error or `0A000` feature not supported):
 - **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
   (input without an offset, text output, `::text`, `::date`,
   `date_trunc`, `extract`, `to_char`, `current_date`, day and month
-  arithmetic), and `AT TIME ZONE` / `timezone()` convert both ways; the
+  arithmetic, a `date` becoming a `TIMESTAMPTZ` at its midnight in the
+  zone), and `AT TIME ZONE` / `timezone()` convert both ways; the
   differences: abbreviations are the fixed-offset ones of PostgreSQL's
   default set (not configurable through `timezone_abbreviations`), and
   `json_agg` / `jsonb_agg` render a `TIMESTAMPTZ` in UTC. Timestamps

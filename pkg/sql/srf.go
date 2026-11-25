@@ -66,7 +66,7 @@ func (s *Session) selectSetValues(ctx context.Context, txn *kvclient.Txn, e pars
 		return selectSet{}, ResultColumn{}, err
 	}
 	col := cols[0]
-	col.NoTZ = len(e.Args) > 0 && col.Type == types.Timestamp && exprNoTZ(e.Args[0], nil)
+	col.NoTZ = len(e.Args) > 0 && col.Type == types.Timestamp && exprNoTZ(e.Args[0], nil, nil)
 	rest := e
 	rest.Func, rest.Args = "", nil
 	plain := rest.Cast == "" && len(rest.Path) == 0 && rest.BinOp == ""
@@ -75,7 +75,7 @@ func (s *Session) selectSetValues(ctx context.Context, txn *kvclient.Txn, e pars
 		if col.Type == types.Unknown {
 			col.Type = types.String
 		}
-		col.NoTZ = exprNoTZ(e, nil)
+		col.NoTZ = exprNoTZ(e, nil, nil)
 	}
 	vals := make([]types.Datum, len(rows))
 	for i, r := range rows {
@@ -96,10 +96,11 @@ func (s *Session) selectSetValues(ctx context.Context, txn *kvclient.Txn, e pars
 
 // exprNoTZ reports whether an expression yields a timestamp WITHOUT
 // time zone, which describes as timestamp (OID 1114) and renders
-// without an offset: a ::timestamp cast, such a column (colNoTZ), and
-// AT TIME ZONE applied to a timestamp with time zone (or the reverse
-// of one without).
-func exprNoTZ(e parser.Expr, colNoTZ func(name string) bool) bool {
+// without an offset: a ::timestamp cast, such a column (colNoTZ), AT
+// TIME ZONE applied to a timestamp with time zone (or the reverse of
+// one without), and a CASE, coalesce, greatest, least or nullif whose
+// arms meet at one (armsNoTZ; colType types them).
+func exprNoTZ(e parser.Expr, colType func(name string) (types.Family, bool), colNoTZ func(name string) bool) bool {
 	if e.Cast != "" {
 		name := strings.ToLower(strings.TrimSpace(e.Cast))
 		if i := strings.IndexByte(name, '('); i >= 0 {
@@ -117,15 +118,17 @@ func exprNoTZ(e parser.Expr, colNoTZ func(name string) bool) bool {
 		}
 		base := e
 		base.BinOp, base.Right = "", nil
-		return exprNoTZ(base, colNoTZ) && exprFamily(*e.Right, nil) != types.Timestamp
+		return exprNoTZ(base, colType, colNoTZ) && exprFamily(*e.Right, nil) != types.Timestamp
 	}
 	switch {
 	case e.Left != nil:
-		return exprNoTZ(*e.Left, colNoTZ)
+		return exprNoTZ(*e.Left, colType, colNoTZ)
+	case e.Case != nil || isArmsFunc(e.Func):
+		return armsNoTZ(exprArms(e), colType, colNoTZ)
 	case e.Func == "date_trunc" && len(e.Args) == 2:
-		return exprNoTZ(e.Args[1], colNoTZ)
+		return exprNoTZ(e.Args[1], colType, colNoTZ)
 	case e.Func == "timezone" && len(e.Args) == 2:
-		return !exprNoTZ(e.Args[1], colNoTZ)
+		return !exprNoTZ(e.Args[1], colType, colNoTZ)
 	case e.Column != "" && colNoTZ != nil:
 		return colNoTZ(e.Column)
 	case e.Lit != nil:

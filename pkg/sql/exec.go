@@ -1230,7 +1230,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := assignColumn(target[i], d)
+			d, cerr := assignColumn(target[i], d, s.zone())
 			if cerr != nil {
 				return nil, cerr
 			}
@@ -1536,7 +1536,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := assignColumn(col, d)
+		d, cerr := assignColumn(col, d, s.zone())
 		if cerr != nil {
 			return false, nil, cerr
 		}
@@ -1570,6 +1570,11 @@ type conflictEnv struct {
 	desc          *catalog.TableDescriptor
 	table         string
 	old, excluded map[catalog.ColumnID]types.Datum
+}
+
+func (e conflictEnv) colKind(name string) (catalog.Column, bool) {
+	_, bare := splitQualified(name)
+	return e.desc.Col(bare)
 }
 
 func (e conflictEnv) col(name string) (types.Datum, error) {
@@ -2752,7 +2757,7 @@ func (s *Session) execSelectBody(ctx context.Context, txn *kvclient.Txn, t, orig
 					fam = types.String
 				}
 			}
-			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil)})
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}
@@ -3238,7 +3243,7 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 					return nil, err
 				}
 			}
-			d, cerr := assignColumn(col, d)
+			d, cerr := assignColumn(col, d, s.zone())
 			if cerr != nil {
 				return nil, cerr
 			}

@@ -2134,6 +2134,22 @@ state or the internode protocol does, and an entry below says so.
   against a `timestamptz`, as wall time against a `timestamp` — in
   filters, index and primary-key spans, joins and subqueries; a date
   outside the timestamp range is before or after every timestamp.
+- **A date becomes a `timestamptz` at its midnight in the session's
+  `TimeZone` everywhere.** The simple `CASE x WHEN y`, `IS [NOT]
+  DISTINCT FROM` and `ANY` / `ALL` over an array still compared a date
+  with a `timestamptz` at UTC midnight, and a date stored into a
+  `timestamptz` column (`INSERT`, `UPDATE`, `ON CONFLICT DO UPDATE`, an
+  expression `DEFAULT`, `INSERT ... SELECT`, a date parameter) was
+  stored at UTC midnight. A set operation or a `VALUES` list mixing a
+  date and a timestamp now meets at the timestamp type (a `UNION` met as
+  text, and sorted as text); a `CASE`, `coalesce`, `greatest`, `least`
+  or `nullif` over a date and a timestamp is the timestamp type (it was
+  its first arm's, a date cutting the timestamps to their day), so
+  `ORDER BY`, `DISTINCT`, `GROUP BY`, a window's `PARTITION BY` and
+  `ORDER BY`, `min` and `max` over it order the date at its midnight.
+  With a timestamp without time zone the result is one too, and the
+  date its wall-clock midnight. An expression index over a timestamp
+  expression is bounded by a date under UTC (it refused one).
 - **The functions of sealed tables in a multi-statement query or a
   pipeline.** `datax_rotate_tenant_key`, `datax_destroy_old_key_versions`,
   `datax_remove_tenant_rows` and `datax_destroy_tenant_key` failed with

@@ -966,9 +966,14 @@ func (s *Session) zone() *time.Location {
 
 // zoneSensitive reports whether a node reads or renders a timestamp
 // with time zone in the session's zone: a text literal (which may be
-// read as one), a cast, an operator over one, a zone-aware builtin.
+// read as one), a cast, an operator over one, a zone-aware builtin, a
+// CASE (whose operand may be a date compared with a timestamp with
+// time zone, and whose date result may become one: evalCase).
 func zoneSensitive(x parser.Expr) bool {
 	if x.Lit != nil && !x.Lit.Null && x.Lit.Fam == types.String || x.Cast != "" {
+		return true
+	}
+	if x.Case != nil || isArmsFunc(x.Func) {
 		return true
 	}
 	switch x.BinOp {
@@ -1293,7 +1298,9 @@ func (s *Session) resolveSelectSubs(ctx context.Context, txn *kvclient.Txn, t *p
 			// FILTER or ORDER BY (array_agg(x ORDER BY (SELECT ...))).
 			call := se
 			wrapped := parser.Expr{Agg: &call}
-			if !exprHasSubquery(wrapped) {
+			if !exprHasSubquery(wrapped) && !(s.zone() != nil && exprHas(wrapped, zoneMarked)) {
+				// (Under a TimeZone that is not UTC its arguments are
+				// marked with it: a CASE whose dates meet timestamps.)
 				continue
 			}
 			v, err := s.resolveValueExpr(ctx, txn, wrapped, params)
@@ -1778,7 +1785,7 @@ func srfColumns(b *builtins.Builtin, e parser.Expr, alias string) []ResultColumn
 		cols[i] = ResultColumn{Name: n, Type: f}
 	}
 	// generate_series over timestamps without time zone yields them.
-	cols[0].NoTZ = cols[0].Type == types.Timestamp && len(e.Args) > 0 && exprNoTZ(e.Args[0], nil)
+	cols[0].NoTZ = cols[0].Type == types.Timestamp && len(e.Args) > 0 && exprNoTZ(e.Args[0], nil, nil)
 	return cols
 }
 

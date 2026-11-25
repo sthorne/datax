@@ -126,6 +126,9 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			}
 			fallthrough
 		case types.Date:
+			if noTZ {
+				d.Loc = nil // its wall-clock midnight
+			}
 			v, err := d.Coerce(types.Timestamp)
 			if err != nil {
 				return types.Datum{}, timestampErr(err, d.Text())

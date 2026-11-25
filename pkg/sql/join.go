@@ -199,6 +199,11 @@ type joinEnv struct {
 	jr    joinedRow
 }
 
+func (j joinEnv) colKind(name string) (catalog.Column, bool) {
+	ref, err := resolveJoinRef(j.sides, name)
+	return ref.col, err == nil
+}
+
 func (j joinEnv) col(name string) (types.Datum, error) {
 	ref, err := resolveJoinRef(j.sides, name)
 	if err != nil {

@@ -795,7 +795,7 @@ func (s *Session) defaultValue(ctx context.Context, txn *kvclient.Txn, cd *colum
 			if err != nil {
 				return types.Datum{}, err
 			}
-			d, cerr := coerceColumn(*col, d)
+			d, cerr := coerceColumnIn(*col, d, s.zone())
 			if cerr != nil {
 				return types.Datum{}, cerr
 			}

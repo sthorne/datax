@@ -2,6 +2,7 @@ package testcluster
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 // TestDateTimestampComparison: a date compares with a timestamp with
@@ -153,4 +155,203 @@ func TestDateTimestampComparison(t *testing.T) {
 			t.Errorf("prepared with a date out of range, run %d: %d %v, want 2", i, n, err)
 		}
 	}
+}
+
+// TestDateTimestampSessionZone: every path that brings a date against
+// a timestamp with time zone takes the date at its midnight in the
+// session's TimeZone, as PostgreSQL's date2timestamptz does — not at
+// UTC midnight: a simple CASE, IS [NOT] DISTINCT FROM, ANY / ALL over
+// an array and IN, the common type of a set operation, a VALUES list
+// or a CASE (and so the ORDER BY, DISTINCT, GROUP BY, min and max over
+// it), and a date stored into a timestamptz column (INSERT, a DEFAULT,
+// INSERT ... SELECT, ON CONFLICT DO UPDATE, UPDATE, a date parameter;
+// COPY's text '2024-01-01' reads as a timestamptz in the zone), and
+// coalesce, greatest, least and nullif and a window's PARTITION BY and
+// ORDER BY over a mix. Against a timestamp without time zone the date
+// is its wall-clock midnight. Each of z's ts sits at the midnight of
+// 2024-01-01 in one zone: 1 in Asia/Tokyo, 2 in UTC, 3 in
+// America/New_York.
+func TestDateTimestampSessionZone(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
+	waitForDatabases(t, ctx, s)
+
+	execSQL(t, ctx, s, `CREATE TABLE z (id INT8 PRIMARY KEY, d DATE, ts TIMESTAMPTZ, tn TIMESTAMP)`)
+	execSQL(t, ctx, s, `INSERT INTO z VALUES
+		(1, '2024-01-01', '2023-12-31 15:00:00+00', '2024-01-01 00:00:00'),
+		(2, '2024-01-01', '2024-01-01 00:00:00+00', '2024-01-01 05:00:00'),
+		(3, '2024-01-01', '2024-01-01 05:00:00+00', '2023-12-31 15:00:00')`)
+	execSQL(t, ctx, s, `CREATE INDEX z_e ON z ((coalesce(ts, ts)))`)
+	rows := func(q string) string {
+		t.Helper()
+		r, serr := trySQL(ctx, s, q)
+		if serr != nil {
+			t.Errorf("%s: %v", q, serr)
+			return ""
+		}
+		var out []string
+		for _, row := range r.Rows {
+			var cells []string
+			for _, d := range row {
+				cells = append(cells, d.Text())
+			}
+			out = append(out, strings.Join(cells, "|"))
+		}
+		return strings.Join(out, " ")
+	}
+	const (
+		tokyo = "2023-12-31 15:00:00+00"
+		utc   = "2024-01-01 00:00:00+00"
+		ny    = "2024-01-01 05:00:00+00"
+	)
+	zones := []string{"UTC", "America/New_York", "Asia/Tokyo"}
+	for _, c := range []struct{ q, utc, ny, tokyo string }{
+		// The simple CASE.
+		{`SELECT id FROM z WHERE CASE d WHEN ts THEN true ELSE false END ORDER BY id`, "2", "3", "1"},
+		{`SELECT CASE '2024-01-01'::date WHEN '2024-01-01 05:00:00+00'::timestamptz THEN 'hit' ELSE 'miss' END`, "miss", "hit", "miss"},
+		// IS [NOT] DISTINCT FROM, in WHERE and in the select list.
+		{`SELECT id FROM z WHERE d IS NOT DISTINCT FROM ts ORDER BY id`, "2", "3", "1"},
+		{`SELECT id, d IS DISTINCT FROM ts FROM z ORDER BY id`, "1|t 2|f 3|t", "1|t 2|t 3|f", "1|f 2|t 3|t"},
+		{`SELECT '2024-01-01'::date IS NOT DISTINCT FROM '2024-01-01 05:00:00+00'::timestamptz`, "f", "t", "f"},
+		// ANY / ALL over an array, IN.
+		{`SELECT id FROM z WHERE d = ANY(ARRAY[ts]) ORDER BY id`, "2", "3", "1"},
+		{`SELECT id FROM z WHERE ts = ANY(ARRAY['2024-01-01'::date]) ORDER BY id`, "2", "3", "1"},
+		{`SELECT id FROM z WHERE '2024-01-01'::date < ALL(ARRAY[ts]) ORDER BY id`, "3", "", "2 3"},
+		{`SELECT id, d <> ALL(ARRAY[ts, NULL]) FROM z ORDER BY id`, "1| 2|f 3|", "1| 2| 3|f", "1|f 2| 3|"},
+		{`SELECT '2024-01-01'::date = ANY(ARRAY['2024-01-01 05:00:00+00'::timestamptz])`, "f", "t", "f"},
+		{`SELECT id, d IN (ts) FROM z ORDER BY id`, "1|f 2|t 3|f", "1|f 2|f 3|t", "1|t 2|f 3|f"},
+		// A set operation, a VALUES list: a date and a timestamp with
+		// time zone meet at timestamptz (they used to meet as text).
+		{`SELECT x FROM (SELECT '2024-01-01'::date AS x UNION SELECT '2024-01-01 05:00:00+00'::timestamptz) s ORDER BY x`,
+			utc + " " + ny, ny, tokyo + " " + ny},
+		{`SELECT x FROM (SELECT d AS x FROM z UNION SELECT ts FROM z WHERE id <> 2) s ORDER BY x`,
+			tokyo + " " + utc + " " + ny, tokyo + " " + ny, tokyo + " " + ny},
+		{`SELECT x FROM (VALUES ('2024-01-01'::date), ('2024-01-01 05:00:00+00'::timestamptz)) v(x) ORDER BY x`,
+			utc + " " + ny, ny + " " + ny, tokyo + " " + ny},
+		{`SELECT max(x), min(x) FROM (SELECT '2024-01-01'::date AS x UNION ALL SELECT '2024-01-01 04:00:00+00'::timestamptz) s`,
+			"2024-01-01 04:00:00+00|" + utc, ny + "|2024-01-01 04:00:00+00", "2024-01-01 04:00:00+00|" + tokyo},
+		// ... and with a timestamp without time zone, at wall time.
+		{`SELECT x FROM (SELECT '2024-01-01'::date AS x UNION SELECT '2024-01-01 00:00:00'::timestamp) s`,
+			"2024-01-01 00:00:00", "2024-01-01 00:00:00", "2024-01-01 00:00:00"},
+		// A CASE that yields a date or a timestamptz is a timestamptz
+		// (it used to be a date, the timestamps cut to their day), and
+		// sorts, groups and aggregates as one.
+		{`SELECT CASE WHEN id = 1 THEN d ELSE ts END FROM z ORDER BY id`,
+			utc + " " + utc + " " + ny, ny + " " + utc + " " + ny, tokyo + " " + utc + " " + ny},
+		{`SELECT id FROM z ORDER BY CASE WHEN id = 1 THEN d ELSE ts END DESC, id`, "3 1 2", "1 3 2", "3 2 1"},
+		{`SELECT DISTINCT CASE WHEN id = 1 THEN d ELSE ts END AS x FROM z ORDER BY x`,
+			utc + " " + ny, utc + " " + ny, tokyo + " " + utc + " " + ny},
+		{`SELECT count(*) FROM z GROUP BY CASE WHEN id = 1 THEN d ELSE ts END ORDER BY 1`, "1 2", "1 2", "1 1 1"},
+		{`SELECT min(CASE WHEN id = 1 THEN d ELSE ts END), max(CASE WHEN id = 1 THEN d ELSE ts END) FROM z WHERE id < 3`,
+			utc + "|" + utc, utc + "|" + ny, tokyo + "|" + utc},
+		// ... and with a timestamp without time zone it is one, the date
+		// at its wall-clock midnight.
+		{`SELECT CASE WHEN id = 1 THEN d ELSE tn END FROM z ORDER BY id`,
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00",
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00",
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00"},
+		{`SELECT CASE WHEN true THEN '2024-01-01'::date ELSE '2024-01-01 00:00:00'::timestamp END`,
+			"2024-01-01 00:00:00", "2024-01-01 00:00:00", "2024-01-01 00:00:00"},
+		// coalesce, greatest, least and nullif over a date and a
+		// timestamp are the timestamp type (they were their first
+		// argument's, a date first cutting the timestamps to their day).
+		{`SELECT greatest(d, ts) FROM z ORDER BY id`, utc + " " + utc + " " + ny, ny + " " + ny + " " + ny, tokyo + " " + utc + " " + ny},
+		{`SELECT least(d, ts) FROM z ORDER BY id`, tokyo + " " + utc + " " + utc, tokyo + " " + utc + " " + ny, tokyo + " " + tokyo + " " + tokyo},
+		{`SELECT coalesce(NULL, d, ts) FROM z WHERE id = 1`, utc, ny, tokyo},
+		{`SELECT coalesce('2024-01-01'::date, now())`, utc, ny, tokyo},
+		{`SELECT id, nullif(d, ts) FROM z ORDER BY id`, "1|" + utc + " 2| 3|" + utc, "1|" + ny + " 2|" + ny + " 3|", "1| 2|" + tokyo + " 3|" + tokyo},
+		{`SELECT greatest(d, tn), least(d, tn), coalesce(d, tn) FROM z WHERE id = 3`,
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00",
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00",
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00"},
+		{`SELECT count(*) FROM z GROUP BY greatest(d, ts) ORDER BY 1`, "1 2", "3", "1 1 1"},
+		// A window's PARTITION BY and ORDER BY over such a CASE or
+		// function.
+		{`SELECT id, row_number() OVER (PARTITION BY CASE WHEN id = 1 THEN d ELSE ts END ORDER BY id) FROM z ORDER BY id`,
+			"1|1 2|2 3|1", "1|1 2|1 3|2", "1|1 2|1 3|1"},
+		{`SELECT id, rank() OVER (ORDER BY CASE WHEN id = 1 THEN d ELSE ts END) FROM z ORDER BY id`,
+			"1|1 2|1 3|3", "1|2 2|1 3|2", "1|1 2|2 3|3"},
+		{`SELECT id, row_number() OVER (PARTITION BY greatest(d, ts) ORDER BY id) FROM z ORDER BY id`,
+			"1|1 2|2 3|1", "1|1 2|2 3|3", "1|1 2|1 3|1"},
+		{`SELECT id, rank() OVER (ORDER BY least(d, ts)) FROM z ORDER BY id`, "1|1 2|2 3|2", "1|1 2|2 3|3", "1|1 2|1 3|1"},
+		// An expression index bounds a timestamp expression by a date
+		// where the date's place is certain; the filter decides the rest.
+		{`SELECT id FROM z WHERE coalesce(ts, ts) >= '2024-01-01'::date ORDER BY id`, "2 3", "3", "1 2 3"},
+		{`SELECT id FROM z WHERE coalesce(ts, ts) = '2024-01-01'::date ORDER BY id`, "2", "3", "1"},
+	} {
+		for zi, zone := range zones {
+			execSQL(t, ctx, s, `SET TIME ZONE '`+zone+`'`)
+			want := []string{c.utc, c.ny, c.tokyo}[zi]
+			if got := rows(c.q); got != want {
+				t.Errorf("%s, in %s: %q, want %q", c.q, zone, got, want)
+			}
+		}
+	}
+	execSQL(t, ctx, s, `SET TIME ZONE 'Asia/Tokyo'`)
+	// The type a CASE, coalesce or greatest over a date and a timestamp
+	// describes as: without time zone only when no arm is with one.
+	for _, c := range []struct {
+		q    string
+		noTZ bool
+	}{
+		{`SELECT CASE WHEN id = 1 THEN d ELSE tn END FROM z`, true},
+		{`SELECT CASE WHEN id = 1 THEN d WHEN id = 2 THEN tn ELSE ts END FROM z`, false},
+		{`SELECT coalesce(d, tn) FROM z`, true},
+		{`SELECT greatest(d, ts) FROM z`, false},
+	} {
+		r, serr := trySQL(ctx, s, c.q)
+		if serr != nil {
+			t.Errorf("%s: %v", c.q, serr)
+			continue
+		}
+		if col := r.Columns[0]; col.Type != types.Timestamp || col.NoTZ != c.noTZ {
+			t.Errorf("%s: %s (without time zone: %v), want TIMESTAMP (without time zone: %v)", c.q, col.Type, col.NoTZ, c.noTZ)
+		}
+	}
+	execSQL(t, ctx, s, `SET TIME ZONE 'UTC'`)
+	if got := rows(`EXPLAIN SELECT id FROM z WHERE coalesce(ts, ts) >= '2024-01-01'::date`); !strings.Contains(got, `scan of index "z_e" (coalesce(ts, ts) >= `+utc+`)`) {
+		t.Errorf("a date bounding an expression index under UTC: %q", got)
+	}
+
+	// A date stored into a timestamptz column is its midnight in the
+	// session's zone; into a timestamp column, its wall-clock midnight.
+	execSQL(t, ctx, s, `CREATE TABLE st (id INT8 PRIMARY KEY, ts TIMESTAMPTZ DEFAULT '2024-01-01'::date, tn TIMESTAMP)`)
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	day := pgtype.Date{Time: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), Valid: true}
+	for zi, zone := range zones {
+		want := []string{utc, ny, tokyo}[zi]
+		execSQL(t, ctx, s, `SET TIME ZONE '`+zone+`'`)
+		execSQL(t, ctx, s, `DELETE FROM st`)
+		execSQL(t, ctx, s, `INSERT INTO st (id, ts, tn) VALUES (1, '2024-01-01'::date, '2024-01-01'::date)`)
+		execSQL(t, ctx, s, `INSERT INTO st (id) VALUES (2)`)
+		execSQL(t, ctx, s, `INSERT INTO st (id, ts) SELECT 3, d FROM z WHERE id = 1`)
+		execSQL(t, ctx, s, `INSERT INTO st (id, ts) VALUES (4, NULL)`)
+		execSQL(t, ctx, s, `UPDATE st SET ts = '2024-01-01'::date WHERE id = 4`)
+		execSQL(t, ctx, s, `INSERT INTO st (id, ts) VALUES (5, NULL) ON CONFLICT (id) DO NOTHING`)
+		execSQL(t, ctx, s, `INSERT INTO st (id, ts) VALUES (5, NULL) ON CONFLICT (id) DO UPDATE SET ts = '2024-01-01'::date`)
+		if _, err := conn.Exec(ctx, `SET TIME ZONE '`+zone+`'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO st (id, ts) VALUES (6, $1::date)`, day); err != nil {
+			t.Fatalf("a date parameter, in %s: %v", zone, err)
+		}
+		if _, err := conn.PgConn().CopyFrom(ctx, strings.NewReader("7\t2024-01-01\n"), `COPY st (id, ts) FROM STDIN`); err != nil {
+			t.Fatalf("COPY, in %s: %v", zone, err)
+		}
+		got := rows(`SELECT id, ts, tn FROM st ORDER BY id`)
+		w := "1|" + want + "|2024-01-01 00:00:00"
+		for id := 2; id <= 7; id++ {
+			w += " " + strconv.Itoa(id) + "|" + want + "|"
+		}
+		if got != w {
+			t.Errorf("dates stored in %s:\n got %q\nwant %q", zone, got, w)
+		}
+	}
+	execSQL(t, ctx, s, `SET TIME ZONE 'UTC'`)
 }
