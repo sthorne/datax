@@ -269,6 +269,32 @@ var (
 	ErrTimestampRange = errors.New("timestamp out of range")
 )
 
+// The dates whose midnight is a timestamp: [minTimestampDay,
+// maxTimestampDay), as days since the Unix epoch.
+var (
+	minTimestampDay = minTimestamp.Unix() / 86400
+	maxTimestampDay = maxTimestamp.Unix() / 86400
+)
+
+// DateNanos is the timestamp of a date's midnight (UTC nanoseconds of
+// the wall clock), or ErrTimestampRange for a date outside the
+// timestamp range: days times a day's nanoseconds would wrap int64.
+func DateNanos(days int64) (int64, error) {
+	if days < minTimestampDay || days >= maxTimestampDay {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
+	}
+	return days * NanosPerDay, nil
+}
+
+// TimeNanos is t as UTC Unix nanoseconds, or ErrTimestampRange when t
+// is outside the timestamp range (time.UnixNano would wrap).
+func TimeNanos(t time.Time) (int64, error) {
+	if t.Before(minTimestamp) || !t.Before(maxTimestamp) {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, t.UTC().Format("2006-01-02 15:04:05"))
+	}
+	return t.UnixNano(), nil
+}
+
 // ParseTimestamp parses a timestamp string to UTC Unix nanoseconds (a
 // text without an offset is UTC; ParseTimestampIn reads it in a zone).
 func ParseTimestamp(s string) (int64, error) { return ParseTimestampIn(s, nil) }
@@ -525,7 +551,11 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		}
 		return NewDate(days), nil
 	case d.Fam == Date && target == Timestamp:
-		return NewTimestamp(d.I * 86400 * 1e9), nil
+		n, err := DateNanos(d.I)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimestamp(n), nil
 	case d.Fam == String && target == Bytes:
 		b, err := ParseBytes(d.S)
 		if err != nil {

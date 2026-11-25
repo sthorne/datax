@@ -61,6 +61,8 @@ const (
 	CodeDuplicateJSONKey = "22030"
 	// DECIMAL(p,s): integer digits exceed precision−scale.
 	CodeNumericValueOutOfRange = "22003"
+	// A date or timestamp outside the timestamp range.
+	CodeDatetimeFieldOverflow = "22008"
 	// COPY FROM STDIN.
 	CodeInvalidTextRepresentation = "22P02"
 	CodeBadCopyFormat             = "22P04"

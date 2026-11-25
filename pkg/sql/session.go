@@ -44,7 +44,11 @@ func resolveAsOf(operand string, now hlc.Timestamp) (hlc.Timestamp, error) {
 		return now.AddNanos(-FollowerReadLag.Nanoseconds()), nil
 	}
 	if t, err := time.Parse(time.RFC3339Nano, operand); err == nil {
-		ts := hlc.Timestamp{WallTime: t.UnixNano()}
+		nanos, err := types.TimeNanos(t)
+		if err != nil {
+			return hlc.Timestamp{}, err
+		}
+		ts := hlc.Timestamp{WallTime: nanos}
 		if !ts.Less(now) {
 			return hlc.Timestamp{}, fmt.Errorf("timestamp %q is not in the past", operand)
 		}

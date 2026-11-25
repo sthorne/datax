@@ -71,7 +71,11 @@ func CastIn(d types.Datum, typ string, loc *time.Location) (types.Datum, error) 
 	case d.Fam == types.Timestamp && d.NoTZ && isTimestamptzType(name):
 		return Cast(types.NewTimestamp(types.WallInZone(d.I, loc)), typ)
 	case d.Fam == types.Date && isTimestamptzType(name):
-		return Cast(types.NewTimestamp(types.WallInZone(d.I*types.NanosPerDay, loc)), typ)
+		n, err := types.DateNanos(d.I)
+		if err != nil {
+			return types.Datum{}, timestampErr(err, d.Text())
+		}
+		return Cast(types.NewTimestamp(types.WallInZone(n, loc)), typ)
 	case d.Fam == types.String && isTimestamptzType(name):
 		d.Loc = loc
 	}
@@ -88,7 +92,13 @@ func AddIntervalIn(t time.Time, iv Interval, sign int64, loc *time.Location) tim
 	if iv.Months != 0 || iv.Days != 0 {
 		wall := time.Unix(0, types.InZone(t.UnixNano(), loc)).UTC()
 		wall = Interval{Months: iv.Months, Days: iv.Days}.AddTo(wall, sign)
-		t = time.Unix(0, types.WallInZone(wall.UnixNano(), loc)).UTC()
+		n, err := types.TimeNanos(wall)
+		if err != nil {
+			// Outside the timestamp range: the caller refuses it
+			// (tsDatum); the zone's offset cannot bring it back.
+			return wall
+		}
+		t = time.Unix(0, types.WallInZone(n, loc)).UTC()
 	}
 	return t.Add(time.Duration(sign * iv.Nanos))
 }
@@ -115,5 +125,6 @@ func DateArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (t
 	if op == "-" {
 		sign = -1
 	}
-	return tsDatum(AddIntervalIn(tsTime(ts), step, sign, loc)), true, nil
+	out, err := tsDatum(AddIntervalIn(tsTime(ts), step, sign, loc))
+	return out, true, err
 }

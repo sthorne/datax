@@ -71,8 +71,21 @@ func tsTime(d types.Datum) time.Time { return time.Unix(0, d.I).UTC() }
 func dateTime(d types.Datum) time.Time {
 	return time.Unix(d.I*86400, 0).UTC()
 }
-func tsDatum(t time.Time) types.Datum {
-	return types.NewTimestamp(types.RoundMicros(t.UTC().UnixNano()))
+
+// tsDatum is t as a timestamp, or 22008 when t is outside the timestamp
+// range (its nanoseconds would wrap an int64).
+func tsDatum(t time.Time) (types.Datum, error) {
+	n, err := types.TimeNanos(t)
+	if err != nil {
+		return types.Datum{}, errTimestampRange()
+	}
+	return types.NewTimestamp(types.RoundMicros(n)), nil
+}
+
+// errTimestampRange is PostgreSQL's error for a timestamp result
+// outside the range.
+func errTimestampRange() error {
+	return errf(CodeDatetimeField, "timestamp out of range")
 }
 func dateDatum(t time.Time) types.Datum {
 	return types.NewDate(floorDiv(t.UTC().Unix(), 86400))
@@ -135,10 +148,22 @@ func DateArith(l types.Datum, op string, r types.Datum) (types.Datum, bool, erro
 		}
 		return types.NewTime(n), true, nil
 	case l.Fam == types.Date && r.Fam == types.Time && op == "+":
-		return types.NewTimestamp(l.I*types.NanosPerDay + r.I), true, nil
+		n, err := types.DateNanos(l.I)
+		if err != nil {
+			return types.Datum{}, true, errTimestampRange()
+		}
+		return types.NewTimestamp(n + r.I), true, nil
 	case l.Fam == types.Date && r.Fam == types.Date && op == "-":
 		return types.NewInt(l.I - r.I), true, nil
 	case l.Fam == types.Timestamp && temporal(r) && op == "-", l.Fam == types.Date && r.Fam == types.Timestamp && op == "-":
+		// The date side is promoted to a timestamp, which it must fit.
+		for _, d := range [2]types.Datum{l, r} {
+			if d.Fam == types.Date {
+				if _, err := types.DateNanos(d.I); err != nil {
+					return types.Datum{}, true, errTimestampRange()
+				}
+			}
+		}
 		lt, rt := temporalTime(l), temporalTime(r)
 		d := lt.Sub(rt)
 		days := int64(d / (24 * time.Hour))
@@ -152,7 +177,10 @@ func DateArith(l types.Datum, op string, r types.Datum) (types.Datum, bool, erro
 		}
 		// date ± interval is a timestamp, as in PostgreSQL; a
 		// timestamp without time zone stays one.
-		out := tsDatum(iv.AddTo(temporalTime(l), sign))
+		out, err := tsDatum(iv.AddTo(temporalTime(l), sign))
+		if err != nil {
+			return types.Datum{}, true, err
+		}
 		out.NoTZ = l.NoTZ
 		return out, true, nil
 	case temporal(l) && isNum(r) && l.Fam == types.Timestamp:
@@ -248,7 +276,7 @@ func init() {
 			if t.Year() != int(a[0].I) || int(t.Month()) != int(a[1].I) || t.Day() != int(a[2].I) || a[3].I > 23 || a[4].I > 59 || sec < 0 || sec >= 60 {
 				return types.Datum{}, errf(CodeDatetimeField, "timestamp field value out of range")
 			}
-			return tsDatum(t), nil
+			return tsDatum(t)
 		}})
 	register(&Builtin{Name: "make_interval", Args: []types.Family{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, Any}, MinArgs: 0, Ret: types.IntervalFam, Category: catTime,
 		Doc: "An interval from years, months, weeks, days, hours, minutes and seconds.",
@@ -874,9 +902,16 @@ func dateTruncIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
 		return types.Datum{}, errf(CodeInvalidArgument, "unit %q not recognized for date_trunc", a[0].S)
 	}
 	if z != time.UTC {
-		return types.NewTimestamp(types.WallInZone(w.UnixNano(), z)), nil
+		n, err := types.TimeNanos(w)
+		if err != nil {
+			return types.Datum{}, errTimestampRange()
+		}
+		return types.NewTimestamp(types.WallInZone(n, z)), nil
 	}
-	out := tsDatum(w)
+	out, err := tsDatum(w)
+	if err != nil {
+		return types.Datum{}, err
+	}
 	out.NoTZ = a[1].Fam == types.Timestamp && a[1].NoTZ // a timestamp stays one
 	return out, nil
 }
@@ -909,7 +944,12 @@ func toTimestampIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
 			return types.Datum{}, err
 		}
 		sec := math.Floor(f)
-		return tsDatum(time.Unix(int64(sec), int64((f-sec)*1e9)).UTC()), nil
+		if math.IsNaN(f) || math.Abs(sec) > 1e13 {
+			// Far outside the range, and beyond what int64 seconds
+			// convert exactly.
+			return types.Datum{}, errTimestampRange()
+		}
+		return tsDatum(time.Unix(int64(sec), int64((f-sec)*1e9)).UTC())
 	}
 	t, err := parseWithPattern(a[0].Text(), a[1].S)
 	if err != nil {
@@ -917,9 +957,13 @@ func toTimestampIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
 	}
 	if loc != nil {
 		// The parsed fields are a wall clock in the session's zone.
-		return types.NewTimestamp(types.WallInZone(t.UnixNano(), loc)), nil
+		n, err := types.TimeNanos(t)
+		if err != nil {
+			return types.Datum{}, errTimestampRange()
+		}
+		return types.NewTimestamp(types.WallInZone(n, loc)), nil
 	}
-	return tsDatum(t), nil
+	return tsDatum(t)
 }
 
 func toCharIn(a []types.Datum, loc *time.Location) (types.Datum, error) {
