@@ -2115,6 +2115,16 @@ state or the internode protocol does, and an entry below says so.
   column's range is `22003 smallint / integer / bigint out of range` (a
   numeric `NaN` `0A000`). Comparisons are unchanged: `WHERE n = 7.5`
   matches no integer.
+- **Integer columns keep their width through views, CTEs, derived
+  tables and set operations.** An `INT2` or `INT4` column read through
+  a view, a `WITH` query or a subquery in `FROM` was described as
+  `int8` (OID 20), and a view's `pg_attribute` and
+  `information_schema.columns` rows said `bigint`; they now carry
+  `int2` / `int4` as in PostgreSQL (the catalog rows of a view created
+  before this say `bigint` until it is recreated; its results are
+  described right). A set operation's integer column is its
+  widest member's: `int2 UNION int8` took the first member's width and
+  described as `int2`, whatever the values; it is now `int8`.
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the

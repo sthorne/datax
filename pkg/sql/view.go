@@ -428,7 +428,10 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		columns = append(columns, catalog.Column{ID: catalog.ColumnID(i + 1), Name: name, Type: typ})
+		// An integer column keeps its width (int2 / int4 / int8), so
+		// pg_attribute and information_schema describe it as PostgreSQL
+		// does.
+		columns = append(columns, catalog.Column{ID: catalog.ColumnID(i + 1), Name: name, Type: typ, Width: rc.Width})
 	}
 	dbID, err := s.cat.DatabaseID(ctx, txn, dbName)
 	if err != nil {
