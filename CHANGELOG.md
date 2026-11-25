@@ -2163,6 +2163,32 @@ state or the internode protocol does, and an entry below says so.
   the result dropped the declared scale it tracked. It now carries the
   largest scale among its inputs, as PostgreSQL's numeric addition does.
   Expression results still render without it.
+- **`int2`, `int4` and `int8` are types of their own in expressions**
+  (was PG-F-016). An integer literal was a bigint and an `INT4` value
+  became one in any expression, so `2147483647::int4 + 1` was
+  `2147483648`, `pg_typeof(1)` said `int8` and `SELECT 1` or `SELECT
+  int4_col + 1` described as `int8`. As in PostgreSQL:
+  - An integer literal is an `integer` when it fits, else a `bigint`
+    (else `numeric`).
+  - `+ - * / %` and the bitwise operators are of their wider operand's
+    type (`int2 + int2` is `int2`, `int2 + int4` `int4`, anything with
+    an `int8` `int8`), and a result out of that type's range is `22003
+    smallint / integer / bigint out of range` (`int8` overflow said
+    `integer out of range`; `-9223372036854775808 / -1` wrapped). A
+    shift wraps in its left operand's type (`1 << 31` is
+    `-2147483648`). `CASE`, `COALESCE`, `GREATEST`, `LEAST` and `NULLIF`
+    are of their arms' common type, `MIN`, `MAX` and the bitwise
+    aggregates of their argument's.
+  - `pg_typeof` of an integer says `smallint`, `integer` or `bigint`
+    (it said `int8`); `to_regtype('int4')` / `('integer')` is `23` and
+    `to_regtype('int2')` `21` (both were `20`).
+  - Computed columns describe as `int2` / `int4` / `int8` on the wire
+    (single-table, join, grouped, FROM-less, `VALUES`, `RETURNING`), and
+    so does a bind parameter compared with, stored into or cast to an
+    `INT2` / `INT4` column, so a client encodes it in that width (pgx
+    refuses `70000` for an `int2` parameter, as against PostgreSQL).
+    `CREATE TABLE ... AS SELECT int2_col + 1` makes an `INT4` column.
+  - `sum` over `int2` / `int4` stays `bigint`, over `int8` `numeric`.
 - **Float and integer edge cases match PostgreSQL 16.**
   - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's
     `rint` does: `round(2.5::float8)` is `2` (was `3`), and

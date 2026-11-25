@@ -48,7 +48,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | Type | Aliases | Notes |
 |---|---|---|
 | `INT8` | `BIGINT` | 64-bit |
-| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
+| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. An integer literal that fits is an `INT4`, and arithmetic is of the wider operand's width, as in PostgreSQL (`a + 1` is `INT4` and overflows with `22003 integer out of range`; `a + 1::int8` is `INT8`); `SUM` is `INT8` |
 | `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
 | `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` with halves away from zero as in PostgreSQL (`1.005` → `1.01`, `-2.5` → `-3`), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
@@ -1142,17 +1142,19 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   on RE2. A predicate used as a value
   (`qty > 3 AS big`) is three-valued: NULL when an input is NULL.
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
-  parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
-  always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), the integer bitwise operators `&` (and), `|` (or), `#`
-  (xor), `<<` and `>>` (shifts, which wrap rather than overflow; the
-  count is taken modulo 64) and the prefix `~` (not), the prefix `@`
+  parentheses (exact on DECIMAL and the integers; integer arithmetic is
+  of the wider operand's width, `INT2`, `INT4` or `INT8`, and integer
+  division truncates; `^` is always FLOAT8; division by zero is SQLSTATE
+  `22012`, overflow of the result's width `22003 smallint / integer /
+  bigint out of range`), the integer bitwise operators `&` (and), `|`
+  (or), `#` (xor), `<<` and `>>` (shifts, which wrap in the left
+  operand's width rather than overflow; the count is taken modulo 32,
+  64 for an `INT8`) and the prefix `~` (not), the prefix `@`
   (absolute value), `|/` (square root) and `||/` (cube root) — the
   binary ones, like the vector distances and jsonb's `#-`, bind looser
   than `+` and `-` and tighter than the comparisons, left to right, as
-  in PostgreSQL (`1 + 2 & 3` is `3`), and are computed on INT8, so
-  `1 << 31` over an `INT4` is `2147483648`, not PostgreSQL's
-  `-2147483648` (PostgreSQL 14 removed the factorial `!`; use
+  in PostgreSQL (`1 + 2 & 3` is `3`; `1 << 31` is `-2147483648`;
+  PostgreSQL 14 removed the factorial `!`; use
   `factorial(n)`), date and time arithmetic (`date + 1`, `date - date` in
   days, `timestamp ± interval` and `date ± interval` on the calendar
   with month steps clamped to the end of the month, `timestamp -

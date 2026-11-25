@@ -168,6 +168,14 @@ type Datum struct {
 	// offset ("2026-08-30 01:02:03", not "...+00"). The value is the same
 	// UTC wall-clock nanosecond count either way; Compare ignores it.
 	NoTZ bool `json:"notz,omitempty"`
+	// W is a TYPE HINT, never stored: an Int datum's integer width, 2
+	// (smallint) or 4 (integer), 0 being 8 (bigint). An integer literal
+	// that fits in int4 carries 4, a value read from an int2 or int4
+	// column or cast to one carries its width, and integer arithmetic
+	// gives its result the wider operand's width, overflowing at it
+	// (IntWidth, IntFits). The value is the same either way; Compare
+	// and storage ignore it.
+	W int8 `json:"-"`
 	// Pad is DISPLAY-ONLY: a String datum read from (or written to) a
 	// CHAR(n) column renders blank-padded to n characters. S keeps the
 	// trailing-space-trimmed text that equality, grouping and storage
@@ -197,6 +205,49 @@ func NewInt(v int64) Datum     { return Datum{Fam: Int, I: v} }
 func NewFloat(v float64) Datum { return Datum{Fam: Float, F: v} }
 func NewString(v string) Datum { return Datum{Fam: String, S: v} }
 func NewBool(v bool) Datum     { return Datum{Fam: Bool, B: v} }
+
+// IntWidth is an Int datum's integer width: 2, 4 or 8 (see W).
+func (d Datum) IntWidth() int32 {
+	if d.W == 2 || d.W == 4 {
+		return int32(d.W)
+	}
+	return 8
+}
+
+// WithIntWidth returns d carrying integer width w (2, 4; anything else
+// is 8).
+func (d Datum) WithIntWidth(w int32) Datum {
+	if w == 2 || w == 4 {
+		d.W = int8(w)
+	} else {
+		d.W = 0
+	}
+	return d
+}
+
+// IntWidthName is the PostgreSQL name of an integer width (2, 4,
+// anything else 8): smallint, integer, bigint.
+func IntWidthName(w int32) string {
+	switch w {
+	case 2:
+		return "smallint"
+	case 4:
+		return "integer"
+	}
+	return "bigint"
+}
+
+// IntFits reports whether v is in range of integer width w (2, 4;
+// anything else 8).
+func IntFits(v int64, w int32) bool {
+	switch w {
+	case 2:
+		return v >= math.MinInt16 && v <= math.MaxInt16
+	case 4:
+		return v >= math.MinInt32 && v <= math.MaxInt32
+	}
+	return true
+}
 
 // NewTimestamp is UTC nanoseconds since the Unix epoch.
 func NewTimestamp(nanos int64) Datum { return Datum{Fam: Timestamp, I: nanos} }

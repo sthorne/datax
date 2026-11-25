@@ -6910,7 +6910,14 @@ func (p *parser) parseValueExpr() (Expr, error) {
 				txt = "-" + txt
 			}
 			if i, err := strconv.ParseInt(txt, 10, 64); err == nil {
+				// An integer literal is an integer (int4) when it fits,
+				// else a bigint, as PostgreSQL types it (make_const;
+				// a negative literal is folded first, so -2147483648 is
+				// an integer).
 				d := types.NewInt(i)
+				if types.IntFits(i, 4) {
+					d.W = 4
+				}
 				e.Lit = &d
 			} else {
 				// An integer literal beyond int8 is numeric, as in

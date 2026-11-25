@@ -437,6 +437,25 @@ func (sp aggSpec) resultType() types.Family {
 	return sp.argType
 }
 
+// resultWidth is the integer width (ResultColumn.Width) of the
+// aggregate's result: MIN, MAX and the bitwise aggregates are of their
+// argument's type (int2 / int4 stay so), every other integer aggregate
+// (count, sum over int2 / int4, ...) is a bigint.
+func (sp aggSpec) resultWidth() int32 {
+	switch sp.fn {
+	case "MIN", "MAX", "BIT_AND", "BIT_OR", "BIT_XOR":
+	default:
+		return 0
+	}
+	if sp.argType == types.Int && sp.resultType() == types.Int {
+		switch sp.intWidth {
+		case 2, 4:
+			return sp.intWidth
+		}
+	}
+	return 0
+}
+
 // sumIntAsNumeric reports a SUM over int8 (PostgreSQL's int8_sum), which
 // is numeric: an int8 total can overflow. A SUM over int2 or int4 is
 // bigint.
@@ -446,11 +465,18 @@ func (sp aggSpec) sumIntAsNumeric() bool {
 
 // intExprWidth is the integer width (2, 4 or 8) PostgreSQL gives an
 // integer-valued expression, as far as datax can tell: a literal that
-// fits in int4 is int4, a column has its declared width, a cast to
-// int2 / int4 / int8 has that width, arithmetic and CASE / COALESCE /
-// GREATEST / LEAST / NULLIF take the widest operand's. Anything else
-// (a function, a parameter, a subquery) is int8. A NULL literal is 0,
-// which defers to the other operands.
+// fits in int4 is int4 (the width its datum carries, types.Datum.W), a
+// column has its declared width, a cast to int2 / int4 / int8 has that
+// width, arithmetic and CASE / COALESCE / GREATEST / LEAST / NULLIF take
+// the widest operand's. Anything else (a function, a parameter, a
+// subquery) is int8. A NULL literal is 0, which defers to the other
+// operands.
+//
+// It is the one source of integer widths: the result descriptions use
+// it, and evaluation gives the values the same widths (a literal's and
+// a column's datum carry theirs, arithmetic takes the wider operand's,
+// and a CASE, a call or a cast is given this width), so a value never
+// leaves wider than its column was described.
 func intExprWidth(e parser.Expr, colWidth func(name string) int32) int32 {
 	w := int32(8)
 	switch {
@@ -458,10 +484,12 @@ func intExprWidth(e parser.Expr, colWidth func(name string) int32) int32 {
 		w = intExprWidth(*e.Left, colWidth)
 	case e.Lit != nil:
 		switch {
+		case e.Lit.Fam == types.Int:
+			// A NULL of a type (a scalar subquery's, while describing)
+			// has its width too.
+			w = e.Lit.IntWidth()
 		case e.Lit.Null:
 			w = 0
-		case e.Lit.Fam == types.Int && e.Lit.I >= math.MinInt32 && e.Lit.I <= math.MaxInt32:
-			w = 4
 		}
 	case e.Column != "" && len(e.Path) == 0:
 		w = colWidth(e.Column)
@@ -492,16 +520,21 @@ func intExprWidth(e parser.Expr, colWidth func(name string) int32) int32 {
 		}
 	}
 	if e.Cast != "" {
-		switch strings.TrimPrefix(strings.ToLower(e.Cast), "pg_catalog.") {
-		case "int2", "smallint":
-			w = 2
-		case "int4", "int", "integer":
-			w = 4
-		default:
-			w = 8
-		}
+		w = castIntWidth(e.Cast)
 	}
 	return w
+}
+
+// castIntWidth is the integer width of a cast to typ: 2 for int2, 4 for
+// int4, 8 for anything else.
+func castIntWidth(typ string) int32 {
+	switch strings.TrimPrefix(strings.ToLower(strings.TrimSpace(typ)), "pg_catalog.") {
+	case "int2", "smallint":
+		return 2
+	case "int4", "int", "integer":
+		return 4
+	}
+	return 8
 }
 
 // aggState is the streaming accumulator for one group's aggregates.

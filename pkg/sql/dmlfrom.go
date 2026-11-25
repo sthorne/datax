@@ -285,7 +285,7 @@ func dmlReturningFor(sides []joinSide, ti int, exprs []parser.SelectExpr) (*dmlR
 func (r *dmlReturning) columns() []ResultColumn {
 	cols := make([]ResultColumn, len(r.proj))
 	for i, p := range r.proj {
-		cols[i] = exprResult(p.name, p.typ, p.ref.col)
+		cols[i] = p.result()
 	}
 	return cols
 }

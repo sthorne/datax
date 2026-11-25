@@ -69,7 +69,7 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 			c, ok := desc.Col(stripQualifier(n))
 			return ok && c.NoTZ
 		})
-		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ, NoTZ: noTZ}})
+		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ, NoTZ: noTZ, Width: exprWidth(typ, e, descColWidth(desc))}})
 	}
 	return proj, nil
 }
@@ -228,6 +228,11 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						return nil, ToSQLError(verr)
 					}
 					cols[i].Type = fam
+					ci := make([]ResultColumn, len(memberCols))
+					for mi, mc := range memberCols {
+						ci[mi] = mc[i]
+					}
+					cols[i].Width = unifyWidth(fam, ci)
 				}
 				return cols, nil
 			}
@@ -268,7 +273,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				}
 				cols := make([]ResultColumn, len(gq.outs))
 				for i, oc := range gq.outs {
-					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+					cols[i] = oc.result()
 				}
 				return cols, nil
 			}
@@ -310,7 +315,11 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						fam = sc[0].Type
 					}
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+				w := exprWidth(fam, se.Expr, nil)
+				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
+					w = 0
+				}
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil), Width: w})
 			}
 			return cols, nil
 		}
@@ -337,7 +346,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				}
 				cols := make([]ResultColumn, len(gq.outs))
 				for i, oc := range gq.outs {
-					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+					cols[i] = oc.result()
 				}
 				return cols, nil
 			}
@@ -347,7 +356,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = exprResult(p.name, p.typ, p.ref.col)
+				cols[i] = p.result()
 			}
 			return cols, nil
 		}
@@ -358,7 +367,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 			}
 			cols := make([]ResultColumn, len(gq.outs))
 			for i, oc := range gq.outs {
-				cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+				cols[i] = oc.result()
 			}
 			return cols, nil
 		}

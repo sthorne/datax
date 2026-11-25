@@ -58,12 +58,16 @@ func (s *Session) execScalarSub(ctx context.Context, txn *kvclient.Txn, e parser
 	}
 	// The value carries the subquery's column type, NULL included, so the
 	// expression around it types (and describes) as planning did.
-	fam := res.Columns[col].Type
+	fam, width := res.Columns[col].Type, res.Columns[col].Width
 	switch len(res.Rows) {
 	case 0:
-		return types.Datum{Null: true, Fam: fam}, nil
+		return types.Datum{Null: true, Fam: fam}.WithIntWidth(width), nil
 	case 1:
-		return conformTo(res.Rows[0][col], fam), nil
+		d := conformTo(res.Rows[0][col], fam)
+		if d.Fam == types.Int {
+			d = d.WithIntWidth(width)
+		}
+		return d, nil
 	}
 	return types.Datum{}, newErrf(CodeCardinality, "more than one row returned by a subquery used as an expression")
 }
@@ -180,7 +184,7 @@ func (s *Session) typeSubqueryOperands(ctx context.Context, e parser.Expr) (pars
 				ok = false
 				return e
 			}
-			null := types.Datum{Null: true, Fam: col.Type}
+			null := types.Datum{Null: true, Fam: col.Type}.WithIntWidth(col.Width)
 			out.Sub, out.Lit = nil, &null
 		}
 		if e.Left != nil {
