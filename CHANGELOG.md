@@ -2105,6 +2105,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A `float8` value stores into a `numeric` column, and `float8::numeric`
+  keeps 15 significant digits**, as in PostgreSQL (was PG-T-033). An
+  `INSERT`, `INSERT ... SELECT`, `UPDATE` or `ON CONFLICT DO UPDATE`
+  storing one failed with `22P02 cannot use FLOAT8 value as DECIMAL`; it
+  now converts as `float8_numeric` does and the column's scale rounds it.
+  The cast printed the float's shortest exact digits
+  (`(0.1::float8 + 0.2::float8)::numeric` was `0.30000000000000004`); it
+  is now `0.3`. `numeric[]` and `float8[]` values store into `int2[]` /
+  `int4[]` / `int8[]` (and `float8[]` into `numeric[]`) columns element
+  by element with the scalar assignment casts, where each was `22P02`.
 - **A date outside the timestamp range is refused, not wrapped, when it
   becomes a timestamp.** `'1500-01-01'::date::timestamptz` returned
   `2084-07-20 23:34:33.709552+00`: the date's midnight overflowed the

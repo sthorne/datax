@@ -104,3 +104,82 @@ func TestAssignmentCasts(t *testing.T) {
 	expect(`SELECT count(*) FROM ac WHERE id = 1.5`, "0")
 	expect(`SELECT count(*) FROM ac WHERE id = 1.0`, "1")
 }
+
+// TestAssignmentCastsFloatNumericAndArrays: a float8 value stores into
+// a numeric column as PostgreSQL's assignment cast float8_numeric
+// converts it (15 significant digits, then the column's typmod rounds),
+// on INSERT ... VALUES and SELECT, UPDATE and ON CONFLICT DO UPDATE; the
+// float8::numeric cast takes the same 15 digits. numeric[] and float8[]
+// values store into integer and numeric array columns element by
+// element with the scalar casts. Before, each store failed with 22P02
+// ("cannot use FLOAT8 value as DECIMAL", "array element 1.5: cannot use
+// DECIMAL value as INT8") and the cast kept 17 digits. The expected
+// values are PostgreSQL 16's.
+func TestAssignmentCastsFloatNumericAndArrays(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	exec := func(q string) {
+		t.Helper()
+		if _, err := conn.Exec(ctx, q, pgx.QueryExecModeSimpleProtocol); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	expect := func(q, want string) {
+		t.Helper()
+		res, err := conn.PgConn().Exec(ctx, q).ReadAll()
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		var out []string
+		for _, r := range res {
+			for _, row := range r.Rows {
+				var parts []string
+				for _, v := range row {
+					parts = append(parts, string(v))
+				}
+				out = append(out, strings.Join(parts, "|"))
+			}
+		}
+		if got := strings.Join(out, "; "); got != want {
+			t.Fatalf("%s:\n got %q\nwant %q", q, got, want)
+		}
+	}
+	refused := func(q, code, msg string) {
+		t.Helper()
+		_, err := conn.Exec(ctx, q, pgx.QueryExecModeSimpleProtocol)
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || pe.Code != code || pe.Message != msg {
+			t.Fatalf("%s: %v, want %s %q", q, err, code, msg)
+		}
+	}
+
+	expect(`SELECT (0.1::float8 + 0.2::float8)::numeric, (1::float8 / 3)::numeric, 1e20::float8::numeric`,
+		"0.3|0.333333333333333|100000000000000000000")
+
+	exec(`CREATE TABLE fn (id INT8 PRIMARY KEY, n NUMERIC, m NUMERIC(6,2), f FLOAT8)`)
+	exec(`INSERT INTO fn VALUES (1, 0.1::float8 + 0.2::float8, 1.005::float8, 2.5), (2, 'NaN'::float8, 3.14159::float8, 0.125)`)
+	expect(`SELECT id, n, m FROM fn ORDER BY id`, "1|0.3|1.01; 2|NaN|3.14")
+	exec(`INSERT INTO fn (id, n, m) SELECT id + 10, f, f FROM fn`)
+	expect(`SELECT id, n, m FROM fn WHERE id > 10 ORDER BY id`, "11|2.5|2.50; 12|0.125|0.13")
+	exec(`UPDATE fn SET n = f * 3, m = f / 3 WHERE id = 1`)
+	expect(`SELECT n, m FROM fn WHERE id = 1`, "7.5|0.83")
+	exec(`INSERT INTO fn VALUES (2, 0, 0, 0.75) ON CONFLICT (id) DO UPDATE SET n = excluded.f`)
+	expect(`SELECT n FROM fn WHERE id = 2`, "0.75")
+	refused(`INSERT INTO fn (id, m) VALUES (20, 12345.678::float8)`, "22003",
+		`numeric field overflow in column "m": a field with precision 6, scale 2 must round to an absolute value less than 10^4`)
+
+	exec(`CREATE TABLE fa (id INT8 PRIMARY KEY, a INT2[], b INT4[], c INT8[], n NUMERIC[])`)
+	exec(`INSERT INTO fa VALUES (1, ARRAY[1.5, 2.4], ARRAY[1.5::float8, 2.5::float8], ARRAY[-2.5, NULL], ARRAY[0.1::float8 + 0.2::float8])`)
+	expect(`SELECT a, b, c, n FROM fa`, "{2,2}|{2,2}|{-3,NULL}|{0.3}")
+	exec(`UPDATE fa SET b = ARRAY[7.5, -0.5] WHERE id = 1`)
+	expect(`SELECT b FROM fa`, "{8,-1}")
+	refused(`INSERT INTO fa (id, a) VALUES (2, ARRAY[32767.5])`, "22003", "smallint out of range")
+	refused(`INSERT INTO fa (id, b) VALUES (2, ARRAY[3e9::float8])`, "22003", "integer out of range")
+}
