@@ -19,27 +19,9 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 	case e.Left != nil:
 		fam = exprFamily(*e.Left, colType)
 	case e.Case != nil:
-		arms := make([]parser.Expr, 0, len(e.Case.Whens)+1)
-		for _, w := range e.Case.Whens {
-			arms = append(arms, w.Result)
-		}
-		if e.Case.Else != nil {
-			arms = append(arms, *e.Case.Else)
-		}
-		for _, a := range arms {
-			f := exprFamily(a, colType)
-			switch {
-			case fam == types.Unknown:
-				fam = f
-			case fam == types.Date && f == types.Timestamp:
-				// The date arms become timestamps (with time zone, at
-				// their midnight in the session's zone: evalCase).
-				fam = types.Timestamp
-			}
-			if fam != types.Unknown && fam != types.Date {
-				break
-			}
-		}
+		fam = armsFamily(exprArms(e), colType)
+	case isArmsFunc(e.Func):
+		fam = armsFamily(e.Args, colType)
 	case e.Func == "array_construct":
 		elem := types.String
 		for _, a := range e.Args {
@@ -96,6 +78,105 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 		fam = builtins.CastFamily(e.Cast, fam)
 	}
 	return fam
+}
+
+// isArmsFunc reports the functions whose result is their arguments'
+// common type, as a CASE's is its arms'.
+func isArmsFunc(name string) bool {
+	switch name {
+	case "coalesce", "greatest", "least", "nullif":
+		return true
+	}
+	return false
+}
+
+// exprArms are the expressions whose common type e yields: a CASE's
+// results, an arms function's arguments (isArmsFunc); nil otherwise.
+func exprArms(e parser.Expr) []parser.Expr {
+	switch {
+	case e.Case != nil:
+		arms := make([]parser.Expr, 0, len(e.Case.Whens)+1)
+		for _, w := range e.Case.Whens {
+			arms = append(arms, w.Result)
+		}
+		if e.Case.Else != nil {
+			arms = append(arms, *e.Case.Else)
+		}
+		return arms
+	case isArmsFunc(e.Func):
+		return e.Args
+	}
+	return nil
+}
+
+// armsFamily is the family arms meet at: the first typed arm's, except
+// that a date and a timestamp meet at timestamp, as in PostgreSQL's
+// select_common_type (the dates become timestamps: dateArmsKind).
+func armsFamily(arms []parser.Expr, colType func(name string) (types.Family, bool)) types.Family {
+	fam := types.Unknown
+	for _, a := range arms {
+		f := exprFamily(a, colType)
+		switch {
+		case fam == types.Unknown:
+			fam = f
+		case fam == types.Date && f == types.Timestamp:
+			fam = types.Timestamp
+		}
+		if fam != types.Unknown && fam != types.Date {
+			break
+		}
+	}
+	return fam
+}
+
+// armsNoTZ reports arms that meet at a timestamp without time zone:
+// some arm is a timestamp and every timestamp arm is without time zone
+// (a date arm becomes one at its wall-clock midnight). A timestamp
+// with time zone among them makes the common type one.
+func armsNoTZ(arms []parser.Expr, colType func(name string) (types.Family, bool), colNoTZ func(name string) bool) bool {
+	ts := false
+	for _, a := range arms {
+		if exprFamily(a, colType) != types.Timestamp {
+			continue
+		}
+		if !exprNoTZ(a, colType, colNoTZ) {
+			return false
+		}
+		ts = true
+	}
+	return ts
+}
+
+// dateArmsKind reports whether arms (exprArms) mix a date with a
+// timestamp, so a date among them becomes the timestamp they meet at,
+// and whether that is a timestamp without time zone. The arms are typed
+// through env's columns when it can type them (kindEnv).
+func dateArmsKind(arms []parser.Expr, env exprEnv) (mixed, noTZ bool) {
+	var colType func(string) (types.Family, bool)
+	var colNoTZ func(string) bool
+	if ke, ok := env.(kindEnv); ok && env != nil {
+		colType = func(n string) (types.Family, bool) {
+			c, ok := ke.colKind(n)
+			return c.Type, ok
+		}
+		colNoTZ = func(n string) bool {
+			c, ok := ke.colKind(n)
+			return ok && c.NoTZ
+		}
+	}
+	date, ts := false, false
+	for _, a := range arms {
+		switch exprFamily(a, colType) {
+		case types.Date:
+			date = true
+		case types.Timestamp:
+			ts = true
+		}
+	}
+	if !date || !ts {
+		return false, false
+	}
+	return true, armsNoTZ(arms, colType, colNoTZ)
 }
 
 // aggFamily is the result family of an aggregate call: its argument's

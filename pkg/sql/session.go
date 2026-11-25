@@ -1793,6 +1793,20 @@ type tableEnv struct {
 	row  map[catalog.ColumnID]types.Datum
 }
 
+// kindEnv is an exprEnv that can type its columns: the expressions
+// whose type is their arms' common type (a CASE, coalesce, greatest,
+// least, nullif) find it from them (dateArmsKind).
+type kindEnv interface {
+	colKind(name string) (catalog.Column, bool)
+}
+
+func (t tableEnv) colKind(name string) (catalog.Column, bool) {
+	if t.desc == nil {
+		return catalog.Column{}, false
+	}
+	return t.desc.Col(name)
+}
+
 func (t tableEnv) col(name string) (types.Datum, error) {
 	if t.desc == nil || t.row == nil {
 		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q is not available in this context", name)
@@ -1834,7 +1848,7 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		}
 		base = d
 	case e.Case != nil:
-		d, err := evalCase(e.Case, e.Zone, env, params)
+		d, err := evalCase(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -2170,6 +2184,22 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		}
 		args[i] = d
 	}
+	if isArmsFunc(e.Func) {
+		// Dates among a timestamp's arguments become timestamps first
+		// (meetDate), so coalesce, greatest, least and nullif return the
+		// common type and compare at the date's midnight.
+		for i, a := range args {
+			if a.Null || a.Fam != types.Date {
+				continue
+			}
+			c, err := meetDate(a, e, env)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			args[i] = c
+		}
+		meetArgDates(args, e.Zone)
+	}
 	if b, ok := builtins.Lookup(e.Func); ok && !b.Session {
 		d, err := b.CallIn(args, e.Zone)
 		if err != nil {
@@ -2490,7 +2520,8 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 // operand with each WHEN value (a date against a timestamp with time
 // zone at its midnight in loc, the session's TimeZone), the searched
 // form tests each condition.
-func evalCase(ce *parser.CaseExpr, loc *time.Location, env exprEnv, params []types.Datum) (types.Datum, error) {
+func evalCase(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
+	ce, loc := e.Case, e.Zone
 	var operand types.Datum
 	if ce.Operand != nil {
 		d, err := evalExprEnv(*ce.Operand, env, params)
@@ -2520,25 +2551,86 @@ func evalCase(ce *parser.CaseExpr, loc *time.Location, env exprEnv, params []typ
 		}
 		if hit {
 			d, err := evalExprEnv(w.Result, env, params)
-			return caseResult(d, loc), err
+			if err != nil {
+				return d, err
+			}
+			return meetDate(d, e, env)
 		}
 	}
 	if ce.Else != nil {
 		d, err := evalExprEnv(*ce.Else, env, params)
-		return caseResult(d, loc), err
+		if err != nil {
+			return d, err
+		}
+		return meetDate(d, e, env)
 	}
 	return types.DNull, nil
 }
 
-// caseResult marks a date a CASE yields with the session's TimeZone
-// (types.Datum.Loc): where its arms mix a date with a timestamp with
-// time zone the CASE is a timestamp with time zone (exprFamily), and
-// the date becomes one, or compares with one, at its midnight there.
-func caseResult(d types.Datum, loc *time.Location) types.Datum {
-	if loc != nil && !d.Null && d.Fam == types.Date {
-		d.Loc = loc
+// meetArgDates is meetDate by the values, for arguments whose types an
+// environment could not tell: dates among timestamps become timestamps
+// at their midnight, in loc unless every timestamp is without time
+// zone. A date out of the timestamp range is left as it is (it still
+// orders before or after every timestamp).
+func meetArgDates(args []types.Datum, loc *time.Location) {
+	date, ts, noTZ := false, false, true
+	for _, a := range args {
+		switch {
+		case a.Null:
+		case a.Fam == types.Date:
+			date = true
+		case a.Fam == types.Timestamp:
+			ts, noTZ = true, noTZ && a.NoTZ
+		}
 	}
-	return d
+	if !date || !ts {
+		return
+	}
+	if noTZ {
+		loc = nil
+	}
+	for i, a := range args {
+		if a.Null || a.Fam != types.Date {
+			continue
+		}
+		if n, err := types.DateMidnight(a.I, loc); err == nil {
+			args[i] = types.NewTimestamp(n)
+			args[i].NoTZ = noTZ
+		}
+	}
+}
+
+// meetDate brings a date that e (a CASE, coalesce, greatest, least or
+// nullif) yields, or takes as an argument, to the type e's arms meet
+// at: where they mix a date with a timestamp it is that timestamp
+// (exprFamily, exprNoTZ), and the date becomes its midnight — in the
+// session's TimeZone (e.Zone) for a timestamp with time zone, at wall
+// time for one without (types.DateMidnight). Where the arms cannot be
+// typed (an environment that cannot type its columns) the date carries
+// the zone instead (types.Datum.Loc), and becomes a timestamp with time
+// zone, or compares with one, at its midnight there.
+func meetDate(d types.Datum, e parser.Expr, env exprEnv) (types.Datum, error) {
+	if d.Null || d.Fam != types.Date {
+		return d, nil
+	}
+	mixed, noTZ := dateArmsKind(exprArms(e), env)
+	if !mixed {
+		if e.Zone != nil {
+			d.Loc = e.Zone
+		}
+		return d, nil
+	}
+	loc := e.Zone
+	if noTZ {
+		loc = nil
+	}
+	n, err := types.DateMidnight(d.I, loc)
+	if err != nil {
+		return types.Datum{}, newErrf(CodeDatetimeFieldOverflow, "%v", err)
+	}
+	ts := types.NewTimestamp(n)
+	ts.NoTZ = noTZ
+	return ts, nil
 }
 
 // tsVectorMatchCall reports whether a conjunct is `to_tsvector(config,

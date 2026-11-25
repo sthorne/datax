@@ -1572,6 +1572,11 @@ type conflictEnv struct {
 	old, excluded map[catalog.ColumnID]types.Datum
 }
 
+func (e conflictEnv) colKind(name string) (catalog.Column, bool) {
+	_, bare := splitQualified(name)
+	return e.desc.Col(bare)
+}
+
 func (e conflictEnv) col(name string) (types.Datum, error) {
 	q, bare := splitQualified(name)
 	row := e.old
@@ -2752,7 +2757,7 @@ func (s *Session) execSelectBody(ctx context.Context, txn *kvclient.Txn, t, orig
 					fam = types.String
 				}
 			}
-			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil)})
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}

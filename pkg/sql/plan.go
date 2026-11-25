@@ -65,7 +65,10 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) bool {
+		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) (types.Family, bool) {
+			c, ok := desc.Col(stripQualifier(n))
+			return c.Type, ok
+		}, func(n string) bool {
 			c, ok := desc.Col(stripQualifier(n))
 			return ok && c.NoTZ
 		})
@@ -320,7 +323,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						fam = sc[0].Type
 					}
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil)})
 			}
 			return cols, nil
 		}

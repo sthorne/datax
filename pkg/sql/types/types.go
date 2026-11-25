@@ -187,9 +187,10 @@ type Datum struct {
 	// Loc is a READ hint, never stored: a String datum the session took
 	// from a statement's literal or text parameter carries the
 	// session's TimeZone, in which it reads as a TIMESTAMPTZ when its
-	// text names no offset; a Date datum a CASE yielded carries it too,
-	// and becomes a TIMESTAMPTZ (or compares with one) at its midnight
-	// there (DateMidnight). nil is UTC.
+	// text names no offset; a Date datum a CASE or coalesce-like call
+	// yielded, where its arms could not be typed, carries it too, and
+	// becomes a TIMESTAMPTZ (or compares with one) at its midnight there
+	// (DateMidnight). nil is UTC.
 	Loc *time.Location `json:"-"`
 }
 

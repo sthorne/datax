@@ -297,11 +297,11 @@ func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Exp
 			// against a timestamp without time zone, and against one
 			// with time zone under UTC. Under another TimeZone it falls
 			// at its midnight there against a timestamp with time zone,
-			// and an expression's type does not always say which kind it
-			// yields (coalesce(tn, tn) keeps tn's): the filter decides,
-			// value by value (types.CompareIn). Out of range it bounds
-			// nothing.
-			if cmp.Zone != nil && !exprNoTZ(e, func(name string) bool { c, ok := desc.Col(name); return ok && c.NoTZ }) {
+			// and an expression's description does not always say which
+			// kind it yields (a function returning its argument's): the
+			// filter decides, value by value (types.CompareIn). Out of
+			// range it bounds nothing.
+			if cmp.Zone != nil && !exprNoTZ(e, colType, func(name string) bool { c, ok := desc.Col(name); return ok && c.NoTZ }) {
 				break
 			}
 			if n, derr := types.DateMidnight(d.I, nil); derr == nil {

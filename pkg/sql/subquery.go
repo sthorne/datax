@@ -973,7 +973,7 @@ func zoneSensitive(x parser.Expr) bool {
 	if x.Lit != nil && !x.Lit.Null && x.Lit.Fam == types.String || x.Cast != "" {
 		return true
 	}
-	if x.Case != nil {
+	if x.Case != nil || isArmsFunc(x.Func) {
 		return true
 	}
 	switch x.BinOp {
@@ -1785,7 +1785,7 @@ func srfColumns(b *builtins.Builtin, e parser.Expr, alias string) []ResultColumn
 		cols[i] = ResultColumn{Name: n, Type: f}
 	}
 	// generate_series over timestamps without time zone yields them.
-	cols[0].NoTZ = cols[0].Type == types.Timestamp && len(e.Args) > 0 && exprNoTZ(e.Args[0], nil)
+	cols[0].NoTZ = cols[0].Type == types.Timestamp && len(e.Args) > 0 && exprNoTZ(e.Args[0], nil, nil)
 	return cols
 }
 

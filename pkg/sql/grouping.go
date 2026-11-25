@@ -48,6 +48,7 @@ type groupedQuery struct {
 	// colNoTZ tells that of an input column (result descriptions).
 	keyNoTZ []bool
 	colNoTZ func(name string) bool
+	colType func(name string) (types.Family, bool)
 	// sets are the grouping sets, as key positions (GROUP BY without
 	// ROLLUP, CUBE or GROUPING SETS is the one set of every key).
 	sets  [][]int
@@ -83,6 +84,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		c, ok := desc.Col(n)
 		return c.Type, ok
 	}
+	gq.colType = colType
 	gq.colNoTZ = func(n string) bool {
 		c, ok := desc.Col(stripQualifier(n))
 		return ok && c.NoTZ
@@ -129,7 +131,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		gq.keys = append(gq.keys, k)
 		gq.keyCols = append(gq.keyCols, col)
 		gq.keyTypes = append(gq.keyTypes, typ)
-		gq.keyNoTZ = append(gq.keyNoTZ, typ == types.Timestamp && exprNoTZ(k, gq.colNoTZ))
+		gq.keyNoTZ = append(gq.keyNoTZ, typ == types.Timestamp && exprNoTZ(k, colType, gq.colNoTZ))
 	}
 	for _, set := range t.GroupingSets {
 		for _, k := range set {
@@ -306,7 +308,7 @@ func (rw *groupRewriter) out(name string, e parser.Expr) groupedOut {
 	if o.typ == types.Unknown {
 		o.typ = types.String
 	}
-	o.noTZ = o.typ == types.Timestamp && exprNoTZ(e, rw.envNoTZ)
+	o.noTZ = o.typ == types.Timestamp && exprNoTZ(e, rw.envColType, rw.envNoTZ)
 	return o
 }
 
@@ -335,7 +337,7 @@ func (gq *groupedQuery) specNoTZ(i int) bool {
 		return false
 	}
 	if sp.arg != nil {
-		return exprNoTZ(*sp.arg, gq.colNoTZ)
+		return exprNoTZ(*sp.arg, gq.colType, gq.colNoTZ)
 	}
 	return sp.col.NoTZ
 }

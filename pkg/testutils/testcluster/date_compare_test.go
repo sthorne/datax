@@ -12,6 +12,7 @@ import (
 
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
+	"github.com/sthorne/datax/pkg/sql/types"
 )
 
 // TestDateTimestampComparison: a date compares with a timestamp with
@@ -164,9 +165,12 @@ func TestDateTimestampComparison(t *testing.T) {
 // or a CASE (and so the ORDER BY, DISTINCT, GROUP BY, min and max over
 // it), and a date stored into a timestamptz column (INSERT, a DEFAULT,
 // INSERT ... SELECT, ON CONFLICT DO UPDATE, UPDATE, a date parameter;
-// COPY's text '2024-01-01' reads as a timestamptz in the zone). Each
-// of z's rows sits at the midnight of 2024-01-01 in one zone: 1 in
-// Asia/Tokyo, 2 in UTC, 3 in America/New_York.
+// COPY's text '2024-01-01' reads as a timestamptz in the zone), and
+// coalesce, greatest, least and nullif and a window's PARTITION BY and
+// ORDER BY over a mix. Against a timestamp without time zone the date
+// is its wall-clock midnight. Each of z's ts sits at the midnight of
+// 2024-01-01 in one zone: 1 in Asia/Tokyo, 2 in UTC, 3 in
+// America/New_York.
 func TestDateTimestampSessionZone(t *testing.T) {
 	tc := Start(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -174,11 +178,11 @@ func TestDateTimestampSessionZone(t *testing.T) {
 	s := sql.NewSession(tc.Nodes[0].DB(), catalog.NewAccessor())
 	waitForDatabases(t, ctx, s)
 
-	execSQL(t, ctx, s, `CREATE TABLE z (id INT8 PRIMARY KEY, d DATE, ts TIMESTAMPTZ)`)
+	execSQL(t, ctx, s, `CREATE TABLE z (id INT8 PRIMARY KEY, d DATE, ts TIMESTAMPTZ, tn TIMESTAMP)`)
 	execSQL(t, ctx, s, `INSERT INTO z VALUES
-		(1, '2024-01-01', '2023-12-31 15:00:00+00'),
-		(2, '2024-01-01', '2024-01-01 00:00:00+00'),
-		(3, '2024-01-01', '2024-01-01 05:00:00+00')`)
+		(1, '2024-01-01', '2023-12-31 15:00:00+00', '2024-01-01 00:00:00'),
+		(2, '2024-01-01', '2024-01-01 00:00:00+00', '2024-01-01 05:00:00'),
+		(3, '2024-01-01', '2024-01-01 05:00:00+00', '2023-12-31 15:00:00')`)
 	execSQL(t, ctx, s, `CREATE INDEX z_e ON z ((coalesce(ts, ts)))`)
 	rows := func(q string) string {
 		t.Helper()
@@ -242,6 +246,36 @@ func TestDateTimestampSessionZone(t *testing.T) {
 		{`SELECT count(*) FROM z GROUP BY CASE WHEN id = 1 THEN d ELSE ts END ORDER BY 1`, "1 2", "1 2", "1 1 1"},
 		{`SELECT min(CASE WHEN id = 1 THEN d ELSE ts END), max(CASE WHEN id = 1 THEN d ELSE ts END) FROM z WHERE id < 3`,
 			utc + "|" + utc, utc + "|" + ny, tokyo + "|" + utc},
+		// ... and with a timestamp without time zone it is one, the date
+		// at its wall-clock midnight.
+		{`SELECT CASE WHEN id = 1 THEN d ELSE tn END FROM z ORDER BY id`,
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00",
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00",
+			"2024-01-01 00:00:00 2024-01-01 05:00:00 2023-12-31 15:00:00"},
+		{`SELECT CASE WHEN true THEN '2024-01-01'::date ELSE '2024-01-01 00:00:00'::timestamp END`,
+			"2024-01-01 00:00:00", "2024-01-01 00:00:00", "2024-01-01 00:00:00"},
+		// coalesce, greatest, least and nullif over a date and a
+		// timestamp are the timestamp type (they were their first
+		// argument's, a date first cutting the timestamps to their day).
+		{`SELECT greatest(d, ts) FROM z ORDER BY id`, utc + " " + utc + " " + ny, ny + " " + ny + " " + ny, tokyo + " " + utc + " " + ny},
+		{`SELECT least(d, ts) FROM z ORDER BY id`, tokyo + " " + utc + " " + utc, tokyo + " " + utc + " " + ny, tokyo + " " + tokyo + " " + tokyo},
+		{`SELECT coalesce(NULL, d, ts) FROM z WHERE id = 1`, utc, ny, tokyo},
+		{`SELECT coalesce('2024-01-01'::date, now())`, utc, ny, tokyo},
+		{`SELECT id, nullif(d, ts) FROM z ORDER BY id`, "1|" + utc + " 2| 3|" + utc, "1|" + ny + " 2|" + ny + " 3|", "1| 2|" + tokyo + " 3|" + tokyo},
+		{`SELECT greatest(d, tn), least(d, tn), coalesce(d, tn) FROM z WHERE id = 3`,
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00",
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00",
+			"2024-01-01 00:00:00|2023-12-31 15:00:00|2024-01-01 00:00:00"},
+		{`SELECT count(*) FROM z GROUP BY greatest(d, ts) ORDER BY 1`, "1 2", "3", "1 1 1"},
+		// A window's PARTITION BY and ORDER BY over such a CASE or
+		// function.
+		{`SELECT id, row_number() OVER (PARTITION BY CASE WHEN id = 1 THEN d ELSE ts END ORDER BY id) FROM z ORDER BY id`,
+			"1|1 2|2 3|1", "1|1 2|1 3|2", "1|1 2|1 3|1"},
+		{`SELECT id, rank() OVER (ORDER BY CASE WHEN id = 1 THEN d ELSE ts END) FROM z ORDER BY id`,
+			"1|1 2|1 3|3", "1|2 2|1 3|2", "1|1 2|2 3|3"},
+		{`SELECT id, row_number() OVER (PARTITION BY greatest(d, ts) ORDER BY id) FROM z ORDER BY id`,
+			"1|1 2|2 3|1", "1|1 2|2 3|3", "1|1 2|1 3|1"},
+		{`SELECT id, rank() OVER (ORDER BY least(d, ts)) FROM z ORDER BY id`, "1|1 2|2 3|2", "1|1 2|2 3|3", "1|1 2|1 3|1"},
 		// An expression index bounds a timestamp expression by a date
 		// where the date's place is certain; the filter decides the rest.
 		{`SELECT id FROM z WHERE coalesce(ts, ts) >= '2024-01-01'::date ORDER BY id`, "2 3", "3", "1 2 3"},
@@ -253,6 +287,27 @@ func TestDateTimestampSessionZone(t *testing.T) {
 			if got := rows(c.q); got != want {
 				t.Errorf("%s, in %s: %q, want %q", c.q, zone, got, want)
 			}
+		}
+	}
+	execSQL(t, ctx, s, `SET TIME ZONE 'Asia/Tokyo'`)
+	// The type a CASE, coalesce or greatest over a date and a timestamp
+	// describes as: without time zone only when no arm is with one.
+	for _, c := range []struct {
+		q    string
+		noTZ bool
+	}{
+		{`SELECT CASE WHEN id = 1 THEN d ELSE tn END FROM z`, true},
+		{`SELECT CASE WHEN id = 1 THEN d WHEN id = 2 THEN tn ELSE ts END FROM z`, false},
+		{`SELECT coalesce(d, tn) FROM z`, true},
+		{`SELECT greatest(d, ts) FROM z`, false},
+	} {
+		r, serr := trySQL(ctx, s, c.q)
+		if serr != nil {
+			t.Errorf("%s: %v", c.q, serr)
+			continue
+		}
+		if col := r.Columns[0]; col.Type != types.Timestamp || col.NoTZ != c.noTZ {
+			t.Errorf("%s: %s (without time zone: %v), want TIMESTAMP (without time zone: %v)", c.q, col.Type, col.NoTZ, c.noTZ)
 		}
 	}
 	execSQL(t, ctx, s, `SET TIME ZONE 'UTC'`)
