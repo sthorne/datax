@@ -2,12 +2,14 @@ package testcluster
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/sthorne/datax/pkg/sql"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -113,7 +115,7 @@ func TestAggregateExpressions(t *testing.T) {
 
 	runGroupedCases(t, ctx, s, []groupedCase{
 		// Without GROUP BY: one row.
-		{sql: `SELECT SUM(amount) / COUNT(amount) FROM sales`, want: "21"},
+		{sql: `SELECT SUM(amount) / COUNT(amount) FROM sales`, want: "21.0000000000000000"}, // sum(int8) is numeric
 		{sql: `SELECT COUNT(*) * 2, MAX(amount) - MIN(amount) AS spread FROM sales`, want: "12|35"},
 		{sql: `SELECT COALESCE(SUM(amount), 0) + 1 FROM sales WHERE id > 100`, want: "1"},
 		{sql: `SELECT ROUND(AVG(amount) / 4, 2) FROM sales`, want: "5.25"},
@@ -137,12 +139,12 @@ func TestAggregateExpressions(t *testing.T) {
 		{sql: `SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n = 3 AND region = 'north'`, want: "north|3"},
 		// ORDER BY an expression over aggregates, or a position naming one.
 		{sql: `SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) * -1`, want: "west|70; north|35"},
-		{sql: `SELECT region, SUM(amount) / COUNT(*) AS per FROM sales GROUP BY region ORDER BY 2 DESC`, want: "west|23; north|11"},
+		{sql: `SELECT region, SUM(amount) / COUNT(*) AS per FROM sales GROUP BY region ORDER BY 2 DESC`, want: "west|23.3333333333333333; north|11.6666666666666667"},
 		{sql: `SELECT region FROM sales GROUP BY region ORDER BY MAX(amount) - MIN(amount)`, want: "west; north"},
 		// A grouped join.
 		{sql: `SELECT r.name, SUM(s.amount) * 100 / MAX(r.target) AS pct_of_target FROM sales s JOIN regions r ON r.name = s.region
 			GROUP BY r.name HAVING SUM(s.amount) * 100 / MAX(r.target) > 50 ORDER BY SUM(s.amount) DESC`,
-			want: "west|70; north|116"},
+			want: "west|70.0000000000000000; north|116.6666666666666667"},
 		// Neither grouped nor aggregated: 42803.
 		{sql: `SELECT city, SUM(amount) / COUNT(*) FROM sales GROUP BY region`, code: "42803"},
 		{sql: `SELECT amount + SUM(amount) FROM sales`, code: "42803"},
@@ -359,5 +361,92 @@ func TestDistinctOn(t *testing.T) {
 	var score int64
 	if err := conn.QueryRow(ctx, `SELECT DISTINCT ON (player) player, score FROM scores WHERE player <> $1 ORDER BY player, score DESC`, "ann").Scan(&player, &score); err != nil || player != "bob" || score != 20 {
 		t.Fatalf("prepared: %s %d %v", player, score, err)
+	}
+}
+
+// TestSumResultTypes: sum's result type is PostgreSQL's — bigint over
+// int2 and int4 (and integer literals, CASE ... THEN 1 ELSE 0 and casts
+// to them), numeric over int8, so a total past the bigint range is
+// exact rather than 22003 — through a table, a view, a CTE, a derived
+// table, a join, a window and a scalar subquery, in the RowDescription
+// of every pgx mode and in the values. PostgreSQL 16 gives the same
+// rows and types.
+func TestSumResultTypes(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, q := range []string{
+		`CREATE TABLE st (id INT8 PRIMARY KEY, a INT2, b INT4, c INT8, g TEXT)`,
+		`INSERT INTO st VALUES (1, 1, 2, 9223372036854775807, 'x'), (2, 4, 5, 9223372036854775807, 'x'), (3, 7, 8, -5, 'y')`,
+		`CREATE VIEW stv AS SELECT a, b, c, g FROM st`,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	const oidInt8, oidNumeric = 20, 1700
+	cases := []struct {
+		sql  string
+		oids []uint32
+		want string
+	}{
+		{`SELECT sum(a), sum(b), sum(c) FROM st`, []uint32{oidInt8, oidInt8, oidNumeric}, "12|15|18446744073709551609"},
+		{`SELECT sum(a), sum(b), sum(c) FROM stv`, []uint32{oidInt8, oidInt8, oidNumeric}, "12|15|18446744073709551609"},
+		{`WITH w AS (SELECT b, c FROM st) SELECT sum(b), sum(c) FROM w`, []uint32{oidInt8, oidNumeric}, "15|18446744073709551609"},
+		{`SELECT sum(b), sum(c) FROM (SELECT b, c FROM stv) s`, []uint32{oidInt8, oidNumeric}, "15|18446744073709551609"},
+		{`SELECT g, sum(b), sum(c) FROM stv GROUP BY g ORDER BY g`, []uint32{25, oidInt8, oidNumeric}, "x|7|18446744073709551614; y|8|-5"},
+		{`SELECT sum(x.b), sum(y.c) FROM st x JOIN stv y ON y.a = x.a`, []uint32{oidInt8, oidNumeric}, "15|18446744073709551609"},
+		{`SELECT sum(1), sum(b + 1), sum(CASE WHEN b > 2 THEN 1 ELSE 0 END), sum(c::int4 % 2), sum(b::int8), sum(id)
+			FROM st WHERE id = 3`, []uint32{oidInt8, oidInt8, oidInt8, oidInt8, oidNumeric, oidNumeric}, "1|9|1|-1|8|3"},
+		{`SELECT sum(b) / count(*), sum(c) / count(*) FROM st WHERE id = 3`, []uint32{oidInt8, oidNumeric}, "8|-5.0000000000000000"},
+		{`SELECT id, sum(b) OVER (ORDER BY id), sum(c) OVER (ORDER BY id) FROM st ORDER BY id`,
+			[]uint32{oidInt8, oidInt8, oidNumeric}, "1|2|9223372036854775807; 2|7|18446744073709551614; 3|15|18446744073709551609"},
+		{`SELECT (SELECT sum(c) FROM st), (SELECT sum(b) FROM stv)`, []uint32{oidNumeric, oidInt8}, "18446744073709551609|15"},
+		{`SELECT sum(c) FROM st WHERE false`, []uint32{oidNumeric}, "<nil>"},
+	}
+	modes := []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol}
+	for _, c := range cases {
+		for _, mode := range modes {
+			rows, err := conn.Query(ctx, c.sql, mode)
+			if err != nil {
+				t.Fatalf("%v %s: %v", mode, c.sql, err)
+			}
+			var oids []uint32
+			for _, fd := range rows.FieldDescriptions() {
+				oids = append(oids, fd.DataTypeOID)
+			}
+			var got []string
+			for rows.Next() {
+				vals, err := rows.Values()
+				if err != nil {
+					rows.Close()
+					t.Fatalf("%v %s: %v", mode, c.sql, err)
+				}
+				parts := make([]string, len(vals))
+				for i, v := range vals {
+					if n, ok := v.(pgtype.Numeric); ok {
+						parts[i] = numericString(n)
+					} else {
+						parts[i] = fmt.Sprint(v)
+					}
+				}
+				got = append(got, strings.Join(parts, "|"))
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				t.Fatalf("%v %s: %v", mode, c.sql, err)
+			}
+			if !sameOIDs(oids, c.oids) {
+				t.Errorf("%v %s: OIDs %v, want %v", mode, c.sql, oids, c.oids)
+			}
+			if g := strings.Join(got, "; "); g != c.want {
+				t.Errorf("%v %s: rows %q, want %q", mode, c.sql, g, c.want)
+			}
+		}
 	}
 }

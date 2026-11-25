@@ -87,6 +87,9 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
   does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
   `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).
+- `SUM` of an `INT8` is a DECIMAL, as in PostgreSQL, so a total past
+  `INT8`'s range is exact; `SUM` of an `INT2` or `INT4` (an integer
+  literal, `CASE ... THEN 1 ELSE 0 END`) is an `INT8`.
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
   operand demotes the expression to float. DECIMAL division, and `AVG`
   of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use

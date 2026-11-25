@@ -2125,6 +2125,13 @@ state or the internode protocol does, and an entry below says so.
   described right). A set operation's integer column is its
   widest member's: `int2 UNION int8` took the first member's width and
   described as `int2`, whatever the values; it is now `int8`.
+- **`sum` over `int8` is `numeric`**, as in PostgreSQL, so a total past
+  the `int8` range is exact instead of `22003 bigint out of range in
+  sum` (was PG-F-029). `sum` over `int2` and `int4` — and over integer
+  literals, `CASE ... THEN 1 ELSE 0 END` and casts to `int4` — stays
+  `bigint`. A query that divides it changes with it, as in PostgreSQL:
+  `sum(int8_col) / count(*)` is a numeric division (`21.0000000000000000`,
+  was `21`).
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the

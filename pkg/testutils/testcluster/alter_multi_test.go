@@ -613,7 +613,8 @@ func TestAlterAddColumnBackfillConcurrentWrites(t *testing.T) {
 	for i := range tc.Nodes {
 		hi := newAlterHarness(t, ctx, writers[1+i%4])
 		total := hi.text(`SELECT count(*) FROM w`)
-		hi.expect(`SELECT count(u), count(DISTINCT u), count(r), count(at), sum(k) / 5 FROM w`, strings.Repeat(total+"|", 4)+total)
+		// sum(k) is numeric (k is INT8): the division keeps 16 decimals.
+		hi.expect(`SELECT count(u), count(DISTINCT u), count(r), count(at), sum(k) / 5 FROM w`, strings.Repeat(total+"|", 4)+total+".0000000000000000")
 		// The rows that predate the ALTER share its now().
 		hi.expect(`SELECT count(DISTINCT at) FROM w WHERE id <= 1500`, "1")
 		// The unique index has an entry for every row and none other.

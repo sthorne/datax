@@ -233,7 +233,7 @@ func TestBoundedStalenessMultiRangeConsistency(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if len(res.Rows) != 1 || res.Rows[0][0].I != 16*500 {
+		if len(res.Rows) != 1 || res.Rows[0][0].Text() != "8000" { // 16*500; sum(int8) is numeric
 			stop.Store(true)
 			wg.Wait()
 			t.Fatalf("inconsistent snapshot: %+v", res.Rows)

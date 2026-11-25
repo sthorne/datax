@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/sthorne/datax/pkg/cluster"
 	"github.com/sthorne/datax/pkg/keys"
 	"github.com/sthorne/datax/pkg/keystore"
@@ -113,6 +114,10 @@ func queryStrings(t *testing.T, ctx context.Context, conn *pgx.Conn, q string) [
 		}
 		var parts []string
 		for _, v := range vals {
+			if n, ok := v.(pgtype.Numeric); ok { // sum(int8), for one
+				parts = append(parts, numericString(n))
+				continue
+			}
 			parts = append(parts, fmt.Sprint(v))
 		}
 		out = append(out, strings.Join(parts, "|"))
@@ -121,6 +126,15 @@ func queryStrings(t *testing.T, ctx context.Context, conn *pgx.Conn, q string) [
 		t.Fatalf("%s: %v", q, err)
 	}
 	return out
+}
+
+// numericString renders a numeric value as its text form ("150").
+func numericString(n pgtype.Numeric) string {
+	v, err := n.Value()
+	if err != nil || v == nil {
+		return fmt.Sprint(n)
+	}
+	return fmt.Sprint(v)
 }
 
 func sameStrings(t *testing.T, what string, got []string, want ...string) {

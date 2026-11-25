@@ -98,6 +98,9 @@ func aggFamily(se parser.SelectExpr, colType func(name string) (types.Family, bo
 		sp.argType = exprFamily(parser.Expr{Column: se.AggCol}, colType)
 	case se.AggArg != nil:
 		sp.argType = exprFamily(*se.AggArg, colType)
+		// Columns' widths are not known here: an integer column counts
+		// as int8 (resolveAggSpec, which has them, settles the rest).
+		sp.intWidth = intExprWidth(*se.AggArg, func(string) int32 { return 8 })
 	}
 	return sp.resultType()
 }
