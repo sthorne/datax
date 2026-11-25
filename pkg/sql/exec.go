@@ -1224,7 +1224,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := coerceColumn(target[i], d)
+			d, cerr := assignColumn(target[i], d)
 			if cerr != nil {
 				return nil, cerr
 			}
@@ -1530,7 +1530,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := coerceColumn(col, d)
+		d, cerr := assignColumn(col, d)
 		if cerr != nil {
 			return false, nil, cerr
 		}
@@ -3232,7 +3232,7 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 					return nil, err
 				}
 			}
-			d, cerr := coerceColumn(col, d)
+			d, cerr := assignColumn(col, d)
 			if cerr != nil {
 				return nil, cerr
 			}

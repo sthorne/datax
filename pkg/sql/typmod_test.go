@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"math"
 	"testing"
 
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -63,5 +64,62 @@ func TestEnforceTypmod(t *testing.T) {
 	}
 	if d, err := enforceTypmod(col, types.DNull); err != nil || !d.Null {
 		t.Fatalf("null: %+v, %v", d, err)
+	}
+}
+
+// TestAssignColumn: the assignment casts the write path applies —
+// numeric into an integer column rounds half away from zero, float8
+// half to even (rint), each range-checked against the column's width
+// with PostgreSQL's message; anything else (float8 into numeric too)
+// is coerceColumn's.
+func TestAssignColumn(t *testing.T) {
+	int2 := catalog.Column{Name: "a", Type: types.Int, Width: 2}
+	int4 := catalog.Column{Name: "b", Type: types.Int, Width: 4}
+	int8 := catalog.Column{Name: "c", Type: types.Int}
+	num := catalog.Column{Name: "n", Type: types.Decimal}
+	for _, c := range []struct {
+		col  catalog.Column
+		in   types.Datum
+		want string
+		code string
+	}{
+		{int8, types.NewDecimal("2.5"), "3", ""},
+		{int8, types.NewDecimal("-2.5"), "-3", ""},
+		{int8, types.NewDecimal("2.49"), "2", ""},
+		{int4, types.NewFloat(2.5), "2", ""},
+		{int4, types.NewFloat(3.5), "4", ""},
+		{int2, types.NewFloat(-2.5), "-2", ""},
+		{int2, types.NewDecimal("32767.4"), "32767", ""},
+		{int2, types.NewDecimal("32767.5"), "smallint out of range", CodeNumericValueOutOfRange},
+		{int2, types.NewDecimal("1e30"), "smallint out of range", CodeNumericValueOutOfRange},
+		{int4, types.NewFloat(-2147483648.4), "-2147483648", ""},
+		{int4, types.NewFloat(2147483647.5), "integer out of range", CodeNumericValueOutOfRange},
+		{int4, types.NewFloat(math.NaN()), "integer out of range", CodeNumericValueOutOfRange},
+		{int8, types.NewFloat(math.Inf(1)), "bigint out of range", CodeNumericValueOutOfRange},
+		{int8, types.NewDecimal("9223372036854775807.5"), "bigint out of range", CodeNumericValueOutOfRange},
+		{int4, types.NewDecimal("NaN"), "cannot convert NaN to integer", CodeFeatureNotSupported},
+		{num, types.NewFloat(1.5), `column "n": cannot use FLOAT8 value as DECIMAL`, CodeInvalidTextRepresentation},
+		{num, types.NewInt(7), "7", ""},
+		{int8, types.NewString("12"), "12", ""},
+		{int8, types.DNull, "NULL", ""},
+	} {
+		got, err := assignColumn(c.col, c.in)
+		if c.code != "" {
+			if err == nil || err.Code != c.code || err.Msg != c.want {
+				t.Errorf("%s ← %s: %v, want %s %q", c.col.TypeSQL(), c.in.Text(), err, c.code, c.want)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s ← %s: %v", c.col.TypeSQL(), c.in.Text(), err)
+			continue
+		}
+		text := got.Text()
+		if got.Null {
+			text = "NULL"
+		}
+		if text != c.want || (!got.Null && got.Fam != c.col.Type) {
+			t.Errorf("%s ← %s: %s %q, want %q", c.col.TypeSQL(), c.in.Text(), got.Fam, text, c.want)
+		}
 	}
 }

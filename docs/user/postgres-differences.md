@@ -361,7 +361,13 @@ syntax error or `0A000` feature not supported):
   and a system catalog's OID is PostgreSQL's (`'pg_class'::regclass`
   is 1259). The `to_regclass`, `to_regproc`, `to_regprocedure`,
   `to_regnamespace` and `to_regrole` lookups return the OID (`NULL`
-  where the cast would fail), not the name.
+  where the cast would fail), not the name. A `float8` value stored
+  into a `numeric` column is refused (`22P02`), where PostgreSQL converts
+  it: write `x::numeric`. That cast keeps the float's shortest exact
+  digits (`(0.1::float8 + 0.2::float8)::numeric` is
+  `0.30000000000000004`), where PostgreSQL rounds to 15 significant
+  digits (`0.3`). A numeric or `float8` value stored into an integer
+  column converts as in PostgreSQL.
 - **`COPY FROM STDIN` outside a transaction block is not atomic.** It
   commits in chunks (128 rows / 1 MiB) as the stream arrives, so a
   failure partway leaves the earlier chunks committed — the error names

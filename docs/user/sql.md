@@ -76,6 +76,14 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
   column converts (correctly rounded). So is an integer literal outside
   `INT8`'s range (`99999999999999999999`).
+- Storing a DECIMAL or `FLOAT8` value into an integer column (`INSERT`,
+  `INSERT ... SELECT`, `UPDATE`, `ON CONFLICT DO UPDATE`) converts it as
+  PostgreSQL's assignment casts do: a DECIMAL rounds halves away from
+  zero (`2.5` → `3`), a `FLOAT8` halves to even (`2.5::float8` → `2`),
+  and a value outside the column's range is `22003` (`smallint out of
+  range`). A comparison does not round: `WHERE n = 7.5` matches no
+  integer. A `FLOAT8` value into a DECIMAL column is refused (`22P02`);
+  cast it (`x::numeric`).
 - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
   does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
   `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).

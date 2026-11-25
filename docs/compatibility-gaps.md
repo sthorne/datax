@@ -48,7 +48,7 @@ Open gaps by area and priority.
 |---|---:|---:|---:|---:|---:|
 | [PG: Query language](#query-language) | 0 | 9 | 12 | 0 | 21 |
 | [PG: Functions and operators](#functions-and-operators) | 0 | 6 | 11 | 0 | 17 |
-| [PG: Types](#types) | 0 | 9 | 17 | 0 | 26 |
+| [PG: Types](#types) | 0 | 9 | 18 | 0 | 27 |
 | [PG: DDL](#ddl) | 0 | 14 | 9 | 1 | 24 |
 | [PG: Programmability](#programmability) | 2 | 2 | 2 | 0 | 6 |
 | [PG: Transactions and concurrency](#transactions-and-concurrency) | 1 | 6 | 5 | 0 | 12 |
@@ -67,9 +67,9 @@ Open gaps by area and priority.
 | [CR: Virtual clusters and cluster settings](#virtual-clusters-and-cluster-settings) | 0 | 1 | 1 | 0 | 2 |
 | [CR: SHOW statements, crdb_internal, console](#show-statements-crdb_internal-and-the-console) | 0 | 2 | 2 | 0 | 4 |
 | [CR: Schema changes, statistics, diagnostics](#schema-changes-statistics-and-diagnostics) | 0 | 2 | 2 | 0 | 4 |
-| **PostgreSQL total** | **3** | **68** | **83** | **1** | **155** |
+| **PostgreSQL total** | **3** | **68** | **84** | **1** | **156** |
 | **CockroachDB total** | **2** | **24** | **19** | **0** | **45** |
-| **All** | **5** | **92** | **102** | **1** | **200** |
+| **All** | **5** | **92** | **103** | **1** | **201** |
 
 The most consequential gaps, in the order they should probably be taken:
 see [Priorities](#priorities) at the end.
@@ -146,6 +146,7 @@ which do exist: see PG-F-022.
 | ID | Gap | Today | Workaround | P | Size | Src | Issue |
 |---|---|---|---|---|---|---|---|
 | PG-T-031 | `json_agg` / `jsonb_agg` render a `timestamptz` in UTC; zone abbreviations are a fixed list (no `timezone_abbreviations`, none DST-dependent); an invalid startup setting is ignored where PostgreSQL ends the connection | silently different | `to_jsonb` per row | P3 | S | D | — |
+| PG-T-033 | `float8` into a `numeric` column, an assignment cast in PostgreSQL, is refused (numeric and float8 into an integer column convert); and datax's `float8` → `numeric` cast keeps the shortest exact digits (`(0.1::float8 + 0.2::float8)::numeric` is `0.30000000000000004`) where PostgreSQL's rounds to 15 significant digits (`0.3`) | `22P02 column "n": cannot use FLOAT8 value as DECIMAL`; the cast silently different | `x::numeric`, `round(x::numeric, n)` | P3 | S | D | — |
 | PG-T-004 | `REAL` / `FLOAT4` columns are `float8` (`pg_typeof(real_col)` is `float8`) | silently different (precision and wire type differ) | — | P2 | M | V | — |
 | PG-T-005 | `infinity` / `-infinity` dates and timestamps; BC dates; a `date` takes the years 0000 to 9999 and a `timestamp` / `timestamptz` 1678-01-01 to 2261-12-31 (PostgreSQL: 4713 BC to 5874897 AD, and to 294276 AD); special inputs `'epoch'`, `'today'`, `'now'`, `'tomorrow'`. Year 0000 is a valid `date` (`'0000-01-01'::date`, `make_date(0, 1, 1)`: the proleptic year before 0001), where PostgreSQL, which has no year 0, refuses it with `22008`. A `date` before 1677-09-22 or after 2262-04-11 cast to a timestamp wraps to a wrong instant instead of failing (`'1500-01-01'::date::timestamptz` is `2084-07-20 23:34:33.709552+00`) | `22007 invalid input syntax for type date: "infinity"` (and likewise for BC and five-digit years); a timestamp text outside its range is `22008 timestamp out of range`; a binary-format parameter or COPY field outside these ranges, PostgreSQL's infinity encodings included, is `22008`; year 0000 and the date-to-timestamp wrap are silently different | sentinel values; `now()` | P2 | M | V | — |
 | PG-T-006 | `TIMESTAMP` (without time zone) expressions and casts become `timestamptz`; `date + interval` is `timestamptz` (PostgreSQL: `timestamp`); a bind parameter for a `TIMESTAMP` column describes as `timestamptz` | silently different (wire type) | pass UTC | P2 | M | V | — |

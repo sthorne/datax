@@ -2105,6 +2105,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A numeric or float8 value stores into an integer column**, as
+  PostgreSQL's assignment casts allow: `INSERT INTO t (n) VALUES (2.5)`,
+  `INSERT ... SELECT avg(x)`, `UPDATE t SET n = n * 1.1` and `ON CONFLICT
+  DO UPDATE SET n = excluded.price` into an `INT2` / `INT4` / `INT8`
+  column failed with `22P02 cannot use DECIMAL value as INT8`. A numeric
+  rounds half away from zero (`2.5` → `3`), a float8 half to even
+  (`2.5::float8` → `2`, PostgreSQL's `rint`), and a value outside the
+  column's range is `22003 smallint / integer / bigint out of range` (a
+  numeric `NaN` `0A000`). Comparisons are unchanged: `WHERE n = 7.5`
+  matches no integer.
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the
