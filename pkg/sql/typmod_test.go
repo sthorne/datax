@@ -103,7 +103,7 @@ func TestAssignColumn(t *testing.T) {
 		{int8, types.NewString("12"), "12", ""},
 		{int8, types.DNull, "NULL", ""},
 	} {
-		got, err := assignColumn(c.col, c.in)
+		got, err := assignColumn(c.col, c.in, nil)
 		if c.code != "" {
 			if err == nil || err.Code != c.code || err.Msg != c.want {
 				t.Errorf("%s ← %s: %v, want %s %q", c.col.TypeSQL(), c.in.Text(), err, c.code, c.want)

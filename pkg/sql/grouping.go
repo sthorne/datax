@@ -733,6 +733,13 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 			if err != nil {
 				return nil, err
 			}
+			if !d.Null && d.Fam == types.Date && gq.keyTypes[i] == types.Timestamp {
+				// A key that mixes dates and timestamps (a CASE) groups
+				// a date as the timestamp it becomes (evalCase).
+				if c, cerr := d.Coerce(types.Timestamp); cerr == nil {
+					d = c
+				}
+			}
 			keys[i] = d
 		}
 		// A row counts once in each grouping set, in the group of its

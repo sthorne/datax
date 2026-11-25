@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/sql/parser"
@@ -17,8 +18,9 @@ import (
 // their canonical group key; ALL forms keep multiplicities (UNION ALL
 // concatenates, INTERSECT ALL keeps the smaller count, EXCEPT ALL
 // subtracts the right count). The head names the output; each column's
-// type unifies the members' (numeric families lift, anything else meets
-// as text) and every value is conformed to it. The total materialized
+// type unifies the members' (numeric families lift, a date and a
+// timestamp meet at timestamp, anything else meets as text) and every
+// value is conformed to it. The total materialized
 // row count is capped (54000) so a runaway operand fails rather than
 // exhausting the gateway.
 
@@ -70,8 +72,23 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 	// Unify the column types across members and conform every value.
 	cols := make([]ResultColumn, len(head.Columns))
 	copy(cols, head.Columns)
+	// A member's dates becoming timestamps are at midnight in this zone
+	// (setOpDates).
+	dateZones := make([]*time.Location, len(cols))
+	for i := range cols {
+		ci := make([]ResultColumn, len(members))
+		for mi, res := range members {
+			ci[mi] = res.Columns[i]
+		}
+		if noTZ, ok := setOpDates(ci); ok {
+			cols[i].NoTZ = noTZ
+			if !noTZ {
+				dateZones[i] = s.zone()
+			}
+		}
+	}
 	if valuesList(asts) {
-		if err := resolveValuesTypes(asts, members, cols); err != nil {
+		if err := resolveValuesTypes(asts, members, cols, dateZones); err != nil {
 			return nil, err
 		}
 	}
@@ -93,7 +110,16 @@ func (s *Session) execSetOps(ctx context.Context, txn *kvclient.Txn, t *parser.S
 				continue
 			}
 			for _, row := range operands[mi].rows {
-				if !row[i].Null {
+				switch {
+				case row[i].Null:
+				case row[i].Fam == types.Date && cols[i].Type == types.Timestamp:
+					c, err := row[i].CoerceIn(types.Timestamp, dateZones[i])
+					if err != nil {
+						return nil, ToSQLError(err)
+					}
+					c.NoTZ = cols[i].NoTZ
+					row[i] = c
+				default:
 					row[i] = conformTo(row[i], cols[i].Type)
 				}
 			}
@@ -172,8 +198,10 @@ func untypedLiteral(e parser.Expr) bool {
 // untyped literals ('...', NULL) converted to it (22P02 when one is not
 // a valid input of it), and text when no row is typed; rows of types
 // of different categories are refused (42804). Every value is
-// converted to its column's type, and members and cols record it.
-func resolveValuesTypes(asts []*parser.Select, members []*Result, cols []ResultColumn) error {
+// converted to its column's type, and members and cols record it. A
+// date becoming a timestamp is its midnight in dateZones[i] (nil: wall
+// midnight; see setOpDates).
+func resolveValuesTypes(asts []*parser.Select, members []*Result, cols []ResultColumn, dateZones []*time.Location) error {
 	for i := range cols {
 		pick, err := valuesColumnType(asts, i, func(mi int) types.Family { return members[mi].Columns[i].Type })
 		if err != nil {
@@ -185,9 +213,15 @@ func resolveValuesTypes(asts []*parser.Select, members []*Result, cols []ResultC
 				if d.Null || d.Fam == pick {
 					continue
 				}
-				c, err := d.Coerce(pick)
+				c, err := d.CoerceIn(pick, dateZones[i])
 				if err != nil {
+					if d.Fam == types.Date {
+						return ToSQLError(err)
+					}
 					return newErrf(CodeInvalidTextRepresentation, "invalid input syntax for type %s: %q", pgTypeName(pick), d.Text())
+				}
+				if d.Fam == types.Date && pick == types.Timestamp {
+					c.NoTZ = cols[i].NoTZ
 				}
 				row[i] = c
 			}
@@ -273,7 +307,9 @@ func unifyWidth(fam types.Family, cols []ResultColumn) int32 {
 
 // unifyFamily is the type two set-operation members' columns meet at:
 // the same family stays, the numeric families lift (INT8 < DECIMAL <
-// FLOAT8), an unknown side yields to the other, anything else is text.
+// FLOAT8), a date and a timestamp meet at timestamp (as PostgreSQL's
+// select_common_type has it), an unknown side yields to the other,
+// anything else is text.
 func unifyFamily(a, b types.Family) types.Family {
 	switch {
 	case a == b:
@@ -282,6 +318,8 @@ func unifyFamily(a, b types.Family) types.Family {
 		return b
 	case b == types.Unknown:
 		return a
+	case dateVsTimestamp(a, b):
+		return types.Timestamp
 	}
 	rank := func(f types.Family) int {
 		switch f {
@@ -301,6 +339,28 @@ func unifyFamily(a, b types.Family) types.Family {
 		return b
 	}
 	return types.String
+}
+
+// setOpDates reports a set operation's output column whose members
+// (cols, one per member) mix a date with a timestamp: they meet at
+// timestamp, and the dates become timestamps at their midnight. The
+// column is a timestamp without time zone (noTZ, the dates at their
+// wall-clock midnight) when every timestamp member is one, and with
+// time zone otherwise (the dates at their midnight in the session's
+// TimeZone, as PostgreSQL's date2timestamptz promotes them).
+func setOpDates(cols []ResultColumn) (noTZ, ok bool) {
+	var date, ts bool
+	noTZ = true
+	for _, c := range cols {
+		switch c.Type {
+		case types.Date:
+			date = true
+		case types.Timestamp:
+			ts = true
+			noTZ = noTZ && c.NoTZ
+		}
+	}
+	return noTZ, date && ts
 }
 
 // intersectRows keeps the left rows that also occur on the right: each

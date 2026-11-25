@@ -10,7 +10,8 @@ import (
 // output columns: literals, columns (through colType), casts, builtin
 // calls (the registry's result family), arithmetic (numeric
 // promotion), || (text), predicates (bool), CASE (the first typed
-// arm). types.Unknown when it cannot be told (callers describe as
+// arm; a date arm and a timestamp arm meet at timestamp, as in
+// PostgreSQL). types.Unknown when it cannot be told (callers describe as
 // text).
 func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) types.Family {
 	fam := types.Unknown
@@ -18,14 +19,26 @@ func exprFamily(e parser.Expr, colType func(name string) (types.Family, bool)) t
 	case e.Left != nil:
 		fam = exprFamily(*e.Left, colType)
 	case e.Case != nil:
+		arms := make([]parser.Expr, 0, len(e.Case.Whens)+1)
 		for _, w := range e.Case.Whens {
-			if f := exprFamily(w.Result, colType); f != types.Unknown {
+			arms = append(arms, w.Result)
+		}
+		if e.Case.Else != nil {
+			arms = append(arms, *e.Case.Else)
+		}
+		for _, a := range arms {
+			f := exprFamily(a, colType)
+			switch {
+			case fam == types.Unknown:
 				fam = f
+			case fam == types.Date && f == types.Timestamp:
+				// The date arms become timestamps (with time zone, at
+				// their midnight in the session's zone: evalCase).
+				fam = types.Timestamp
+			}
+			if fam != types.Unknown && fam != types.Date {
 				break
 			}
-		}
-		if fam == types.Unknown && e.Case.Else != nil {
-			fam = exprFamily(*e.Case.Else, colType)
 		}
 	case e.Func == "array_construct":
 		elem := types.String

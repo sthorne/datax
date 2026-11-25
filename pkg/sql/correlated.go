@@ -1074,7 +1074,7 @@ func compareDatumsIn(l types.Datum, op string, r types.Datum, loc *time.Location
 		return false, nil
 	}
 	if !plainCmpOp(op) {
-		return applyCmpOp(op, l, r)
+		return applyCmpOpIn(op, l, r, "", loc)
 	}
 	if r.Fam == types.String && l.Fam != types.String && l.Fam != types.Enum && !l.Fam.IsArray() {
 		// An untyped value (a text-format parameter, a quoted literal)

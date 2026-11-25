@@ -187,7 +187,9 @@ type Datum struct {
 	// Loc is a READ hint, never stored: a String datum the session took
 	// from a statement's literal or text parameter carries the
 	// session's TimeZone, in which it reads as a TIMESTAMPTZ when its
-	// text names no offset. nil is UTC.
+	// text names no offset; a Date datum a CASE yielded carries it too,
+	// and becomes a TIMESTAMPTZ (or compares with one) at its midnight
+	// there (DateMidnight). nil is UTC.
 	Loc *time.Location `json:"-"`
 }
 
@@ -284,6 +286,25 @@ func DateNanos(days int64) (int64, error) {
 		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
 	}
 	return days * NanosPerDay, nil
+}
+
+// DateMidnight is the timestamp a date becomes, as PostgreSQL's
+// date2timestamptz and date2timestamp make it: its midnight read in loc
+// for a timestamp with time zone (loc is the session's TimeZone), its
+// wall-clock midnight for one without (loc nil). Every conversion of a
+// date to a timestamp goes through it — a cast, a comparison, an
+// assignment to a column, a CASE or set operation's common type — so
+// they agree. ErrTimestampRange for a date outside the timestamp range.
+func DateMidnight(days int64, loc *time.Location) (int64, error) {
+	n, err := DateNanos(days)
+	if err != nil || loc == nil || loc == time.UTC {
+		return n, err
+	}
+	n = WallInZone(n, loc)
+	if n < minTimestamp.UnixNano() || n >= maxTimestamp.UnixNano() {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
+	}
+	return n, nil
 }
 
 // TimeNanos is t as UTC Unix nanoseconds, or ErrTimestampRange when t
@@ -551,7 +572,7 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		}
 		return NewDate(days), nil
 	case d.Fam == Date && target == Timestamp:
-		n, err := DateNanos(d.I)
+		n, err := DateMidnight(d.I, d.Loc)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -622,10 +643,26 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 	return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 }
 
+// CoerceIn is Coerce under the session's TimeZone (nil: UTC): a date
+// becomes a timestamp with time zone at its midnight in loc
+// (DateMidnight). Pass nil for a timestamp without time zone, whose
+// date is its wall-clock midnight.
+func (d Datum) CoerceIn(target Family, loc *time.Location) (Datum, error) {
+	if !d.Null && d.Fam == Date && target == Timestamp {
+		n, err := DateMidnight(d.I, loc)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimestamp(n), nil
+	}
+	return d.Coerce(target)
+}
+
 // Compare returns -1/0/1; comparing with NULL or across incomparable types
 // returns an error (callers treat NULL comparisons as "no match"). A
-// date against a timestamp with time zone promotes the date to its UTC
-// midnight; CompareIn takes the session's zone.
+// date against a timestamp with time zone promotes the date to its
+// midnight in the date's Loc (UTC when it has none); CompareIn takes
+// the session's zone.
 func (d Datum) Compare(o Datum) (int, error) { return d.CompareIn(o, nil) }
 
 // CompareIn is Compare under the session's TimeZone (nil: UTC), which
@@ -639,8 +676,14 @@ func (d Datum) CompareIn(o Datum, loc *time.Location) (int, error) {
 	}
 	switch {
 	case d.Fam == Date && o.Fam == Timestamp:
+		if loc == nil {
+			loc = d.Loc
+		}
 		return compareDateTimestamp(d.I, o, loc), nil
 	case d.Fam == Timestamp && o.Fam == Date:
+		if loc == nil {
+			loc = o.Loc
+		}
 		return -compareDateTimestamp(o.I, d, loc), nil
 	}
 	if d.Fam == Int && o.Fam == Float {
@@ -759,9 +802,16 @@ func compareDateTimestamp(days int64, ts Datum, loc *time.Location) int {
 	case days >= maxTimestampDay:
 		return 1
 	}
-	n := days * NanosPerDay
-	if !ts.NoTZ && loc != nil && loc != time.UTC {
-		n = WallInZone(n, loc)
+	if ts.NoTZ {
+		loc = nil
+	}
+	n, err := DateMidnight(days, loc)
+	if err != nil {
+		// The zone's offset carried a date at the range's edge out.
+		if days < (minTimestampDay+maxTimestampDay)/2 {
+			return -1
+		}
+		return 1
 	}
 	return cmpInt(n, ts.I)
 }

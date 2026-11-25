@@ -289,7 +289,27 @@ func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Exp
 	switch cmp.Op {
 	case "=", "<", "<=", ">", ">=":
 		fam := exprFamily(e, colType)
-		if d, err := evalExpr(cmp.Value, nil, nil, params); err == nil && fam != types.Unknown && !d.Null && !dateVsTimestamp(d.Fam, fam) {
+		d, err := evalExpr(cmp.Value, nil, nil, params)
+		switch {
+		case err != nil || fam == types.Unknown || d.Null:
+		case d.Fam == types.Date && fam == types.Timestamp:
+			// The date's wall-clock midnight, which is where it falls
+			// against a timestamp without time zone, and against one
+			// with time zone under UTC. Under another TimeZone it falls
+			// at its midnight there against a timestamp with time zone,
+			// and an expression's type does not always say which kind it
+			// yields (coalesce(tn, tn) keeps tn's): the filter decides,
+			// value by value (types.CompareIn). Out of range it bounds
+			// nothing.
+			if cmp.Zone != nil && !exprNoTZ(e, func(name string) bool { c, ok := desc.Col(name); return ok && c.NoTZ }) {
+				break
+			}
+			if n, derr := types.DateMidnight(d.I, nil); derr == nil {
+				pc.d, pc.usable, pc.exprFam = types.NewTimestamp(n), true, fam
+			}
+		case dateVsTimestamp(d.Fam, fam):
+			// A timestamp against a date expression: left to the filter.
+		default:
 			if d, cerr := d.Coerce(fam); cerr == nil {
 				pc.d, pc.usable, pc.exprFam = d, true, fam
 			}
@@ -310,12 +330,13 @@ func exprConj(desc *catalog.TableDescriptor, cmp parser.Comparison, e parser.Exp
 // row. ok is false when the value cannot bound the column.
 func boundValue(col catalog.Column, cmp parser.Comparison, d types.Datum) (types.Datum, bool) {
 	if !d.Null && d.Fam == types.Date && col.Type == types.Timestamp {
-		n, err := types.DateNanos(d.I)
+		loc := cmp.Zone
+		if col.NoTZ {
+			loc = nil
+		}
+		n, err := types.DateMidnight(d.I, loc)
 		if err != nil {
 			return d, false
-		}
-		if !col.NoTZ && cmp.Zone != nil {
-			n = types.WallInZone(n, cmp.Zone)
 		}
 		return types.NewTimestamp(n), true
 	}

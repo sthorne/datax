@@ -66,3 +66,57 @@ func TestCompareDateTimestamp(t *testing.T) {
 		t.Errorf("Compare: %d %v", c, err)
 	}
 }
+
+// TestDateMidnight: the one conversion of a date to a timestamp — its
+// midnight in the session's zone for a timestamp with time zone, its
+// wall-clock midnight for one without — and the paths that take it: a
+// coercion under a zone (CoerceIn), and a date carrying the zone as
+// its Loc (a CASE's result), in Coerce and Compare alike.
+func TestDateMidnight(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip("no zone database:", err)
+	}
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Skip("no zone database:", err)
+	}
+	days, err := ParseDate("2024-01-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		loc  *time.Location
+		want string
+	}{
+		{nil, "2024-01-01 00:00:00+00"},
+		{time.UTC, "2024-01-01 00:00:00+00"},
+		{ny, "2024-01-01 05:00:00+00"},
+		{tokyo, "2023-12-31 15:00:00+00"},
+	} {
+		n, err := DateMidnight(days, c.loc)
+		if err != nil || NewTimestamp(n).Text() != c.want {
+			t.Errorf("DateMidnight in %v: %s %v, want %s", c.loc, NewTimestamp(n).Text(), err, c.want)
+		}
+		v, err := NewDate(days).CoerceIn(Timestamp, c.loc)
+		if err != nil || v.Text() != c.want {
+			t.Errorf("CoerceIn %v: %s %v, want %s", c.loc, v.Text(), err, c.want)
+		}
+		d := NewDate(days)
+		d.Loc = c.loc
+		if v, err := d.Coerce(Timestamp); err != nil || v.Text() != c.want {
+			t.Errorf("Coerce of a date in %v: %s %v, want %s", c.loc, v.Text(), err, c.want)
+		}
+		at, _ := ParseTimestamp(c.want)
+		if cmp, err := d.Compare(NewTimestamp(at)); err != nil || cmp != 0 {
+			t.Errorf("Compare of a date in %v with %s: %d %v, want 0", c.loc, c.want, cmp, err)
+		}
+	}
+	// A date whose midnight in the zone falls outside the range.
+	if _, err := DateMidnight(minTimestampDay, tokyo); err == nil {
+		t.Error("1678-01-01 in Asia/Tokyo: no error, want ErrTimestampRange")
+	}
+	if c, err := NewDate(minTimestampDay).CompareIn(NewTimestamp(minTimestamp.UnixNano()), tokyo); err != nil || c != -1 {
+		t.Errorf("1678-01-01 in Asia/Tokyo against the first timestamp: %d %v, want -1", c, err)
+	}
+}

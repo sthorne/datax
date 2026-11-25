@@ -1834,7 +1834,7 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		}
 		base = d
 	case e.Case != nil:
-		d, err := evalCase(e.Case, env, params)
+		d, err := evalCase(e.Case, e.Zone, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
@@ -2368,7 +2368,7 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 				}
 				rhs = v
 			}
-			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -2487,8 +2487,10 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 }
 
 // evalCase evaluates a CASE expression: the simple form compares the
-// operand with each WHEN value, the searched form tests each condition.
-func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Datum, error) {
+// operand with each WHEN value (a date against a timestamp with time
+// zone at its midnight in loc, the session's TimeZone), the searched
+// form tests each condition.
+func evalCase(ce *parser.CaseExpr, loc *time.Location, env exprEnv, params []types.Datum) (types.Datum, error) {
 	var operand types.Datum
 	if ce.Operand != nil {
 		d, err := evalExprEnv(*ce.Operand, env, params)
@@ -2505,7 +2507,7 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 				return types.Datum{}, err
 			}
 			if !operand.Null && !v.Null {
-				if c, err := operand.Compare(v); err == nil && c == 0 {
+				if c, err := operand.CompareIn(v, loc); err == nil && c == 0 {
 					hit = true
 				}
 			}
@@ -2517,13 +2519,26 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 			hit = ok
 		}
 		if hit {
-			return evalExprEnv(w.Result, env, params)
+			d, err := evalExprEnv(w.Result, env, params)
+			return caseResult(d, loc), err
 		}
 	}
 	if ce.Else != nil {
-		return evalExprEnv(*ce.Else, env, params)
+		d, err := evalExprEnv(*ce.Else, env, params)
+		return caseResult(d, loc), err
 	}
 	return types.DNull, nil
+}
+
+// caseResult marks a date a CASE yields with the session's TimeZone
+// (types.Datum.Loc): where its arms mix a date with a timestamp with
+// time zone the CASE is a timestamp with time zone (exprFamily), and
+// the date becomes one, or compares with one, at its midnight there.
+func caseResult(d types.Datum, loc *time.Location) types.Datum {
+	if loc != nil && !d.Null && d.Fam == types.Date {
+		d.Loc = loc
+	}
+	return d
 }
 
 // tsVectorMatchCall reports whether a conjunct is `to_tsvector(config,
@@ -2655,7 +2670,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 			}
 		}
 		if nullAwareOp(cmp.Op) {
-			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -2757,11 +2772,11 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 		}
 	}
 	if nullAwareOp(cmp.Op) {
-		ok, err := applyNullAware(cmp.Op, lhs, rhs)
+		ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 		return ok, false, err
 	}
 	if _, _, q := parser.SplitQuantified(cmp.Op); q {
-		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape)
+		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 	}
 	if lhs.Null || rhs.Null {
 		return false, true, nil
@@ -2891,8 +2906,10 @@ func boolTest(op string, d types.Datum) (bool, error) {
 }
 
 // distinctFrom evaluates x IS [NOT] DISTINCT FROM y: NULLs compare as a
-// value, equal to each other and different from everything else.
-func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
+// value, equal to each other and different from everything else. loc
+// is the session's TimeZone (nil: UTC), at whose midnight a date
+// compares with a timestamp with time zone.
+func distinctFrom(op string, lhs, rhs types.Datum, loc *time.Location) (bool, error) {
 	distinct := lhs.Null != rhs.Null
 	if !lhs.Null && !rhs.Null {
 		if rhs.Fam != lhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
@@ -2900,7 +2917,7 @@ func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
 				rhs = c
 			}
 		}
-		c, err := lhs.Compare(rhs)
+		c, err := lhs.CompareIn(rhs, loc)
 		distinct = err != nil || c != 0
 	}
 	return distinct != strings.Contains(op, "NOT"), nil
@@ -2921,22 +2938,18 @@ func nullAwareOp(op string) bool {
 	return false
 }
 
-// applyNullAware evaluates the null-aware operators.
-func applyNullAware(op string, lhs, rhs types.Datum) (bool, error) {
+// applyNullAware evaluates the null-aware operators, under the
+// session's TimeZone loc (nil: UTC).
+func applyNullAware(op string, lhs, rhs types.Datum, loc *time.Location) (bool, error) {
 	if strings.Contains(op, "DISTINCT") {
-		return distinctFrom(op, lhs, rhs)
+		return distinctFrom(op, lhs, rhs, loc)
 	}
 	return boolTest(op, lhs)
 }
 
-// applyCmpOp applies an operator to two values: ordering operators
-// through Compare, the regular-expression operators on text.
-func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
-	return applyCmpOpEsc(op, lhs, rhs, "")
-}
-
-// applyCmpOpEsc is applyCmpOp with a pattern's ESCAPE character ("" =
-// backslash, parser.NoEscape = none).
+// applyCmpOpEsc applies an operator to two values — ordering operators
+// through Compare, the regular-expression operators on text — with a
+// pattern's ESCAPE character ("" = backslash, parser.NoEscape = none).
 func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
 	return applyCmpOpIn(op, lhs, rhs, escape, nil)
 }
@@ -2987,7 +3000,7 @@ func applyCmpOpIn(op string, lhs, rhs types.Datum, escape string, loc *time.Loca
 	if _, _, ok := parser.SplitQuantified(op); ok {
 		// Quantified comparison over an array value (or a text array
 		// literal '{a,b}'); UNKNOWN is not a match.
-		ok, _, err := quantCmp3(op, lhs, rhs, escape)
+		ok, _, err := quantCmp3(op, lhs, rhs, escape, loc)
 		return ok, err
 	}
 	if lhs.Fam != rhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
@@ -3008,8 +3021,10 @@ func applyCmpOpIn(op string, lhs, rhs types.Datum, escape string, loc *time.Loca
 // UNKNOWN when none does but some comparison is UNKNOWN (a NULL); ALL
 // fails when some element fails and is UNKNOWN when none does but some
 // is UNKNOWN. Over no elements ANY is false and ALL true, whatever x
-// is; a NULL array is UNKNOWN.
-func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, error) {
+// is; a NULL array is UNKNOWN. loc is the session's TimeZone (nil:
+// UTC), at whose midnight a date compares with a timestamp with time
+// zone.
+func quantCmp3(op string, lhs, rhs types.Datum, escape string, loc *time.Location) (bool, bool, error) {
 	base, quant, _ := parser.SplitQuantified(op)
 	if rhs.Null {
 		return false, true, nil
@@ -3034,12 +3049,12 @@ func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, erro
 			unknown = true
 			continue
 		}
-		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) {
+		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) && !dateVsTimestamp(ed.Fam, lhs.Fam) {
 			if c, err := ed.Coerce(lhs.Fam); err == nil {
 				ed = c
 			}
 		}
-		ok, err := applyCmpOpEsc(base, lhs, ed, escape)
+		ok, err := applyCmpOpIn(base, lhs, ed, escape, loc)
 		if err != nil {
 			return false, false, err
 		}
@@ -3108,7 +3123,7 @@ func likeToRegexpEsc(pattern, escape string) string {
 }
 
 // plainCmpOp reports whether op is an ordering comparison the typed
-// Coerce-and-Compare path handles; the rest go through applyCmpOp.
+// Coerce-and-Compare path handles; the rest go through applyCmpOpIn.
 func plainCmpOp(op string) bool {
 	switch op {
 	case "=", "!=", "<", "<=", ">", ">=":

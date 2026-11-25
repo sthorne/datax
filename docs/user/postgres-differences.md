@@ -465,10 +465,14 @@ syntax error or `0A000` feature not supported):
 - **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
   (input without an offset, text output, `::text`, `::date`,
   `date_trunc`, `extract`, `to_char`, `current_date`, day and month
-  arithmetic), and `AT TIME ZONE` / `timezone()` convert both ways; the
+  arithmetic, a `date` becoming a `TIMESTAMPTZ` at its midnight in the
+  zone), and `AT TIME ZONE` / `timezone()` convert both ways; the
   differences: abbreviations are the fixed-offset ones of PostgreSQL's
-  default set (not configurable through `timezone_abbreviations`), and
-  `json_agg` / `jsonb_agg` render a `TIMESTAMPTZ` in UTC. Timestamps
+  default set (not configurable through `timezone_abbreviations`),
+  `json_agg` / `jsonb_agg` render a `TIMESTAMPTZ` in UTC, and a `CASE`
+  mixing a `date` with a `TIMESTAMP` (without time zone) is a
+  `TIMESTAMPTZ` with the date at its midnight in the zone (PostgreSQL:
+  a `TIMESTAMP` at wall-clock midnight). Timestamps
   keep microsecond precision, as PostgreSQL's do: input rounds to it
   and text shows at most six fractional digits. `current_time` is a
   `time` (PostgreSQL's is `timetz`), and `localtimestamp` a

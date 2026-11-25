@@ -139,11 +139,11 @@ func timestampSeries(a []types.Datum, loc *time.Location) (RowIter, error) {
 			d.Loc = loc
 		}
 		if d.Fam == types.Date && loc != nil {
-			n, err := types.DateNanos(d.I)
+			n, err := types.DateMidnight(d.I, loc)
 			if err != nil {
 				return nil, timestampErr(err, d.Text())
 			}
-			d = types.NewTimestamp(types.WallInZone(n, loc))
+			d = types.NewTimestamp(n)
 		}
 		if d.Fam != types.Timestamp {
 			v, err := d.Coerce(types.Timestamp)

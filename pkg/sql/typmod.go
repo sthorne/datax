@@ -3,6 +3,7 @@ package sql
 import (
 	"errors"
 	"math"
+	"time"
 
 	"github.com/sthorne/datax/pkg/sql/builtins"
 	"github.com/sthorne/datax/pkg/sql/catalog"
@@ -58,6 +59,17 @@ func stampDisplay(col *catalog.Column, d types.Datum) types.Datum {
 // parses ignoring any offset, everything else takes the family's
 // coercion. The SQLSTATE is 22P02 for text that does not parse.
 func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
+	return coerceColumnIn(col, d, nil)
+}
+
+// coerceColumnIn is coerceColumn under the session's TimeZone loc (nil:
+// UTC): a date stored into a TIMESTAMPTZ column is its midnight in loc,
+// as PostgreSQL's date2timestamptz makes it, and into a TIMESTAMP
+// column its wall-clock midnight (types.DateMidnight).
+func coerceColumnIn(col catalog.Column, d types.Datum, loc *time.Location) (types.Datum, *Error) {
+	if col.NoTZ {
+		loc = nil
+	}
 	if !d.Null && col.Type == types.Enum {
 		v, err := col.EnumValue(d)
 		if err != nil {
@@ -72,7 +84,7 @@ func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 		}
 		return types.NewTimestamp(n), nil
 	}
-	out, err := d.Coerce(col.Type)
+	out, err := d.CoerceIn(col.Type, loc)
 	if err != nil {
 		if errors.Is(err, types.ErrTimestampRange) {
 			return d, newErrf(CodeDatetimeFieldOverflow, "column %q: %v", col.Name, err)
@@ -94,7 +106,10 @@ func coerceColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 // id 2. (float8 into numeric, also an assignment cast in PostgreSQL,
 // is still refused: datax's float → numeric conversion keeps the
 // shortest exact digits, PostgreSQL's rounds to 15.)
-func assignColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
+//
+// loc is the session's TimeZone (nil: UTC), in which a date becomes a
+// timestamp with time zone (coerceColumnIn).
+func assignColumn(col catalog.Column, d types.Datum, loc *time.Location) (types.Datum, *Error) {
 	if d.Null {
 		return coerceColumn(col, d)
 	}
@@ -129,7 +144,7 @@ func assignColumn(col catalog.Column, d types.Datum) (types.Datum, *Error) {
 		}
 		return v, nil
 	}
-	return coerceColumn(col, d)
+	return coerceColumnIn(col, d, loc)
 }
 
 // pureWidening reports whether changing a column's declared type from
