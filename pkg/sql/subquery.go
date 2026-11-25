@@ -946,7 +946,14 @@ func exprHasSub(e parser.Expr) bool {
 // or — under a TimeZone that is not UTC — what reads or renders in the
 // zone (zoneSensitive), which the pass marks with it.
 func (s *Session) needsResolve(e parser.Expr) bool {
-	return exprHasSub(e) || s.zone() != nil && exprHas(e, zoneSensitive)
+	return exprHasSub(e) || s.zone() != nil && exprHas(e, zoneMarked)
+}
+
+// zoneMarked reports a node the session marks with its TimeZone: a
+// zone-sensitive one (zoneSensitive), or a condition (a comparison, a
+// searched CASE) whose comparisons take the zone (Comparison.Zone).
+func zoneMarked(x parser.Expr) bool {
+	return zoneSensitive(x) || x.Cmp != nil || x.Case != nil
 }
 
 // zone is the session's TimeZone when it is not UTC (nil when it is).
@@ -1105,6 +1112,9 @@ func (s *Session) cmpNeedsResolve(cmp parser.Comparison) bool {
 	if cmp.Sub != nil || s.needsResolve(cmp.Value) {
 		return true
 	}
+	if loc := s.zone(); loc != nil && cmp.Zone != loc && cmp.Op != "TRUE" && cmp.Op != "FALSE" {
+		return true // to be marked with the zone
+	}
 	if cmp.Expr != nil && s.needsResolve(*cmp.Expr) {
 		return true
 	}
@@ -1138,8 +1148,14 @@ func (s *Session) resolveWhereSubs(ctx context.Context, txn *kvclient.Txn, where
 	}
 	out := make([]parser.Comparison, len(where))
 	copy(out, where)
+	loc := s.zone()
 	for i := range out {
 		cmp := &out[i]
+		if loc != nil {
+			// A date compares with a timestamp with time zone at its
+			// midnight in the session's zone.
+			cmp.Zone = loc
+		}
 		if len(cmp.Or) > 0 {
 			// OR groups may hold scalar subqueries and now() calls:
 			// resolve each disjunct recursively.

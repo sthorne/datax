@@ -623,10 +623,25 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 }
 
 // Compare returns -1/0/1; comparing with NULL or across incomparable types
-// returns an error (callers treat NULL comparisons as "no match").
-func (d Datum) Compare(o Datum) (int, error) {
+// returns an error (callers treat NULL comparisons as "no match"). A
+// date against a timestamp with time zone promotes the date to its UTC
+// midnight; CompareIn takes the session's zone.
+func (d Datum) Compare(o Datum) (int, error) { return d.CompareIn(o, nil) }
+
+// CompareIn is Compare under the session's TimeZone (nil: UTC), which
+// decides only where a date falls against a timestamp with time zone:
+// at its midnight in loc, as PostgreSQL's date_cmp_timestamptz promotes
+// it. Against a timestamp without time zone a date is its wall-clock
+// midnight whatever the zone.
+func (d Datum) CompareIn(o Datum, loc *time.Location) (int, error) {
 	if d.Null || o.Null {
 		return 0, fmt.Errorf("NULL comparison")
+	}
+	switch {
+	case d.Fam == Date && o.Fam == Timestamp:
+		return compareDateTimestamp(d.I, o, loc), nil
+	case d.Fam == Timestamp && o.Fam == Date:
+		return -compareDateTimestamp(o.I, d, loc), nil
 	}
 	if d.Fam == Int && o.Fam == Float {
 		return cmpFloat(float64(d.I), o.F), nil
@@ -731,6 +746,24 @@ func (d Datum) Compare(o Datum) (int, error) {
 		return vector.Compare(vector.Decode(d.S), vector.Decode(o.S)), nil
 	}
 	return 0, fmt.Errorf("cannot compare %s values", d.Fam)
+}
+
+// compareDateTimestamp orders a date (days since the epoch) against a
+// timestamp. A date outside the timestamp range has no midnight to
+// compare, but it is still before (or after) every timestamp, as in
+// PostgreSQL's date_cmp_timestamp.
+func compareDateTimestamp(days int64, ts Datum, loc *time.Location) int {
+	switch {
+	case days < minTimestampDay:
+		return -1
+	case days >= maxTimestampDay:
+		return 1
+	}
+	n := days * NanosPerDay
+	if !ts.NoTZ && loc != nil && loc != time.UTC {
+		n = WallInZone(n, loc)
+	}
+	return cmpInt(n, ts.I)
 }
 
 // liftDecimal lifts a numeric datum to decimal (float via its shortest

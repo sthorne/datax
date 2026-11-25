@@ -2318,8 +2318,8 @@ func pkPointValues(desc *catalog.TableDescriptor, where []parser.Comparison, par
 		if err != nil {
 			continue // row-dependent value (column RHS): not a point bound
 		}
-		d, cerr := coerceColumn(col, d)
-		if cerr != nil {
+		d, ok = boundValue(col, cmp, d)
+		if !ok {
 			return nil, false, nil // un-coercible: cannot match anything via point path; fall to scan
 		}
 		if d.Null {

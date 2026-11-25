@@ -671,6 +671,7 @@ func normalizeConds(conds []parser.Comparison) []parser.Comparison {
 	out := make([]parser.Comparison, len(conds))
 	for i, c := range conds {
 		nc := c
+		nc.Zone = nil // the session's marking, as normalizeExpr clears it
 		if c.Expr != nil {
 			e := normalizeExpr(*c.Expr)
 			nc.Expr = &e

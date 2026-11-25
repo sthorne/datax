@@ -186,8 +186,8 @@ func bindPKPoint(desc *catalog.TableDescriptor, shape []int, where []parser.Comp
 		if err != nil {
 			return accessPlan{}, false, nil
 		}
-		d, cerr := coerceColumn(col, d)
-		if cerr != nil || d.Null {
+		d, ok := boundValue(col, where[ci], d)
+		if !ok || d.Null {
 			return accessPlan{}, false, nil
 		}
 		out[i] = d

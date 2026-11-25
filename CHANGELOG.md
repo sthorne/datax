@@ -2116,6 +2116,14 @@ state or the internode protocol does, and an entry below says so.
   `make_timestamp`, `SPLIT AT ... WITH EXPIRATION`). An `AS OF SYSTEM
   TIME` or `with_min_timestamp` timestamp outside the range is refused
   instead of read at a wrapped time (PG-T-005).
+- **A date compares with a timestamp.** `date = timestamptz` (and `<>`,
+  `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, joins) failed with `XX000
+  cannot compare DATE with TIMESTAMPTZ`, and a date against a
+  `timestamptz` column was read at UTC midnight. As in PostgreSQL the
+  date is now promoted to its midnight — in the session's `TimeZone`
+  against a `timestamptz`, as wall time against a `timestamp` — in
+  filters, index and primary-key spans, joins and subqueries; a date
+  outside the timestamp range is before or after every timestamp.
 - **`sum` over `numeric` keeps its inputs' display scale.** A sum of
   `NUMERIC(10,2)` values printed `19.8` where PostgreSQL prints `19.80`:
   the result dropped the declared scale it tracked. It now carries the
