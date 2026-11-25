@@ -403,6 +403,10 @@ func TestSumResultTypes(t *testing.T) {
 		{`SELECT sum(x.b), sum(y.c) FROM st x JOIN stv y ON y.a = x.a`, []uint32{oidInt8, oidNumeric}, "15|18446744073709551609"},
 		{`SELECT sum(1), sum(b + 1), sum(CASE WHEN b > 2 THEN 1 ELSE 0 END), sum(c::int4 % 2), sum(b::int8), sum(id)
 			FROM st WHERE id = 3`, []uint32{oidInt8, oidInt8, oidInt8, oidInt8, oidNumeric, oidNumeric}, "1|9|1|-1|8|3"},
+		// Bitwise operators keep their operands' width, as PostgreSQL's
+		// int4and/int4or/int4shl do, so the sum stays bigint over int2/int4.
+		{`SELECT sum(b & 1), sum(a | b), sum(b << 1), sum(c & 1) FROM st WHERE id = 3`,
+			[]uint32{oidInt8, oidInt8, oidInt8, oidNumeric}, "0|15|16|1"},
 		{`SELECT sum(b) / count(*), sum(c) / count(*) FROM st WHERE id = 3`, []uint32{oidInt8, oidNumeric}, "8|-5.0000000000000000"},
 		{`SELECT id, sum(b) OVER (ORDER BY id), sum(c) OVER (ORDER BY id) FROM st ORDER BY id`,
 			[]uint32{oidInt8, oidInt8, oidNumeric}, "1|2|9223372036854775807; 2|7|18446744073709551614; 3|15|18446744073709551609"},

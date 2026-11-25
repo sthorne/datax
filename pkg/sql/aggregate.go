@@ -483,8 +483,10 @@ func intExprWidth(e parser.Expr, colWidth func(name string) int32) int32 {
 	}
 	if e.BinOp != "" && e.Right != nil {
 		switch e.BinOp {
-		case "+", "-", "*", "/", "%":
+		case "+", "-", "*", "/", "%", "&", "|", "#":
 			w = max(w, intExprWidth(*e.Right, colWidth))
+		case "<<", ">>":
+			// A shift keeps its left operand's type.
 		default:
 			w = 8
 		}
