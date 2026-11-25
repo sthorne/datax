@@ -26,13 +26,22 @@ import (
 // override one a column fixed, and numeric (or date and timestamp)
 // columns of different widths agree on the first.
 func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]types.Family, *Error) {
+	fams, _, serr := s.PlanParamTypes(ctx, stmt)
+	return fams, serr
+}
+
+// PlanParamTypes is PlanParams with each integer parameter's width (2,
+// 4, 0 = 8), as PostgreSQL types a parameter by where it stands: one
+// compared with or stored into an int4 column, cast to int4, or an
+// operand of arithmetic with an int4 expression is an int4.
+func (s *Session) PlanParamTypes(ctx context.Context, stmt parser.Statement) ([]types.Family, []int32, *Error) {
 	n := parser.CountParams(stmt)
 	if n == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	expanded, err := s.expandViews(ctx, nil, stmt)
 	if err != nil {
-		return nil, ToSQLError(err)
+		return nil, nil, ToSQLError(err)
 	}
 	pt := newParamTyper(n, func(name string) (*catalog.TableDescriptor, error) {
 		return s.lookupForPlan(ctx, name)
@@ -89,9 +98,9 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 		return func() { s.restoreRelations(map[string]*relation{name: prev}) }, nil
 	}
 	if err := pt.statement(expanded, nil, true); err != nil {
-		return nil, ToSQLError(err)
+		return nil, nil, ToSQLError(err)
 	}
-	return pt.fams, nil
+	return pt.fams, pt.widths, nil
 }
 
 // paramTyper carries the inference of one statement's parameter types.
@@ -102,6 +111,8 @@ func (s *Session) PlanParams(ctx context.Context, stmt parser.Statement) ([]type
 // type nothing).
 type paramTyper struct {
 	fams []types.Family
+	// widths are the integer parameters' widths (2, 4, 0 = 8).
+	widths []int32
 	// fixed marks a family a column fixed (see PlanParams); a suggested
 	// family can be replaced by a fixed one, never the reverse.
 	fixed    []bool
@@ -116,7 +127,7 @@ type paramTyper struct {
 }
 
 func newParamTyper(n int, lookup func(string) (*catalog.TableDescriptor, error)) *paramTyper {
-	return &paramTyper{fams: make([]types.Family, n), fixed: make([]bool, n), lookup: lookup}
+	return &paramTyper{fams: make([]types.Family, n), widths: make([]int32, n), fixed: make([]bool, n), lookup: lookup}
 }
 
 // paramScope resolves column references for one query level, falling
@@ -124,6 +135,8 @@ func newParamTyper(n int, lookup func(string) (*catalog.TableDescriptor, error))
 type paramScope struct {
 	parent  *paramScope
 	resolve func(name string) (types.Family, bool)
+	// width gives a column resolve resolves its integer width (nil: 8).
+	width func(name string) int32
 }
 
 func (sc *paramScope) column(name string) (types.Family, bool) {
@@ -136,6 +149,23 @@ func (sc *paramScope) column(name string) (types.Family, bool) {
 		}
 	}
 	return types.Unknown, false
+}
+
+// columnWidth is the integer width (2, 4 or 8) of the column column
+// resolves.
+func (sc *paramScope) columnWidth(name string) int32 {
+	for s := sc; s != nil; s = s.parent {
+		if s.resolve == nil {
+			continue
+		}
+		if _, ok := s.resolve(name); ok {
+			if s.width == nil {
+				return 8
+			}
+			return s.width(name)
+		}
+	}
+	return 8
 }
 
 // tableScope resolves a single table's columns, bare or qualified by
@@ -154,7 +184,7 @@ func tableScope(parent *paramScope, desc *catalog.TableDescriptor, table, alias 
 			return c.Type, true
 		}
 		return types.Unknown, false
-	}}
+	}, width: descColWidth(desc)}
 }
 
 // columnsScope resolves the output columns of a described query (a
@@ -174,26 +204,50 @@ func columnsScope(parent *paramScope, cols []ResultColumn, alias string) *paramS
 			}
 		}
 		return types.Unknown, false
+	}, width: func(name string) int32 {
+		q, col := splitQualified(name)
+		if q == "" {
+			col = name
+		}
+		for _, c := range cols {
+			if strings.EqualFold(c.Name, col) && (c.Width == 2 || c.Width == 4) {
+				return c.Width
+			}
+		}
+		return 8
 	}}
 }
 
 // set records family fam for parameter n (1-based). fixed is a column's
 // type; otherwise the family is only a suggestion.
 func (pt *paramTyper) set(n int, fam types.Family, fixed bool) {
+	pt.setW(n, fam, 8, fixed)
+}
+
+// setW is set with an integer family's width (2, 4 or 8), which comes
+// and goes with the family: the first column that fixes the parameter
+// sets it, as its family.
+func (pt *paramTyper) setW(n int, fam types.Family, width int32, fixed bool) {
 	if n <= 0 || n > len(pt.fams) || fam == types.Unknown || pt.err != nil {
 		return
 	}
 	i := n - 1
+	if fam != types.Int || (width != 2 && width != 4) {
+		width = 0
+	}
 	cur := pt.fams[i]
 	switch {
 	case cur == types.Unknown:
-		pt.fams[i], pt.fixed[i] = fam, fixed
+		pt.fams[i], pt.widths[i], pt.fixed[i] = fam, width, fixed
 	case cur == fam:
+		if fixed && !pt.fixed[i] {
+			pt.widths[i] = width
+		}
 		pt.fixed[i] = pt.fixed[i] || fixed
 	case !fixed:
 		// A suggestion never changes a family already chosen.
 	case !pt.fixed[i]:
-		pt.fams[i], pt.fixed[i] = fam, true
+		pt.fams[i], pt.widths[i], pt.fixed[i] = fam, width, true
 	case paramFamiliesAgree(cur, fam):
 		// The first column's type stands; the comparison converts.
 	default:
@@ -220,10 +274,11 @@ func paramFamiliesAgree(a, b types.Family) bool {
 	return group(a) != 0 && group(a) == group(b)
 }
 
-// value types a value expression standing where fam is expected: a bare
-// parameter takes it (fixed when fixed), a parameter inside arithmetic,
-// CASE or a call is only suggested it.
-func (pt *paramTyper) value(e parser.Expr, fam types.Family, fixed bool) {
+// value types a value expression standing where fam (of integer width
+// width) is expected: a bare parameter takes it (fixed when fixed), a
+// parameter inside arithmetic, CASE or a call is only suggested the
+// family.
+func (pt *paramTyper) value(e parser.Expr, fam types.Family, width int32, fixed bool) {
 	if fam == types.Unknown {
 		return
 	}
@@ -231,7 +286,7 @@ func (pt *paramTyper) value(e parser.Expr, fam types.Family, fixed bool) {
 		return // $1::type: the cast fixed it (see expr)
 	}
 	if e.Param > 0 && e.BinOp == "" && e.Func == "" && len(e.Path) == 0 {
-		pt.set(e.Param, fam, fixed)
+		pt.setW(e.Param, fam, width, fixed)
 		return
 	}
 	var suggest func(e parser.Expr)
@@ -280,7 +335,7 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 		for _, row := range t.Rows {
 			for i, e := range row {
 				if i < len(target) {
-					pt.value(e, target[i].Type, true)
+					pt.value(e, target[i].Type, target[i].IntWidth(), true)
 				}
 			}
 		}
@@ -290,7 +345,7 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 			for m := t.Select; m != nil; m = m.Union {
 				for i, se := range m.Exprs {
 					if i < len(target) && !se.Star && se.Agg == "" {
-						pt.value(se.Expr, target[i].Type, true)
+						pt.value(se.Expr, target[i].Type, target[i].IntWidth(), true)
 					}
 				}
 			}
@@ -300,7 +355,7 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 		if oc := t.OnConflict; oc != nil {
 			for _, set := range oc.Set {
 				if col, ok := desc.Col(set.Column); ok {
-					pt.value(set.Value, col.Type, true)
+					pt.value(set.Value, col.Type, col.IntWidth(), true)
 				}
 			}
 		}
@@ -320,7 +375,7 @@ func (pt *paramTyper) statement(stmt parser.Statement, parent *paramScope, top b
 		}
 		for _, set := range t.Set {
 			if col, ok := desc.Col(set.Column); ok {
-				pt.value(set.Value, col.Type, true)
+				pt.value(set.Value, col.Type, col.IntWidth(), true)
 			}
 		}
 		if len(t.From) > 0 {
@@ -517,6 +572,12 @@ func (pt *paramTyper) member(m *parser.Select, parent *paramScope, top bool) {
 						return types.Unknown, false
 					}
 					return ref.col.Type, true
+				}, width: func(name string) int32 {
+					ref, err := resolveJoinRef(sides, name)
+					if err != nil {
+						return 8
+					}
+					return ref.col.IntWidth()
 				}}
 			}
 		} else if top && pt.err == nil {
@@ -594,14 +655,14 @@ func (pt *paramTyper) walker(sc *paramScope, self *parser.Select) *parser.Walker
 // the column's type (an array of it for = ANY / @>, the other
 // text-search type for @@), or a computed left-hand side's.
 func (pt *paramTyper) cond(c parser.Comparison, sc *paramScope) {
-	fam, fixed := types.Unknown, false
+	fam, fixed, width := types.Unknown, false, int32(8)
 	switch {
 	case c.Column != "":
 		f, ok := sc.column(c.Column)
 		if !ok {
 			return
 		}
-		fam, fixed = f, true
+		fam, fixed, width = f, true, sc.columnWidth(c.Column)
 		if len(c.Path) > 0 {
 			fam = pathResultType(c.Path)
 		}
@@ -610,12 +671,13 @@ func (pt *paramTyper) cond(c parser.Comparison, sc *paramScope) {
 		if lhs.Param > 0 && lhs.BinOp == "" && lhs.Func == "" {
 			// $1 = col: the parameter takes the other side's type.
 			if f := exprFamily(c.Value, sc.column); f != types.Unknown {
-				pt.set(lhs.Param, f, c.Value.Column != "" && c.Value.BinOp == "")
+				pt.setW(lhs.Param, f, intExprWidth(c.Value, sc.columnWidth), c.Value.Column != "" && c.Value.BinOp == "")
 			}
 			return
 		}
 		fam = exprFamily(lhs, sc.column)
 		fixed = lhs.Column != "" && lhs.BinOp == "" && lhs.Func == ""
+		width = intExprWidth(lhs, sc.columnWidth)
 	default:
 		return
 	}
@@ -627,6 +689,9 @@ func (pt *paramTyper) cond(c parser.Comparison, sc *paramScope) {
 		if !fam.IsArray() && fam != types.Jsonb {
 			fam = types.ArrayOf(fam)
 		}
+	}
+	if len(c.Path) > 0 {
+		width = 8
 	}
 	switch op {
 	case "@@", "NOT @@":
@@ -640,9 +705,9 @@ func (pt *paramTyper) cond(c parser.Comparison, sc *paramScope) {
 		// A pattern is text whatever the column.
 		fam, fixed = types.String, false
 	}
-	pt.value(c.Value, fam, fixed)
+	pt.value(c.Value, fam, width, fixed)
 	for _, v := range c.Values {
-		pt.value(v, fam, fixed)
+		pt.value(v, fam, width, fixed)
 	}
 }
 
@@ -653,7 +718,7 @@ func (pt *paramTyper) expr(e parser.Expr, sc *paramScope) {
 	if e.Param > 0 && e.Cast != "" {
 		// $1::int8: the parameter is of the type it is cast to, as in
 		// PostgreSQL.
-		pt.set(e.Param, builtins.CastFamily(e.Cast, types.Unknown), true)
+		pt.setW(e.Param, builtins.CastFamily(e.Cast, types.Unknown), castIntWidth(e.Cast), true)
 	}
 	if e.Func != "" {
 		for i, a := range e.Args {
@@ -702,12 +767,12 @@ func (pt *paramTyper) expr(e parser.Expr, sc *paramScope) {
 		numeric := func(f types.Family) bool { return f == types.Int || f == types.Float || f == types.Decimal }
 		if bareParam(*e.Right) {
 			if f := exprFamily(lhs, sc.column); numeric(f) {
-				pt.set(e.Right.Param, f, false)
+				pt.setW(e.Right.Param, f, intExprWidth(lhs, sc.columnWidth), false)
 			}
 		}
 		if bareParam(lhs) {
 			if f := exprFamily(*e.Right, sc.column); numeric(f) {
-				pt.set(lhs.Param, f, false)
+				pt.setW(lhs.Param, f, intExprWidth(*e.Right, sc.columnWidth), false)
 			}
 		}
 	}

@@ -77,4 +77,11 @@ func TestParsePurgeWhere(t *testing.T) {
 }
 
 func strLit(s string) *types.Datum { d := types.NewString(s); return &d }
-func intLit(i int64) *types.Datum  { d := types.NewInt(i); return &d }
+func intLit(i int64) *types.Datum {
+	// A literal that fits in int4 is an integer, as PostgreSQL types it.
+	d := types.NewInt(i)
+	if types.IntFits(i, 4) {
+		d.W = 4
+	}
+	return &d
+}

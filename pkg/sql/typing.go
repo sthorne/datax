@@ -2,6 +2,7 @@ package sql
 
 import (
 	"github.com/sthorne/datax/pkg/sql/builtins"
+	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/parser"
 	"github.com/sthorne/datax/pkg/sql/types"
 )
@@ -177,6 +178,35 @@ func dateArmsKind(arms []parser.Expr, env exprEnv) (mixed, noTZ bool) {
 		return false, false
 	}
 	return true, armsNoTZ(arms, colType, colNoTZ)
+}
+
+// exprWidth is the integer width (ResultColumn.Width: 2, 4, 0 = 8) of
+// an output column of family fam that e computes: intExprWidth's, for
+// an integer; 0 for any other family. colWidth gives a column's width
+// (nil: every column is 8).
+func exprWidth(fam types.Family, e parser.Expr, colWidth func(name string) int32) int32 {
+	if fam != types.Int {
+		return 0
+	}
+	if colWidth == nil {
+		colWidth = func(string) int32 { return 8 }
+	}
+	switch w := intExprWidth(e, colWidth); w {
+	case 2, 4:
+		return w
+	}
+	return 0
+}
+
+// descColWidth is colWidth over a descriptor's columns, a qualifier
+// dropped.
+func descColWidth(desc *catalog.TableDescriptor) func(name string) int32 {
+	return func(n string) int32 {
+		if c, ok := desc.Col(stripQualifier(n)); ok {
+			return c.IntWidth()
+		}
+		return 8
+	}
 }
 
 // aggFamily is the result family of an aggregate call: its argument's

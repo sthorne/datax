@@ -209,7 +209,15 @@ func (j joinEnv) col(name string) (types.Datum, error) {
 	if err != nil {
 		return types.Datum{}, err
 	}
-	return j.jr.datum(ref), nil
+	return typedCol(j.jr.datum(ref), &ref.col), nil
+}
+
+func (j joinEnv) colWidth(name string) int32 {
+	ref, err := resolveJoinRef(j.sides, name)
+	if err != nil {
+		return 8
+	}
+	return ref.col.IntWidth()
 }
 
 // joinProj is one output column of a join select: a plain column (ref),
@@ -220,6 +228,18 @@ type joinProj struct {
 	ref  joinRef
 	expr *parser.Expr
 	typ  types.Family
+	// width is a computed integer's width (ResultColumn.Width).
+	width int32
+}
+
+// result describes the output column: a plain column's own type, a
+// computed one's family and integer width.
+func (p joinProj) result() ResultColumn {
+	rc := exprResult(p.name, p.typ, p.ref.col)
+	if p.expr != nil && p.typ == types.Int {
+		rc.Width = p.width
+	}
+	return rc
 }
 
 // walkExprRefs resolves every column reference inside an expression at
@@ -327,7 +347,14 @@ func resolveJoinProjection(sides []joinSide, exprs []parser.SelectExpr) ([]joinP
 			if typ == types.Unknown {
 				typ = types.String
 			}
-			proj = append(proj, joinProj{name: name, expr: &e, typ: typ})
+			width := exprWidth(typ, e, func(n string) int32 {
+				ref, err := resolveJoinRef(sides, n)
+				if err != nil {
+					return 8
+				}
+				return ref.col.IntWidth()
+			})
+			proj = append(proj, joinProj{name: name, expr: &e, typ: typ, width: width})
 		}
 	}
 	return proj, nil
@@ -981,7 +1008,7 @@ func (s *Session) execJoinSelect(ctx context.Context, txn *kvclient.Txn, baseDes
 
 	res := &Result{}
 	for _, p := range proj {
-		res.Columns = append(res.Columns, exprResult(p.name, p.typ, p.ref.col))
+		res.Columns = append(res.Columns, p.result())
 	}
 	// Output positions of the correlated expressions (a star ahead of
 	// them expands to every side's visible columns).

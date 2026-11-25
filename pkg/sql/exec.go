@@ -1595,7 +1595,15 @@ func (e conflictEnv) col(name string) (types.Datum, error) {
 	if !ok {
 		d = types.DNull
 	}
-	return d, nil
+	return typedCol(d, &col), nil
+}
+
+func (e conflictEnv) colWidth(name string) int32 {
+	_, bare := splitQualified(name)
+	if col, ok := e.desc.Col(bare); ok {
+		return col.IntWidth()
+	}
+	return 8
 }
 
 // returning is a resolved RETURNING list: the projection over the rows a
@@ -2757,7 +2765,7 @@ func (s *Session) execSelectBody(ctx context.Context, txn *kvclient.Txn, t, orig
 					fam = types.String
 				}
 			}
-			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil)})
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil), Width: exprWidth(fam, se.Expr, nil)})
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}

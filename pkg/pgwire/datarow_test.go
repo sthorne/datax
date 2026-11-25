@@ -231,3 +231,29 @@ func BenchmarkDataRowEncode(b *testing.B) {
 		})
 	}
 }
+
+// TestConformIntWidths: a result's integer columns take the widths
+// Describe reported (the rows are encoded in them), and a value out of
+// an int2 / int4 column's range is 22003 rather than sent truncated to
+// the width (binary) or under an OID it does not fit (text).
+func TestConformIntWidths(t *testing.T) {
+	res := &sql.Result{
+		Columns: []sql.ResultColumn{{Name: "a", Type: types.Int}, {Name: "b", Type: types.Int, Width: 4}, {Name: "s", Type: types.String}},
+		Rows:    [][]types.Datum{{types.NewInt(1), types.NewInt(2), types.NewString("x")}},
+	}
+	described := []sql.ResultColumn{{Type: types.Int, Width: 4}, {Type: types.Int}, {Type: types.String}}
+	if serr := conformIntWidths(described, res); serr != nil || res.Columns[0].Width != 4 || res.Columns[1].Width != 0 {
+		t.Fatalf("widths %d %d, %v; want Describe's 4 0", res.Columns[0].Width, res.Columns[1].Width, serr)
+	}
+	res.Rows = append(res.Rows, []types.Datum{types.NewInt(2147483648), types.NewInt(1), types.NewString("y")})
+	if serr := conformIntWidths(described, res); serr == nil || serr.Code != sql.CodeNumericValueOutOfRange || serr.Msg != "integer out of range" {
+		t.Fatalf("int4 column holding 2147483648: %v, want 22003 integer out of range", serr)
+	}
+	small := &sql.Result{
+		Columns: []sql.ResultColumn{{Type: types.Int, Width: 2}},
+		Rows:    [][]types.Datum{{types.DNull}, {types.NewInt(-32769)}},
+	}
+	if serr := conformIntWidths(nil, small); serr == nil || serr.Msg != "smallint out of range" {
+		t.Fatalf("int2 column holding -32769: %v, want 22003 smallint out of range", serr)
+	}
+}

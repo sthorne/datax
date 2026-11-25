@@ -1786,6 +1786,18 @@ func (s *Session) forgetDDL() {
 // paths, arithmetic) is environment-independent.
 type exprEnv interface {
 	col(name string) (types.Datum, error)
+	// colWidth is a column's integer width (2, 4 or 8; 8 for a name
+	// that is no integer column), which the value col returns carries.
+	colWidth(name string) int32
+}
+
+// typedCol is a column's value as an expression reads it: an integer
+// carries the column's width (types.Datum.W).
+func typedCol(d types.Datum, col *catalog.Column) types.Datum {
+	if d.Fam == types.Int && col.Type == types.Int {
+		return d.WithIntWidth(col.IntWidth())
+	}
+	return d
 }
 
 // tableEnv is the single-table environment: descriptor + row map. A nil
@@ -1822,7 +1834,17 @@ func (t tableEnv) col(name string) (types.Datum, error) {
 	if !ok {
 		d = types.DNull
 	}
-	return d, nil
+	return typedCol(d, &col), nil
+}
+
+func (t tableEnv) colWidth(name string) int32 {
+	if t.desc == nil {
+		return 8
+	}
+	if col, ok := t.desc.Col(name); ok {
+		return col.IntWidth()
+	}
+	return 8
 }
 
 // evalExpr evaluates an expression against a single table's row — the
@@ -1856,12 +1878,22 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, err
 		}
 		base = d
+		if base.Fam == types.Int {
+			// The CASE's type is its arms' common one, whatever arm
+			// chose the value.
+			base = base.WithIntWidth(intExprWidth(parser.Expr{Case: e.Case}, env.colWidth))
+		}
 	case e.Func != "":
 		d, err := evalFunc(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
 		base = d
+		if base.Fam == types.Int {
+			// COALESCE and its kin are of their arguments' common type;
+			// any other function's integer result is a bigint.
+			base = base.WithIntWidth(intExprWidth(parser.Expr{Func: e.Func, Args: e.Args}, env.colWidth))
+		}
 	case e.Lit != nil:
 		base = *e.Lit
 	case e.Param > 0:
@@ -1869,6 +1901,12 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, newErrf(CodeInvalidParameter, "missing value for parameter $%d", e.Param)
 		}
 		base = params[e.Param-1]
+		if base.Fam == types.Int {
+			// A parameter is a bigint here whatever produced its value
+			// (an EXECUTE argument's literal, say), as intExprWidth
+			// types it.
+			base.W = 0
+		}
 	case e.Column != "":
 		d, err := env.col(e.Column)
 		if err != nil {
@@ -1949,6 +1987,9 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return base, nil
 		}
 		d, err := builtins.CastIn(base, e.Cast, e.Zone)
+		if err == nil && d.Fam == types.Int {
+			d = d.WithIntWidth(castIntWidth(e.Cast))
+		}
 		return d, builtinErr(err)
 	}
 	return base, nil
@@ -2035,6 +2076,9 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 		return d, builtinErr(err)
 	case builtins.IsBitwiseOp(op):
 		d, err := builtins.Bitwise(l, op, r)
+		if err == nil && d.Fam == types.Int {
+			d = intBitwiseWidth(d, l, op, r)
+		}
 		return d, builtinErr(err)
 	}
 	if d, ok, err := builtins.DateArithIn(l, op, r, loc); ok {
@@ -2071,41 +2115,19 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 			return d, nil
 		}
 		d, err := builtins.Mod(l, r)
+		if err == nil && d.Fam == types.Int && l.Fam == types.Int && r.Fam == types.Int {
+			// The remainder is smaller than the divisor: it fits.
+			d = d.WithIntWidth(max(l.IntWidth(), r.IntWidth()))
+		}
 		return d, builtinErr(err)
 	case "^":
 		d, err := builtins.Power(l, r)
 		return d, builtinErr(err)
 	}
 	if l.Fam == types.Int && r.Fam == types.Int {
-		// Integer arithmetic overflows to an error, never wraps.
 		switch op {
-		case "+":
-			s := l.I + r.I
-			if (s > l.I) != (r.I > 0) && r.I != 0 {
-				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-			}
-			return types.NewInt(s), nil
-		case "-":
-			s := l.I - r.I
-			if (s < l.I) != (r.I > 0) && r.I != 0 {
-				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-			}
-			return types.NewInt(s), nil
-		case "*":
-			if l.I != 0 && r.I != 0 {
-				p := l.I * r.I
-				if p/r.I != l.I || (l.I == -1 && r.I == math.MinInt64) || (r.I == -1 && l.I == math.MinInt64) {
-					return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-				}
-				return types.NewInt(p), nil
-			}
-			return types.NewInt(0), nil
-		case "/":
-			// Integer division truncates (PostgreSQL semantics).
-			if r.I == 0 {
-				return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
-			}
-			return types.NewInt(l.I / r.I), nil
+		case "+", "-", "*", "/":
+			return intArith(l, op, r)
 		}
 	}
 	// Exact decimal arithmetic when either side is DECIMAL and the other
@@ -2176,6 +2198,84 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	return types.Datum{}, newErrf(CodeFeatureNotSupported, "unsupported operator %q", op)
 }
 
+// intArith evaluates l op r (+, -, *, /) for two integers as
+// PostgreSQL's integer operators do: the result is of the wider
+// operand's type (int2 + int2 is int2, int2 + int4 int4, anything with
+// an int8 int8), and a result out of that type's range is 22003
+// "smallint / integer / bigint out of range", never wrapped. Division
+// truncates toward zero.
+func intArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
+	w := max(l.IntWidth(), r.IntWidth())
+	var v int64
+	overflow := false
+	switch op {
+	case "+":
+		v = l.I + r.I
+		overflow = (v > l.I) != (r.I > 0) && r.I != 0
+	case "-":
+		v = l.I - r.I
+		overflow = (v < l.I) != (r.I > 0) && r.I != 0
+	case "*":
+		if l.I != 0 && r.I != 0 {
+			v = l.I * r.I
+			overflow = v/r.I != l.I || (l.I == -1 && r.I == math.MinInt64) || (r.I == -1 && l.I == math.MinInt64)
+		}
+	case "/":
+		if r.I == 0 {
+			return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+		}
+		if r.I == -1 {
+			// math.MinInt64 / -1 does not trap in Go: it wraps.
+			v = -l.I
+			overflow = l.I == math.MinInt64
+		} else {
+			v = l.I / r.I
+		}
+	}
+	if overflow || !types.IntFits(v, w) {
+		return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "%s out of range", types.IntWidthName(w))
+	}
+	return types.NewInt(v).WithIntWidth(w), nil
+}
+
+// intBitwiseWidth gives the result d of the bitwise l op r its
+// PostgreSQL type: a shift keeps its left operand's (and wraps at it,
+// as PostgreSQL's int2shl / int4shl do on x86-64, which take the count
+// modulo 32), the others take the wider operand's, which an and, or or
+// xor of two values in range cannot leave. A text operand counts as a
+// bigint.
+func intBitwiseWidth(d, l types.Datum, op string, r types.Datum) types.Datum {
+	width := func(x types.Datum) int32 {
+		if x.Fam == types.Int {
+			return x.IntWidth()
+		}
+		return 8
+	}
+	switch op {
+	case "<<", ">>":
+		switch w := width(l); w {
+		case 2, 4:
+			count := r
+			if count.Fam != types.Int {
+				count, _ = count.Coerce(types.Int) // Bitwise has read it
+			}
+			n := uint64(count.I) & 31
+			if op == "<<" {
+				v := int32(l.I) << n
+				if w == 2 {
+					v = int32(int16(v))
+				}
+				d.I = int64(v)
+			} else {
+				d.I = int64(int32(l.I) >> n)
+			}
+			return d.WithIntWidth(w)
+		}
+		return d.WithIntWidth(8)
+	}
+	return d.WithIntWidth(max(width(l), width(r)))
+}
+
 // evalFunc evaluates a builtin scalar call ("now" never reaches here —
 // the session splices it before execution).
 func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
@@ -2221,6 +2321,11 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		}
 		return types.NewString(quoteIdentifier(args[0].Text())), nil
 	case "pg_typeof":
+		if args[0].Fam == types.Int {
+			// An integer is named by its width, as PostgreSQL's regtype
+			// output names it: smallint, integer, bigint.
+			return types.NewString(types.IntWidthName(args[0].IntWidth())), nil
+		}
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
 	case "to_regtype":
 		// The type's OID when the name is a type's, NULL when it is not:
@@ -2236,6 +2341,18 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		fam, err := types.ParseType(name)
 		if err != nil {
 			return types.DNull, nil
+		}
+		if fam == types.Int || fam == types.ArrayOf(types.Int) {
+			// int2 / smallint and int4 / int / integer are types of their
+			// own (21, 23; arrays 1005, 1007), not int8's 20.
+			elem := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(name), "[]"))
+			oids := map[int32][2]int64{2: {21, 1005}, 4: {23, 1007}}
+			if o, ok := oids[castIntWidth(elem)]; ok {
+				if fam.IsArray() {
+					return types.NewInt(o[1]), nil
+				}
+				return types.NewInt(o[0]), nil
+			}
 		}
 		return types.NewInt(vtable.TypeOID(fam)), nil
 	case "format_type":
