@@ -3,6 +3,7 @@ package kvserver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -246,6 +247,11 @@ type Store struct {
 	// the merge queue reads it (mergeWouldHideHistory).
 	gcTTL atomic.Int64
 
+	// droppedWarnAt rate-limits HandleRaftMessage's warning about
+	// messages for a range this store has raft state for but no replica
+	// (unix nanos of the last one).
+	droppedWarnAt atomic.Int64
+
 	mu struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
@@ -408,9 +414,15 @@ func (s *Store) LoadReplicas() error {
 	return nil
 }
 
-// CreateReplica creates (and boots) a brand-new replica of a range whose
-// initial membership includes this store. Used at cluster bootstrap and by
-// the split/upreplication paths.
+// CreateReplica writes the descriptor of a brand-new range whose initial
+// membership includes this store, flushes the state engine so the
+// descriptor is durable before the replica can vote, and starts the
+// replica. The server calls it only to create range 1 at cluster
+// bootstrap (bootstrap true); tests use it to stand up ranges. Other
+// replicas are created elsewhere: a split's right-hand side by the split
+// trigger (finishSplit), which a replay of the left-hand side's log
+// re-creates after a crash, and an upreplicated replica by the preseed
+// snapshot (ApplySnapshotStream), which flushes before it starts.
 func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Replica, error) {
 	rep, ok := desc.GetReplica(s.cfg.NodeID)
 	if !ok {
@@ -424,12 +436,11 @@ func (s *Store) CreateReplica(desc kvpb.RangeDescriptor, bootstrap bool) (*Repli
 	if err := b.Commit(true); err != nil {
 		return nil, err
 	}
-	if bootstrap {
-		// A bootstrapped range's descriptor is the store's root: on a
-		// WAL-less state engine make it durable before raft starts.
-		if err := s.flushState(); err != nil {
-			return nil, err
-		}
+	// Nothing in any raft log re-creates this replica: on a WAL-less state
+	// engine make its descriptor durable before raft starts and the
+	// replica can vote or acknowledge entries.
+	if err := s.flushState(); err != nil {
+		return nil, err
 	}
 	return s.startReplica(desc, rep.ReplicaID, bootstrap)
 }
@@ -544,6 +555,21 @@ func (s *Store) LocalDescriptor(id base.RangeID) (kvpb.RangeDescriptor, bool) {
 	return r.Desc(), true
 }
 
+// FailedReplicas lists, in order, the ranges whose replica on this store
+// was stopped by a failure (Replica.Failed): still in the store map,
+// serving nothing until the node restarts.
+func (s *Store) FailedReplicas() []base.RangeID {
+	var out []base.RangeID
+	s.VisitReplicas(func(r *Replica) bool {
+		if r.Failed() {
+			out = append(out, r.rangeID)
+		}
+		return true
+	})
+	slices.Sort(out)
+	return out
+}
+
 // VisitReplicas calls f for each replica until it returns false.
 func (s *Store) VisitReplicas(f func(*Replica) bool) {
 	s.mu.Lock()
@@ -648,14 +674,37 @@ func (s *Store) localDescriptors() []kvpb.RangeDescriptor {
 func (s *Store) HandleRaftMessage(ctx context.Context, rangeID base.RangeID, m raftpb.Message) {
 	r, ok := s.GetReplica(rangeID)
 	if !ok {
-		// No replica here (yet). Phase 7 creates replicas on preseed;
-		// until then, stray messages are dropped.
+		// No replica here (yet): replicas are created by preseed or by a
+		// split's application, so stray messages are dropped. Raft state
+		// on this store for the range means it held a replica that was
+		// never removed and is now missing (lost on a crash, say): the
+		// range may be short a voter, which deserves more than a debug
+		// line.
+		if s.hasRaftState(rangeID) {
+			now := time.Now().UnixNano()
+			last := s.droppedWarnAt.Load()
+			if now-last >= int64(droppedWarnEvery) && s.droppedWarnAt.CompareAndSwap(last, now) {
+				log.Warnf("dropping raft message from replica %d for %s: this store holds raft state for the range but no replica",
+					m.From, rangeID)
+				return
+			}
+		}
 		log.Debugf("dropping raft message for unknown %s", rangeID)
 		return
 	}
 	if err := r.stepRaftMessage(ctx, m); err != nil && err != errRaftStopped {
 		log.Warnf("%s: raft step failed: %v", rangeID, err)
 	}
+}
+
+// droppedWarnEvery bounds HandleRaftMessage's warning rate.
+const droppedWarnEvery = 10 * time.Second
+
+// hasRaftState reports whether the raft engine holds a HardState for the
+// range.
+func (s *Store) hasRaftState(rangeID base.RangeID) bool {
+	v, err := s.raftEngine().Get(keys.RaftHardStateKey(rangeID))
+	return err == nil && v != nil
 }
 
 func containsKey(d kvpb.RangeDescriptor, k keys.Key) bool { return d.ContainsKey(k) }

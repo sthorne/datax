@@ -92,6 +92,12 @@ type ServerOptions struct {
 	// rather than accepted and held (0 = the default, 512; negative =
 	// no cap).
 	MaxPendingAuth int
+	// MaxMessageSize caps the body of one client message once the
+	// connection has authenticated; a longer one ends the connection with
+	// a FATAL 08P01 (0 = the default, DefaultMaxMessageSize; negative =
+	// no cap). Before authentication the cap is maxPreAuthMessageSize,
+	// whatever this says.
+	MaxMessageSize int
 	// MockSecret, when set, returns the cluster-wide secret that keys
 	// the stand-in verifier for users Auth does not know (the salt in
 	// server-first is derived from the user name under it, so a name

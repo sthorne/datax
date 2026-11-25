@@ -336,6 +336,10 @@ var (
 		Name: "datax_sql_preauth_closed_total",
 		Help: "SQL connections ended before authentication completed (issue #212), by cause: handshake-timeout (no startup or a stalled SCRAM exchange within the authentication deadline), pending-full (refused at accept because this node already holds its maximum of unauthenticated connections).",
 	}, []string{"cause"})
+	HTTPConnsRefused = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_http_conns_refused_total",
+		Help: "HTTP connections closed as they were accepted because this node already held --http-max-conns open HTTP connections.",
+	})
 	AuthSecretUnavailable = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auth_secret_unavailable_total", Help: "Password authentications refused because this node could not read the cluster's authentication secret (issue #196). Non-zero means this node is refusing SQL password logins.",
 	})

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/sthorne/datax/pkg/kvclient"
 	"github.com/sthorne/datax/pkg/kvpb"
 	"github.com/sthorne/datax/pkg/sql/types"
+	"github.com/sthorne/datax/pkg/util/decimal"
 	"github.com/sthorne/datax/pkg/util/hlc"
 )
 
@@ -34,7 +36,9 @@ type Column struct {
 	Name string       `json:"name"`
 	Type types.Family `json:"type"`
 	// Precision/Scale enforce a DECIMAL(p,s) typmod: values are rescaled
-	// to Scale (round-half-even) on write and rejected (22003) when their
+	// to Scale on write, halves away from zero as in PostgreSQL (until
+	// 0.58 halves went to even; rows written then keep that rounding),
+	// and rejected (22003) when their
 	// integer digits exceed Precision−Scale. Zero Precision = bare
 	// DECIMAL, unconstrained — the safe pre-existing meaning, so old
 	// descriptors keep their behavior (append-only JSON, pkg/version
@@ -317,6 +321,65 @@ func (c *Column) Conform(d types.Datum) (types.Datum, error) {
 		return d, nil
 	}
 	return d, nil
+}
+
+// ConformDecimal applies a DECIMAL(p,s) column's typmod to a value
+// about to be stored, as PostgreSQL's numeric typmod coercion does: the
+// value rounds to Scale with halves away from zero (1.005 → 1.01,
+// -1.005 → -1.01), then fails with 22003 when its integer digits exceed
+// Precision−Scale (so 9.999 into DECIMAL(3,2) rounds to 10.00 and then
+// overflows). NaN fits any NUMERIC(p,s), an infinity none. The result
+// keeps canonical text in S and carries Scale in Dscale (display). An
+// array column of DECIMAL(p,s) conforms element by element. A column
+// without a precision, a value of another family and NULL pass through.
+func (c *Column) ConformDecimal(d types.Datum) (types.Datum, error) {
+	if d.Null || c.Precision == 0 {
+		return d, nil
+	}
+	if c.Type.IsArray() {
+		if c.Type.Elem() != types.Decimal || !d.Fam.IsArray() {
+			return d, nil
+		}
+		elem := *c
+		elem.Type = types.Decimal
+		out := make([]types.Datum, len(d.A))
+		for i, e := range d.A {
+			v, err := elem.ConformDecimal(e)
+			if err != nil {
+				return d, err
+			}
+			out[i] = v
+		}
+		return types.NewArray(types.Decimal, out), nil
+	}
+	if c.Type != types.Decimal || d.Fam != types.Decimal {
+		return d, nil
+	}
+	if f, ok := types.DecimalSpecial(d); ok {
+		if math.IsNaN(f) {
+			return d, nil
+		}
+		return d, &ValueError{Code: "22003", Msg: fmt.Sprintf(
+			"numeric field overflow in column %q: a field with precision %d, scale %d cannot hold an infinite value",
+			c.Name, c.Precision, c.Scale)}
+	}
+	v, err := decimal.Parse(d.S)
+	if err != nil {
+		return d, &ValueError{Code: "22P02", Msg: fmt.Sprintf("column %q: %v", c.Name, err)}
+	}
+	q := decimal.RoundHalfAway(v, c.Scale)
+	abs := q
+	if abs.Sign() < 0 {
+		abs = decimal.Neg(abs)
+	}
+	if decimal.Cmp(abs, decimal.New(1, c.Precision-c.Scale)) >= 0 {
+		return d, &ValueError{Code: "22003", Msg: fmt.Sprintf(
+			"numeric field overflow in column %q: a field with precision %d, scale %d must round to an absolute value less than 10^%d",
+			c.Name, c.Precision, c.Scale, c.Precision-c.Scale)}
+	}
+	out := types.NewDecimal(q.String())
+	out.Dscale = c.Scale
+	return out, nil
 }
 
 // Stamp sets the display hints a stored value of this column carries

@@ -35,6 +35,7 @@ type replSection struct {
 	Over          replBucket   `json:"over_replicated"`
 	NoQuorum      replBucket   `json:"no_quorum"`
 	Undiverse     replBucket   `json:"undiverse"`
+	Unavailable   replBucket   `json:"unavailable_replicas"`
 	Domains       []replDomain `json:"domains"`
 	Tiers         []string     `json:"tiers"`
 	DefaultFactor int          `json:"default_replication_factor"`

@@ -12,7 +12,7 @@ import (
 // Signed session tokens for the HTTP console (issue #158). A browser
 // signs in once and carries a token instead of replaying its password on
 // every poll; the token is self-contained and verified from a key every
-// node derives from the cluster's shared authentication secret, so a
+// node derives from a secret the cluster shares, so a
 // token minted by n1 is accepted by n2 with no session store and no
 // replication of session state.
 //
@@ -20,10 +20,11 @@ import (
 // caller's roles are still resolved per request from the catalog (so a
 // dropped role, NOLOGIN, or a revoked admin membership closes the door
 // at once), and the transport is the console's TLS. Being stateless, a
-// token cannot be revoked before it expires — signing out clears the
+// token cannot be revoked individually — signing out clears the
 // cookie, which ends the session on that browser, and rotating the
-// cluster's authentication secret invalidates every outstanding token.
-// The TTL is what bounds a stolen token's life, so it is short.
+// secret the key is derived from (`datax debug rotate-session-secret`,
+// pkg/server/session.go) invalidates every outstanding token. The TTL
+// is what bounds an unnoticed stolen token's life, so it is short.
 
 // SessionKeyPurpose is the domain-separation label under which the
 // session signing key is derived from the cluster's authentication

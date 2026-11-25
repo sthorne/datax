@@ -4,8 +4,68 @@ import (
 	"math/big"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"testing"
 )
+
+// TestDivSelectsPostgresScale: Div at SelectDivScale's scale gives the
+// digits PostgreSQL shows for numeric division (outputs taken from
+// PostgreSQL 16, shown at the result's display scale).
+func TestDivSelectsPostgresScale(t *testing.T) {
+	big1000 := "0." + strings.Repeat("0", 990) + "3333333333"
+	for _, c := range []struct {
+		a, b           string
+		ascale, bscale int32
+		want           string
+	}{
+		{"0.0000005", "1", 7, 0, "0.000000500000000000000000"},
+		{"0.0000001", "3", 7, 0, "0.000000033333333333333333"},
+		{"1", "3", 0, 0, "0.33333333333333333333"},
+		{"0.0000003", "2", 7, 0, "0.000000150000000000000000"}, // avg(1e-7, 2e-7)
+		{"5", "3", 0, 0, "1.6666666666666667"},                 // avg(1, 2, 2)
+		{"1.5", "1", 2, 0, "1.50000000000000000000"},           // 1.50 / 1
+		{"10000", "3", 0, 0, "3333.3333333333333333"},
+		{"99999", "7", 0, 0, "14285.571428571429"},
+		{"12345678901234567890", "7", 0, 0, "1763668414462081127"},
+		{"1e-20", "7", 20, 0, "0.0000000000000000000014285714285714285714"},
+		{"7", "1e-20", 0, 20, "700000000000000000000.00000000000000000000"},
+		{"-2", "3", 0, 0, "-0.66666666666666666667"},
+		{"2.5", "2", 1, 0, "1.25000000000000000000"},
+		{"0", "5", 0, 0, "0.00000000000000000000"},
+		{"1", "0.5", 0, 1, "2.0000000000000000"},
+		{"1e100", "3", 0, 0, strings.Repeat("3", 100)},
+		{"1e-990", "3", 990, 0, big1000}, // scale capped at 1000
+		// Halves round away from zero (half-even would end in 4).
+		{"1234567890123456789012345", "10", 0, 0, "123456789012345678901235"},
+		{"-1234567890123456789012345", "10", 0, 0, "-123456789012345678901235"},
+	} {
+		a, b := mustParse(t, c.a), mustParse(t, c.b)
+		scale := SelectDivScale(a, b, c.ascale, c.bscale)
+		q, err := Div(a, b, scale)
+		if err != nil {
+			t.Fatalf("%s / %s: %v", c.a, c.b, err)
+		}
+		if got := padScale(q.String(), scale); got != c.want {
+			t.Errorf("%s / %s: got %s (scale %d), want %s", c.a, c.b, got, scale, c.want)
+		}
+	}
+	if _, err := Div(mustParse(t, "1"), mustParse(t, "0"), 20); err == nil {
+		t.Fatal("division by zero accepted")
+	}
+}
+
+func padScale(s string, scale int32) string {
+	if scale == 0 {
+		return s
+	}
+	frac := 0
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		frac = len(s) - i - 1
+	} else {
+		s += "."
+	}
+	return s + strings.Repeat("0", int(scale)-frac)
+}
 
 func mustParse(t *testing.T, s string) Dec {
 	t.Helper()

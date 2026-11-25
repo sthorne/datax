@@ -402,6 +402,25 @@ func (e *Engine) Delete(key []byte) error {
 	return e.db.Delete(key, pebble.NoSync)
 }
 
+// PutDurable writes key so that it survives a crash before it returns: a
+// synced write, or on an engine with no WAL (where Put reaches disk only
+// at the next flush) a write followed by a flush. A flush writes the
+// whole memtable, so it is for small local records that change rarely;
+// callers skip it when the value is unchanged.
+func (e *Engine) PutDurable(key, value []byte) error {
+	if !e.walDisabled {
+		opt := pebble.Sync
+		if TestingNoSync {
+			opt = pebble.NoSync
+		}
+		return e.db.Set(key, value, opt)
+	}
+	if err := e.db.Set(key, value, pebble.NoSync); err != nil {
+		return err
+	}
+	return e.Flush()
+}
+
 // NewBatch returns an indexed batch: writes are visible to reads through the
 // batch itself (required by MVCC read-modify-write sequences), and atomic on
 // Commit.

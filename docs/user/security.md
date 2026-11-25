@@ -468,6 +468,14 @@ Rejected credentials are audited (`datax_auth_failures_total`); an
 authenticated non-admin hitting an admin endpoint gets 403 and an
 `admin-denied` audit record (`datax_admin_denied_total`).
 
+The HTTP port bounds what a peer can hold before (or without)
+authenticating, in either mode. A request has `--auth-timeout` (60 s)
+to send its headers and body; a keep-alive connection that sends no
+new request for 2 minutes is closed; headers are capped at 64 KiB; and
+past `--http-max-conns` (512) open connections a new one is closed as
+it is accepted (`datax_http_conns_refused_total`). Responses are not
+bounded, so long polls and `/debug/pprof/profile` are unaffected.
+
 Prometheus scrape config:
 
 ```yaml
@@ -499,16 +507,35 @@ it. Both are `POST` and require a JSON content type, which with
 `SameSite=Strict` is what stops another origin driving either.
 
 The cookie is a signed token — user, issue time, expiry, and a MAC under
-a key every node derives from the cluster's authentication secret. It
+a key every node derives from a secret the cluster shares (below). It
 carries no password and needs no session store, so a token minted by one
 node is accepted by every other with nothing replicated between them.
 What it asserts is identity only: roles are resolved per request from
 the catalog, so revoking `LOGIN` or the admin role takes effect at once
 rather than at expiry. Being stateless it cannot be revoked
-individually — signing out ends the session on that browser, and
-rotating the cluster's authentication secret invalidates every
-outstanding token at once. The 12-hour TTL is what bounds a stolen
-cookie's life.
+individually — signing out ends the session on that browser — and the
+12-hour TTL is what bounds the life of a stolen cookie nobody noticed.
+
+To revoke every outstanding token at once, root runs:
+
+```sh
+datax debug rotate-session-secret --addr <node>:26257 --certs-dir certs --user root
+```
+
+It writes a new session secret, the secret the signing key is derived
+from (until the first rotation it is derived from the cluster's
+authentication secret, which is left alone because it also keys the
+stand-in SCRAM salts). The node that runs it stops accepting the old
+tokens at once; every other node re-reads the secret at least every 10
+seconds, and a node that cannot read it then accepts no token until it
+can. The command returns after those 10 seconds (plus a second's
+margin), so when it reports success no node accepts a token signed
+before it. Everyone, root included, signs in again; HTTP Basic and
+client certificates are unaffected. Only root may run it — not any
+admin — since root is the one principal whose sessions revoking `LOGIN`
+cannot end. It needs cluster version v26: on a cluster not yet
+finalized at v26 it is refused, because a node on an older binary would
+keep accepting the old tokens.
 
 A browser that presents a CA-signed client certificate is signed in by
 it and never sees the form. A user with no password (certificate-only)

@@ -98,12 +98,7 @@ func (n *Node) writeSealIdentity() {
 	if prev, err := os.ReadFile(path); err == nil && string(prev) == string(raw) {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Debugf("writing %s: %v", SealIdentityFile, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceFileSynced(path, raw); err != nil {
 		log.Debugf("writing %s: %v", SealIdentityFile, err)
 	}
 }
@@ -304,7 +299,10 @@ func (n *Node) setPeerUnsealLocal(off bool) {
 	if off {
 		val = "off"
 	}
-	if err := n.engine.Put(keys.StorePeerUnsealKey(), []byte(val)); err != nil {
+	// Durable (a synced write, or a flush on a store with no WAL), so a
+	// crash cannot roll an "off" back to "on" until the next heartbeat.
+	// It runs only when the setting changes.
+	if err := n.engine.PutDurable(keys.StorePeerUnsealKey(), []byte(val)); err != nil {
 		log.Debugf("recording the peer-unseal setting: %v", err)
 	}
 	log.Infof("peer unseal is %s for this cluster", val)

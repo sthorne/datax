@@ -51,7 +51,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
 | `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
-| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` (round-half-even), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
+| `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` with halves away from zero as in PostgreSQL (`1.005` → `1.01`, `-2.5` → `-3`), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
 | `TEXT` | `STRING`, `VARCHAR` | unbounded |
 | `VARCHAR(n)` | `CHARACTER VARYING(n)` | at most `n` characters: a longer value is refused (`22001`) unless the excess is spaces, which are dropped; `varchar` (OID 1043) with the typmod on the wire |
 | `CHAR(n)` | `CHARACTER(n)`; bare `CHAR` is `CHAR(1)` | fixed width: stored trimmed of trailing spaces, rendered blank-padded to `n` (`'ab'` in a `CHAR(3)` reads back as `'ab '`); `length()`, `||` and comparisons see the trimmed value; `bpchar` (OID 1042) on the wire |
@@ -63,7 +63,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | `TIME` | `TIME WITHOUT TIME ZONE`, `TIME(p)` | time of day, microsecond precision on the wire (`time`, OID 1083); input `'04:05:06.789'`, `'4:05 PM'`, `'16:05'`, a timestamp text (its clock is taken), an offset is ignored; `24:00:00` allowed; `TIME WITH TIME ZONE` is refused; cluster version v10 for a column |
 | enum types | `CREATE TYPE name AS ENUM ('a', 'b', ...)` | a column of the type stores the label's ordinal and orders by declaration (`ORDER BY`, `min` / `max`, indexes and keys); input and output are the label; an unknown label is `22P02`; `'a'::name` casts a literal; `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'c'` appends (no `BEFORE` / `AFTER`; usable at once on every gateway); `DROP TYPE [IF EXISTS] name` refuses while a column uses it (`2BP01`); `pg_type` (`typtype = 'e'`), `pg_enum`, `information_schema.columns` (`USER-DEFINED`), psql's `\dT` and `\d`; a quoted name keeps its case (`CREATE TYPE "Role"`, `r "Role"`, `::"Role"`), as Prisma writes it, and prints quoted (`format_type`, `'"Role"'::regtype`); described on the wire with the type's OID (values as labels, text and binary); no arrays of enums, no `RENAME VALUE`; cluster version v10 |
 | `T[]` | `T ARRAY`, `T[][]` (one-dimensional whatever the brackets) | an array of any scalar type but `JSONB`, `TSVECTOR` and `TSQUERY` (`INT8[]`, `TEXT[]`, `VARCHAR(3)[]`, `DECIMAL(6,2)[]` — the modifiers apply per element); literals `'{1,2}'`, `'{a,"b c",NULL}'` and `ARRAY[1, 2]`; `a[i]` (1-based, NULL out of range; no slices); `= ANY(a)` / `<> ALL(a)` and the other comparison operators with `ANY` / `ALL`; `@>`, `<@`, `&&`; `||` with an array or an element; equality and ordering element by element; `unnest` in `FROM` (`FROM unnest(a) AS u(x)`) and in a FROM-less select list (`SELECT unnest($1::int8[])` expands a parameter into rows), `array_agg`, `array_length`, `cardinality`, `array_append` / `array_prepend` / `array_cat` / `array_position` / `array_remove` / `array_to_string` / `string_to_array` / `array_upper` / `array_lower` / `array_ndims`; PostgreSQL's array OIDs, text and binary formats on the wire (pgx slices scan and bind; `WHERE id = ANY($1)` with a slice); not indexable and not a key; `GROUP BY` and `ORDER BY` work; cluster version v10 for a column |
-| `DATE` | | |
+| `DATE` | | a calendar day, the years 0000 to 9999 (a value outside is refused). Year 0000 is accepted as the year before 0001, though PostgreSQL has no year 0 and refuses it |
 | `BYTES` | `BYTEA` | `'\xdeadbeef'` hex literals; a value is stored and read whole, and a row cannot exceed 60 MiB (`54000`) — for more than a few MiB use a [large object](#large-objects) |
 | `UUID` | | |
 | `JSONB` | `JSON` | normalized on write: sorted keys, compact |
@@ -74,18 +74,28 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   `WHERE tag = 'a0eebc99-...'` — and become index bounds.
 - Non-integer numeric literals are **DECIMAL**, as in PostgreSQL: `0.1`
   survives to a DECIMAL column unrounded. Assigning one to a `FLOAT8`
-  column converts (correctly rounded).
+  column converts (correctly rounded). So is an integer literal outside
+  `INT8`'s range (`99999999999999999999`).
+- `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
+  does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
+  `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).
 - DECIMAL arithmetic and `SUM`/`AVG` are exact; mixing in a `FLOAT8`
-  operand demotes the expression to float. `AVG` of an `INT8` or a
-  `DECIMAL` is a DECIMAL rounded to 6 fractional digits (half-even), as
-  in PostgreSQL; `AVG(FLOAT8)` is a FLOAT8. Float values never
-  implicitly convert *to* DECIMAL.
+  operand demotes the expression to float. DECIMAL division, and `AVG`
+  of an `INT8` or a `DECIMAL` (a DECIMAL, as in PostgreSQL), use
+  PostgreSQL's result scale: at least 16 significant digits and at
+  least as many fractional digits as either operand, at most 1000,
+  halves rounded away from zero (`1::numeric / 3` is
+  `0.33333333333333333333`, `0.0000001::numeric / 3` is
+  `0.000000033333333333333333`). `AVG(FLOAT8)` is a FLOAT8. Float
+  values never implicitly convert *to* DECIMAL.
 - `DECIMAL(p,s)` applies on every write — `INSERT`, `UPDATE`, parameters
   in both wire formats, `COPY`, and `DEFAULT` values — including primary
   key and indexed columns (two values that round to the same stored
-  number collide as duplicates). Expression and aggregate *results* are
-  plain DECIMALs and render canonically (`SUM` of `9.90`s can print
-  `19.8`), like PostgreSQL's rule that expressions lose the typmod.
+  number collide as duplicates). Expression results are plain DECIMALs
+  and render canonically (`a + a` of `9.90`s prints `19.8`, where
+  PostgreSQL keeps the scale and prints `19.80`). `SUM` keeps the
+  largest declared scale among its inputs, as PostgreSQL does (`SUM` of
+  `9.90`s prints `19.80`).
 - The other type modifiers — the integer widths, `VARCHAR(n)` /
   `CHAR(n)`, `TIMESTAMP` without time zone, `TIMESTAMP(p)` — apply on
   the same paths, and a column that carries one describes with
@@ -482,9 +492,12 @@ conversion is the type's cast: widening (`INT8` to `DECIMAL` or
 `FLOAT8`, `DATE` to `TIMESTAMPTZ`), anything to `TEXT`, and `TEXT` to a
 typed column when every value parses (`INT8`, `DECIMAL`, `FLOAT8`,
 `BOOL`, `TIMESTAMPTZ`, `DATE`, `BYTES`, `UUID`, `JSONB`); a `DECIMAL`
-typmod change rescales, and a change of integer width, character
-length or timestamp form checks every stored value against the new
-modifier (`22003` / `22001`). A value that cannot convert fails the
+typmod change rescales every stored value as a write into the column
+does (halves away from zero: `1.005` to `DECIMAL(10,2)` is `1.01`) and
+fails with `22003` when one no longer fits, and a change of integer
+width, character length or timestamp form checks every stored value
+against the new modifier (`22003` / `22001`). An array column's
+modifiers are its elements', and change the same way. A value that cannot convert fails the
 statement (`22P02`) and the column is left as it was. A modifier change
 that cannot lose a value (a wider integer, a longer `VARCHAR`, more
 timestamp digits) skips the rewrite: one descriptor write, and the
@@ -1958,7 +1971,29 @@ automatically by the server — DDL included, so autocommit `CREATE`,
 `40001` when two of them change the catalog at once. The server re-runs
 such a statement, with backoff, until it succeeds, its
 `statement_timeout` is about to run out, or it has retried for 30
-seconds. Other transaction tools:
+seconds.
+
+As in PostgreSQL, several statements sent together outside `BEGIN` are
+one **implicit transaction**: the statements of one multi-statement
+query string (`psql -c "INSERT ...; UPDATE ..."`, or a driver's `Exec`
+of a script without parameters), and the statements of one
+extended-protocol pipeline up to its `Sync` (pgx's `SendBatch`, JDBC's
+`executeBatch`). They commit together at the end, or, if one fails,
+none of them does. A `COMMIT` or `ROLLBACK` among them ends the implicit
+transaction early, and the statements after it start another; a `BEGIN`
+among them turns it into a transaction block, the statements before it
+included, which stays open after the query. `SAVEPOINT` is refused in
+an implicit transaction (`25P01`), and so are the statements PostgreSQL
+refuses in any transaction block (`25001`: `VACUUM`, `CREATE INDEX
+CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `DISCARD ALL`). datax's online
+statements — `CREATE INDEX` on an existing table, the `ALTER TABLE`
+actions that read the rows, `CREATE TABLE ... AS`, `ANALYZE`, `AS OF
+SYSTEM TIME`, ... ([the list](postgres-differences.md#things-that-exist-but-behave-differently))
+— commit the statements before them and run on their own; the
+statements after them are a new implicit transaction. An implicit transaction of several statements is
+not retried by the server — results have already gone to the client —
+so it can fail with `40001` like a `BEGIN` block. Other transaction
+tools:
 
 ```sql
 SAVEPOINT sp;  ROLLBACK TO SAVEPOINT sp;  RELEASE SAVEPOINT sp;
@@ -2161,7 +2196,9 @@ The rules are PostgreSQL's:
   with `WARNING: you don't own a lock of type ExclusiveLock` (`01000`).
 - **Transaction locks** (`_xact_`) are released when the transaction
   commits or rolls back, and by `ROLLBACK TO` a savepoint taken before
-  them; outside a transaction block the statement is the transaction.
+  them; outside a transaction block the statement is the transaction
+  (or the implicit transaction of a multi-statement query or a
+  pipeline: see [Transactions and retries](#transactions-and-retries)).
 - **Shared and exclusive.** Any number of sessions may hold a shared
   lock; an exclusive one conflicts with every hold by another session.
   A session's own holds never conflict with each other.

@@ -65,3 +65,76 @@ func TestLocalityAdvertiseFlag(t *testing.T) {
 		}
 	}
 }
+
+// TestSQLMaxMessageSizeFlag: --sql-max-message-size reaches the config
+// as bytes, unset is the default (0), and a value outside 1MiB..1GiB, or
+// no byte count at all, is a startup error naming the flag.
+func TestSQLMaxMessageSizeFlag(t *testing.T) {
+	cfgOf := func(args ...string) (int, error) {
+		t.Helper()
+		f := newServerFlags("start")
+		f.fs.SetOutput(io.Discard)
+		if err := f.fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := f.config(false)
+		return cfg.SQLMaxMessageSize, err
+	}
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{nil, 0},
+		{[]string{"--sql-max-message-size=64MiB"}, 64 << 20},
+		{[]string{"--sql-max-message-size=1MiB"}, 1 << 20},
+		{[]string{"--sql-max-message-size=1GiB"}, 1 << 30},
+		{[]string{"--sql-max-message-size=536870912"}, 512 << 20},
+	} {
+		got, err := cfgOf(c.args...)
+		if err != nil || got != c.want {
+			t.Errorf("%v: %d, %v; want %d", c.args, got, err, c.want)
+		}
+	}
+	for _, v := range []string{"512KiB", "2GiB", "1.5GiB", "0", "lots", "-1"} {
+		if _, err := cfgOf("--sql-max-message-size=" + v); err == nil || !strings.Contains(err.Error(), "--sql-max-message-size") {
+			t.Errorf("%q: %v, want an error naming the flag", v, err)
+		}
+	}
+}
+
+// TestInMemoryWarning: a node started without --dir keeps its data in
+// memory, still the default, and says so at startup unless --in-memory
+// asks for that; --in-memory with --dir is refused.
+func TestInMemoryWarning(t *testing.T) {
+	parse := func(args ...string) *serverFlags {
+		t.Helper()
+		f := newServerFlags("init")
+		f.fs.SetOutput(io.Discard)
+		if err := f.fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	for _, args := range [][]string{nil, {"--dir="}} {
+		f := parse(args...)
+		if w := f.inMemoryWarning(); !strings.Contains(w, "lost") || !strings.Contains(w, "--dir") {
+			t.Fatalf("%v: warning %q", args, w)
+		}
+		if cfg, err := f.config(true); err != nil || cfg.Dir != "" {
+			t.Fatalf("%v: in-memory is no longer the default: %+v %v", args, cfg.Dir, err)
+		}
+	}
+	if w := parse("--dir=/var/lib/datax").inMemoryWarning(); w != "" {
+		t.Fatalf("warned with a data directory: %q", w)
+	}
+	f := parse("--in-memory")
+	if w := f.inMemoryWarning(); w != "" {
+		t.Fatalf("warned with --in-memory: %q", w)
+	}
+	if cfg, err := f.config(true); err != nil || cfg.Dir != "" {
+		t.Fatalf("--in-memory: %+v %v", cfg.Dir, err)
+	}
+	if _, err := parse("--in-memory", "--dir=/var/lib/datax").config(true); err == nil {
+		t.Fatal("--in-memory with --dir was accepted")
+	}
+}

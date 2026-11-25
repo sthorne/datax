@@ -121,6 +121,32 @@ func TestCopyFromText(t *testing.T) {
 	}
 }
 
+// TestCopyFromLargeCopyData: the server's message size cap leaves COPY
+// alone. One CopyData of 8 MiB (rows of 1 MiB each, as a client that
+// sends a row per message does with large rows) loads, as does a
+// stream of many such messages; the cap is per message, not per COPY.
+func TestCopyFromLargeCopyData(t *testing.T) {
+	tc := Start(t, 1)
+	r := dialRaw(t, tc)
+	r.simpleExec("CREATE TABLE cbig (id INT8 PRIMARY KEY, body TEXT)")
+	payload := strings.Repeat("y", 1<<20)
+	var one strings.Builder
+	for i := 1; i <= 8; i++ {
+		fmt.Fprintf(&one, "%d\t%s\n", i, payload)
+	}
+	r.copyIn("COPY cbig FROM STDIN", 0)
+	r.send(&pgproto3.CopyData{Data: []byte(one.String())})
+	r.finishCopy(8)
+	r.copyIn("COPY cbig FROM STDIN", 0)
+	for i := 9; i <= 24; i++ {
+		r.send(&pgproto3.CopyData{Data: []byte(fmt.Sprintf("%d\t%s\n", i, payload))})
+	}
+	r.finishCopy(16)
+	if n := countRows(t, tc, "cbig"); n != 24 {
+		t.Fatalf("%d rows, want 24", n)
+	}
+}
+
 func TestCopyFromCSV(t *testing.T) {
 	tc := Start(t, 3)
 	r := dialRaw(t, tc)

@@ -386,6 +386,14 @@ func (s *Store) ApplySnapshotStream(header []byte, next func() ([]SnapshotKV, er
 	if err := b.Commit(true); err != nil {
 		return err
 	}
+	// The replica exists only because of this stream; no raft log here
+	// would re-create it. On a WAL-less state engine its descriptor and
+	// state must be durable before raft starts and the replica votes or
+	// acknowledges entries, or a crash loses a replica the range still
+	// counts as a member.
+	if err := s.flushState(); err != nil {
+		return err
+	}
 	if _, err := s.startReplica(h.Desc, h.ReplicaID, false); err != nil {
 		return err
 	}

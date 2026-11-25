@@ -618,6 +618,14 @@ type PushTxnResponse struct {
 	// InFlightKeys, when Status is STAGING, is the staged write set the
 	// pusher needs to run status recovery.
 	InFlightKeys []keys.Key `json:"in_flight_keys,omitempty"`
+	// StagedEpoch and StagedSequence, when Status is STAGING, are the
+	// staged record's epoch and sequence: the in-flight writes were sent
+	// with them, so an intent is one of them only at StagedEpoch and at
+	// StagedSequence or above (an earlier write of the transaction to the
+	// same key is not). StagedSequence 0 means a leaseholder from before
+	// the fields: a parallel commit always stages at sequence 1 or above.
+	StagedEpoch    int32 `json:"staged_epoch,omitempty"`
+	StagedSequence int32 `json:"staged_sequence,omitempty"`
 }
 
 // RecoverTxnRequest finalizes a STAGING transaction record after status
@@ -628,6 +636,16 @@ type RecoverTxnRequest struct {
 	RequestHeader           // Key = the transaction's anchor key
 	TxnID         uuid.UUID `json:"txn_id"`
 	Commit        bool      `json:"commit"`
+	// StagedTS, StagedEpoch and StagedSequence name the staged record the
+	// recoverer verified. With StagedTS set, a record that is no longer
+	// staged at exactly that timestamp, epoch and sequence (the
+	// transaction re-staged since) is left as is. Introduced under
+	// cluster version v25: senders set them only once the cluster has
+	// finalized v25 (pkg/version rule 4), since an older replica drops
+	// them and would finalize what a newer one refuses.
+	StagedTS       hlc.Timestamp `json:"staged_ts,omitempty"`
+	StagedEpoch    int32         `json:"staged_epoch,omitempty"`
+	StagedSequence int32         `json:"staged_sequence,omitempty"`
 }
 
 type RecoverTxnResponse struct {

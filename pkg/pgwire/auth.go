@@ -138,6 +138,7 @@ func (c *conn) authenticateSCRAM(user string) error {
 	}
 	msg, err := c.backend.Receive()
 	if err != nil {
+		c.refuseOversized(err)
 		return err
 	}
 	initial, ok := msg.(*pgproto3.SASLInitialResponse)
@@ -172,6 +173,7 @@ func (c *conn) authenticateSCRAM(user string) error {
 	}
 	msg, err = c.backend.Receive()
 	if err != nil {
+		c.refuseOversized(err)
 		return err
 	}
 	resp, ok := msg.(*pgproto3.SASLResponse)

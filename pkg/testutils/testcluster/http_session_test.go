@@ -14,8 +14,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sthorne/datax/pkg/base"
+	"github.com/sthorne/datax/pkg/cluster"
+	"github.com/sthorne/datax/pkg/rpc"
 	"github.com/sthorne/datax/pkg/security"
 	"github.com/sthorne/datax/pkg/server"
+	"github.com/sthorne/datax/pkg/util/hlc"
+	"github.com/sthorne/datax/pkg/version"
 )
 
 // postJSON sends a JSON body and returns the status, body and response.
@@ -403,4 +408,151 @@ func firstLine(s string) string {
 		return s[:200]
 	}
 	return s
+}
+
+// TestHTTPSessionRevokedBySecretRotation: rotating the session secret
+// (`datax debug rotate-session-secret`) revokes every outstanding console
+// token on every node by the time the call returns, root's included —
+// the one principal that cannot be made NOLOGIN — while a fresh sign-in
+// works everywhere. Only root may rotate it, not merely an admin.
+func TestHTTPSessionRevokedBySecretRotation(t *testing.T) {
+	httpLis := make([]net.Listener, 2)
+	for i := range httpLis {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		httpLis[i] = lis
+	}
+	tc, certsDir := startSecureCluster(t, "topsecret", func(i int, cfg *server.Config) {
+		if i < len(httpLis) {
+			cfg.HTTPListener = httpLis[i]
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	bases := []string{"https://" + tc.Nodes[0].HTTPAddr(), "https://" + tc.Nodes[1].HTTPAddr()}
+	plain := httpsClient(t, certsDir, "")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		code, _, _ := authedGet(t, plain, bases[0]+"/status", "root", "topsecret")
+		if code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("root basic auth never succeeded (last code %d)", code)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	conn, err := connectSecure(ctx, secureURL(tc, certsDir, "root", "topsecret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE USER ops PASSWORD 'ops-pw'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `GRANT ADMIN TO ops`); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close(ctx)
+
+	signIn := func(user, pass string) string {
+		t.Helper()
+		code, body, resp := postJSON(t, plain, bases[0]+"/api/login", map[string]string{"user": user, "password": pass})
+		if code != http.StatusOK {
+			t.Fatalf("sign-in as %s: %d (%s)", user, code, body)
+		}
+		for _, c := range resp.Cookies() {
+			if c.Name == "datax_session" {
+				return c.Value
+			}
+		}
+		t.Fatalf("sign-in as %s set no session cookie", user)
+		return ""
+	}
+	// withToken presents a token the way a thief replays a stolen cookie.
+	withToken := func(base, token string) int {
+		t.Helper()
+		req, err := http.NewRequest("GET", base+"/api/cluster", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.AddCookie(&http.Cookie{Name: "datax_session", Value: token})
+		resp, err := plain.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	rootToken, opsToken := signIn("root", "topsecret"), signIn("ops", "ops-pw")
+	for _, base := range bases {
+		for _, tok := range []string{rootToken, opsToken} {
+			if code := withToken(base, tok); code != http.StatusOK {
+				t.Fatalf("%s: a fresh token got %d, want 200", base, code)
+			}
+		}
+	}
+
+	for _, u := range []string{"root", "ops"} {
+		if err := security.CreateClientCert(certsDir, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	call := func(user string) cluster.AdminResponse {
+		t.Helper()
+		tlsCfg, err := security.LoadClientTLS(certsDir, user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		trans := rpc.NewTransport(hlc.NewClock(nil, base.DefaultMaxClockOffset), nil, nil)
+		trans.SetTLS(tlsCfg)
+		cctx, ccancel := context.WithTimeout(ctx, 30*time.Second)
+		defer ccancel()
+		var resp cluster.AdminResponse
+		if err := trans.Call(cctx, tc.Nodes[0].Addr(), "admin", cluster.AdminRequest{Op: "rotate-session-secret"}, &resp); err != nil {
+			t.Fatalf("rotate-session-secret as %q: %v", user, err)
+		}
+		return resp
+	}
+	// An admin who is not root may not rotate it, and nothing changes.
+	if resp := call("ops"); !strings.Contains(resp.Error, "only be run as root") {
+		t.Fatalf("rotate-session-secret as an admin: %q, want a root-only refusal", resp.Error)
+	}
+	if code := withToken(bases[1], rootToken); code != http.StatusOK {
+		t.Fatalf("a refused rotation revoked a token: %d", code)
+	}
+
+	// Root rotates; once the call returns, no node accepts the old tokens.
+	if resp := call("root"); resp.Error != "" {
+		t.Fatalf("rotate-session-secret as root: %s", resp.Error)
+	}
+	for _, base := range bases {
+		for name, tok := range map[string]string{"root": rootToken, "ops": opsToken} {
+			if code := withToken(base, tok); code != http.StatusUnauthorized {
+				t.Fatalf("%s: %s's token from before the rotation got %d, want 401", base, name, code)
+			}
+		}
+	}
+
+	// A sign-in after it works on every node.
+	fresh := signIn("root", "topsecret")
+	for _, base := range bases {
+		if code := withToken(base, fresh); code != http.StatusOK {
+			t.Fatalf("%s: a token from after the rotation got %d, want 200", base, code)
+		}
+	}
+}
+
+// TestSessionSecretRotationNeedsV26: below cluster version v26 a node
+// never reads the session secret, so the rotation is refused there.
+func TestSessionSecretRotationNeedsV26(t *testing.T) {
+	tc, _ := StartWithEngines(t, 1, func(c *server.Config) { c.BinaryVersionOverride = version.V25 })
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp := adminCall(t, ctx, tc.Nodes[0].Addr(), cluster.AdminRequest{Op: "rotate-session-secret"})
+	if !strings.Contains(resp.Error, "needs cluster version v26") {
+		t.Fatalf("rotate-session-secret at v25: %q, want a version refusal", resp.Error)
+	}
 }

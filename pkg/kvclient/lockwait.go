@@ -185,6 +185,11 @@ func (t *Txn) GetBatchForUpdateNoWait(ctx context.Context, ks []keys.Key, skip b
 			}
 			rest = nil
 		default:
+			// Any other failure may have locked keys on the ranges
+			// that answered: track them all, as for NOWAIT above.
+			for _, i := range rest {
+				t.recordWrite(ks[i])
+			}
 			return nil, err
 		}
 	}
@@ -210,11 +215,15 @@ func (t *Txn) lockOneNoWait(ctx context.Context, key keys.Key, skip bool) (bool,
 		t.mu.Lock()
 		if !t.mu.anchored && keys.Key(t.mu.txn.Key).Equal(k) {
 			t.mu.txn.Key = nil
+			t.mu.recordMaybe = false
 		}
 		t.mu.Unlock()
 	}
 	if refused && skip {
 		return false, nil
+	}
+	if !refused {
+		t.mayHaveWritten([]keys.Key{k}, ba.Header.CreateTxnRecord)
 	}
 	return false, err
 }

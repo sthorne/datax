@@ -76,6 +76,7 @@ type Sampler struct {
 	dir   string
 	start time.Time
 	host  hostReader
+	now   func() time.Time // clock for sample times; nil means time.Now
 
 	mu       sync.Mutex
 	latest   Sample
@@ -142,6 +143,9 @@ func (s *Sampler) Latest() Sample {
 // Sample takes a sample now and returns it.
 func (s *Sampler) Sample() Sample {
 	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
 	out := Sample{At: now, Cores: runtime.NumCPU(), ProcessUp: int64(now.Sub(s.start).Seconds())}
 
 	// Go runtime: available everywhere.

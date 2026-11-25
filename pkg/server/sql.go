@@ -49,6 +49,7 @@ func (n *Node) startSQL() error {
 	opts := pgwire.ServerOptions{
 		SlowStatementThreshold: n.cfg.SlowStatementThreshold, NodeID: int32(n.ident.NodeID),
 		AuthTimeout: n.cfg.AuthTimeout, MaxPendingAuth: n.cfg.SQLMaxPendingAuth,
+		MaxMessageSize: n.cfg.SQLMaxMessageSize,
 	}
 	opts.Forward = func(ctx context.Context, node, pid int32, secret uint32, terminate bool) (bool, error) {
 		addr, err := n.resolvePeer(base.NodeID(node))

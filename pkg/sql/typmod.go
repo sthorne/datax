@@ -1,11 +1,8 @@
 package sql
 
 import (
-	"math"
-
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/types"
-	"github.com/sthorne/datax/pkg/util/decimal"
 )
 
 // colResult describes an output column a table column backs directly:
@@ -87,6 +84,11 @@ func pureWidening(old, new catalog.Column) bool {
 	if old.Type != new.Type {
 		return false
 	}
+	if old.Type.IsArray() {
+		// The modifiers apply per element: judge the element type
+		// (DECIMAL(10,3)[] to DECIMAL(10,2)[] must round every element).
+		old.Type, new.Type = old.Type.Elem(), new.Type.Elem()
+	}
 	switch old.Type {
 	case types.Enum:
 		return old.EnumType == new.EnumType
@@ -113,12 +115,14 @@ func pureWidening(old, new catalog.Column) bool {
 }
 
 // enforceTypmod applies a column's type modifiers to a value about to
-// be stored. For DECIMAL(p,s) the value is rescaled to s (round-half-
-// even), and rejected with SQLSTATE 22003 when its integer digits
+// be stored. For DECIMAL(p,s) the value is rescaled to s (halves away
+// from zero: 1.005 → 1.01, -1.005 → -1.01), and rejected with SQLSTATE 22003 when its integer digits
 // exceed p−s — PostgreSQL semantics, including the order (9.999 into
 // DECIMAL(3,2) first rounds to 10.00, then overflows); the returned
 // datum keeps canonical text in S (identity/storage) and carries the
-// declared scale in Dscale (display). The integer width, character
+// declared scale in Dscale (display). That part is
+// catalog.Column.ConformDecimal, which ALTER COLUMN TYPE's rewrite
+// (rowenc.EncodeValue) applies too. The integer width, character
 // length, CHAR padding and TIMESTAMP modifiers are catalog.Column.
 // Conform's (22003 / 22001 / 22007). Columns without a typmod and NULLs
 // pass through untouched.
@@ -133,16 +137,8 @@ func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
 		if err != nil {
 			return d, ToSQLError(err)
 		}
-		if out.Fam.Elem() == types.Decimal && col.Precision > 0 {
-			elem := col
-			elem.Type = types.Decimal
-			elems := make([]types.Datum, len(out.A))
-			for i, e := range out.A {
-				if elems[i], err = enforceTypmod(elem, e); err != nil {
-					return d, err
-				}
-			}
-			out = types.NewArray(types.Decimal, elems)
+		if out, err = col.ConformDecimal(out); err != nil {
+			return d, ToSQLError(err)
 		}
 		return out, nil
 	}
@@ -153,37 +149,9 @@ func enforceTypmod(col catalog.Column, d types.Datum) (types.Datum, error) {
 		}
 		return out, nil
 	}
-	if col.Precision == 0 || d.Fam != types.Decimal {
-		return d, nil
-	}
-	if f, ok := types.DecimalSpecial(d); ok {
-		// NaN fits any NUMERIC(p,s); an infinity fits none.
-		if math.IsNaN(f) {
-			return d, nil
-		}
-		return d, newErrf(CodeNumericValueOutOfRange,
-			"numeric field overflow in column %q: a field with precision %d, scale %d cannot hold an infinite value",
-			col.Name, col.Precision, col.Scale)
-	}
-	v, err := decimal.Parse(d.S)
+	out, err := col.ConformDecimal(d)
 	if err != nil {
-		return d, newErrf(CodeInvalidTextRepresentation, "column %q: %v", col.Name, err)
+		return d, ToSQLError(err)
 	}
-	q, err := decimal.Quantize(v, col.Scale)
-	if err != nil {
-		return d, newErrf(CodeNumericValueOutOfRange, "column %q: %v", col.Name, err)
-	}
-	abs := q
-	if abs.Sign() < 0 {
-		abs = decimal.Neg(abs)
-	}
-	limit := decimal.New(1, col.Precision-col.Scale)
-	if decimal.Cmp(abs, limit) >= 0 {
-		return d, newErrf(CodeNumericValueOutOfRange,
-			"numeric field overflow in column %q: a field with precision %d, scale %d must round to an absolute value less than 10^%d",
-			col.Name, col.Precision, col.Scale, col.Precision-col.Scale)
-	}
-	out := types.NewDecimal(q.String())
-	out.Dscale = col.Scale
 	return out, nil
 }
