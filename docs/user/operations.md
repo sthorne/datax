@@ -55,7 +55,11 @@ serves, on that address:
   A replica on a live node that the node reports in its heartbeat as
   stopped by a storage failure or never loaded counts as not live, as
   in the health check, and its range is also listed under **dead
-  replicas**.
+  replicas**. A heartbeat lists at most 64 such replicas per kind; a
+  node that reports more is asked for the rest. If it does not answer,
+  a range that would be in one state or another depending on its
+  unlisted replicas is counted under **unknown** (a tile shown only
+  while it counts a range), not as healthy.
   The **failure domains** table is what rack-aware placement is for:
   per locality tier value, the nodes, replicas and leases it holds, and
   what its loss would cost — how many ranges would drop below a
@@ -347,6 +351,8 @@ dashboard row links to:
 | `upgrade-unfinalized` | warning | every node runs a newer binary than the cluster version; `datax admin upgrade` has not been run (nodes) |
 | `replicas-failed` | critical | a live node has replicas whose raft group a storage failure stopped (a raft-engine write error such as ENOSPC or EIO, a failed apply); they serve nothing until the node restarts, and the node keeps heartbeating, so dead-node repair does not replace them. Check the node's log and disk, then restart it (nodes) |
 | `replicas-missing` | warning | a live node has been named in a range's descriptor for over a minute with no replica of the range loaded (one lost in a crash, say); it counts toward the range's quorum but cannot vote (nodes) |
+| `replicas-unverified` | warning | a live node reports more failed or missing replicas than its heartbeat lists (at most 64 of each), and did not answer when asked for the rest; whether its replicas of higher-numbered ranges serve is unknown (nodes) |
+| `replication-unknown` | warning | ranges that would be under-replicated or without quorum, or not, depending on replicas a `replicas-unverified` node did not report; counted in neither of those checks (ranges) |
 | `quorum-lost` | critical | a range has fewer serving replicas than a majority; it cannot serve until a node returns (ranges). A serving replica is one on a live node that the node does not report failed or missing |
 | `under-replicated` | warning | a range has fewer serving replicas than its replication factor (ranges) |
 | `diversity` | warning | a range's replicas share a locality tier they could spread across (ranges) |

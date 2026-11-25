@@ -290,8 +290,9 @@ type AdminResponse struct {
 	// leader (cluster version v22, issue #316).
 	ClearRange *ClearRangeAnswer `json:"clear_range,omitempty"`
 	// Status answers node-status: the serving node's /status document
-	// (server.NodeStatus), optionally filtered to one range. Raw JSON so
-	// this package does not depend on the server package's types.
+	// (server.NodeStatus), optionally filtered to one range; and
+	// node-detail and unavailable-replicas, likewise. Raw JSON so this
+	// package does not depend on the server package's types.
 	Status json.RawMessage `json:"status,omitempty"`
 	// ClusterKey answers the cluster-key-* ops (issue #310).
 	ClusterKey *ClusterKeyAnswer `json:"cluster_key,omitempty"`

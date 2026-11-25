@@ -560,6 +560,19 @@ func TestConsoleRendersEveryRouteOpenedCold(t *testing.T) {
   return out.join(" | ");
 })()`, "qps | sort by qps | button first | sort by this column | descending: sorted descending — press to reverse | ascending: sorted ascending — press for the table's own order | none: sort by this column | "+
 			"span | sort by span | words first | sort by this column | ascending: sorted ascending — press to reverse | descending: sorted descending — press for the table's own order | none: sort by this column")
+		// The unknown replication state: shown, as a warning, only while
+		// it counts a range — ranges a node could not be asked about.
+		check(data, "the unknown tile appears only while it counts ranges", `(() => {
+  const base = { default_replication_factor: 3, healthy: { count: 5, ranges: [1, 2, 3, 4, 5] } };
+  const tile = () => document.querySelector('#repl-tiles [data-bucket="unknown"]');
+  renderReplication({ replication: base });
+  const before = tile() ? "shown" : "hidden";
+  renderReplication({ replication: { ...base, unknown: { count: 6, ranges: [6, 7, 8, 9, 10, 11] } } });
+  const t = tile(), note = document.getElementById("repl-note").textContent;
+  const out = [before, t ? t.querySelector(".value").textContent : "none", t && t.classList.contains("draining"), note.includes("6 range(s) are unknown")];
+  if (lastCluster) renderReplication(lastCluster);
+  return out.join(",");
+})()`, "hidden,6,true,true")
 		check(data, "the hotspots table is gone (#283)", `String(!document.getElementById('repl-hot') && !document.getElementById('sec-hot-ranges'))`, "true")
 		check(data, "every range row has the six cells (#283)",
 			`String([...document.querySelectorAll('#cluster-ranges tr[data-range]')].every(r => r.children.length === 6))`, "true")

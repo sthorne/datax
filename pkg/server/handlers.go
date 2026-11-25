@@ -233,8 +233,8 @@ func (n *Node) publishLiveness(ctx context.Context) {
 		nd.SQL = n.sqlServer().Activity().Summary()
 	}
 	failed, missing := n.unavailableReplicas()
-	nd.FailedReplicas, nd.FailedReplicaCount = capReplicaReport(failed)
-	nd.MissingReplicas, nd.MissingReplicaCount = capReplicaReport(missing)
+	nd.FailedReplicas, nd.FailedReplicaCount = capReplicaReport(failed, n.reportCap())
+	nd.MissingReplicas, nd.MissingReplicaCount = capReplicaReport(missing, n.reportCap())
 	raw, _ := json.Marshal(nd)
 	if err := n.db.Put(ctx, keys.NodeRegistryKey(n.ident.NodeID), raw); err != nil {
 		log.Debugf("liveness heartbeat failed: %v", err)

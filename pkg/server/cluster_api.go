@@ -339,7 +339,7 @@ func (n *Node) clusterDocFor(req *http.Request, p ClusterPrincipal, v keyViewer)
 		doc.Storage = &m
 	}
 	doc.Rollup = rollup(doc.Nodes, doc.Ranges)
-	doc.Replication = n.replicationStatus(descs, doc.Nodes)
+	doc.Replication = n.replicationStatus(req.Context(), descs, doc.Nodes)
 	// Set last: every key above has been rendered by now, and the flag
 	// states what actually happened to them for this caller.
 	doc.KeysRedacted = v.redactedAny()
