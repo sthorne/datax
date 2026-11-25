@@ -76,6 +76,10 @@ var adminUnauditedOps = map[string]bool{
 	"cluster-key-install":  true,
 	"node-status":          true,
 	"node-detail":          true,
+	// unavailable-replicas is asked under the node identity on each
+	// health check and replication view while a peer's heartbeat lists
+	// are capped.
+	"unavailable-replicas": true,
 	// notify is one node handing another its committed notifications: a
 	// record per batch would be a record per NOTIFY.
 	"notify": true,
@@ -506,6 +510,17 @@ func (n *Node) serveAdminOp(ctx context.Context, req cluster.AdminRequest) clust
 		// (/api/node?id=N fans out under the node identity; admin-only
 		// like node-status, so the admin-only material is included).
 		raw, err := json.Marshal(n.localNodeDetail(ctx, allKeysViewer()))
+		if err != nil {
+			return cluster.AdminResponse{Error: err.Error()}
+		}
+		return cluster.AdminResponse{Status: raw}
+
+	case "unavailable-replicas":
+		// This node's failed and missing replicas, uncapped: a peer's
+		// health check and replication view ask when this node's
+		// heartbeat lists fell short of its counts (replica_health.go).
+		failed, missing := n.unavailableReplicas()
+		raw, err := json.Marshal(unavailableReport{Failed: failed, Missing: missing})
 		if err != nil {
 			return cluster.AdminResponse{Error: err.Error()}
 		}

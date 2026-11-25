@@ -2163,7 +2163,18 @@ state or the internode protocol does, and an entry below says so.
   heartbeat row holds at most 64 range IDs (the lowest), so a node with
   thousands of dead replicas does not bloat its row on every heartbeat;
   `failed_replica_count` and `missing_replica_count` carry the exact
-  totals, which the health summaries report.
+  totals, which the health summaries report. Classification stays exact
+  past the cap: when a peer's count exceeds its list, the health check
+  and the replication view ask that peer for its full lists (the new
+  internode admin op `unavailable-replicas`, within 3 s). If it does not
+  answer, its replicas past the lists are unknown: the new check
+  `replicas-unverified` (warning) names the node, and a range whose
+  state depends on them is counted as `replication-unknown` (warning) in
+  the health check and under the new `unknown` state in `/api/cluster`'s
+  replication section (an **unknown** tile in the console, shown only
+  while it counts a range), never as healthy. Only a binary that caps
+  its lists sends counts, and it answers the op, so an older peer is
+  never asked.
 - **The console's replication view shows dead replicas on live nodes.**
   The health check counts a replica its live node reports failed or
   missing as unavailable, but the replication tiles and buckets still

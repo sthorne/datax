@@ -276,7 +276,10 @@ No gossip protocol in v1; membership is join-based:
   whose descriptor has named it for over a minute with no replica loaded
   (`missing_replicas`). Each list holds at most 64 range IDs, the
   lowest; `failed_replica_count` and `missing_replica_count` give the
-  exact totals. The health check counts those as unavailable;
+  exact totals; a reader whose peer's count exceeds its list asks the
+  peer for the full lists (admin op `unavailable-replicas`), and treats
+  the replicas past them as unknown if it does not answer. The health
+  check counts those as unavailable;
   the allocator does not yet act on them (dead-node repair below is
   driven by liveness alone).
 
