@@ -2156,9 +2156,10 @@ state or the internode protocol does, and an entry below says so.
   a view, a `WITH` query or a subquery in `FROM` was described as
   `int8` (OID 20), and a view's `pg_attribute` and
   `information_schema.columns` rows said `bigint`; they now carry
-  `int2` / `int4` as in PostgreSQL (the catalog rows of a view created
-  before this say `bigint` until it is recreated; its results are
-  described right). A set operation's integer column is its
+  `int2` / `int4` as in PostgreSQL. A view created by an older binary,
+  whose stored columns say `int8`, describes the same way without being
+  recreated: the catalogs derive its integer widths from its query. A
+  set operation's integer column is its
   widest member's: `int2 UNION int8` took the first member's width and
   described as `int2`, whatever the values; it is now `int8`.
 - **`sum` over `int8` is `numeric`**, as in PostgreSQL, so a total past

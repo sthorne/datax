@@ -704,6 +704,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		if !listed(d) {
 			continue
 		}
+		// A view stored before views kept integer widths describes
+		// as its query does.
+		d = s.withViewWidths(ctx, d)
 		env.Tables = append(env.Tables, d)
 		// Statistics count every row of a table: a role that may not read
 		// the rows sees none, and neither does one its row-security
