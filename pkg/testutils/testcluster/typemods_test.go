@@ -118,13 +118,14 @@ func TestColumnTypeModifiers(t *testing.T) {
 	}
 
 	// LIKE and CREATE TABLE AS keep the modifiers of table columns; a
-	// computed column is bare.
+	// computed column is bare (smallint + integer is an integer, as in
+	// PostgreSQL).
 	execSQL(t, ctx, s, `CREATE TABLE ty_like (LIKE ty)`)
 	if c := execSQL(t, ctx, s, `SHOW CREATE TABLE ty_like`).Rows[0][1].S; !strings.Contains(c, "sm INT2") || !strings.Contains(c, "c CHAR(3)") || !strings.Contains(c, "tz TIMESTAMPTZ(3)") {
 		t.Fatalf("LIKE:\n%s", c)
 	}
 	execSQL(t, ctx, s, `CREATE TABLE ty_as AS SELECT id, v, ts, sm + 1 AS sm1 FROM ty`)
-	if c := execSQL(t, ctx, s, `SHOW CREATE TABLE ty_as`).Rows[0][1].S; !strings.Contains(c, "id INT4") || !strings.Contains(c, "v VARCHAR(5)") || !strings.Contains(c, "ts TIMESTAMP,") || !strings.Contains(c, "sm1 INT8") {
+	if c := execSQL(t, ctx, s, `SHOW CREATE TABLE ty_as`).Rows[0][1].S; !strings.Contains(c, "id INT4") || !strings.Contains(c, "v VARCHAR(5)") || !strings.Contains(c, "ts TIMESTAMP,") || !strings.Contains(c, "sm1 INT4") {
 		t.Fatalf("CREATE TABLE AS:\n%s", c)
 	}
 	refused(`INSERT INTO ty_like (id, v) VALUES (9, 'toolong')`, "22001")
@@ -141,7 +142,7 @@ func TestColumnTypeModifiers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	wantOIDs := []uint32{23, 21, 20, 1043, 1042, 1114, 1184, 20, 25}
+	wantOIDs := []uint32{23, 21, 20, 1043, 1042, 1114, 1184, 23, 25}
 	wantMods := []int32{-1, -1, -1, 9, 7, -1, 3, -1, -1}
 	for i, f := range sd.Fields {
 		if f.DataTypeOID != wantOIDs[i] || f.TypeModifier != wantMods[i] {
@@ -165,7 +166,13 @@ func TestColumnTypeModifiers(t *testing.T) {
 		int32(10), int16(-7), int64(1<<40), "wire", "w", wantTS, wantTZ); err != nil {
 		t.Fatalf("binary params: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO ty (id, sm) VALUES ($1, $2)`, int32(11), int32(70000)); err == nil || !strings.Contains(err.Error(), "22003") {
+	// A parameter stored into the int2 column describes as int2, as in
+	// PostgreSQL, so pgx refuses 70000 before sending it; a bigint
+	// parameter of that value is 22003 on the store.
+	if _, err := conn.Exec(ctx, `INSERT INTO ty (id, sm) VALUES ($1, $2)`, int32(11), int32(70000)); err == nil || !strings.Contains(err.Error(), "int2") {
+		t.Fatalf("out-of-range int2 param: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO ty (id, sm) VALUES ($1, $2::int8)`, int32(11), int64(70000)); err == nil || !strings.Contains(err.Error(), "22003") {
 		t.Fatalf("out-of-range binary param: %v", err)
 	}
 	scfg, _ := pgx.ParseConfig(pgURL(tc, 0))

@@ -57,6 +57,8 @@ const purgeTruncateWait = 10 * time.Second
 
 // PurgeRangeResult is what the leader's step reports.
 type PurgeRangeResult struct {
+	// Desc is the range as the collection left it: narrower than the
+	// range the purge listed when a split applied before the collection.
 	Desc kvpb.RangeDescriptor
 	// Threshold is the time the range collected at.
 	Threshold hlc.Timestamp
@@ -98,18 +100,26 @@ func (s *Store) PurgeRangeBelow(ctx context.Context, rangeID base.RangeID, start
 	if desc.StartKey.Compare(start) < 0 || end.Compare(desc.EndKey) < 0 {
 		return res, fmt.Errorf("%s spans %s to %s, beyond the purged span: a purge acts on whole ranges", rangeID, keys.Pretty(desc.StartKey), keys.Pretty(desc.EndKey))
 	}
-	res.Desc = desc
 	r.resolveIntentsForPurge(ctx, desc)
 
 	res.Threshold = s.cfg.Clock.Now()
 	if !limit.IsEmpty() && limit.Less(res.Threshold) {
 		res.Threshold = limit
 	}
+	if k := s.cfg.TestingKnobs.BeforePurgeCollect; k != nil {
+		k(rangeID)
+	}
 	removed, err := r.collectGarbage(ctx, res.Threshold, false, nil)
 	if err != nil {
 		return res, err
 	}
 	res.Removed = removed
+	// The range as the collection left it, not as it was checked: a split
+	// that applied in between (a load-based split, the purge's own of
+	// another span) took the right-hand side away, with the threshold
+	// that side had then, and the purge must reach that side itself. A
+	// split that applies after the collection copies the new threshold.
+	res.Desc = r.Desc()
 	gcIndex := r.AppliedIndex()
 
 	// Followers first, then the log: truncating beneath a follower that

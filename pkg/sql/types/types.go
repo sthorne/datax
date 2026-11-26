@@ -168,6 +168,14 @@ type Datum struct {
 	// offset ("2026-08-30 01:02:03", not "...+00"). The value is the same
 	// UTC wall-clock nanosecond count either way; Compare ignores it.
 	NoTZ bool `json:"notz,omitempty"`
+	// W is a TYPE HINT, never stored: an Int datum's integer width, 2
+	// (smallint) or 4 (integer), 0 being 8 (bigint). An integer literal
+	// that fits in int4 carries 4, a value read from an int2 or int4
+	// column or cast to one carries its width, and integer arithmetic
+	// gives its result the wider operand's width, overflowing at it
+	// (IntWidth, IntFits). The value is the same either way; Compare
+	// and storage ignore it.
+	W int8 `json:"-"`
 	// Pad is DISPLAY-ONLY: a String datum read from (or written to) a
 	// CHAR(n) column renders blank-padded to n characters. S keeps the
 	// trailing-space-trimmed text that equality, grouping and storage
@@ -187,7 +195,10 @@ type Datum struct {
 	// Loc is a READ hint, never stored: a String datum the session took
 	// from a statement's literal or text parameter carries the
 	// session's TimeZone, in which it reads as a TIMESTAMPTZ when its
-	// text names no offset. nil is UTC.
+	// text names no offset; a Date datum a CASE or coalesce-like call
+	// yielded, where its arms could not be typed, carries it too, and
+	// becomes a TIMESTAMPTZ (or compares with one) at its midnight there
+	// (DateMidnight). nil is UTC.
 	Loc *time.Location `json:"-"`
 }
 
@@ -197,6 +208,49 @@ func NewInt(v int64) Datum     { return Datum{Fam: Int, I: v} }
 func NewFloat(v float64) Datum { return Datum{Fam: Float, F: v} }
 func NewString(v string) Datum { return Datum{Fam: String, S: v} }
 func NewBool(v bool) Datum     { return Datum{Fam: Bool, B: v} }
+
+// IntWidth is an Int datum's integer width: 2, 4 or 8 (see W).
+func (d Datum) IntWidth() int32 {
+	if d.W == 2 || d.W == 4 {
+		return int32(d.W)
+	}
+	return 8
+}
+
+// WithIntWidth returns d carrying integer width w (2, 4; anything else
+// is 8).
+func (d Datum) WithIntWidth(w int32) Datum {
+	if w == 2 || w == 4 {
+		d.W = int8(w)
+	} else {
+		d.W = 0
+	}
+	return d
+}
+
+// IntWidthName is the PostgreSQL name of an integer width (2, 4,
+// anything else 8): smallint, integer, bigint.
+func IntWidthName(w int32) string {
+	switch w {
+	case 2:
+		return "smallint"
+	case 4:
+		return "integer"
+	}
+	return "bigint"
+}
+
+// IntFits reports whether v is in range of integer width w (2, 4;
+// anything else 8).
+func IntFits(v int64, w int32) bool {
+	switch w {
+	case 2:
+		return v >= math.MinInt16 && v <= math.MaxInt16
+	case 4:
+		return v >= math.MinInt32 && v <= math.MaxInt32
+	}
+	return true
+}
 
 // NewTimestamp is UTC nanoseconds since the Unix epoch.
 func NewTimestamp(nanos int64) Datum { return Datum{Fam: Timestamp, I: nanos} }
@@ -284,6 +338,25 @@ func DateNanos(days int64) (int64, error) {
 		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
 	}
 	return days * NanosPerDay, nil
+}
+
+// DateMidnight is the timestamp a date becomes, as PostgreSQL's
+// date2timestamptz and date2timestamp make it: its midnight read in loc
+// for a timestamp with time zone (loc is the session's TimeZone), its
+// wall-clock midnight for one without (loc nil). Every conversion of a
+// date to a timestamp goes through it — a cast, a comparison, an
+// assignment to a column, a CASE or set operation's common type — so
+// they agree. ErrTimestampRange for a date outside the timestamp range.
+func DateMidnight(days int64, loc *time.Location) (int64, error) {
+	n, err := DateNanos(days)
+	if err != nil || loc == nil || loc == time.UTC {
+		return n, err
+	}
+	n = WallInZone(n, loc)
+	if n < minTimestamp.UnixNano() || n >= maxTimestamp.UnixNano() {
+		return 0, fmt.Errorf("%w: %s (1678-01-01 to 2261-12-31)", ErrTimestampRange, NewDate(days).Text())
+	}
+	return n, nil
 }
 
 // TimeNanos is t as UTC Unix nanoseconds, or ErrTimestampRange when t
@@ -551,7 +624,7 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 		}
 		return NewDate(days), nil
 	case d.Fam == Date && target == Timestamp:
-		n, err := DateNanos(d.I)
+		n, err := DateMidnight(d.I, d.Loc)
 		if err != nil {
 			return Datum{}, err
 		}
@@ -622,10 +695,26 @@ func (d Datum) Coerce(target Family) (Datum, error) {
 	return Datum{}, fmt.Errorf("cannot use %s value as %s", d.Fam, target)
 }
 
+// CoerceIn is Coerce under the session's TimeZone (nil: UTC): a date
+// becomes a timestamp with time zone at its midnight in loc
+// (DateMidnight). Pass nil for a timestamp without time zone, whose
+// date is its wall-clock midnight.
+func (d Datum) CoerceIn(target Family, loc *time.Location) (Datum, error) {
+	if !d.Null && d.Fam == Date && target == Timestamp {
+		n, err := DateMidnight(d.I, loc)
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimestamp(n), nil
+	}
+	return d.Coerce(target)
+}
+
 // Compare returns -1/0/1; comparing with NULL or across incomparable types
 // returns an error (callers treat NULL comparisons as "no match"). A
-// date against a timestamp with time zone promotes the date to its UTC
-// midnight; CompareIn takes the session's zone.
+// date against a timestamp with time zone promotes the date to its
+// midnight in the date's Loc (UTC when it has none); CompareIn takes
+// the session's zone.
 func (d Datum) Compare(o Datum) (int, error) { return d.CompareIn(o, nil) }
 
 // CompareIn is Compare under the session's TimeZone (nil: UTC), which
@@ -639,8 +728,14 @@ func (d Datum) CompareIn(o Datum, loc *time.Location) (int, error) {
 	}
 	switch {
 	case d.Fam == Date && o.Fam == Timestamp:
+		if loc == nil {
+			loc = d.Loc
+		}
 		return compareDateTimestamp(d.I, o, loc), nil
 	case d.Fam == Timestamp && o.Fam == Date:
+		if loc == nil {
+			loc = o.Loc
+		}
 		return -compareDateTimestamp(o.I, d, loc), nil
 	}
 	if d.Fam == Int && o.Fam == Float {
@@ -759,9 +854,16 @@ func compareDateTimestamp(days int64, ts Datum, loc *time.Location) int {
 	case days >= maxTimestampDay:
 		return 1
 	}
-	n := days * NanosPerDay
-	if !ts.NoTZ && loc != nil && loc != time.UTC {
-		n = WallInZone(n, loc)
+	if ts.NoTZ {
+		loc = nil
+	}
+	n, err := DateMidnight(days, loc)
+	if err != nil {
+		// The zone's offset carried a date at the range's edge out.
+		if days < (minTimestampDay+maxTimestampDay)/2 {
+			return -1
+		}
+		return 1
 	}
 	return cmpInt(n, ts.I)
 }

@@ -2105,6 +2105,16 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **A `float8` value stores into a `numeric` column, and `float8::numeric`
+  keeps 15 significant digits**, as in PostgreSQL (was PG-T-033). An
+  `INSERT`, `INSERT ... SELECT`, `UPDATE` or `ON CONFLICT DO UPDATE`
+  storing one failed with `22P02 cannot use FLOAT8 value as DECIMAL`; it
+  now converts as `float8_numeric` does and the column's scale rounds it.
+  The cast printed the float's shortest exact digits
+  (`(0.1::float8 + 0.2::float8)::numeric` was `0.30000000000000004`); it
+  is now `0.3`. `numeric[]` and `float8[]` values store into `int2[]` /
+  `int4[]` / `int8[]` (and `float8[]` into `numeric[]`) columns element
+  by element with the scalar assignment casts, where each was `22P02`.
 - **A date outside the timestamp range is refused, not wrapped, when it
   becomes a timestamp.** `'1500-01-01'::date::timestamptz` returned
   `2084-07-20 23:34:33.709552+00`: the date's midnight overflowed the
@@ -2124,6 +2134,22 @@ state or the internode protocol does, and an entry below says so.
   against a `timestamptz`, as wall time against a `timestamp` — in
   filters, index and primary-key spans, joins and subqueries; a date
   outside the timestamp range is before or after every timestamp.
+- **A date becomes a `timestamptz` at its midnight in the session's
+  `TimeZone` everywhere.** The simple `CASE x WHEN y`, `IS [NOT]
+  DISTINCT FROM` and `ANY` / `ALL` over an array still compared a date
+  with a `timestamptz` at UTC midnight, and a date stored into a
+  `timestamptz` column (`INSERT`, `UPDATE`, `ON CONFLICT DO UPDATE`, an
+  expression `DEFAULT`, `INSERT ... SELECT`, a date parameter) was
+  stored at UTC midnight. A set operation or a `VALUES` list mixing a
+  date and a timestamp now meets at the timestamp type (a `UNION` met as
+  text, and sorted as text); a `CASE`, `coalesce`, `greatest`, `least`
+  or `nullif` over a date and a timestamp is the timestamp type (it was
+  its first arm's, a date cutting the timestamps to their day), so
+  `ORDER BY`, `DISTINCT`, `GROUP BY`, a window's `PARTITION BY` and
+  `ORDER BY`, `min` and `max` over it order the date at its midnight.
+  With a timestamp without time zone the result is one too, and the
+  date its wall-clock midnight. An expression index over a timestamp
+  expression is bounded by a date under UTC (it refused one).
 - **The functions of sealed tables in a multi-statement query or a
   pipeline.** `datax_rotate_tenant_key`, `datax_destroy_old_key_versions`,
   `datax_remove_tenant_rows` and `datax_destroy_tenant_key` failed with
@@ -2146,9 +2172,10 @@ state or the internode protocol does, and an entry below says so.
   a view, a `WITH` query or a subquery in `FROM` was described as
   `int8` (OID 20), and a view's `pg_attribute` and
   `information_schema.columns` rows said `bigint`; they now carry
-  `int2` / `int4` as in PostgreSQL (the catalog rows of a view created
-  before this say `bigint` until it is recreated; its results are
-  described right). A set operation's integer column is its
+  `int2` / `int4` as in PostgreSQL. A view created by an older binary,
+  whose stored columns say `int8`, describes the same way without being
+  recreated: the catalogs derive its integer widths from its query. A
+  set operation's integer column is its
   widest member's: `int2 UNION int8` took the first member's width and
   described as `int2`, whatever the values; it is now `int8`.
 - **`sum` over `int8` is `numeric`**, as in PostgreSQL, so a total past
@@ -2163,6 +2190,32 @@ state or the internode protocol does, and an entry below says so.
   the result dropped the declared scale it tracked. It now carries the
   largest scale among its inputs, as PostgreSQL's numeric addition does.
   Expression results still render without it.
+- **`int2`, `int4` and `int8` are types of their own in expressions**
+  (was PG-F-016). An integer literal was a bigint and an `INT4` value
+  became one in any expression, so `2147483647::int4 + 1` was
+  `2147483648`, `pg_typeof(1)` said `int8` and `SELECT 1` or `SELECT
+  int4_col + 1` described as `int8`. As in PostgreSQL:
+  - An integer literal is an `integer` when it fits, else a `bigint`
+    (else `numeric`).
+  - `+ - * / %` and the bitwise operators are of their wider operand's
+    type (`int2 + int2` is `int2`, `int2 + int4` `int4`, anything with
+    an `int8` `int8`), and a result out of that type's range is `22003
+    smallint / integer / bigint out of range` (`int8` overflow said
+    `integer out of range`; `-9223372036854775808 / -1` wrapped). A
+    shift wraps in its left operand's type (`1 << 31` is
+    `-2147483648`). `CASE`, `COALESCE`, `GREATEST`, `LEAST` and `NULLIF`
+    are of their arms' common type, `MIN`, `MAX` and the bitwise
+    aggregates of their argument's.
+  - `pg_typeof` of an integer says `smallint`, `integer` or `bigint`
+    (it said `int8`); `to_regtype('int4')` / `('integer')` is `23` and
+    `to_regtype('int2')` `21` (both were `20`).
+  - Computed columns describe as `int2` / `int4` / `int8` on the wire
+    (single-table, join, grouped, FROM-less, `VALUES`, `RETURNING`), and
+    so does a bind parameter compared with, stored into or cast to an
+    `INT2` / `INT4` column, so a client encodes it in that width (pgx
+    refuses `70000` for an `int2` parameter, as against PostgreSQL).
+    `CREATE TABLE ... AS SELECT int2_col + 1` makes an `INT4` column.
+  - `sum` over `int2` / `int4` stays `bigint`, over `int8` `numeric`.
 - **Float and integer edge cases match PostgreSQL 16.**
   - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's
     `rint` does: `round(2.5::float8)` is `2` (was `3`), and

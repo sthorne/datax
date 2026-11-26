@@ -127,8 +127,9 @@ syntax error or `0A000` feature not supported):
   value is stored trimmed, so `c = 'ab  '` compares the literal with
   its spaces (PostgreSQL trims both sides) while `c = 'ab'`, `length`
   and `||` agree; expression results lose the modifier and describe
-  as the family (`a + 1` over an `INT4` is `INT8`, `ts + '1 day'` over
-  a `TIMESTAMP` stays a `TIMESTAMP`, as `::timestamp` yields one, `GROUPING()` is `INT8`),
+  as the family (`ts + '1 day'` over a `TIMESTAMP` stays a `TIMESTAMP`,
+  as `::timestamp` yields one), except that integer expressions keep
+  PostgreSQL's widths (`a + 1` over an `INT4` is `INT4`, see below),
   and a bind parameter for a `TIMESTAMP` column describes as
   `timestamptz` (pass UTC); expression results render in canonical
   form, without the declared scale PostgreSQL keeps (`a + a` over a
@@ -156,10 +157,20 @@ syntax error or `0A000` feature not supported):
   `TIME WITH TIME ZONE` is refused at parse (`42601`).
 - **Bare decimal literals are DECIMAL** — same as PostgreSQL, but note
   `SELECT 1.5` describes as `NUMERIC`, not `float8`.
-- **Integer and float function results**: the bitwise operators work
-  on INT8 whatever the operands' declared widths, so a shift that
-  overflows an `INT2` or `INT4` (`1 << 31`) yields the INT8 value
-  where PostgreSQL wraps in the narrower type. The float functions
+- **Integer widths** follow PostgreSQL: an integer literal is an
+  `integer` when it fits, operators are of their wider operand's type
+  and overflow at it (`22003 integer out of range`), a shift wraps in
+  its left operand's type, and `CASE` / `COALESCE` / `GREATEST` /
+  `LEAST` / `NULLIF`, `MIN` / `MAX` and the bitwise aggregates keep
+  their arguments' width. Other functions' integer results are
+  `bigint` where PostgreSQL keeps the argument's type (`abs(int4_col)`,
+  `GROUPING()` and `date - date` are `bigint` here, `integer` there),
+  and so is a bind parameter or a quoted literal in arithmetic
+  (`int4_col + $1` is `bigint`; PostgreSQL types the parameter `int4`,
+  as datax's ParameterDescription does). `pg_typeof` names an integer
+  `smallint` / `integer` / `bigint` as PostgreSQL does, but other types
+  by their `pg_type` name (`float8`, `_int8`). **Integer and float
+  function results**: the float functions
   (`sin`, `exp`, `ln`, `cbrt`, ...) come from Go's math library and
   can differ from PostgreSQL's (the C library's) in the last digit;
   the degree-based ones (`sind`, `cosd`, ...) are exact at the special
@@ -366,13 +377,10 @@ syntax error or `0A000` feature not supported):
   and a system catalog's OID is PostgreSQL's (`'pg_class'::regclass`
   is 1259). The `to_regclass`, `to_regproc`, `to_regprocedure`,
   `to_regnamespace` and `to_regrole` lookups return the OID (`NULL`
-  where the cast would fail), not the name. A `float8` value stored
-  into a `numeric` column is refused (`22P02`), where PostgreSQL converts
-  it: write `x::numeric`. That cast keeps the float's shortest exact
-  digits (`(0.1::float8 + 0.2::float8)::numeric` is
-  `0.30000000000000004`), where PostgreSQL rounds to 15 significant
-  digits (`0.3`). A numeric or `float8` value stored into an integer
-  column converts as in PostgreSQL.
+  where the cast would fail), not the name. A numeric or `float8` value
+  stored into an integer or `numeric` column (and a `numeric[]` or
+  `float8[]` value into an integer or `numeric` array column) converts
+  as in PostgreSQL.
 - **`COPY FROM STDIN` outside a transaction block is not atomic.** It
   commits in chunks (128 rows / 1 MiB) as the stream arrives, so a
   failure partway leaves the earlier chunks committed — the error names
@@ -465,7 +473,8 @@ syntax error or `0A000` feature not supported):
 - **Time zones**: `TimeZone` governs `TIMESTAMPTZ` as in PostgreSQL
   (input without an offset, text output, `::text`, `::date`,
   `date_trunc`, `extract`, `to_char`, `current_date`, day and month
-  arithmetic), and `AT TIME ZONE` / `timezone()` convert both ways; the
+  arithmetic, a `date` becoming a `TIMESTAMPTZ` at its midnight in the
+  zone), and `AT TIME ZONE` / `timezone()` convert both ways; the
   differences: abbreviations are the fixed-offset ones of PostgreSQL's
   default set (not configurable through `timezone_abbreviations`), and
   `json_agg` / `jsonb_agg` render a `TIMESTAMPTZ` in UTC. Timestamps

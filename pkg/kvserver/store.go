@@ -154,6 +154,10 @@ type TestingKnobs struct {
 	// it waits for its latches — lets a test change the range (a split)
 	// in that window (issue #389).
 	BeforeLatch func(ba *kvpb.BatchRequest)
+	// BeforePurgeCollect runs on a purge's leader after it has checked
+	// the range's bounds and before it collects — lets a test split the
+	// range in that window.
+	BeforePurgeCollect func(rangeID base.RangeID)
 	// AfterLatch runs after a batch acquires its latches, before it is
 	// evaluated — lets tests hold a latch open deliberately.
 	AfterLatch func(ba *kvpb.BatchRequest)

@@ -47,9 +47,10 @@ func runExprCases(t *testing.T, ctx context.Context, s *sql.Session, cases []exp
 }
 
 // TestExpressionResultTypes: computed output columns describe on the
-// wire as their real types — an integer sum as int8, a cast as its
-// target, a builtin by its declared result — so drivers scan them
-// without a text round trip.
+// wire as their real types — integer arithmetic as its wider operand's
+// type (an integer literal is an int4), a cast as its target, a builtin
+// by its declared result — so drivers scan them without a text round
+// trip.
 func TestExpressionResultTypes(t *testing.T) {
 	tc := Start(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -66,6 +67,7 @@ func TestExpressionResultTypes(t *testing.T) {
 	const (
 		oidBool        = 16
 		oidInt8        = 20
+		oidInt4        = 23
 		oidText        = 25
 		oidFloat8      = 701
 		oidNumeric     = 1700
@@ -76,9 +78,9 @@ func TestExpressionResultTypes(t *testing.T) {
 		q    string
 		oids []uint32
 	}{
-		{`SELECT 1 + 1, 2 * 3.5, 7 / 2.0, 'a' || 'b', 1 < 2`, []uint32{oidInt8, oidNumeric, oidNumeric, oidText, oidBool}},
+		{`SELECT 1 + 1, 2 * 3.5, 7 / 2.0, 'a' || 'b', 1 < 2`, []uint32{oidInt4, oidNumeric, oidNumeric, oidText, oidBool}},
 		{`SELECT id * 2, price * 2, length(name), upper(name), round(price), at::date, ok IS TRUE FROM r`, []uint32{oidInt8, oidNumeric, oidInt8, oidText, oidNumeric, oidDate, oidBool}},
-		{`SELECT '5'::int8, 1::float8, 2 ^ 3, sqrt(4), coalesce(price, 0), greatest(id, 3), CASE WHEN ok THEN 1 ELSE 0 END FROM r`, []uint32{oidInt8, oidFloat8, oidInt8, oidFloat8, oidNumeric, oidInt8, oidInt8}},
+		{`SELECT '5'::int8, 1::float8, 2 ^ 3, sqrt(4), coalesce(price, 0), greatest(id, 3), CASE WHEN ok THEN 1 ELSE 0 END FROM r`, []uint32{oidInt8, oidFloat8, oidInt8, oidFloat8, oidNumeric, oidInt8, oidInt4}},
 		{`SELECT now() > at, at + '1 day', extract(year FROM at) FROM r`, []uint32{oidBool, oidTimestamptz, oidNumeric}},
 	}
 	for i, c := range cases {

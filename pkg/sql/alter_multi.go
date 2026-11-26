@@ -581,7 +581,7 @@ func (s *Session) applyAddColumn(ctx context.Context, txn *kvclient.Txn, desc *c
 		if err != nil {
 			return 0, newErrf(CodeSyntaxError, "DEFAULT for column %q: %v", def.Name, err)
 		}
-		d, cerr := coerceColumn(col, d)
+		d, cerr := coerceColumnIn(col, d, s.zone())
 		if cerr != nil {
 			return 0, cerr
 		}

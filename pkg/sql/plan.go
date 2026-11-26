@@ -65,11 +65,14 @@ func resolveProjection(desc *catalog.TableDescriptor, exprs []parser.SelectExpr)
 		if typ == types.Unknown {
 			typ = types.String
 		}
-		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) bool {
+		noTZ := typ == types.Timestamp && exprNoTZ(e, func(n string) (types.Family, bool) {
+			c, ok := desc.Col(stripQualifier(n))
+			return c.Type, ok
+		}, func(n string) bool {
 			c, ok := desc.Col(stripQualifier(n))
 			return ok && c.NoTZ
 		})
-		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ, NoTZ: noTZ}})
+		proj = append(proj, projCol{expr: &e, name: name, col: catalog.Column{Type: typ, NoTZ: noTZ, Width: exprWidth(typ, e, descColWidth(desc))}})
 	}
 	return proj, nil
 }
@@ -198,8 +201,9 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 		}
 		if t.Union != nil {
 			// A set operation's output is named by its head and typed by
-			// unifying every member (the numeric families lift, anything
-			// else meets as text); a VALUES list's as execution types it
+			// unifying every member (the numeric families lift, a date
+			// and a timestamp meet at timestamp, anything else meets as
+			// text); a VALUES list's as execution types it
 			// (resolveValuesTypes).
 			head := *t
 			head.Union, head.OrderBy, head.Limit, head.Offset = nil, nil, -1, 0
@@ -221,6 +225,15 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				}
 				asts, memberCols = append(asts, m), append(memberCols, mc)
 			}
+			for i := range cols {
+				ci := make([]ResultColumn, len(memberCols))
+				for mi, mc := range memberCols {
+					ci[mi] = mc[i]
+				}
+				if noTZ, ok := setOpDates(ci); ok {
+					cols[i].NoTZ = noTZ
+				}
+			}
 			if valuesList(asts) {
 				for i := range cols {
 					fam, verr := valuesColumnType(asts, i, func(mi int) types.Family { return memberCols[mi][i].Type })
@@ -228,6 +241,11 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						return nil, ToSQLError(verr)
 					}
 					cols[i].Type = fam
+					ci := make([]ResultColumn, len(memberCols))
+					for mi, mc := range memberCols {
+						ci[mi] = mc[i]
+					}
+					cols[i].Width = unifyWidth(fam, ci)
 				}
 				return cols, nil
 			}
@@ -268,7 +286,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				}
 				cols := make([]ResultColumn, len(gq.outs))
 				for i, oc := range gq.outs {
-					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+					cols[i] = oc.result()
 				}
 				return cols, nil
 			}
@@ -310,7 +328,11 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 						fam = sc[0].Type
 					}
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+				w := exprWidth(fam, se.Expr, nil)
+				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
+					w = 0
+				}
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil), Width: w})
 			}
 			return cols, nil
 		}
@@ -337,7 +359,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				}
 				cols := make([]ResultColumn, len(gq.outs))
 				for i, oc := range gq.outs {
-					cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+					cols[i] = oc.result()
 				}
 				return cols, nil
 			}
@@ -347,7 +369,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 			}
 			cols := make([]ResultColumn, len(proj))
 			for i, p := range proj {
-				cols[i] = exprResult(p.name, p.typ, p.ref.col)
+				cols[i] = p.result()
 			}
 			return cols, nil
 		}
@@ -358,7 +380,7 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 			}
 			cols := make([]ResultColumn, len(gq.outs))
 			for i, oc := range gq.outs {
-				cols[i] = ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ}
+				cols[i] = oc.result()
 			}
 			return cols, nil
 		}

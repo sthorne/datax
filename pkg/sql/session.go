@@ -704,6 +704,9 @@ func (s *Session) virtualEnv(ctx context.Context, txn *kvclient.Txn, scope envTa
 		if !listed(d) {
 			continue
 		}
+		// A view stored before views kept integer widths describes
+		// as its query does.
+		d = s.withViewWidths(ctx, d)
 		env.Tables = append(env.Tables, d)
 		// Statistics count every row of a table: a role that may not read
 		// the rows sees none, and neither does one its row-security
@@ -1783,6 +1786,18 @@ func (s *Session) forgetDDL() {
 // paths, arithmetic) is environment-independent.
 type exprEnv interface {
 	col(name string) (types.Datum, error)
+	// colWidth is a column's integer width (2, 4 or 8; 8 for a name
+	// that is no integer column), which the value col returns carries.
+	colWidth(name string) int32
+}
+
+// typedCol is a column's value as an expression reads it: an integer
+// carries the column's width (types.Datum.W).
+func typedCol(d types.Datum, col *catalog.Column) types.Datum {
+	if d.Fam == types.Int && col.Type == types.Int {
+		return d.WithIntWidth(col.IntWidth())
+	}
+	return d
 }
 
 // tableEnv is the single-table environment: descriptor + row map. A nil
@@ -1791,6 +1806,20 @@ type exprEnv interface {
 type tableEnv struct {
 	desc *catalog.TableDescriptor
 	row  map[catalog.ColumnID]types.Datum
+}
+
+// kindEnv is an exprEnv that can type its columns: the expressions
+// whose type is their arms' common type (a CASE, coalesce, greatest,
+// least, nullif) find it from them (dateArmsKind).
+type kindEnv interface {
+	colKind(name string) (catalog.Column, bool)
+}
+
+func (t tableEnv) colKind(name string) (catalog.Column, bool) {
+	if t.desc == nil {
+		return catalog.Column{}, false
+	}
+	return t.desc.Col(name)
 }
 
 func (t tableEnv) col(name string) (types.Datum, error) {
@@ -1805,7 +1834,17 @@ func (t tableEnv) col(name string) (types.Datum, error) {
 	if !ok {
 		d = types.DNull
 	}
-	return d, nil
+	return typedCol(d, &col), nil
+}
+
+func (t tableEnv) colWidth(name string) int32 {
+	if t.desc == nil {
+		return 8
+	}
+	if col, ok := t.desc.Col(name); ok {
+		return col.IntWidth()
+	}
+	return 8
 }
 
 // evalExpr evaluates an expression against a single table's row — the
@@ -1834,17 +1873,27 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 		}
 		base = d
 	case e.Case != nil:
-		d, err := evalCase(e.Case, env, params)
+		d, err := evalCase(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
 		base = d
+		if base.Fam == types.Int {
+			// The CASE's type is its arms' common one, whatever arm
+			// chose the value.
+			base = base.WithIntWidth(intExprWidth(parser.Expr{Case: e.Case}, env.colWidth))
+		}
 	case e.Func != "":
 		d, err := evalFunc(e, env, params)
 		if err != nil {
 			return types.Datum{}, err
 		}
 		base = d
+		if base.Fam == types.Int {
+			// COALESCE and its kin are of their arguments' common type;
+			// any other function's integer result is a bigint.
+			base = base.WithIntWidth(intExprWidth(parser.Expr{Func: e.Func, Args: e.Args}, env.colWidth))
+		}
 	case e.Lit != nil:
 		base = *e.Lit
 	case e.Param > 0:
@@ -1852,6 +1901,12 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return types.Datum{}, newErrf(CodeInvalidParameter, "missing value for parameter $%d", e.Param)
 		}
 		base = params[e.Param-1]
+		if base.Fam == types.Int {
+			// A parameter is a bigint here whatever produced its value
+			// (an EXECUTE argument's literal, say), as intExprWidth
+			// types it.
+			base.W = 0
+		}
 	case e.Column != "":
 		d, err := env.col(e.Column)
 		if err != nil {
@@ -1932,6 +1987,9 @@ func evalExprEnv(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum,
 			return base, nil
 		}
 		d, err := builtins.CastIn(base, e.Cast, e.Zone)
+		if err == nil && d.Fam == types.Int {
+			d = d.WithIntWidth(castIntWidth(e.Cast))
+		}
 		return d, builtinErr(err)
 	}
 	return base, nil
@@ -2018,6 +2076,9 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 		return d, builtinErr(err)
 	case builtins.IsBitwiseOp(op):
 		d, err := builtins.Bitwise(l, op, r)
+		if err == nil && d.Fam == types.Int {
+			d = intBitwiseWidth(d, l, op, r)
+		}
 		return d, builtinErr(err)
 	}
 	if d, ok, err := builtins.DateArithIn(l, op, r, loc); ok {
@@ -2054,41 +2115,19 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 			return d, nil
 		}
 		d, err := builtins.Mod(l, r)
+		if err == nil && d.Fam == types.Int && l.Fam == types.Int && r.Fam == types.Int {
+			// The remainder is smaller than the divisor: it fits.
+			d = d.WithIntWidth(max(l.IntWidth(), r.IntWidth()))
+		}
 		return d, builtinErr(err)
 	case "^":
 		d, err := builtins.Power(l, r)
 		return d, builtinErr(err)
 	}
 	if l.Fam == types.Int && r.Fam == types.Int {
-		// Integer arithmetic overflows to an error, never wraps.
 		switch op {
-		case "+":
-			s := l.I + r.I
-			if (s > l.I) != (r.I > 0) && r.I != 0 {
-				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-			}
-			return types.NewInt(s), nil
-		case "-":
-			s := l.I - r.I
-			if (s < l.I) != (r.I > 0) && r.I != 0 {
-				return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-			}
-			return types.NewInt(s), nil
-		case "*":
-			if l.I != 0 && r.I != 0 {
-				p := l.I * r.I
-				if p/r.I != l.I || (l.I == -1 && r.I == math.MinInt64) || (r.I == -1 && l.I == math.MinInt64) {
-					return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "integer out of range")
-				}
-				return types.NewInt(p), nil
-			}
-			return types.NewInt(0), nil
-		case "/":
-			// Integer division truncates (PostgreSQL semantics).
-			if r.I == 0 {
-				return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
-			}
-			return types.NewInt(l.I / r.I), nil
+		case "+", "-", "*", "/":
+			return intArith(l, op, r)
 		}
 	}
 	// Exact decimal arithmetic when either side is DECIMAL and the other
@@ -2159,6 +2198,84 @@ func applyArithIn(l types.Datum, op string, r types.Datum, loc *time.Location) (
 	return types.Datum{}, newErrf(CodeFeatureNotSupported, "unsupported operator %q", op)
 }
 
+// intArith evaluates l op r (+, -, *, /) for two integers as
+// PostgreSQL's integer operators do: the result is of the wider
+// operand's type (int2 + int2 is int2, int2 + int4 int4, anything with
+// an int8 int8), and a result out of that type's range is 22003
+// "smallint / integer / bigint out of range", never wrapped. Division
+// truncates toward zero.
+func intArith(l types.Datum, op string, r types.Datum) (types.Datum, error) {
+	w := max(l.IntWidth(), r.IntWidth())
+	var v int64
+	overflow := false
+	switch op {
+	case "+":
+		v = l.I + r.I
+		overflow = (v > l.I) != (r.I > 0) && r.I != 0
+	case "-":
+		v = l.I - r.I
+		overflow = (v < l.I) != (r.I > 0) && r.I != 0
+	case "*":
+		if l.I != 0 && r.I != 0 {
+			v = l.I * r.I
+			overflow = v/r.I != l.I || (l.I == -1 && r.I == math.MinInt64) || (r.I == -1 && l.I == math.MinInt64)
+		}
+	case "/":
+		if r.I == 0 {
+			return types.Datum{}, newErrf(CodeDivisionByZero, "division by zero")
+		}
+		if r.I == -1 {
+			// math.MinInt64 / -1 does not trap in Go: it wraps.
+			v = -l.I
+			overflow = l.I == math.MinInt64
+		} else {
+			v = l.I / r.I
+		}
+	}
+	if overflow || !types.IntFits(v, w) {
+		return types.Datum{}, newErrf(CodeNumericValueOutOfRange, "%s out of range", types.IntWidthName(w))
+	}
+	return types.NewInt(v).WithIntWidth(w), nil
+}
+
+// intBitwiseWidth gives the result d of the bitwise l op r its
+// PostgreSQL type: a shift keeps its left operand's (and wraps at it,
+// as PostgreSQL's int2shl / int4shl do on x86-64, which take the count
+// modulo 32), the others take the wider operand's, which an and, or or
+// xor of two values in range cannot leave. A text operand counts as a
+// bigint.
+func intBitwiseWidth(d, l types.Datum, op string, r types.Datum) types.Datum {
+	width := func(x types.Datum) int32 {
+		if x.Fam == types.Int {
+			return x.IntWidth()
+		}
+		return 8
+	}
+	switch op {
+	case "<<", ">>":
+		switch w := width(l); w {
+		case 2, 4:
+			count := r
+			if count.Fam != types.Int {
+				count, _ = count.Coerce(types.Int) // Bitwise has read it
+			}
+			n := uint64(count.I) & 31
+			if op == "<<" {
+				v := int32(l.I) << n
+				if w == 2 {
+					v = int32(int16(v))
+				}
+				d.I = int64(v)
+			} else {
+				d.I = int64(int32(l.I) >> n)
+			}
+			return d.WithIntWidth(w)
+		}
+		return d.WithIntWidth(8)
+	}
+	return d.WithIntWidth(max(width(l), width(r)))
+}
+
 // evalFunc evaluates a builtin scalar call ("now" never reaches here —
 // the session splices it before execution).
 func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
@@ -2169,6 +2286,22 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 			return types.Datum{}, err
 		}
 		args[i] = d
+	}
+	if isArmsFunc(e.Func) {
+		// Dates among a timestamp's arguments become timestamps first
+		// (meetDate), so coalesce, greatest, least and nullif return the
+		// common type and compare at the date's midnight.
+		for i, a := range args {
+			if a.Null || a.Fam != types.Date {
+				continue
+			}
+			c, err := meetDate(a, e, env)
+			if err != nil {
+				return types.Datum{}, err
+			}
+			args[i] = c
+		}
+		meetArgDates(args, e.Zone)
 	}
 	if b, ok := builtins.Lookup(e.Func); ok && !b.Session {
 		d, err := b.CallIn(args, e.Zone)
@@ -2188,6 +2321,11 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		}
 		return types.NewString(quoteIdentifier(args[0].Text())), nil
 	case "pg_typeof":
+		if args[0].Fam == types.Int {
+			// An integer is named by its width, as PostgreSQL's regtype
+			// output names it: smallint, integer, bigint.
+			return types.NewString(types.IntWidthName(args[0].IntWidth())), nil
+		}
 		return types.NewString(vtable.TypeName(args[0].Fam)), nil
 	case "to_regtype":
 		// The type's OID when the name is a type's, NULL when it is not:
@@ -2203,6 +2341,18 @@ func evalFunc(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, er
 		fam, err := types.ParseType(name)
 		if err != nil {
 			return types.DNull, nil
+		}
+		if fam == types.Int || fam == types.ArrayOf(types.Int) {
+			// int2 / smallint and int4 / int / integer are types of their
+			// own (21, 23; arrays 1005, 1007), not int8's 20.
+			elem := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(name), "[]"))
+			oids := map[int32][2]int64{2: {21, 1005}, 4: {23, 1007}}
+			if o, ok := oids[castIntWidth(elem)]; ok {
+				if fam.IsArray() {
+					return types.NewInt(o[1]), nil
+				}
+				return types.NewInt(o[0]), nil
+			}
 		}
 		return types.NewInt(vtable.TypeOID(fam)), nil
 	case "format_type":
@@ -2368,7 +2518,7 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 				}
 				rhs = v
 			}
-			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -2487,8 +2637,11 @@ func matchesWhereMemo(where []parser.Comparison, desc *catalog.TableDescriptor, 
 }
 
 // evalCase evaluates a CASE expression: the simple form compares the
-// operand with each WHEN value, the searched form tests each condition.
-func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Datum, error) {
+// operand with each WHEN value (a date against a timestamp with time
+// zone at its midnight in loc, the session's TimeZone), the searched
+// form tests each condition.
+func evalCase(e parser.Expr, env exprEnv, params []types.Datum) (types.Datum, error) {
+	ce, loc := e.Case, e.Zone
 	var operand types.Datum
 	if ce.Operand != nil {
 		d, err := evalExprEnv(*ce.Operand, env, params)
@@ -2505,7 +2658,7 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 				return types.Datum{}, err
 			}
 			if !operand.Null && !v.Null {
-				if c, err := operand.Compare(v); err == nil && c == 0 {
+				if c, err := operand.CompareIn(v, loc); err == nil && c == 0 {
 					hit = true
 				}
 			}
@@ -2517,13 +2670,87 @@ func evalCase(ce *parser.CaseExpr, env exprEnv, params []types.Datum) (types.Dat
 			hit = ok
 		}
 		if hit {
-			return evalExprEnv(w.Result, env, params)
+			d, err := evalExprEnv(w.Result, env, params)
+			if err != nil {
+				return d, err
+			}
+			return meetDate(d, e, env)
 		}
 	}
 	if ce.Else != nil {
-		return evalExprEnv(*ce.Else, env, params)
+		d, err := evalExprEnv(*ce.Else, env, params)
+		if err != nil {
+			return d, err
+		}
+		return meetDate(d, e, env)
 	}
 	return types.DNull, nil
+}
+
+// meetArgDates is meetDate by the values, for arguments whose types an
+// environment could not tell: dates among timestamps become timestamps
+// at their midnight, in loc unless every timestamp is without time
+// zone. A date out of the timestamp range is left as it is (it still
+// orders before or after every timestamp).
+func meetArgDates(args []types.Datum, loc *time.Location) {
+	date, ts, noTZ := false, false, true
+	for _, a := range args {
+		switch {
+		case a.Null:
+		case a.Fam == types.Date:
+			date = true
+		case a.Fam == types.Timestamp:
+			ts, noTZ = true, noTZ && a.NoTZ
+		}
+	}
+	if !date || !ts {
+		return
+	}
+	if noTZ {
+		loc = nil
+	}
+	for i, a := range args {
+		if a.Null || a.Fam != types.Date {
+			continue
+		}
+		if n, err := types.DateMidnight(a.I, loc); err == nil {
+			args[i] = types.NewTimestamp(n)
+			args[i].NoTZ = noTZ
+		}
+	}
+}
+
+// meetDate brings a date that e (a CASE, coalesce, greatest, least or
+// nullif) yields, or takes as an argument, to the type e's arms meet
+// at: where they mix a date with a timestamp it is that timestamp
+// (exprFamily, exprNoTZ), and the date becomes its midnight — in the
+// session's TimeZone (e.Zone) for a timestamp with time zone, at wall
+// time for one without (types.DateMidnight). Where the arms cannot be
+// typed (an environment that cannot type its columns) the date carries
+// the zone instead (types.Datum.Loc), and becomes a timestamp with time
+// zone, or compares with one, at its midnight there.
+func meetDate(d types.Datum, e parser.Expr, env exprEnv) (types.Datum, error) {
+	if d.Null || d.Fam != types.Date {
+		return d, nil
+	}
+	mixed, noTZ := dateArmsKind(exprArms(e), env)
+	if !mixed {
+		if e.Zone != nil {
+			d.Loc = e.Zone
+		}
+		return d, nil
+	}
+	loc := e.Zone
+	if noTZ {
+		loc = nil
+	}
+	n, err := types.DateMidnight(d.I, loc)
+	if err != nil {
+		return types.Datum{}, newErrf(CodeDatetimeFieldOverflow, "%v", err)
+	}
+	ts := types.NewTimestamp(n)
+	ts.NoTZ = noTZ
+	return ts, nil
 }
 
 // tsVectorMatchCall reports whether a conjunct is `to_tsvector(config,
@@ -2655,7 +2882,7 @@ func condsHold(conds []parser.Comparison, env exprEnv, params []types.Datum) (bo
 			}
 		}
 		if nullAwareOp(cmp.Op) {
-			ok, err := applyNullAware(cmp.Op, lhs, rhs)
+			ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 			if err != nil {
 				return false, err
 			}
@@ -2757,11 +2984,11 @@ func cond3(cmp parser.Comparison, env exprEnv, params []types.Datum) (bool, bool
 		}
 	}
 	if nullAwareOp(cmp.Op) {
-		ok, err := applyNullAware(cmp.Op, lhs, rhs)
+		ok, err := applyNullAware(cmp.Op, lhs, rhs, cmp.Zone)
 		return ok, false, err
 	}
 	if _, _, q := parser.SplitQuantified(cmp.Op); q {
-		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape)
+		return quantCmp3(cmp.Op, lhs, rhs, cmp.Escape, cmp.Zone)
 	}
 	if lhs.Null || rhs.Null {
 		return false, true, nil
@@ -2891,8 +3118,10 @@ func boolTest(op string, d types.Datum) (bool, error) {
 }
 
 // distinctFrom evaluates x IS [NOT] DISTINCT FROM y: NULLs compare as a
-// value, equal to each other and different from everything else.
-func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
+// value, equal to each other and different from everything else. loc
+// is the session's TimeZone (nil: UTC), at whose midnight a date
+// compares with a timestamp with time zone.
+func distinctFrom(op string, lhs, rhs types.Datum, loc *time.Location) (bool, error) {
 	distinct := lhs.Null != rhs.Null
 	if !lhs.Null && !rhs.Null {
 		if rhs.Fam != lhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
@@ -2900,7 +3129,7 @@ func distinctFrom(op string, lhs, rhs types.Datum) (bool, error) {
 				rhs = c
 			}
 		}
-		c, err := lhs.Compare(rhs)
+		c, err := lhs.CompareIn(rhs, loc)
 		distinct = err != nil || c != 0
 	}
 	return distinct != strings.Contains(op, "NOT"), nil
@@ -2921,22 +3150,18 @@ func nullAwareOp(op string) bool {
 	return false
 }
 
-// applyNullAware evaluates the null-aware operators.
-func applyNullAware(op string, lhs, rhs types.Datum) (bool, error) {
+// applyNullAware evaluates the null-aware operators, under the
+// session's TimeZone loc (nil: UTC).
+func applyNullAware(op string, lhs, rhs types.Datum, loc *time.Location) (bool, error) {
 	if strings.Contains(op, "DISTINCT") {
-		return distinctFrom(op, lhs, rhs)
+		return distinctFrom(op, lhs, rhs, loc)
 	}
 	return boolTest(op, lhs)
 }
 
-// applyCmpOp applies an operator to two values: ordering operators
-// through Compare, the regular-expression operators on text.
-func applyCmpOp(op string, lhs, rhs types.Datum) (bool, error) {
-	return applyCmpOpEsc(op, lhs, rhs, "")
-}
-
-// applyCmpOpEsc is applyCmpOp with a pattern's ESCAPE character ("" =
-// backslash, parser.NoEscape = none).
+// applyCmpOpEsc applies an operator to two values — ordering operators
+// through Compare, the regular-expression operators on text — with a
+// pattern's ESCAPE character ("" = backslash, parser.NoEscape = none).
 func applyCmpOpEsc(op string, lhs, rhs types.Datum, escape string) (bool, error) {
 	return applyCmpOpIn(op, lhs, rhs, escape, nil)
 }
@@ -2987,7 +3212,7 @@ func applyCmpOpIn(op string, lhs, rhs types.Datum, escape string, loc *time.Loca
 	if _, _, ok := parser.SplitQuantified(op); ok {
 		// Quantified comparison over an array value (or a text array
 		// literal '{a,b}'); UNKNOWN is not a match.
-		ok, _, err := quantCmp3(op, lhs, rhs, escape)
+		ok, _, err := quantCmp3(op, lhs, rhs, escape, loc)
 		return ok, err
 	}
 	if lhs.Fam != rhs.Fam && !dateVsTimestamp(lhs.Fam, rhs.Fam) {
@@ -3008,8 +3233,10 @@ func applyCmpOpIn(op string, lhs, rhs types.Datum, escape string, loc *time.Loca
 // UNKNOWN when none does but some comparison is UNKNOWN (a NULL); ALL
 // fails when some element fails and is UNKNOWN when none does but some
 // is UNKNOWN. Over no elements ANY is false and ALL true, whatever x
-// is; a NULL array is UNKNOWN.
-func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, error) {
+// is; a NULL array is UNKNOWN. loc is the session's TimeZone (nil:
+// UTC), at whose midnight a date compares with a timestamp with time
+// zone.
+func quantCmp3(op string, lhs, rhs types.Datum, escape string, loc *time.Location) (bool, bool, error) {
 	base, quant, _ := parser.SplitQuantified(op)
 	if rhs.Null {
 		return false, true, nil
@@ -3034,12 +3261,12 @@ func quantCmp3(op string, lhs, rhs types.Datum, escape string) (bool, bool, erro
 			unknown = true
 			continue
 		}
-		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) {
+		if ed.Fam != lhs.Fam && !(numericFam(ed.Fam) && numericFam(lhs.Fam)) && !dateVsTimestamp(ed.Fam, lhs.Fam) {
 			if c, err := ed.Coerce(lhs.Fam); err == nil {
 				ed = c
 			}
 		}
-		ok, err := applyCmpOpEsc(base, lhs, ed, escape)
+		ok, err := applyCmpOpIn(base, lhs, ed, escape, loc)
 		if err != nil {
 			return false, false, err
 		}
@@ -3108,7 +3335,7 @@ func likeToRegexpEsc(pattern, escape string) string {
 }
 
 // plainCmpOp reports whether op is an ordering comparison the typed
-// Coerce-and-Compare path handles; the rest go through applyCmpOp.
+// Coerce-and-Compare path handles; the rest go through applyCmpOpIn.
 func plainCmpOp(op string) bool {
 	switch op {
 	case "=", "!=", "<", "<=", ">", ">=":

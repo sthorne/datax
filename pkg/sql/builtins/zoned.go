@@ -71,11 +71,11 @@ func CastIn(d types.Datum, typ string, loc *time.Location) (types.Datum, error) 
 	case d.Fam == types.Timestamp && d.NoTZ && isTimestamptzType(name):
 		return Cast(types.NewTimestamp(types.WallInZone(d.I, loc)), typ)
 	case d.Fam == types.Date && isTimestamptzType(name):
-		n, err := types.DateNanos(d.I)
+		n, err := types.DateMidnight(d.I, loc)
 		if err != nil {
 			return types.Datum{}, timestampErr(err, d.Text())
 		}
-		return Cast(types.NewTimestamp(types.WallInZone(n, loc)), typ)
+		return Cast(types.NewTimestamp(n), typ)
 	case d.Fam == types.String && isTimestamptzType(name):
 		d.Loc = loc
 	}

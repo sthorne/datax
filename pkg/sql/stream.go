@@ -530,12 +530,21 @@ type keptEnv struct {
 	vals []types.Datum
 }
 
+func (e *keptEnv) colKind(name string) (catalog.Column, bool) { return e.desc.Col(name) }
+
 func (e *keptEnv) col(name string) (types.Datum, error) {
 	col, ok := e.desc.Col(name)
 	if !ok {
 		return types.Datum{}, newErrf(CodeUndefinedColumn, "column %q does not exist", name)
 	}
-	return e.get(col.ID), nil
+	return typedCol(e.get(col.ID), &col), nil
+}
+
+func (e *keptEnv) colWidth(name string) int32 {
+	if col, ok := e.desc.Col(name); ok {
+		return col.IntWidth()
+	}
+	return 8
 }
 
 func (e *keptEnv) get(id catalog.ColumnID) types.Datum {

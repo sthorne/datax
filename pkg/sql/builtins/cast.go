@@ -126,6 +126,9 @@ func Cast(d types.Datum, typ string) (types.Datum, error) {
 			}
 			fallthrough
 		case types.Date:
+			if noTZ {
+				d.Loc = nil // its wall-clock midnight
+			}
 			v, err := d.Coerce(types.Timestamp)
 			if err != nil {
 				return types.Datum{}, timestampErr(err, d.Text())
@@ -432,12 +435,13 @@ func toDecimal(d types.Datum) (types.Datum, error) {
 	case types.Int:
 		return types.NewDecimal(decimal.FromInt(d.I).String()), nil
 	case types.Float:
-		// An explicit cast may launder a float: its shortest decimal
-		// rendering (what the user sees) is the value.
+		// float8_numeric: the value rendered with DBL_DIG (15)
+		// significant digits (%.15g) and parsed, so float noise below
+		// the 15th digit is dropped: (0.1 + 0.2)::numeric is 0.3.
 		if v, ok := types.DecimalFromSpecial(d.F); ok {
 			return v, nil // NaN and the infinities are numeric's too
 		}
-		v, err := types.ParseDecimal(strconv.FormatFloat(d.F, 'f', -1, 64))
+		v, err := types.ParseDecimal(strconv.FormatFloat(d.F, 'g', 15, 64))
 		if err != nil {
 			return types.Datum{}, errf(CodeInvalidText, "%v", err)
 		}

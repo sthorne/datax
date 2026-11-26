@@ -32,9 +32,15 @@ type groupedOut struct {
 	name     string
 	typ      types.Family
 	noTZ     bool         // a TIMESTAMP without time zone, as the ungrouped paths mark it
+	width    int32        // an integer's width (ResultColumn.Width)
 	groupPos int          // ≥0 → group key position; else -1
 	aggPos   int          // ≥0 → aggregate spec position; else -1
 	expr     *parser.Expr // otherwise: evaluated over the environment
+}
+
+// result describes the output column.
+func (oc groupedOut) result() ResultColumn {
+	return ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ, Width: oc.width}
 }
 
 // groupedQuery is the resolved shape of a grouped/aggregate SELECT.
@@ -44,10 +50,13 @@ type groupedQuery struct {
 	keys     []parser.Expr
 	keyCols  []catalog.Column
 	keyTypes []types.Family
+	// keyWidths are the keys' integer widths (ResultColumn.Width).
+	keyWidths []int32
 	// keyNoTZ marks a timestamp key that is without time zone, and
 	// colNoTZ tells that of an input column (result descriptions).
 	keyNoTZ []bool
 	colNoTZ func(name string) bool
+	colType func(name string) (types.Family, bool)
 	// sets are the grouping sets, as key positions (GROUP BY without
 	// ROLLUP, CUBE or GROUPING SETS is the one set of every key).
 	sets  [][]int
@@ -83,6 +92,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		c, ok := desc.Col(n)
 		return c.Type, ok
 	}
+	gq.colType = colType
 	gq.colNoTZ = func(n string) bool {
 		c, ok := desc.Col(stripQualifier(n))
 		return ok && c.NoTZ
@@ -129,7 +139,8 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 		gq.keys = append(gq.keys, k)
 		gq.keyCols = append(gq.keyCols, col)
 		gq.keyTypes = append(gq.keyTypes, typ)
-		gq.keyNoTZ = append(gq.keyNoTZ, typ == types.Timestamp && exprNoTZ(k, gq.colNoTZ))
+		gq.keyWidths = append(gq.keyWidths, exprWidth(typ, k, descColWidth(desc)))
+		gq.keyNoTZ = append(gq.keyNoTZ, typ == types.Timestamp && exprNoTZ(k, colType, gq.colNoTZ))
 	}
 	for _, set := range t.GroupingSets {
 		for _, k := range set {
@@ -161,7 +172,7 @@ func resolveGrouped(desc *catalog.TableDescriptor, t *parser.Select) (*groupedQu
 			if name == "" {
 				name = strings.ToLower(se.Agg)
 			}
-			gq.outs = append(gq.outs, groupedOut{name: name, typ: gq.specs[pos].resultType(), noTZ: gq.specNoTZ(pos), groupPos: -1, aggPos: pos})
+			gq.outs = append(gq.outs, groupedOut{name: name, typ: gq.specs[pos].resultType(), noTZ: gq.specNoTZ(pos), width: gq.specs[pos].resultWidth(), groupPos: -1, aggPos: pos})
 		case se.Window != nil:
 			return nil, newErrf(CodeFeatureNotSupported, "window function %s() is not supported here", strings.ToLower(se.Agg))
 		default:
@@ -271,14 +282,35 @@ func (rw *groupRewriter) envColType(name string) (types.Family, bool) {
 	return types.Unknown, false
 }
 
+// envColWidth gives the environment's columns' integer widths, for
+// exprWidth (the widths envDesc's columns carry).
+func (rw *groupRewriter) envColWidth(name string) int32 {
+	var i int
+	w := int32(0)
+	switch {
+	case strings.HasPrefix(name, "__g"):
+		if _, err := fmt.Sscanf(name, "__g%d", &i); err == nil && i < len(rw.gq.keyWidths) {
+			w = rw.gq.keyWidths[i]
+		}
+	case strings.HasPrefix(name, "__a"):
+		if _, err := fmt.Sscanf(name, "__a%d", &i); err == nil && i < len(rw.gq.specs) {
+			w = rw.gq.specs[i].resultWidth()
+		}
+	}
+	if w == 2 || w == 4 {
+		return w
+	}
+	return 8
+}
+
 // envDesc builds the environment's descriptor: keys, then aggregates.
 func (rw *groupRewriter) envDesc() *catalog.TableDescriptor {
 	d := &catalog.TableDescriptor{}
 	for i, f := range rw.gq.keyTypes {
-		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(i + 1), Name: groupKeyName(i), Type: f})
+		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(i + 1), Name: groupKeyName(i), Type: f, Width: rw.gq.keyWidths[i]})
 	}
 	for i, sp := range rw.gq.specs {
-		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(len(rw.gq.keyTypes) + i + 1), Name: groupAggName(i), Type: sp.resultType()})
+		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(len(rw.gq.keyTypes) + i + 1), Name: groupAggName(i), Type: sp.resultType(), Width: sp.resultWidth()})
 	}
 	for i := range rw.gq.groupings {
 		d.Columns = append(d.Columns, catalog.Column{ID: catalog.ColumnID(len(rw.gq.keyTypes) + len(rw.gq.specs) + i + 1), Name: groupGroupingName(i), Type: types.Int})
@@ -293,11 +325,11 @@ func (rw *groupRewriter) out(name string, e parser.Expr) groupedOut {
 	if isPlainRef(e) {
 		var i int
 		if _, err := fmt.Sscanf(e.Column, "__g%d", &i); err == nil && strings.HasPrefix(e.Column, "__g") {
-			o.groupPos, o.typ, o.noTZ = i, rw.gq.keyTypes[i], rw.gq.keyNoTZ[i]
+			o.groupPos, o.typ, o.noTZ, o.width = i, rw.gq.keyTypes[i], rw.gq.keyNoTZ[i], rw.gq.keyWidths[i]
 			return o
 		}
 		if _, err := fmt.Sscanf(e.Column, "__a%d", &i); err == nil && strings.HasPrefix(e.Column, "__a") {
-			o.aggPos, o.typ, o.noTZ = i, rw.gq.specs[i].resultType(), rw.gq.specNoTZ(i)
+			o.aggPos, o.typ, o.noTZ, o.width = i, rw.gq.specs[i].resultType(), rw.gq.specNoTZ(i), rw.gq.specs[i].resultWidth()
 			return o
 		}
 	}
@@ -306,7 +338,8 @@ func (rw *groupRewriter) out(name string, e parser.Expr) groupedOut {
 	if o.typ == types.Unknown {
 		o.typ = types.String
 	}
-	o.noTZ = o.typ == types.Timestamp && exprNoTZ(e, rw.envNoTZ)
+	o.width = exprWidth(o.typ, e, rw.envColWidth)
+	o.noTZ = o.typ == types.Timestamp && exprNoTZ(e, rw.envColType, rw.envNoTZ)
 	return o
 }
 
@@ -335,7 +368,7 @@ func (gq *groupedQuery) specNoTZ(i int) bool {
 		return false
 	}
 	if sp.arg != nil {
-		return exprNoTZ(*sp.arg, gq.colNoTZ)
+		return exprNoTZ(*sp.arg, gq.colType, gq.colNoTZ)
 	}
 	return sp.col.NoTZ
 }
@@ -733,6 +766,13 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 			if err != nil {
 				return nil, err
 			}
+			if !d.Null && d.Fam == types.Date && gq.keyTypes[i] == types.Timestamp {
+				// A key that mixes dates and timestamps (a CASE) groups
+				// a date as the timestamp it becomes (evalCase).
+				if c, cerr := d.Coerce(types.Timestamp); cerr == nil {
+					d = c
+				}
+			}
 			keys[i] = d
 		}
 		// A row counts once in each grouping set, in the group of its
@@ -789,10 +829,10 @@ func (s *Session) execGroupedOver(desc *catalog.TableDescriptor, rows []fetchedR
 
 	res := &Result{}
 	for _, oc := range gq.outs {
-		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ})
+		res.Columns = append(res.Columns, oc.result())
 	}
 	for _, oc := range gq.hidden {
-		res.Columns = append(res.Columns, ResultColumn{Name: oc.name, Type: oc.typ, NoTZ: oc.noTZ})
+		res.Columns = append(res.Columns, oc.result())
 	}
 	visible := len(gq.outs)
 	all := append(append([]groupedOut(nil), gq.outs...), gq.hidden...)

@@ -70,3 +70,24 @@ func TestNegativeZeroFloatLiteral(t *testing.T) {
 		}
 	}
 }
+
+// TestIntegerLiteralWidth: an integer literal is an integer (int4,
+// width 4) when it fits, else a bigint (width 0), as PostgreSQL types
+// it; a negative literal is folded first, so -2147483648 is an integer
+// and -2147483649 a bigint.
+func TestIntegerLiteralWidth(t *testing.T) {
+	for q, want := range map[string]int32{
+		"SELECT 1":           4,
+		"SELECT 0":           4,
+		"SELECT 2147483647":  4,
+		"SELECT -2147483648": 4,
+		"SELECT 2147483648":  8,
+		"SELECT -2147483649": 8,
+		"SELECT 1::int8":     4, // the literal; the cast types the expression
+	} {
+		d, _ := literal(t, q)
+		if d.Fam != types.Int || d.IntWidth() != want {
+			t.Errorf("%s: %s width %d, want INT8 width %d", q, d.Fam, d.IntWidth(), want)
+		}
+	}
+}

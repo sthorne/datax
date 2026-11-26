@@ -52,9 +52,9 @@ func TestScanExprWireOutputEqual(t *testing.T) {
 		}{{"simple", nil}, {"text", []int16{0}}, {"binary", []int16{1}}} {
 			for _, q := range []struct{ streamed, materialized string }{
 				{ // computed items over every kind of column
-					`SELECT k + 1, lower(t), t || '!', coalesce(i4, -1) * 2, n2 * 2, upper(vc), ch, length(bb), j -> 'a', ai,
+					`SELECT k + 1, lower(t), t || '!', coalesce(i4, -1) * 2::int8, n2 * 2, upper(vc), ch, length(bb), j -> 'a', ai,
 						CASE WHEN b THEN 'y' WHEN b IS NULL THEN NULL ELSE 'n' END, tz, ts, iv, m, fill + 0, f * 1, u, d, tm, tt FROM wt`,
-					`SELECT k + 1, lower(t), t || '!', coalesce(i4, -1) * 2, n2 * 2, upper(vc), ch, length(bb), j -> 'a', ai,
+					`SELECT k + 1, lower(t), t || '!', coalesce(i4, -1) * 2::int8, n2 * 2, upper(vc), ch, length(bb), j -> 'a', ai,
 						CASE WHEN b THEN 'y' WHEN b IS NULL THEN NULL ELSE 'n' END, tz, ts, iv, m, fill + 0, f * 1, u, d, tm, tt FROM wt ORDER BY k + 0`,
 				},
 				{ // columns named only inside CASE, a comparison value, coalesce

@@ -1230,7 +1230,7 @@ func (s *Session) execInsert(ctx context.Context, txn *kvclient.Txn, t *parser.I
 					return nil, err
 				}
 			}
-			d, cerr := assignColumn(target[i], d)
+			d, cerr := assignColumn(target[i], d, s.zone())
 			if cerr != nil {
 				return nil, cerr
 			}
@@ -1536,7 +1536,7 @@ func (s *Session) insertOnConflict(ctx context.Context, txn *kvclient.Txn, desc 
 		if err != nil {
 			return false, nil, err
 		}
-		d, cerr := assignColumn(col, d)
+		d, cerr := assignColumn(col, d, s.zone())
 		if cerr != nil {
 			return false, nil, cerr
 		}
@@ -1572,6 +1572,11 @@ type conflictEnv struct {
 	old, excluded map[catalog.ColumnID]types.Datum
 }
 
+func (e conflictEnv) colKind(name string) (catalog.Column, bool) {
+	_, bare := splitQualified(name)
+	return e.desc.Col(bare)
+}
+
 func (e conflictEnv) col(name string) (types.Datum, error) {
 	q, bare := splitQualified(name)
 	row := e.old
@@ -1590,7 +1595,15 @@ func (e conflictEnv) col(name string) (types.Datum, error) {
 	if !ok {
 		d = types.DNull
 	}
-	return d, nil
+	return typedCol(d, &col), nil
+}
+
+func (e conflictEnv) colWidth(name string) int32 {
+	_, bare := splitQualified(name)
+	if col, ok := e.desc.Col(bare); ok {
+		return col.IntWidth()
+	}
+	return 8
 }
 
 // returning is a resolved RETURNING list: the projection over the rows a
@@ -2752,7 +2765,7 @@ func (s *Session) execSelectBody(ctx context.Context, txn *kvclient.Txn, t, orig
 					fam = types.String
 				}
 			}
-			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil)})
+			res.Columns = append(res.Columns, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil), Width: exprWidth(fam, se.Expr, nil)})
 			row = append(row, conformTo(d, fam))
 		}
 		rows := [][]types.Datum{row}
@@ -3238,7 +3251,7 @@ func (s *Session) applyUpdate(ctx context.Context, txn *kvclient.Txn, u *updateA
 					return nil, err
 				}
 			}
-			d, cerr := assignColumn(col, d)
+			d, cerr := assignColumn(col, d, s.zone())
 			if cerr != nil {
 				return nil, cerr
 			}

@@ -180,7 +180,10 @@ type prepared struct {
 	stmt      parser.Statement // nil = empty statement
 	nParams   int
 	paramFams []types.Family // inferred; Unknown = text
-	cols      []sql.ResultColumn
+	// paramWidths are the integer parameters' widths (2, 4, 0 = 8),
+	// which their described OIDs (int2, int4, int8) follow.
+	paramWidths []int32
+	cols        []sql.ResultColumn
 	// shape is the statement's fingerprint for the activity accounting,
 	// taken once at Parse from the statement as written (planning may
 	// rewrite the tree in place: stripTableAlias), so every execution
@@ -1053,6 +1056,9 @@ func (c *conn) runSimpleStatements(ctx context.Context, q string, stmts []parser
 			if res.Columns == nil {
 				return 0, nil
 			}
+			if serr := conformIntWidths(nil, res); serr != nil {
+				return 0, serr
+			}
 			c.backend.Send(rowDescription(res.Columns))
 			if res.Stream == nil {
 				c.sendDataRows(res, nil)
@@ -1630,7 +1636,7 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 			return
 		}
 		p.cols = cols
-		fams, serr := c.session.PlanParams(ctx, stmts[0])
+		fams, widths, serr := c.session.PlanParamTypes(ctx, stmts[0])
 		if serr != nil {
 			c.extError(serr)
 			return
@@ -1642,7 +1648,7 @@ func (c *conn) handleParse(ctx context.Context, m *pgproto3.Parse) {
 				fams[i] = types.Vector
 			}
 		}
-		p.paramFams = fams
+		p.paramFams, p.paramWidths = fams, widths
 	default:
 		c.extError(&sql.Error{Code: sql.CodeSyntaxError, Msg: "cannot insert multiple commands into a prepared statement"})
 		return
@@ -1754,6 +1760,9 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) {
 			oid := uint32(oidText)
 			if i < len(p.paramFams) && p.paramFams[i] != types.Unknown {
 				oid = typeOID(p.paramFams[i])
+				if p.paramFams[i] == types.Int && i < len(p.paramWidths) {
+					oid = colOID(sql.ResultColumn{Type: types.Int, Width: p.paramWidths[i]})
+				}
 			}
 			pd.ParameterOIDs = append(pd.ParameterOIDs, oid)
 		}
@@ -1817,6 +1826,11 @@ func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) {
 				return n, serr
 			}
 			if serr := resultMatchesDescribe(pt.stmt.cols, res); serr != nil {
+				pt.done = true
+				pt.close(context.Background())
+				return 0, serr
+			}
+			if serr := conformIntWidths(pt.stmt.cols, res); serr != nil {
 				pt.done = true
 				pt.close(context.Background())
 				return 0, serr
@@ -1900,6 +1914,39 @@ func resultMatchesDescribe(described []sql.ResultColumn, res *sql.Result) *sql.E
 		return &sql.Error{Code: sql.CodeInternal, Msg: "statement returned rows but was described as returning none"}
 	case len(described) != len(res.Columns):
 		return &sql.Error{Code: sql.CodeFeatureNotSupported, Msg: "cached plan must not change result type"}
+	}
+	return nil
+}
+
+// conformIntWidths holds a result's integer columns to the widths the
+// client was told: Describe's (described, on the extended protocol),
+// which the rows are then encoded in, else the result's own. A
+// materialized value out of its int2 / int4 column's range is 22003
+// "smallint / integer out of range", as PostgreSQL's operators raise it,
+// never sent truncated to the width.
+func conformIntWidths(described []sql.ResultColumn, res *sql.Result) *sql.Error {
+	var check []int
+	for i := range res.Columns {
+		col := &res.Columns[i]
+		if col.Type != types.Int {
+			continue
+		}
+		if i < len(described) && described[i].Type == types.Int && col.Width != described[i].Width {
+			col.Width = described[i].Width
+		}
+		if col.Width == 2 || col.Width == 4 {
+			check = append(check, i)
+		}
+	}
+	if len(check) == 0 || res.Stream != nil {
+		return nil
+	}
+	for _, row := range res.Rows {
+		for _, i := range check {
+			if i < len(row) && !row[i].Null && row[i].Fam == types.Int && !types.IntFits(row[i].I, res.Columns[i].Width) {
+				return &sql.Error{Code: sql.CodeNumericValueOutOfRange, Msg: types.IntWidthName(res.Columns[i].Width) + " out of range"}
+			}
+		}
 	}
 	return nil
 }

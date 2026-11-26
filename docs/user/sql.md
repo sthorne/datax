@@ -48,7 +48,7 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
 | Type | Aliases | Notes |
 |---|---|---|
 | `INT8` | `BIGINT` | 64-bit |
-| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. Arithmetic over any integer width is 64-bit (`a + 1` describes as `INT8`, like the sum does in PostgreSQL) |
+| `INT4` | `INT`, `INTEGER` | 32-bit: values outside ±2³¹ are refused (`22003`); `int4` (OID 23) on the wire. An integer literal that fits is an `INT4`, and arithmetic is of the wider operand's width, as in PostgreSQL (`a + 1` is `INT4` and overflows with `22003 integer out of range`; `a + 1::int8` is `INT8`); `SUM` is `INT8` |
 | `INT2` | `SMALLINT` | 16-bit, the same way (`int2`, OID 21) |
 | `FLOAT8` | `DOUBLE PRECISION` | IEEE 754 double |
 | `DECIMAL` | `NUMERIC`, `DEC` | exact arbitrary precision; `DECIMAL(p,s)` is **enforced**: values rescale to `s` with halves away from zero as in PostgreSQL (`1.005` → `1.01`, `-2.5` → `-3`), overflow past `p−s` integer digits is SQLSTATE `22003`, and stored values render with the declared fixed scale (`9.90`) |
@@ -82,8 +82,15 @@ missing versus PostgreSQL see [Differences](postgres-differences.md).
   zero (`2.5` → `3`), a `FLOAT8` halves to even (`2.5::float8` → `2`),
   and a value outside the column's range is `22003` (`smallint out of
   range`). A comparison does not round: `WHERE n = 7.5` matches no
-  integer. A `FLOAT8` value into a DECIMAL column is refused (`22P02`);
-  cast it (`x::numeric`).
+  integer. A `FLOAT8` value into a DECIMAL column converts as
+  `x::numeric` does, then takes the column's scale. A DECIMAL[] or
+  `FLOAT8[]` value into an integer array column (and a `FLOAT8[]` into
+  a DECIMAL[] one) converts element by element by the same rules;
+  `NULL` elements stay `NULL`.
+- `x::numeric` of a `FLOAT8` keeps 15 significant digits, as
+  PostgreSQL's does: `(0.1::float8 + 0.2::float8)::numeric` is `0.3`,
+  `(1::float8 / 3)::numeric` is `0.333333333333333`. `NaN` and the
+  infinities become DECIMAL's `NaN` and `Infinity` / `-Infinity`.
 - `round(x)` of a `FLOAT8` rounds halves to even, as PostgreSQL's `rint`
   does (`round(2.5::float8)` is `2`, `round(-0.5::float8)` is `-0`); a
   `FLOAT8` zero keeps its sign (`-0.0::float8` prints `-0`).
@@ -1142,17 +1149,19 @@ SELECT [DISTINCT [ON (expr, ...)]] * | expr [[AS] alias] | func(...) OVER ([PART
   on RE2. A predicate used as a value
   (`qty > 3 AS big`) is three-valued: NULL when an input is NULL.
 - **Expressions**: arithmetic `+ - * / % ^` with standard precedence and
-  parentheses (exact on DECIMAL/INT8; integer division truncates; `^` is
-  always FLOAT8; division by zero is SQLSTATE `22012`, INT8 overflow
-  `22003`), the integer bitwise operators `&` (and), `|` (or), `#`
-  (xor), `<<` and `>>` (shifts, which wrap rather than overflow; the
-  count is taken modulo 64) and the prefix `~` (not), the prefix `@`
+  parentheses (exact on DECIMAL and the integers; integer arithmetic is
+  of the wider operand's width, `INT2`, `INT4` or `INT8`, and integer
+  division truncates; `^` is always FLOAT8; division by zero is SQLSTATE
+  `22012`, overflow of the result's width `22003 smallint / integer /
+  bigint out of range`), the integer bitwise operators `&` (and), `|`
+  (or), `#` (xor), `<<` and `>>` (shifts, which wrap in the left
+  operand's width rather than overflow; the count is taken modulo 32,
+  64 for an `INT8`) and the prefix `~` (not), the prefix `@`
   (absolute value), `|/` (square root) and `||/` (cube root) — the
   binary ones, like the vector distances and jsonb's `#-`, bind looser
   than `+` and `-` and tighter than the comparisons, left to right, as
-  in PostgreSQL (`1 + 2 & 3` is `3`), and are computed on INT8, so
-  `1 << 31` over an `INT4` is `2147483648`, not PostgreSQL's
-  `-2147483648` (PostgreSQL 14 removed the factorial `!`; use
+  in PostgreSQL (`1 + 2 & 3` is `3`; `1 << 31` is `-2147483648`;
+  PostgreSQL 14 removed the factorial `!`; use
   `factorial(n)`), date and time arithmetic (`date + 1`, `date - date` in
   days, `timestamp ± interval` and `date ± interval` on the calendar
   with month steps clamped to the end of the month, `timestamp -
@@ -2349,7 +2358,7 @@ invalid value `22023`:
 | `statement_memory_limit` | bytes, or `'64MB'`, `'1GB'`, `'512kB'`; `0` = none; default `64MB` | what one statement may hold in memory on the gateway (rows it sorts, aggregates, joins or otherwise collects); past it the statement fails with `53200` instead of growing without bound. Streamed `SELECT`s are unaffected (see [Streaming](#reading)) |
 | `lock_timeout` | as above | a wait on another transaction's live write intent past it fails with `55P03` (without it the wait lasts the conflict budget, then `40001`); to not wait at all, see [`FOR UPDATE NOWAIT` and `SKIP LOCKED`](#not-waiting-for-a-lock-skip-locked-and-nowait) |
 | `idle_in_transaction_session_timeout` | as above | a connection idle inside a block past it is ended with `25P03`; the block rolls back and its intents are released — the fix for stranded transactions from crashed clients |
-| `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it; storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
+| `TimeZone` | an IANA name (any letter case), `UTC`, a POSIX offset (`'UTC+5'`, `'-03'`: positive is WEST of Greenwich, as in PostgreSQL); not an abbreviation | the zone of a `TIMESTAMPTZ` as text: input without an offset (literals, text parameters, `COPY`) reads in it, and text output (the wire, `::text`, `||`, `to_char`), `::date`, `::time`, `::timestamp`, `date_trunc`, `extract`, `current_date` and day and month arithmetic (`+ interval '1 day'` across a DST change) follow it, and so does a `date` becoming a `TIMESTAMPTZ` (a cast, a comparison, storing into a `TIMESTAMPTZ` column, a `CASE`, `coalesce`, `greatest`, `least`, `nullif` or `UNION` mixing the two): it is its midnight in the zone (against a `TIMESTAMP`, its wall-clock midnight); storage, comparison and the binary format stay UTC; `TIMESTAMP` (without time zone) is unaffected. See [Time zones](#time-zones) |
 | `application_name` | any text; the startup parameter too | `pg_stat_activity`, `SHOW SESSIONS` and the dashboard's activity view show it |
 | `search_path` | a list of schema names; default `"$user", public` | where unqualified names resolve and where `CREATE` puts an unqualified object: see [Schemas](#schemas). `pg_catalog` and `information_schema` are always visible, after the path's schemas |
 | `transaction_read_only`, `default_transaction_read_only`, `SET TRANSACTION READ ONLY` / `READ WRITE` (also as `BEGIN` / `START TRANSACTION` modes) | `on` / `off` | a read-only transaction refuses `INSERT`, `UPDATE`, `DELETE`, `COPY`, DDL, `nextval()` and `setval()` with `25006` |

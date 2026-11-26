@@ -118,19 +118,10 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 				return nil, err
 			}
 		}
-		stmts, perr := parser.Parse(d.ViewQuery)
-		if perr != nil || len(stmts) != 1 {
-			return nil, newErrf(CodeInternal, "view %q: stored query does not parse: %v", d.Name, perr)
+		m, err := viewMember(d, bare)
+		if err != nil {
+			return nil, err
 		}
-		sel, ok := stmts[0].(*parser.Select)
-		if !ok {
-			return nil, newErrf(CodeInternal, "view %q: stored query is not a SELECT", d.Name)
-		}
-		cols := make([]string, 0, len(d.Columns))
-		for _, c := range d.Columns {
-			cols = append(cols, c.Name)
-		}
-		m := parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner), SearchPath: viewResolutionPath(d.ViewSearchPath), Bindings: d.ViewBindings}
 		if db != "" {
 			m.Qualified = lname
 		}
@@ -160,6 +151,82 @@ func (s *Session) expandViews(ctx context.Context, txn *kvclient.Txn, stmt parse
 		return &c, nil
 	}
 	return stmt, nil
+}
+
+// viewMember is the WITH member a view expands to under the name bare:
+// its stored query, run as its owner through its own search path and
+// bindings, its columns named as the view's.
+func viewMember(d *catalog.TableDescriptor, bare string) (parser.CTE, error) {
+	stmts, perr := parser.Parse(d.ViewQuery)
+	if perr != nil || len(stmts) != 1 {
+		return parser.CTE{}, newErrf(CodeInternal, "view %q: stored query does not parse: %v", d.Name, perr)
+	}
+	sel, ok := stmts[0].(*parser.Select)
+	if !ok {
+		return parser.CTE{}, newErrf(CodeInternal, "view %q: stored query is not a SELECT", d.Name)
+	}
+	cols := make([]string, 0, len(d.Columns))
+	for _, c := range d.Columns {
+		cols = append(cols, c.Name)
+	}
+	return parser.CTE{Name: bare, Columns: cols, Query: sel, Definer: catalog.OwnerOf(d.Owner), SearchPath: viewResolutionPath(d.ViewSearchPath), Bindings: d.ViewBindings}, nil
+}
+
+// withViewWidths returns d with its integer columns' widths as its
+// query gives them, for the catalogs to describe. A view created before
+// views kept integer widths (#401) stored every integer column as int8
+// (width 0). A view created or replaced since stores the widths and is
+// marked ViewIntWidths, so it is described as stored; an unmarked view
+// with an int8 or int8[] column has its query planned again. The
+// descriptor is left as it is (d itself is returned) when nothing
+// changes or the query no longer plans; it is never written back.
+func (s *Session) withViewWidths(ctx context.Context, d *catalog.TableDescriptor) *catalog.TableDescriptor {
+	if !d.IsView() || d.Virtual != "" || d.ViewIntWidths {
+		return d
+	}
+	stale := false
+	for _, c := range d.Columns {
+		if (c.Type == types.Int || c.Type == types.ArrayOf(types.Int)) && c.Width == 0 {
+			stale = true
+			break
+		}
+	}
+	if !stale {
+		return d
+	}
+	bare := strings.ToLower(d.Name)
+	m, err := viewMember(d, bare)
+	if err != nil {
+		return d
+	}
+	stmts, perr := parser.Parse("SELECT * FROM " + quoteIdentifier(bare))
+	if perr != nil || len(stmts) != 1 {
+		return d
+	}
+	sel, ok := stmts[0].(*parser.Select)
+	if !ok {
+		return d
+	}
+	q := *sel
+	q.With = []parser.CTE{m}
+	cols, serr := s.PlanColumns(ctx, &q)
+	if serr != nil || len(cols) != len(d.Columns) {
+		return d
+	}
+	var out *catalog.TableDescriptor
+	for i, c := range d.Columns {
+		if c.Width != 0 || cols[i].Width == 0 || cols[i].Type != c.Type {
+			continue
+		}
+		if out == nil {
+			out = d.Clone()
+		}
+		out.Columns[i].Width = cols[i].Width
+	}
+	if out == nil {
+		return d
+	}
+	return out
 }
 
 // stmtTables lists every table name a statement references, in first
@@ -471,6 +538,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 			nd := existing.Clone()
 			nd.Columns, nd.NextColumnID = columns, catalog.ColumnID(len(columns)+1)
 			nd.ViewQuery, nd.ViewDepends, nd.ViewSearchPath, nd.ViewBindings = t.Text, deps, viewPath, bindings
+			nd.ViewIntWidths = true
 			if err := s.cat.Update(ctx, txn, nd); err != nil {
 				return nil, err
 			}
@@ -486,7 +554,7 @@ func (s *Session) execCreateView(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	desc := &catalog.TableDescriptor{
 		Name: bare, DatabaseID: dbID, SchemaID: target.Schema.ID, Columns: columns, NextColumnID: catalog.ColumnID(len(columns) + 1),
-		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, Owner: s.user,
+		ViewQuery: t.Text, ViewDepends: deps, ViewSearchPath: viewPath, ViewBindings: bindings, ViewIntWidths: true, Owner: s.user,
 	}
 	if err := s.applyDefaultPrivileges(ctx, txn, dbID, desc.Owner, "TABLES", &desc.Privileges, &desc.GrantOptions); err != nil {
 		return nil, err
