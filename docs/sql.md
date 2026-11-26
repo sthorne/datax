@@ -300,9 +300,12 @@ window. The retention provider that already resolves a range to a
 time-series table's retention (`pkg/server/retention.go`) resolves it to
 this too: a range wholly inside the table collects at the table's
 window, shorter or longer than the node's; a range the table shares
-with other data keeps the longest window of its tenants. The statement
-that sets it splits the table's two edges, and the merge queue leaves
-ranges with different windows apart, so the table's ranges are its own.
+with other data keeps the longest window of its tenants. `CREATE TABLE
+... WITH (gc_ttl)` splits the empty table's two edges; after an `ALTER
+TABLE ... SET (gc_ttl)` the GC pass splits them once the window has
+something to act on (issue #395; `docs/transactions.md`, "A window per
+table"), and the merge queue leaves ranges with different windows
+apart, so the table's ranges are its own.
 Nothing else changes: collection is the same replicated command, the
 newest version of a row stays, and reads at or below the threshold are
 refused. A retention is itself a window, so a table has one or the

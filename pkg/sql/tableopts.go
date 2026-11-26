@@ -168,8 +168,12 @@ func addTTLIndex(desc *catalog.TableDescriptor) {
 // | ttl_expiration = ...), on a table that may hold data. The index a row
 // expiry wants is built first, online, so the option is never in force
 // without it; then one descriptor write sets the options. A new GC
-// window also asks for range boundaries at the table's edges: a window
-// governs only the ranges wholly inside its table.
+// window splits nothing here, unlike one given at CREATE TABLE: it
+// governs only the ranges wholly inside its table, and the GC pass
+// splits the table's edges once the window has something to act on
+// (kvserver's splitForWindows; issue #395) — at once for a table older
+// than its window or with a window longer than the node's, never for
+// one dropped before either.
 func (s *Session) execSetGeneralOptions(ctx context.Context, table string, options map[string]string) *Error {
 	if err := s.requireV21("the gc_ttl and row expiry options"); err != nil {
 		return ToSQLError(err)
@@ -208,13 +212,12 @@ func (s *Session) execSetGeneralOptions(ctx context.Context, table string, optio
 			return serr
 		}
 	}
-	var desc *catalog.TableDescriptor
 	if err := s.db.RunTxn(ctx, "set-table-options", func(ctx context.Context, txn *kvclient.Txn) error {
 		shared, err := s.lookup(ctx, txn, table)
 		if err != nil {
 			return err
 		}
-		desc = shared.Clone()
+		desc := shared.Clone()
 		if _, err := applyGeneralOptions(desc, options, true); err != nil {
 			return err
 		}
@@ -222,21 +225,22 @@ func (s *Session) execSetGeneralOptions(ctx context.Context, table string, optio
 	}); err != nil {
 		return ToSQLError(err)
 	}
-	if _, ok := options["gc_ttl"]; ok {
-		s.splitAtTableEdges(ctx, desc)
-	}
 	return nil
 }
 
-// splitAtTableEdges asks for range boundaries at both ends of a table's
-// key span, as a time-series table gets at creation. A GC window (and a
-// purge) acts on whole ranges, so a range the table shares with a
-// neighbour keeps the longer window of the two; with the edges split,
-// the table's ranges are its own, and the merge queue leaves them so
-// while their window differs from the neighbour's. Best-effort and not
-// sticky: the boundary is held by that rule, not by a mark nobody could
-// name to release, and a split that fails here is asked for again by the
-// node's GC pass when it finds the range straddling the edge.
+// splitAtTableEdges asks for range boundaries at both ends of a table
+// created with a GC window, as a time-series table gets at creation.
+// Done at CREATE TABLE only, while the table is empty: every write of
+// its rows then goes through ranges of its own, so a PURGE, which
+// truncates the logs of the table's ranges, reaches every copy of them
+// (a table that shared a range has its earlier writes in that range's
+// log until housekeeping truncates it). ALTER TABLE ... SET (gc_ttl)
+// leaves the split to the GC pass, which makes it once the window has
+// something to act on (issue #395): a table that only ever lived for
+// seconds then costs no split and no merge. Best-effort and not
+// sticky: the boundary is held by the merge queue's refusal to merge
+// ranges whose windows differ, and a split that fails here is made by
+// the GC pass when it is due.
 func (s *Session) splitAtTableEdges(ctx context.Context, desc *catalog.TableDescriptor) {
 	if desc == nil || desc.ID == 0 {
 		return

@@ -65,6 +65,9 @@ var (
 	AutoSplits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_auto_splits_total", Help: "Size-triggered range splits performed.",
 	})
+	GCWindowSplits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_gc_window_splits_total", Help: "Range splits the GC pass made at the edges of a table with a GC window of its own, once the window had something to act on.",
+	})
 	LoadSplits = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_load_splits_total", Help: "Load-triggered range splits performed.",
 	})
@@ -128,8 +131,11 @@ var (
 	RaftDeferredTruncations = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_deferred_truncations_total", Help: "Log truncations performed on the raft engine once the state engine had flushed past them (split stores).",
 	})
+	RaftMergedStateWipes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
+		Name: "datax_raft_merged_state_wipes_total", Help: "Merged right-hand ranges whose raft state was removed from the raft engine once the state engine had flushed past the merge (split stores).",
+	})
 	RaftTruncationFlushes = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
-		Name: "datax_raft_truncation_flushes_total", Help: "State-engine flushes the housekeeping tick forced so that a log truncation pending past its bound could proceed (split stores).",
+		Name: "datax_raft_truncation_flushes_total", Help: "State-engine flushes the housekeeping tick forced so that a log truncation, or a merged range's raft-state removal, pending past its bound could proceed (split stores).",
 	})
 	RaftReplayedEntries = promauto.With(Registry).NewCounter(prometheus.CounterOpts{
 		Name: "datax_raft_replayed_entries_total", Help: "Committed log entries re-applied at startup because the state engine had not flushed them before the last shutdown.",

@@ -70,9 +70,10 @@ func (s *Store) flushState() error {
 }
 
 // wipeRaftState deletes a range's raft state from the raft engine after
-// its state-machine removal has been flushed (a merged RHS, a removed
-// replica). On a single-engine store the caller's own batch already
-// covered the range-local prefix, so this is a no-op.
+// its state-machine removal has been flushed (a removed replica). On a
+// single-engine store the caller's own batch already covered the
+// range-local prefix, so this is a no-op. A merged RHS goes through
+// wipeMergedRaftState instead, which does not flush.
 func (s *Store) wipeRaftState(rangeID base.RangeID) error {
 	if !s.splitEngines() {
 		return nil
@@ -87,6 +88,98 @@ func (s *Store) wipeRaftState(rangeID base.RangeID) error {
 		return err
 	}
 	return b.Commit(true)
+}
+
+// pendingWipe is a merged RHS whose raft state waits on the raft engine
+// for the state engine to flush past the batch that applied the merge.
+type pendingWipe struct {
+	rangeID base.RangeID
+	seq     uint64 // the merge's apply batch
+	since   time.Time
+}
+
+// wipeMergedRaftState removes a merged RHS's raft state once the merge's
+// apply batch (committed at seq) is durable on the state engine.
+//
+// It used to flush the state engine on the spot, once per merge (issue
+// #395): a merge queue folding hundreds of small ranges back together —
+// what dropping a database whose tables had ranges of their own leaves
+// behind — forced a memtable flush per merge, each a tiny overlapping
+// L0 file, and the store went into Pebble write stalls that shed
+// foreground writes everywhere. The deletion waits instead, as a
+// deferred log truncation does, and goes with the next flush, natural
+// or the one the housekeeping tick forces after TruncationFlushAfter,
+// which then covers every merge pending at the time.
+//
+// Waiting is safe because the RHS's ID is never used again (the range
+// ID counter only moves forward, and rangeIDInUse refuses a split that
+// would reuse it) and its raft group was stopped when the merge
+// applied. A crash before the flush replays the merge from the LHS's
+// log against the RHS's raft state, which is still there; a crash after
+// it leaves the state engine's tombstone for the RHS, and the startup
+// sweep (sweepOrphanRaftState) removes what the wait left.
+func (s *Store) wipeMergedRaftState(rangeID base.RangeID, seq uint64) error {
+	if !s.splitEngines() {
+		return nil
+	}
+	if !s.cfg.Engine.WALDisabled() {
+		return s.wipeRaftState(rangeID) // durable at commit: no flush to wait for
+	}
+	s.wipes.Lock()
+	s.wipes.pending = append(s.wipes.pending, pendingWipe{rangeID: rangeID, seq: seq, since: time.Now()})
+	s.wipes.Unlock()
+	return s.runPendingWipes()
+}
+
+// oldestPendingWipe is when the longest-waiting merged RHS started
+// waiting for a flush, zero if none waits.
+func (s *Store) oldestPendingWipe() time.Time {
+	s.wipes.Lock()
+	defer s.wipes.Unlock()
+	flushed := s.cfg.Engine.FlushedSeqNum()
+	var oldest time.Time
+	for _, w := range s.wipes.pending {
+		if w.seq > flushed && (oldest.IsZero() || w.since.Before(oldest)) {
+			oldest = w.since
+		}
+	}
+	return oldest
+}
+
+// runPendingWipes deletes, in one raft-engine batch, the raft state of
+// every merged RHS whose merge the state engine has flushed.
+func (s *Store) runPendingWipes() error {
+	s.wipes.Lock()
+	flushed := s.cfg.Engine.FlushedSeqNum()
+	var due []base.RangeID
+	keep := s.wipes.pending[:0]
+	for _, w := range s.wipes.pending {
+		if w.seq <= flushed {
+			due = append(due, w.rangeID)
+		} else {
+			keep = append(keep, w)
+		}
+	}
+	s.wipes.pending = keep
+	s.wipes.Unlock()
+	if len(due) == 0 {
+		return nil
+	}
+	b := s.raftEngine().NewBatch()
+	for _, id := range due {
+		pre := keys.RangeUnreplicatedPrefix(id)
+		if err := b.DeleteRange(pre, pre.PrefixEnd()); err != nil {
+			_ = b.Close()
+			return err
+		}
+	}
+	// Unsynced: the merges are flushed, so their tombstones are on the
+	// state engine, and a deletion a crash loses is the startup sweep's.
+	if err := b.Commit(false); err != nil {
+		return err
+	}
+	metrics.RaftMergedStateWipes.Add(float64(len(due)))
+	return nil
 }
 
 // appliedSeq pairs an applied index with the engine sequence number of
@@ -260,6 +353,9 @@ func (s *Store) runDeferredTruncations() {
 			r.mu.Unlock()
 			return true
 		})
+		if w := s.oldestPendingWipe(); !w.IsZero() && (oldest.IsZero() || w.Before(oldest)) {
+			oldest = w
+		}
 		if !oldest.IsZero() && time.Since(oldest) >= after {
 			if err := s.cfg.Engine.Flush(); err != nil {
 				log.Warnf("flushing the state engine for log truncation: %v", err)
@@ -267,6 +363,9 @@ func (s *Store) runDeferredTruncations() {
 				metrics.RaftTruncationFlushes.Inc()
 			}
 		}
+	}
+	if err := s.runPendingWipes(); err != nil {
+		log.Warnf("removing merged ranges' raft state: %v", err)
 	}
 	s.VisitReplicas(func(r *Replica) bool {
 		if err := r.maybeTruncateDeferred(); err != nil {

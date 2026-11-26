@@ -356,7 +356,8 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		// Failing to commit the state machine is not recoverable.
 		log.Fatalf("%s: applying entry %d: %v", r.rangeID, idx, err)
 	}
-	r.noteAppliedSeq(idx, b.SeqNum())
+	applySeq := b.SeqNum()
+	r.noteAppliedSeq(idx, applySeq)
 	r.setApplied(idx)
 	if aerr == nil && cmd.Split != nil {
 		r.finishSplit(cmd.Split)
@@ -368,8 +369,9 @@ func (r *Replica) applyCommand(ctx context.Context, cmd *raftCommand, idx uint64
 		r.finishMerge(cmd.Merge)
 		// The RHS's state-machine side is in the batch above; its raft
 		// state goes once that is durable (a no-op on a single engine,
-		// whose batch covered the whole range-local prefix).
-		if err := r.store.wipeRaftState(cmd.Merge.Right.RangeID); err != nil {
+		// whose batch covered the whole range-local prefix). No flush
+		// here: the deletion waits for one (issue #395).
+		if err := r.store.wipeMergedRaftState(cmd.Merge.Right.RangeID, applySeq); err != nil {
 			log.Warnf("%s: removing merged %s's raft state: %v", r.rangeID, cmd.Merge.Right.RangeID, err)
 		}
 	}

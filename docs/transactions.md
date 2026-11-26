@@ -852,11 +852,19 @@ that already maps ranges to time-series retentions
 - a range the table shares with other data collects at
   `max(node window, every overlapping window)`. One table's short window
   therefore cannot reach another table's history; the price is that it
-  does not bite on a shared range either, so the DDL splits the table's
-  edges, the provider asks for them again whenever a GC pass finds a
-  range straddling one (a restored table was never split), and the
-  merge queue — which already refuses to merge ranges whose windows
-  differ — keeps them apart.
+  does not bite on a shared range either, so the GC pass splits the
+  table's edges (`kvserver.Store.splitForWindows`, before it collects)
+  once the split changes what it may do: at once when the table's
+  window is longer than the store's (the shared range would hold its
+  neighbours' collection back), and otherwise once the table holds a
+  version older than its window — a younger table has nothing for its
+  window to collect, and deferring only keeps history longer (issue
+  #395: splitting at the `ALTER` cost a split and a merge per edge for
+  tables created and dropped in seconds). `CREATE TABLE ... WITH
+  (gc_ttl)` splits the empty table at once, so its writes never pass
+  through a shared range's log, which a purge of the table could not
+  truncate. The merge queue — which already refuses to merge ranges
+  whose windows differ — keeps the split ranges apart.
 
 Nothing about a short window is unsafe, because nothing about the
 threshold assumes it is far in the past: every batch at or below it is
