@@ -2571,6 +2571,18 @@ state or the internode protocol does, and an entry below says so.
   NULL included, sent in that type; `EXISTS` and `IN (SELECT ...)` are
   `boolean`. Describing a portal reports the result formats its Bind
   chose, so pgx's describe modes read binary columns correctly.
+- **An expression over scalar subqueries is described with its own
+  type** (#402). `(SELECT count(*) ...) + (SELECT count(*) ...)` was
+  described as `text` over the extended protocol, so pgx failed with
+  `cannot scan text (OID 25) in text format into *int64`, while the
+  simple protocol returned `int8`. Each scalar subquery is now typed as
+  its own column, and the expression around it by PostgreSQL's operator
+  rules: `(SELECT 1) + (SELECT 2)` is `integer`, anything with an `int8`
+  is `bigint`, a `numeric` or `float8` operand lifts the result, and a
+  comparison is `boolean`. This holds for nested expressions,
+  `coalesce` and `CASE`, in a select list with or without a FROM, and
+  for correlated subqueries. Describe and execution report the same
+  type, and the values are sent in it.
 - **Rate-based health problems no longer miss a burst between two
   reads.** Health is sampled when it is read; a read longer ago than
   the rate window (five minutes by default) was dropped as the

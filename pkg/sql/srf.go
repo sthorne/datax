@@ -132,7 +132,9 @@ func exprNoTZ(e parser.Expr, colType func(name string) (types.Family, bool), col
 	case e.Column != "" && colNoTZ != nil:
 		return colNoTZ(e.Column)
 	case e.Lit != nil:
-		return !e.Lit.Null && e.Lit.Fam == types.Timestamp && e.Lit.NoTZ
+		// A NULL of a timestamp without time zone (a scalar
+		// subquery's, while describing) is one too.
+		return e.Lit.Fam == types.Timestamp && e.Lit.NoTZ
 	}
 	return false
 }

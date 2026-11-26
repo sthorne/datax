@@ -310,7 +310,17 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				if name == "" {
 					name = "?column?"
 				}
-				fam := exprFamily(se.Expr, nil)
+				// Each scalar subquery types as a NULL of its own column's
+				// type (typeSubqueryOperands), so an expression over
+				// subqueries ((SELECT ...) + (SELECT ...), coalesce,
+				// a comparison) types as execution computes it.
+				e, subTyped := se.Expr, false
+				if exprHasSubquery(se.Expr) {
+					if typed, ok := s.typeSubqueryOperands(ctx, se.Expr); ok {
+						e, subTyped = typed, true
+					}
+				}
+				fam := exprFamily(e, nil)
 				if fn, ok := selectSRF(se.Expr); ok {
 					// Named by the function, as execution names it.
 					if se.Alias == "" {
@@ -323,16 +333,14 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 				if fam == types.Unknown {
 					fam = types.String
 				}
-				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
+				w := exprWidth(fam, e, nil)
+				if !subTyped && se.Expr.Sub != nil && se.Expr.BinOp == "" {
 					if sc, serr := s.PlanColumns(ctx, se.Expr.Sub); serr == nil && len(sc) == 1 {
 						fam = sc[0].Type
 					}
-				}
-				w := exprWidth(fam, se.Expr, nil)
-				if se.Expr.Sub != nil && se.Expr.BinOp == "" {
 					w = 0
 				}
-				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(se.Expr, nil, nil), Width: w})
+				cols = append(cols, ResultColumn{Name: name, Type: fam, NoTZ: exprNoTZ(e, nil, nil), Width: w})
 			}
 			return cols, nil
 		}
