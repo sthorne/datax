@@ -144,12 +144,28 @@ func (n *Node) purgeSpan(ctx context.Context, start, end keys.Key) (*kvpb.PurgeR
 		return nil, err
 	}
 	nodes := map[base.NodeID]bool{}
-	for _, desc := range ranges {
+	for i := 0; i < len(ranges); i++ {
+		desc := ranges[i]
 		ans, err := n.purgeRangeOnLeader(ctx, desc, start, end, limit, len(held) > 0)
 		if err != nil {
 			rep.Incomplete = append(rep.Incomplete, fmt.Sprintf("%s was not collected: %v", desc.RangeID, err))
 			rep.Replicas = append(rep.Replicas, kvpb.PurgeReplicaReport{RangeID: desc.RangeID, Error: "range not collected: " + err.Error()})
 			continue
+		}
+		if lo, hi, ok := purgeRemainder(desc, ans.Desc, end); ok {
+			// A split applied after the listing and before the collection
+			// (a load-based split): the right-hand side left with the
+			// threshold it had then, and is purged on its own.
+			more, err := n.rangesTiling(ctx, lo, hi)
+			switch {
+			case err != nil:
+				rep.Incomplete = append(rep.Incomplete, fmt.Sprintf("%s split during the purge and %s to %s was not collected: %v", desc.RangeID, keys.Pretty(lo), keys.Pretty(hi), err))
+			case len(ranges)+len(more) > purgeMaxRanges:
+				rep.Incomplete = append(rep.Incomplete, fmt.Sprintf("%s to %s kept splitting during the purge and was not collected", keys.Pretty(lo), keys.Pretty(hi)))
+			default:
+				ranges = append(ranges, more...)
+				rep.Ranges += len(more)
+			}
 		}
 		rep.VersionsRemoved += ans.Removed
 		if ans.ThresholdNanos > rep.PurgeTSNanos {
@@ -204,6 +220,26 @@ func (n *Node) purgeSpan(ctx context.Context, start, end keys.Key) (*kvpb.PurgeR
 	}
 	rep.Complete = len(rep.Incomplete) == 0
 	return rep, nil
+}
+
+// purgeMaxRanges bounds how many ranges one purge collects, the ranges
+// split off during it included, so a span that never stops splitting
+// ends the purge (reported incomplete) rather than holding it forever.
+const purgeMaxRanges = 100000
+
+// purgeRemainder is the part of listed, clipped to end, that the range
+// as its collection left it (collected) no longer covers: a split that
+// applied in between keeps the left-hand side under the range's ID and
+// hands [collected.EndKey, listed.EndKey) to a new range.
+func purgeRemainder(listed, collected kvpb.RangeDescriptor, end keys.Key) (lo, hi keys.Key, ok bool) {
+	hi = listed.EndKey
+	if end.Compare(hi) < 0 {
+		hi = end
+	}
+	if collected.EndKey.Compare(hi) >= 0 {
+		return nil, nil, false
+	}
+	return collected.EndKey, hi, true
 }
 
 // rangesTiling returns the ranges that cover [start, end), in key order,
