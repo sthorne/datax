@@ -103,6 +103,12 @@ type StoreConfig struct {
 	// the default for a span that also holds non-retention data (never
 	// delete early from a mixed range).
 	RetentionOverride func(start, end keys.Key) (ttl time.Duration, expire, ok bool)
+	// WindowSpans, when set, returns the table spans with an ordinary GC
+	// window of their own (gc_ttl; never a retention, whose tables are
+	// split at creation) that [start, end) only partially overlaps. The
+	// GC pass splits such a range at the table's edges once the window
+	// has something to act on (splitForWindows; issue #395).
+	WindowSpans func(start, end keys.Key) []WindowSpan
 	// GCLimit, when set, bounds every GC threshold the housekeeping pass
 	// sets (issue #376): it returns the highest threshold collection may
 	// set — just below the oldest timestamp a backup in progress reads
@@ -259,6 +265,13 @@ type Store struct {
 	mu struct {
 		sync.Mutex
 		replicas map[base.RangeID]*Replica
+	}
+
+	// wipes holds merged right-hand ranges whose raft state waits for the
+	// state engine to flush past their merge (wipeMergedRaftState).
+	wipes struct {
+		sync.Mutex
+		pending []pendingWipe
 	}
 
 	// consistencyMu round-robins the consistency sweep over led ranges.

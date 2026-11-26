@@ -68,21 +68,38 @@ type routerEnv struct {
 // spans the whole keyspace, its ID counter at 1 (as bootstrap leaves it).
 func startRouterStore(t *testing.T, knobs TestingKnobs) *routerEnv {
 	t.Helper()
+	return startRouterStoreCfg(t, func(cfg *StoreConfig) { cfg.TestingKnobs = knobs })
+}
+
+// startRouterStoreCfg is startRouterStore with the store's config
+// adjusted by opt before the store is made. Engine is opened by the
+// helper; opt may replace it (and set RaftEngine) for a split store.
+func startRouterStoreCfg(t *testing.T, opt func(*StoreConfig)) *routerEnv {
+	t.Helper()
 	eng, err := storage.Open("", storage.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	stopper := stop.NewStopper()
-	t.Cleanup(func() {
-		stopper.Stop()
-		_ = eng.Close()
-	})
 	env := &routerEnv{clock: hlc.NewClock(nil, 250*time.Millisecond)}
-	env.store = NewStore(StoreConfig{
+	cfg := StoreConfig{
 		NodeID: 1, StoreID: 1, Engine: eng, Clock: env.clock, Stopper: stopper,
 		Transport: nopRaftTransport{}, RaftTickInterval: 10 * time.Millisecond,
-		TestingKnobs: knobs,
+	}
+	if opt != nil {
+		opt(&cfg)
+	}
+	t.Cleanup(func() {
+		stopper.Stop()
+		_ = cfg.Engine.Close()
+		if cfg.Engine != eng {
+			_ = eng.Close()
+		}
+		if cfg.RaftEngine != nil {
+			_ = cfg.RaftEngine.Close()
+		}
 	})
+	env.store = NewStore(cfg)
 	env.router = &storeRouter{s: env.store, clock: env.clock}
 	env.store.SetSender(env.router)
 	desc := kvpb.RangeDescriptor{

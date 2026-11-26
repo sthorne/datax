@@ -58,12 +58,7 @@ func TestScalarSubqueryRowDescription(t *testing.T) {
 	ni32 := func() any { return new(*int32) }
 	bl := func() any { return new(bool) }
 
-	cases := []struct {
-		sql  string
-		oids []uint32
-		dest []func() any
-		want []string // one per row: the scanned values, space separated
-	}{
+	cases := []rowDescCase{
 		// The issue's shapes.
 		{`SELECT (SELECT count(*) FROM sq WHERE sq.p = sp.a) FROM sp ORDER BY a`,
 			[]uint32{oidInt8}, []func() any{i64}, []string{"2", "1"}},
@@ -105,6 +100,155 @@ func TestScalarSubqueryRowDescription(t *testing.T) {
 			[]uint32{oidBool}, []func() any{bl}, []string{"true", "false"}},
 	}
 
+	checkRowDescCases(ctx, t, conn, cases)
+
+	// Describe and the rows agree in either result format on the
+	// extended protocol: a text-format int8 is its digits, a binary one
+	// eight bytes.
+	const corr = `SELECT (SELECT count(*) FROM sq WHERE sq.p = sp.a), (SELECT v FROM sq WHERE sq.id = sp.a) FROM sp ORDER BY a`
+	for _, format := range []int16{0, 1} {
+		rr := conn.PgConn().ExecParams(ctx, corr, nil, nil, nil, []int16{format}).Read()
+		if rr.Err != nil {
+			t.Fatalf("format %d: %v", format, rr.Err)
+		}
+		if len(rr.FieldDescriptions) != 2 || rr.FieldDescriptions[0].DataTypeOID != oidInt8 || rr.FieldDescriptions[1].DataTypeOID != oidInt4 {
+			t.Fatalf("format %d: fields %+v", format, rr.FieldDescriptions)
+		}
+		if len(rr.Rows) != 2 {
+			t.Fatalf("format %d: %d rows", format, len(rr.Rows))
+		}
+		count, v := rr.Rows[0][0], rr.Rows[0][1]
+		switch format {
+		case 0:
+			if string(count) != "2" || string(v) != "10" {
+				t.Fatalf("text values %q %q", count, v)
+			}
+		case 1:
+			if len(count) != 8 || count[7] != 2 || len(v) != 4 || v[3] != 10 {
+				t.Fatalf("binary values %x %x", count, v)
+			}
+		}
+	}
+}
+
+// TestScalarSubqueryOperandRowDescription: an expression over scalar
+// subqueries (an arithmetic or comparison operator, a nested expression,
+// coalesce, CASE) is typed by its operands' own types through
+// PostgreSQL's operator rules, with or without a FROM and with the
+// subqueries correlated or not: int4 + int4 is int4, anything with an int8 is int8,
+// a numeric or float8 operand lifts the result, a comparison is a
+// boolean. Describe and execution report the same type in every pgx
+// mode and the values scan into it. Before #402 such an expression
+// described as text (OID 25), so pgx could not scan
+// (SELECT count(*) ...) + (SELECT count(*) ...) into an int64.
+func TestScalarSubqueryOperandRowDescription(t *testing.T) {
+	tc := Start(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, pgURL(tc, 0))
+	if err != nil {
+		t.Fatalf("pgx connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, q := range []string{
+		`CREATE TABLE op (a INT8 PRIMARY KEY)`,
+		`CREATE TABLE oq (id INT8 PRIMARY KEY, p INT8, v INT4, f FLOAT8)`,
+		`INSERT INTO op VALUES (1), (2)`,
+		`INSERT INTO oq VALUES (1, 1, 10, 0.5), (2, 1, 20, 1.5), (3, 2, 30, 2.5)`,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+
+	const (
+		oidBool      = 16
+		oidInt8      = 20
+		oidInt2      = 21
+		oidInt4      = 23
+		oidText      = 25
+		oidFloat8    = 701
+		oidTimestamp = 1114
+		oidNumeric   = 1700
+	)
+	i64 := func() any { return new(int64) }
+	ni64 := func() any { return new(*int64) }
+	i32 := func() any { return new(int32) }
+	i16 := func() any { return new(int16) }
+	str := func() any { return new(string) }
+	f64 := func() any { return new(float64) }
+	bl := func() any { return new(bool) }
+	ts := func() any { return new(time.Time) }
+	one := func(sql string, oid uint32, dest func() any, want ...string) rowDescCase {
+		return rowDescCase{sql: sql, oids: []uint32{oid}, dest: []func() any{dest}, want: want}
+	}
+	c := func(sql string, oids []uint32, dest []func() any, want []string) rowDescCase {
+		return rowDescCase{sql: sql, oids: oids, dest: dest, want: want}
+	}
+
+	checkRowDescCases(ctx, t, conn, []rowDescCase{
+		// The issue's shapes.
+		one(`SELECT (SELECT count(*) FROM (VALUES (1)) v) + (SELECT count(*) FROM (VALUES (1)) w)`, oidInt8, i64, "2"),
+		one(`SELECT (SELECT 1::INT8) + (SELECT 2::INT8)`, oidInt8, i64, "3"),
+		one(`SELECT (SELECT count(*) FROM oq) + (SELECT count(*) FROM oq WHERE p = 1)`, oidInt8, i64, "5"),
+		// Integer widths follow PostgreSQL: int4 with int4 is int4,
+		// anything with an int8 is int8, int2 with int2 is int2.
+		one(`SELECT (SELECT 1) + (SELECT 2)`, oidInt4, i32, "3"),
+		one(`SELECT (SELECT 1) + 1`, oidInt4, i32, "2"),
+		one(`SELECT (SELECT 1::INT8) + 1`, oidInt8, i64, "2"),
+		one(`SELECT 1 + (SELECT count(*) FROM oq)`, oidInt8, i64, "4"),
+		one(`SELECT (SELECT 1::INT2) + (SELECT 2::INT2)`, oidInt2, i16, "3"),
+		c(`SELECT (SELECT count(*) FROM oq) - (SELECT 1), (SELECT count(*) FROM oq) * (SELECT 2), (SELECT count(*) FROM oq) / (SELECT 2), (SELECT count(*) FROM oq) % (SELECT 2)`,
+			[]uint32{oidInt8, oidInt8, oidInt8, oidInt8}, []func() any{i64, i64, i64, i64}, []string{"2 6 1 1"}),
+		c(`SELECT (SELECT 7) - (SELECT 2), (SELECT 7) * (SELECT 2), (SELECT 7) / (SELECT 2), (SELECT 7) % (SELECT 2)`,
+			[]uint32{oidInt4, oidInt4, oidInt4, oidInt4}, []func() any{i32, i32, i32, i32}, []string{"5 14 3 1"}),
+		// Nested expressions and functions over subqueries.
+		one(`SELECT ((SELECT 1) + (SELECT 2)) * 3`, oidInt4, i32, "9"),
+		one(`SELECT ((SELECT count(*) FROM oq) + (SELECT 2)) * 3`, oidInt8, i64, "15"),
+		one(`SELECT coalesce((SELECT 1::INT8), 0)`, oidInt8, i64, "1"),
+		one(`SELECT coalesce((SELECT v FROM oq WHERE id = 99), 0)`, oidInt4, i32, "0"),
+		one(`SELECT coalesce((SELECT sum(v) FROM oq WHERE id = 99), 0) + (SELECT count(*) FROM oq)`, oidInt8, i64, "3"),
+		one(`SELECT CASE WHEN true THEN (SELECT 1) END`, oidInt4, i32, "1"),
+		one(`SELECT CASE WHEN (SELECT count(*) FROM oq) > 2 THEN (SELECT count(*) FROM oq) ELSE 0 END`, oidInt8, i64, "3"),
+		one(`SELECT CASE WHEN false THEN (SELECT 1::INT8) END`, oidInt8, ni64, "<nil>"),
+		// Other families lift the result.
+		one(`SELECT (SELECT 1.5) + (SELECT 2)`, oidNumeric, f64, "3.5"),
+		one(`SELECT (SELECT f FROM oq WHERE id = 2) * (SELECT 2)`, oidFloat8, f64, "3"),
+		one(`SELECT (SELECT 'a'::TEXT) || (SELECT 'b'::TEXT)`, oidText, str, "ab"),
+		one(`SELECT (SELECT '2026-01-01 00:00:00'::TIMESTAMP) + INTERVAL '1 day'`, oidTimestamp, ts, "2026-01-02 00:00:00 +0000 UTC"),
+		// Comparisons are booleans.
+		c(`SELECT (SELECT 1) < (SELECT 2), (SELECT count(*) FROM oq) = (SELECT 3), (SELECT 1) <> (SELECT 1::INT8), (SELECT 2.5) >= (SELECT 2)`,
+			[]uint32{oidBool, oidBool, oidBool, oidBool}, []func() any{bl, bl, bl, bl}, []string{"true true false true"}),
+		// With a FROM, uncorrelated and correlated.
+		one(`SELECT (SELECT count(*) FROM oq) + (SELECT count(*) FROM oq WHERE p = 1) FROM op ORDER BY a`, oidInt8, i64, "5", "5"),
+		one(`SELECT (SELECT 1) + (SELECT 2) FROM op ORDER BY a`, oidInt4, i32, "3", "3"),
+		one(`SELECT (SELECT count(*) FROM oq WHERE oq.p = op.a) + (SELECT count(*) FROM oq WHERE oq.p = op.a) FROM op ORDER BY a`, oidInt8, i64, "4", "2"),
+		c(`SELECT (SELECT v FROM oq WHERE oq.id = op.a) + 1, (SELECT max(v) FROM oq WHERE oq.p = op.a) * (SELECT 2) FROM op ORDER BY a`,
+			[]uint32{oidInt4, oidInt4}, []func() any{i32, i32}, []string{"11 40", "21 60"}),
+		c(`SELECT CASE WHEN a > 1 THEN (SELECT count(*) FROM oq) END, CASE WHEN a > 1 THEN (SELECT v FROM oq WHERE oq.id = op.a) ELSE 0 END FROM op ORDER BY a`,
+			[]uint32{oidInt8, oidInt4}, []func() any{ni64, i32}, []string{"<nil> 0", "3 20"}),
+		c(`SELECT a, (SELECT count(*) FROM oq WHERE oq.p = op.a) > (SELECT 1) FROM op ORDER BY a`,
+			[]uint32{oidInt8, oidBool}, []func() any{i64, bl}, []string{"1 true", "2 false"}),
+	})
+}
+
+// rowDescCase is a query, the OIDs its columns are described with, scan
+// destinations for them and the rows expected (each the scanned values,
+// space separated).
+type rowDescCase struct {
+	sql  string
+	oids []uint32
+	dest []func() any
+	want []string
+}
+
+// checkRowDescCases runs each case in every pgx mode: Describe before
+// Execute (binary and text results) and the simple protocol, whose
+// RowDescription comes from execution, must report the same OIDs, and
+// the values must scan into the destinations.
+func checkRowDescCases(ctx context.Context, t *testing.T, conn *pgx.Conn, cases []rowDescCase) {
+	t.Helper()
 	modes := []pgx.QueryExecMode{
 		pgx.QueryExecModeCacheStatement,
 		pgx.QueryExecModeCacheDescribe,
@@ -147,34 +291,6 @@ func TestScalarSubqueryRowDescription(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("%v %s: rows %q, want %q", mode, c.sql, got, c.want)
-			}
-		}
-	}
-
-	// Describe and the rows agree in either result format on the
-	// extended protocol: a text-format int8 is its digits, a binary one
-	// eight bytes.
-	const corr = `SELECT (SELECT count(*) FROM sq WHERE sq.p = sp.a), (SELECT v FROM sq WHERE sq.id = sp.a) FROM sp ORDER BY a`
-	for _, format := range []int16{0, 1} {
-		rr := conn.PgConn().ExecParams(ctx, corr, nil, nil, nil, []int16{format}).Read()
-		if rr.Err != nil {
-			t.Fatalf("format %d: %v", format, rr.Err)
-		}
-		if len(rr.FieldDescriptions) != 2 || rr.FieldDescriptions[0].DataTypeOID != oidInt8 || rr.FieldDescriptions[1].DataTypeOID != oidInt4 {
-			t.Fatalf("format %d: fields %+v", format, rr.FieldDescriptions)
-		}
-		if len(rr.Rows) != 2 {
-			t.Fatalf("format %d: %d rows", format, len(rr.Rows))
-		}
-		count, v := rr.Rows[0][0], rr.Rows[0][1]
-		switch format {
-		case 0:
-			if string(count) != "2" || string(v) != "10" {
-				t.Fatalf("text values %q %q", count, v)
-			}
-		case 1:
-			if len(count) != 8 || count[7] != 2 || len(v) != 4 || v[3] != 10 {
-				t.Fatalf("binary values %x %x", count, v)
 			}
 		}
 	}

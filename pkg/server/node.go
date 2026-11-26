@@ -897,6 +897,7 @@ func (n *Node) start() error {
 		ClosedTimestampInterval: n.cfg.ClosedTimestampInterval,
 		LoadSplitThreshold:      n.cfg.LoadSplitThreshold,
 		RetentionOverride:       retention.override,
+		WindowSpans:             retention.windowSpans,
 		GCLimit:                 n.gcLimit,
 		MergeBarrier:            n.placementBarrier,
 		RowExpiry:               retention.rowExpiry,

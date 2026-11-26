@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sthorne/datax/pkg/keys"
+	"github.com/sthorne/datax/pkg/kvserver"
 	"github.com/sthorne/datax/pkg/sql/catalog"
 	"github.com/sthorne/datax/pkg/sql/rowenc"
 	"github.com/sthorne/datax/pkg/sql/types"
@@ -34,14 +35,7 @@ type retentionProvider struct {
 	// follow keeps the descriptors of the tables with a window up to
 	// date, and where to resume after a start (catalogFollower).
 	follow *catalogFollower
-	// edgeSplitAt is when the edges of a table with a GC window were
-	// last asked for, by the table's first key (see splitEdges).
-	edgeSplitAt map[string]time.Time
 }
-
-// edgeSplitInterval is how often a table's edge splits are asked for
-// again while one of its ranges still straddles an edge.
-const edgeSplitInterval = time.Minute
 
 type retentionSpan struct {
 	start, end keys.Key
@@ -87,8 +81,9 @@ const retentionRefreshInterval = 30 * time.Second
 //     survivor-keeping GC — a mixed range is never GC'd earlier than any
 //     of its tenants allows, and never expires rows. This is what keeps
 //     one table's short window from reaching another table's history;
-//     the statement that sets a gc_ttl splits the table's edges so that
-//     its ranges are its own;
+//     the GC pass splits a gc_ttl table's edges once its window has
+//     something to act on (windowSpans, kvserver's splitForWindows;
+//     issue #395), and from then on its ranges are its own;
 //   - no overlap → no override.
 func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, bool) {
 	spans := p.get()
@@ -107,9 +102,6 @@ func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, 
 		if ts.ttl > maxTTL {
 			maxTTL = ts.ttl
 		}
-		if !ts.expire {
-			p.splitEdges(ts)
-		}
 	}
 	if !overlaps {
 		return 0, false, false
@@ -120,35 +112,25 @@ func (p *retentionProvider) override(start, end keys.Key) (time.Duration, bool, 
 	return maxTTL, false, true
 }
 
-// splitEdges asks, in the background and at most once per
-// edgeSplitInterval, for range boundaries at the two ends of a table
-// with a GC window, when a range has been found straddling one. The DDL
-// that sets a window splits the edges itself, but best-effort, and a
-// table that arrives by restore was never split at all; without this its
-// window would be set and, on a shared range, never applied.
-func (p *retentionProvider) splitEdges(ts retentionSpan) {
-	p.mu.Lock()
-	if p.edgeSplitAt == nil {
-		p.edgeSplitAt = map[string]time.Time{}
-	}
-	last := p.edgeSplitAt[string(ts.start)]
-	due := p.node != nil && p.node.db != nil && time.Since(last) >= edgeSplitInterval
-	if due {
-		p.edgeSplitAt[string(ts.start)] = time.Now()
-	}
-	p.mu.Unlock()
-	if !due {
-		return
-	}
-	_ = p.node.stopper.RunWorker(func(ctx context.Context) {
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		for _, k := range []keys.Key{ts.start, ts.end} {
-			if _, err := p.node.db.AdminSplit(ctx, k); err != nil {
-				log.Debugf("splitting at %s for a table's GC window: %v", k, err)
-			}
+// windowSpans implements kvserver.StoreConfig.WindowSpans: the tables
+// with a gc_ttl that [start, end) only partially overlaps. A retention
+// table is split at its creation and is not listed: its window expires
+// rows, and a range it shares is aged row by row instead (rowExpiry).
+// Before issue #395 the statement that set a window split the table's
+// edges itself, and a range found straddling one here was split in the
+// background; the GC pass now decides when the split is due.
+func (p *retentionProvider) windowSpans(start, end keys.Key) []kvserver.WindowSpan {
+	var out []kvserver.WindowSpan
+	for _, ts := range p.get() {
+		if ts.expire || start.Compare(ts.end) >= 0 || ts.start.Compare(end) >= 0 {
+			continue
 		}
-	})
+		if ts.start.Compare(start) <= 0 && end.Compare(ts.end) <= 0 {
+			return nil // wholly inside one table: nothing straddles
+		}
+		out = append(out, kvserver.WindowSpan{Start: ts.start, End: ts.end, TTL: ts.ttl})
+	}
+	return out
 }
 
 func (p *retentionProvider) get() []retentionSpan {

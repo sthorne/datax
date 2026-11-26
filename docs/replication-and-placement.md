@@ -598,13 +598,21 @@ state engine's flushed sequence number (Pebble's flush watermark) covers
 the batch that applied that index; the apply path and the housekeeping
 tick both check. Until then a crash could still need those entries: the
 replica restarts at its last flushed applied index and raft re-delivers
-the committed entries above it. The rare structural changes — a merge
-absorbing its RHS, a replica removed from its range, a catch-up
-snapshot replacing a state — flush the state engine before touching the
-raft engine, and a replica created from a preseed snapshot (which no log
-on the store would re-create) is flushed before its raft group starts,
-so the two never disagree about which replicas exist in a
-way replay cannot repair; raft state a crash orphaned on the raft engine
+the committed entries above it. The rare structural changes — a replica
+removed from its range, a catch-up snapshot replacing a state — flush
+the state engine before touching the raft engine, and a replica created
+from a preseed snapshot (which no log on the store would re-create) is
+flushed before its raft group starts, so the two never disagree about
+which replicas exist in a way replay cannot repair. A merge does not
+flush (issue #395: the merge queue folding hundreds of ranges back
+together forced a flush per merge, and the tiny L0 files drove the store
+into Pebble write stalls): the absorbed RHS's raft state is deleted the
+way a deferred truncation is, once the flush watermark covers the
+merge's apply batch, with the housekeeping tick forcing one flush for
+every merge pending past the bound. Its range ID is never used again
+and its raft group stopped at the merge, so the leftover state is read
+by nothing but a replay of the merge after a crash, which needs it;
+`datax_raft_merged_state_wipes_total` counts the deletions. Raft state a crash orphaned on the raft engine
 is swept at startup when the state engine holds the range's tombstone,
 and kept otherwise (an RHS whose split the LHS is about to replay). A
 clean shutdown flushes the state engine, so a normal restart replays

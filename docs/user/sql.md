@@ -1993,6 +1993,16 @@ such a statement, with backoff, until it succeeds, its
 `statement_timeout` is about to run out, or it has retried for 30
 seconds.
 
+The exception is a write **shed under storage backpressure**: a
+`40001` whose message contains `storage overloaded, write shed`. The
+server has already retried the shed write itself for up to 5 seconds
+before returning it, and does not re-run the statement, so a single
+`INSERT` or `UPDATE` outside `BEGIN` can fail with `40001` while a
+node's storage is overloaded. A shed write did not take effect, so
+retrying it is safe; give it a longer backoff than a conflict
+([backpressure](operations.md#backpressure)). The same applies to a
+statement in a `BEGIN` block, which fails the whole transaction.
+
 As in PostgreSQL, several statements sent together outside `BEGIN` are
 one **implicit transaction**: the statements of one multi-statement
 query string (`psql -c "INSERT ...; UPDATE ..."`, or a driver's `Exec`

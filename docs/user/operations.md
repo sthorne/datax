@@ -789,14 +789,20 @@ nothing to collect and removes the bytes from the files and logs.
 **A GC window per table.** Garbage collection normally waits out the
 node's window (25h). `ALTER TABLE t SET (gc_ttl = '10m')` gives one
 table its own, shorter or longer; the housekeeping pass picks it up
-within its descriptor cache (~30s). The statement splits the table's
-edges so the window governs ranges that hold only that table, and those
-ranges are not merged into neighbours with a different window. A range
-that straddles the table and something else keeps the longest window of
-what it holds; when housekeeping finds one (a restored table, a split
-that failed) it asks for the edge splits again, at most once a minute
-per table, so the window takes hold a pass or two later. `debug ranges`
-shows whether the table's ranges start and end at its edges.
+within its descriptor cache (~30s). The window governs ranges that hold
+only that table, and those ranges are not merged into neighbours with a
+different window. A range that straddles the table and something else
+keeps the longest window of what it holds. The GC pass splits the
+table's edges when the window would change what it collects: at once
+when the table holds data older than its window or the window is longer
+than the node's, and not while the table is younger than a shorter
+window, which has nothing to collect yet — so a table created and
+dropped within its window never costs a split and a merge (#395).
+`CREATE TABLE ... WITH (gc_ttl = ...)` splits the empty table's edges
+at once, so every write of its rows goes through its own ranges (and a
+`PURGE` truncates every log that held them). `debug ranges` shows
+whether the table's ranges start and end at its edges;
+`datax_gc_window_splits_total` counts the splits the GC pass made.
 
 ### Row expiry
 
@@ -1521,10 +1527,27 @@ to 5 seconds, and the client sees latency. Overload that lasts longer
 fails the statement with SQLSTATE `40001` ("restart transaction: ...
 storage overloaded, write shed: ..."), and so does a statement whose own
 deadline (`statement_timeout`) would pass during the next backoff — it
-fails before the deadline, not at it. Retry such a statement as any
-other `40001`, with backoff; the statement is not retried again inside
-the server, since that would only multiply the wait. Three limits feed
-the same shed path, told apart by `datax_storage_backpressure_cause_total`:
+fails before the deadline, not at it.
+
+What clients need to know:
+
+- **Any write can fail this way**, including a single statement outside
+  `BEGIN`. Other `40001`s on a single statement are retried inside the
+  server ([details](sql.md#transactions-and-retries)); a shed is not,
+  since re-running the statement would only multiply the wait. A
+  client that retries `40001` only around `BEGIN` ... `COMMIT` blocks
+  needs to retry single statements too.
+- **A shed write did not take effect.** A write is shed before it is
+  evaluated, and the statement's transaction is then rolled back; a
+  `COMMIT` that is shed does not commit. Retrying is safe.
+- **Telling a shed from a conflict:** the message contains
+  `storage overloaded, write shed`. Each shed has already cost up to
+  the 5-second budget, so back off longer than for a conflict (start
+  around a second rather than a few milliseconds) and cap the attempts:
+  a node whose storage stays overloaded will shed the retry too.
+
+Three limits feed the same shed path, told apart by
+`datax_storage_backpressure_cause_total`:
 
 - **`cause=leader`** — the leaseholder's own engine crossed its
   profile's L0/memtable thresholds (or Pebble is mid-stall).
