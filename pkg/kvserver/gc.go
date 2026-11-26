@@ -113,6 +113,7 @@ func (s *Store) RunGCOnce(ctx context.Context, ttl time.Duration) {
 			limit = l
 		}
 	}
+	s.splitForWindows(ctx, ttl)
 	s.VisitReplicas(func(r *Replica) bool {
 		if ctx.Err() != nil {
 			return false

@@ -20,7 +20,6 @@ func (n *Node) TestingMemoryStats() map[string]int {
 	n.loadCooldownMu.Unlock()
 	if p := n.retention; p != nil {
 		p.mu.Lock()
-		out["node.retention.edgesplits"] = len(p.edgeSplitAt)
 		out["node.retention.spans"] = len(p.spans)
 		p.mu.Unlock()
 	}

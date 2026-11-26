@@ -2112,6 +2112,33 @@ state or the internode protocol does, and an entry below says so.
   user docs (`sql.md`, `operations.md`, `postgres-differences.md`) now
   say so, say that a shed write did not take effect and is safe to
   retry, and how to tell a shed from a conflict.
+- **Creating and dropping databases of tables with a GC window no
+  longer drives the store into write stalls** (#395). A workload that
+  looped `CREATE DATABASE`, 50 tables (every third with
+  `SET (gc_ttl = '1h')` and `SET (ttl_expiration = ...)`) and
+  `DROP DATABASE ... CASCADE` made about 25 range splits a second and as
+  many merges, and on an in-memory node a transaction in another
+  database waited up to a minute behind `40001 storage overloaded`.
+  Two causes, both fixed:
+  - Each merge on a split store flushed the state engine before
+    deleting the absorbed range's raft state; hundreds of merges after
+    a drop meant hundreds of tiny overlapping L0 files and Pebble write
+    stalls. The deletion now waits for the next flush, as a deferred
+    log truncation does (`datax_raft_merged_state_wipes_total`), with
+    housekeeping forcing one flush for all of them past 30 s.
+  - `ALTER TABLE ... SET (gc_ttl = ...)` split the table's two edges at
+    once. The GC pass now splits them when the window has something to
+    act on: at once for a table older than its window or with a window
+    longer than the node's, never for a table dropped before then
+    (`datax_gc_window_splits_total`). The pass that splits also
+    collects, so a window takes hold as soon as it did before (one pass
+    later if a new range's leader is not elected in time). `CREATE TABLE ... WITH (gc_ttl = ...)` still splits
+    the empty table's edges, so all its writes stay in its own ranges'
+    logs for `PURGE`.
+  - Measured (`datax demo --nodes 1`, 3 minutes): at 2 workers, splits
+    3905 → 6, merges 2702 → 14, foreground p99 9.3 s → 13 ms, max 68 s
+    → 22 ms; at 4 workers, p99 8.8 s → 20 ms, max 22 s → 80 ms, no write
+    stall or shed write, and 2.8× the DDL throughput.
 - **A `float8` value stores into a `numeric` column, and `float8::numeric`
   keeps 15 significant digits**, as in PostgreSQL (was PG-T-033). An
   `INSERT`, `INSERT ... SELECT`, `UPDATE` or `ON CONFLICT DO UPDATE`

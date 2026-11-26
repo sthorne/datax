@@ -254,6 +254,12 @@ func (s *Store) PurgeReplica(ctx context.Context, rangeID base.RangeID, index ui
 			return rep, fmt.Errorf("flushing for the log truncation: %w", err)
 		}
 	}
+	// The flushes above also cover any merge that absorbed a range into
+	// this one: the absorbed range's log, which held its writes, goes
+	// now rather than at the next housekeeping tick (issue #395).
+	if err := s.runPendingWipes(); err != nil {
+		return rep, fmt.Errorf("removing merged ranges' raft state: %w", err)
+	}
 	logLo := keys.RaftLogPrefix(rangeID)
 	if err := s.raftEngine().CompactSpan(ctx, logLo, logLo.PrefixEnd()); err != nil {
 		return rep, fmt.Errorf("compacting the raft log: %w", err)
