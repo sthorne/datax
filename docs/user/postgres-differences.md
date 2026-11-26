@@ -58,7 +58,10 @@ syntax error or `0A000` feature not supported):
   can fail with `40001` and clients **must** retry
   ([details](sql.md#transactions-and-retries)). Code written for
   PostgreSQL's default read-committed often has no retry loop — it needs
-  one here.
+  one here. Under storage backpressure even a single statement outside
+  `BEGIN` can fail with `40001` (`storage overloaded, write shed`); it
+  did not take effect and can be retried
+  ([details](operations.md#backpressure)).
 - **`FOR UPDATE SKIP LOCKED` and `NOWAIT`** work, with two differences
   that follow from serializable isolation
   ([details](sql.md#not-waiting-for-a-lock-skip-locked-and-nowait)).
@@ -701,7 +704,7 @@ are the differences ([reference](sql.md#large-objects)):
 
 | SQLSTATE | Meaning | What to do |
 |---|---|---|
-| `40001` | serialization failure — including a transaction that read data whose history was garbage-collected under it (it ran longer than a table's `gc_ttl`, or a `PURGE` of what it reads ran meanwhile) | retry the whole transaction |
+| `40001` | serialization failure — including a transaction that read data whose history was garbage-collected under it (it ran longer than a table's `gc_ttl`, or a `PURGE` of what it reads ran meanwhile), and a write shed under storage backpressure (`storage overloaded, write shed`), which can fail a single statement outside `BEGIN` too | retry the whole transaction; after a shed, with a longer backoff |
 | `72000` | snapshot too old: `AS OF SYSTEM TIME` names a moment older than the table's GC window (`gc_ttl`, default 25h), or before a `PURGE` or a dropped table's reclaim | read at a later moment; retrying the same one cannot succeed |
 | `25P02` | transaction poisoned by an earlier error | `ROLLBACK` (or `ROLLBACK TO SAVEPOINT`) |
 | `55P03` | a lock was not available: `FOR UPDATE NOWAIT` met a locked row, or a wait (for a row or an advisory lock) outlasted `lock_timeout` | the row is busy — back off, or do something else; not a retry-now signal |

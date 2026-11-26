@@ -1521,10 +1521,27 @@ to 5 seconds, and the client sees latency. Overload that lasts longer
 fails the statement with SQLSTATE `40001` ("restart transaction: ...
 storage overloaded, write shed: ..."), and so does a statement whose own
 deadline (`statement_timeout`) would pass during the next backoff — it
-fails before the deadline, not at it. Retry such a statement as any
-other `40001`, with backoff; the statement is not retried again inside
-the server, since that would only multiply the wait. Three limits feed
-the same shed path, told apart by `datax_storage_backpressure_cause_total`:
+fails before the deadline, not at it.
+
+What clients need to know:
+
+- **Any write can fail this way**, including a single statement outside
+  `BEGIN`. Other `40001`s on a single statement are retried inside the
+  server ([details](sql.md#transactions-and-retries)); a shed is not,
+  since re-running the statement would only multiply the wait. A
+  client that retries `40001` only around `BEGIN` ... `COMMIT` blocks
+  needs to retry single statements too.
+- **A shed write did not take effect.** A write is shed before it is
+  evaluated, and the statement's transaction is then rolled back; a
+  `COMMIT` that is shed does not commit. Retrying is safe.
+- **Telling a shed from a conflict:** the message contains
+  `storage overloaded, write shed`. Each shed has already cost up to
+  the 5-second budget, so back off longer than for a conflict (start
+  around a second rather than a few milliseconds) and cap the attempts:
+  a node whose storage stays overloaded will shed the retry too.
+
+Three limits feed the same shed path, told apart by
+`datax_storage_backpressure_cause_total`:
 
 - **`cause=leader`** — the leaseholder's own engine crossed its
   profile's L0/memtable thresholds (or Pebble is mid-stall).

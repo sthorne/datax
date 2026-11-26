@@ -2105,6 +2105,13 @@ state or the internode protocol does, and an entry below says so.
   full read's.
 
 ### Fixed
+- **Docs: a write shed under storage backpressure fails even a single
+  statement with `40001`** (#396). Since #391 and #392, a write shed for
+  longer than the 5-second budget fails its statement instead of
+  waiting, and the server does not re-run it, outside `BEGIN` too. The
+  user docs (`sql.md`, `operations.md`, `postgres-differences.md`) now
+  say so, say that a shed write did not take effect and is safe to
+  retry, and how to tell a shed from a conflict.
 - **A `float8` value stores into a `numeric` column, and `float8::numeric`
   keeps 15 significant digits**, as in PostgreSQL (was PG-T-033). An
   `INSERT`, `INSERT ... SELECT`, `UPDATE` or `ON CONFLICT DO UPDATE`
