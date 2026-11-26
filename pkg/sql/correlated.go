@@ -1176,6 +1176,7 @@ type corrProj struct {
 	refs  []string                      // bind-level names across all subqueries (the memo key)
 	bind  *scopeNode                    // any node: all share the bound scope
 	fam   types.Family                  // the expression's type (Unknown: typed by its values)
+	width int32                         // an integer fam's width (2, 4; 0 is 8)
 }
 
 // exprSubqueries lists the subqueries an expression carries, anywhere
@@ -1405,15 +1406,29 @@ func (s *Session) splitCorrelatedProj(ctx context.Context, txn *kvclient.Txn, t 
 		// Describe); the values are conformed to it.
 		null := types.DNull
 		if typed, ok := s.typeSubqueryOperands(ctx, se.Expr); ok {
-			cp.fam = exprFamily(typed, func(n string) (types.Family, bool) {
+			col := func(n string) (catalog.Column, bool) {
 				q, name := "", n
 				if j := strings.LastIndexByte(n, '.'); j >= 0 {
 					q, name = n[:j], n[j+1:]
 				}
-				c, ok := outer.col(q, name)
+				return outer.col(q, name)
+			}
+			cp.fam = exprFamily(typed, func(n string) (types.Family, bool) {
+				c, ok := col(n)
 				return c.Type, ok
 			})
+			// An integer expression has its operands' width (an int4
+			// subquery plus an int4 is an int4), as Describe gives it.
+			cp.width = exprWidth(cp.fam, typed, func(n string) int32 {
+				if c, ok := col(n); ok {
+					return c.IntWidth()
+				}
+				return 8
+			})
 			null.Fam = cp.fam
+			if cp.fam == types.Int {
+				null = null.WithIntWidth(cp.width)
+			}
 		}
 		clone.Exprs[i].Expr = parser.Expr{Lit: &null}
 		projs = append(projs, cp)
@@ -1431,7 +1446,11 @@ func (cp *corrProj) typed(d types.Datum) (types.Datum, bool) {
 	if cp.fam == types.Unknown {
 		return d, false
 	}
-	return conformTo(d, cp.fam), true
+	d = conformTo(d, cp.fam)
+	if d.Fam == types.Int {
+		d = d.WithIntWidth(cp.width)
+	}
+	return d, true
 }
 
 // evalCorrProj evaluates one correlated output expression against a

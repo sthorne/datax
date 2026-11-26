@@ -145,12 +145,25 @@ func (s *Session) typeScalarSubItems(ctx context.Context, t *parser.Select, cols
 	}
 }
 
+// scalarSubNull is the NULL a scalar subquery stands as while the
+// expression around it is typed: of its column's family, integer width
+// (an int4 subquery is an int4 operand, as its values are at execution)
+// and time-zone flavour.
+func scalarSubNull(col ResultColumn) types.Datum {
+	null := types.Datum{Null: true, Fam: col.Type, NoTZ: col.NoTZ}
+	if col.Type == types.Int {
+		null = null.WithIntWidth(col.Width)
+	}
+	return null
+}
+
 // typeSubqueryOperands returns e with every scalar subquery that
 // describes (scalarSubColumn) replaced by a NULL of its type, for
 // typing the expression around it without evaluating anything; a
 // condition carrying one ([NOT] EXISTS, IN (SELECT ...)) stands as a
-// boolean NULL. ok is false when a subquery remains (one that does not
-// describe, or one inside a CASE or ARRAY(SELECT ...)).
+// boolean NULL; a CASE is typed through its arms. ok is false when a
+// subquery remains (one that does not describe, or one inside
+// ARRAY(SELECT ...)).
 func (s *Session) typeSubqueryOperands(ctx context.Context, e parser.Expr) (parser.Expr, bool) {
 	ok := true
 	var walk func(e parser.Expr) parser.Expr
@@ -167,8 +180,41 @@ func (s *Session) typeSubqueryOperands(ctx context.Context, e parser.Expr) (pars
 			}
 			return out
 		}
+		if e.Case != nil && e.Cmp == nil && e.Lit == nil && e.Sub == nil {
+			// A CASE is of its arms' common type: its arms, operand and
+			// compared values are typed alike, and a condition carrying
+			// a subquery (a boolean, which never types the CASE) stands
+			// as TRUE.
+			c := *e.Case
+			if c.Operand != nil {
+				o := walk(*c.Operand)
+				c.Operand = &o
+			}
+			c.Whens = make([]parser.CaseWhen, len(e.Case.Whens))
+			for i, w := range e.Case.Whens {
+				if w.Value != nil {
+					v := walk(*w.Value)
+					w.Value = &v
+				}
+				for _, cond := range w.Cond {
+					if condHas(cond, func(x parser.Expr) bool { return x.Sub != nil }) {
+						w.Cond = []parser.Comparison{{Op: "TRUE"}}
+						break
+					}
+				}
+				w.Result = walk(w.Result)
+				c.Whens[i] = w
+			}
+			if c.Else != nil {
+				el := walk(*c.Else)
+				c.Else = &el
+			}
+			out.Case = &c
+			e.Case = nil
+		}
 		if e.Cmp != nil || e.Case != nil || e.Func == "array" {
-			// CASE arms and ARRAY(SELECT ...) keep their subqueries.
+			// ARRAY(SELECT ...) and a comparison over an expression keep
+			// their subqueries.
 			if exprHasSubquery(e) {
 				ok = false
 			}
@@ -184,7 +230,7 @@ func (s *Session) typeSubqueryOperands(ctx context.Context, e parser.Expr) (pars
 				ok = false
 				return e
 			}
-			null := types.Datum{Null: true, Fam: col.Type}.WithIntWidth(col.Width)
+			null := scalarSubNull(col)
 			out.Sub, out.Lit = nil, &null
 		}
 		if e.Left != nil {
