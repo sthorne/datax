@@ -11,6 +11,26 @@ state or the internode protocol does, and an entry below says so.
 ## 0.58.0 — unreleased
 
 ### Added
+- **Placement compliance and cluster topology over SQL** (#405), with
+  the HTTP listener off.
+  - `SHOW PLACEMENT` gains `satisfied`, `ranges`, `misplaced_ranges`,
+    `unsatisfiable_ranges`, `unattributed_ranges` and
+    `unknown_locality_replicas`: whether the database's table data is
+    where its policy says, read from the range descriptors when asked.
+    Any role can read it, as before. A range shared with another table
+    or system data counts against compliance (no policy governs it), as
+    does a replica on a node of unknown locality. The columns are NULL
+    when the range listing fails, never answered from a stale one.
+  - `SHOW RANGES [FROM DATABASE d]`: one row per range of the database,
+    with each replica's node and locality and the range's status. It
+    needs `CONNECT`; the table name and row-bearing boundary keys are
+    shown only to a role that can see the table.
+  - `SHOW NODES`: node ID, address, locality, liveness, draining and
+    last heartbeat, for the admin role and roles with the new
+    **`VIEWCLUSTER`** attribute (`ALTER ROLE r VIEWCLUSTER`; not
+    inherited, like `CREATEDB`).
+  - **`datax demo --locality`** sets each node's locality, one per node
+    separated by `;`, or one for all.
 - **`datax start --sql-max-message-size`** sets the largest message an
   authenticated SQL client may send (default 256 MiB, accepted range
   1 MiB to 1 GiB; PostgreSQL's own limit is 1 GB). The cap existed but
@@ -1759,6 +1779,12 @@ state or the internode protocol does, and an entry below says so.
   protocol, as before.)
 
 ### Changed
+- **`placement-unsatisfiable` now fires when fewer live nodes satisfy a
+  policy than it wants replicas,** not only when none do (#405). Two
+  nodes in a region for three replicas used to be reported as
+  `placement-misplaced` forever, though the allocator, which adds before
+  it removes, could never fix it; the docs already described it as
+  unsatisfiable. Draining nodes no longer count towards a policy.
 - **Sequences, types and relation names** (with PG-D-035 above):
   - A `DEFAULT nextval('x')` written before `x` exists is `42P01`, as in
     PostgreSQL; it used to be accepted and resolved when used.

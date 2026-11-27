@@ -1023,6 +1023,9 @@ type CreateRole struct {
 	// attributes of those names (nil = not spelled; NOSUPERUSER etc.
 	// set false). SUPERUSER is membership in the built-in admin role.
 	Superuser, CreateDB, CreateRole, Replication *bool
+	// ViewCluster is VIEWCLUSTER / NOVIEWCLUSTER (issue #405): whether
+	// the role may run SHOW NODES without the admin role.
+	ViewCluster *bool
 	// ConnLimit is CONNECTION LIMIT n (-1 = no limit); ValidUntil is
 	// VALID UNTIL 'timestamp' as written ('infinity' included).
 	ConnLimit  *int64
@@ -1333,6 +1336,15 @@ type AlterDatabase struct {
 // database carries and what the cluster resolves it to.
 type ShowPlacement struct{ Database string }
 
+// ShowRanges is SHOW RANGES [FROM DATABASE name] (issue #405): the
+// ranges holding a database's table data and where their replicas are;
+// bare, the session's own database.
+type ShowRanges struct{ Database string }
+
+// ShowNodes is SHOW NODES (issue #405): the cluster's nodes, their
+// localities and liveness.
+type ShowNodes struct{}
+
 // ShowDatabases is SHOW DATABASES.
 type ShowDatabases struct{}
 
@@ -1419,6 +1431,8 @@ func (*DropSchema) stmt()             {}
 func (*AlterSchemaRename) stmt()      {}
 func (*SetSchema) stmt()              {}
 func (*ShowPlacement) stmt()          {}
+func (*ShowRanges) stmt()             {}
+func (*ShowNodes) stmt()              {}
 func (*DropDatabase) stmt()           {}
 func (*AlterDatabase) stmt()          {}
 func (*ShowDatabases) stmt()          {}

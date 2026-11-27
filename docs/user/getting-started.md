@@ -40,7 +40,10 @@ Useful flags: `-nodes N` (1–9), `-http-port 8080` to also serve the
 databases keep their rows for that window before they are reclaimed, and
 a demo keeps everything in memory, so a test suite that creates and
 drops a database per test should run its demo with a short one, e.g.
-`./datax demo -nodes 1 -gc-ttl 5m`.
+`./datax demo -nodes 1 -gc-ttl 5m`. To try placement policies across
+regions, give each node its own locality:
+`./datax demo -nodes 4 -locality 'region=us-east-1;region=us-east-2;region=us-east-1;region=eu-west-1'`
+(one per node, separated by `;`, or one for every node).
 
 Demo data is in-memory only — everything is discarded on Ctrl-C. For a
 persistent cluster see [Deployment](deployment.md).

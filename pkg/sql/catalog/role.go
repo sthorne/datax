@@ -93,6 +93,12 @@ type RoleDescriptor struct {
 	// role, and there is no replication protocol).
 	CreateRole  bool `json:"createrole,omitempty"`
 	Replication bool `json:"replication,omitempty"`
+	// ViewCluster is VIEWCLUSTER (issue #405): the role may run SHOW
+	// NODES, which lists every node's address, locality and liveness,
+	// without the admin role. Like CREATEDB it is the role's own and is
+	// not inherited through membership. Additive JSON: a binary that
+	// predates it reads the role as without it.
+	ViewCluster bool `json:"viewcluster,omitempty"`
 	// ConnLimit is CONNECTION LIMIT: how many sessions the role may have
 	// open at once on one node; nil or -1 for no limit.
 	ConnLimit *int64 `json:"conn_limit,omitempty"`

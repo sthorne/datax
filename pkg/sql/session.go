@@ -268,6 +268,10 @@ type Session struct {
 	BackendPID     int32
 	BackendControl func(pid int32, terminate bool) (bool, error)
 	SessionsHook   func() []SessionInfo
+	// Cluster answers SHOW NODES, SHOW RANGES and SHOW PLACEMENT's
+	// compliance columns (issue #405); nil on a session no SQL server
+	// set up, which then reports them unavailable.
+	Cluster ClusterInfo
 	// pendingWipes are indexes dropped by statements of this session
 	// whose entries are reclaimed once the statement commits.
 	pendingWipes []indexWipe

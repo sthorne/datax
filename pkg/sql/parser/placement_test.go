@@ -119,3 +119,31 @@ func TestParsePlacementErrors(t *testing.T) {
 		}
 	}
 }
+
+// Topology statements and VIEWCLUSTER (issue #405).
+func TestParseShowRangesNodes(t *testing.T) {
+	stmts, err := Parse(`SHOW RANGES; SHOW RANGES FROM DATABASE eu; show nodes; ALTER ROLE app VIEWCLUSTER; CREATE ROLE ops NOVIEWCLUSTER`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if sr, ok := stmts[0].(*ShowRanges); !ok || sr.Database != "" {
+		t.Fatalf("bare SHOW RANGES: %#v", stmts[0])
+	}
+	if sr, ok := stmts[1].(*ShowRanges); !ok || sr.Database != "eu" {
+		t.Fatalf("SHOW RANGES FROM DATABASE: %#v", stmts[1])
+	}
+	if _, ok := stmts[2].(*ShowNodes); !ok {
+		t.Fatalf("SHOW NODES: %#v", stmts[2])
+	}
+	if cr := stmts[3].(*CreateRole); !cr.Alter || cr.ViewCluster == nil || !*cr.ViewCluster {
+		t.Fatalf("VIEWCLUSTER: %+v", cr)
+	}
+	if cr := stmts[4].(*CreateRole); cr.ViewCluster == nil || *cr.ViewCluster {
+		t.Fatalf("NOVIEWCLUSTER: %+v", cr)
+	}
+	for _, bad := range []string{`SHOW RANGES FROM TABLE t`, `SHOW NODES x`} {
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("%s: parsed", bad)
+		}
+	}
+}

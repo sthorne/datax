@@ -111,6 +111,10 @@ func (s *Session) execStmt(ctx context.Context, txn *kvclient.Txn, stmt parser.S
 		return s.execShowDatabases(ctx, txn)
 	case *parser.ShowPlacement:
 		return s.execShowPlacement(ctx, txn, t)
+	case *parser.ShowRanges:
+		return s.execShowRanges(ctx, txn, t)
+	case *parser.ShowNodes:
+		return s.execShowNodes(ctx, txn)
 	case *parser.CreateTable:
 		return s.execCreateTable(ctx, txn, t)
 	case *parser.Explain:
