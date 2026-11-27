@@ -131,6 +131,10 @@ func (p *parser) parseRoleStmt(alter bool) (Statement, error) {
 			set(&cr.CreateDB, true)
 		case "nocreatedb":
 			set(&cr.CreateDB, false)
+		case "viewcluster":
+			set(&cr.ViewCluster, true)
+		case "noviewcluster":
+			set(&cr.ViewCluster, false)
 		case "createrole":
 			set(&cr.CreateRole, true)
 		case "nocreaterole":

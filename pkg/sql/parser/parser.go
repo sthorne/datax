@@ -1134,6 +1134,26 @@ func (p *parser) parseStatement() (Statement, error) {
 			}
 			return sp, nil
 		}
+		if p.peekWord(0, "ranges") {
+			// SHOW RANGES [FROM DATABASE name]; bare, the session's own.
+			p.i++
+			sr := &ShowRanges{}
+			if p.consumeKeyword("FROM") {
+				if !p.consumeIdentWord("database") {
+					return nil, p.errf("SHOW RANGES FROM takes DATABASE")
+				}
+				name, err := p.expectIdent()
+				if err != nil {
+					return nil, err
+				}
+				sr.Database = name
+			}
+			return sr, p.expectEnd("SHOW RANGES")
+		}
+		if p.peekWord(0, "nodes") {
+			p.i++
+			return &ShowNodes{}, p.expectEnd("SHOW NODES")
+		}
 		if p.consumeIdentWord("sequences") {
 			return &ShowSequences{}, nil
 		}

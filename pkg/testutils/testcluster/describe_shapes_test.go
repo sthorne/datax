@@ -102,6 +102,10 @@ var describeSamples = []struct {
 		{sql: `SHOW PLACEMENT`, rows: true},
 		{sql: `SHOW PLACEMENT FOR DATABASE shapes_other2`, rows: true},
 	}},
+	{"ShowRanges", []describeSample{
+		{sql: `SHOW RANGES`, rows: true},
+	}},
+	{"ShowNodes", []describeSample{{sql: `SHOW NODES`, rows: true}}},
 	{"ShowSequences", []describeSample{{sql: `SHOW SEQUENCES`, rows: true}}},
 	{"ShowFunctions", []describeSample{{sql: `SHOW FUNCTIONS`, rows: true}}},
 	{"Show", []describeSample{

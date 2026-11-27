@@ -356,7 +356,7 @@ dashboard row links to:
 | `quorum-lost` | critical | a range has fewer serving replicas than a majority; it cannot serve until a node returns (ranges). A serving replica is one on a live node that the node does not report failed or missing |
 | `under-replicated` | warning | a range has fewer serving replicas than its replication factor (ranges) |
 | `diversity` | warning | a range's replicas share a locality tier they could spread across (ranges) |
-| `placement-unsatisfiable` | critical | a range names a database placement policy that no live node satisfies; the data stays where it is until such a node joins (ranges) |
+| `placement-unsatisfiable` | critical | a range names a database placement policy that fewer live nodes satisfy than it wants replicas; misplaced replicas stay where they are, and lost ones are not replaced, until enough such nodes join (ranges). `SHOW PLACEMENT` reports the same per database over SQL |
 | `placement-misplaced` | warning | a range holds a replica outside its database's placement policy; the allocator moves them home one per pass (ranges) |
 | `meta-unavailable` | critical | the serving node cannot read the `/meta` range list, so it cannot route (ranges) |
 | `backpressure`, `debt-gate`, `write-stalls`, `storage-errors` | warning / critical | the storage counters in the table below are moving over the last five minutes (storage) |

@@ -105,6 +105,7 @@ ALTER ROLE etl NOLOGIN;                                   -- lock out; LOGIN reo
 ALTER ROLE auditor BYPASSRLS;                             -- exempt from row-level security; NOBYPASSRLS undoes it
 CREATE ROLE ops LOGIN SUPERUSER;                          -- = GRANT admin TO ops; NOSUPERUSER revokes it
 ALTER ROLE builder CREATEDB;                              -- may CREATE DATABASE without admin
+ALTER ROLE monitor VIEWCLUSTER;                           -- may SHOW NODES without admin
 ALTER ROLE contractor VALID UNTIL '2027-01-01';           -- its password stops working then
 ALTER ROLE batch CONNECTION LIMIT 10;                     -- sessions per node; -1: no limit
 DROP ROLE analyst;                                        -- refused (2BP01) while it owns objects
@@ -160,7 +161,9 @@ in `admin`, so it is everything `admin` is, and `NOSUPERUSER` revokes
 the membership (`root` keeps it). `CREATEDB` lets the role create
 databases, owned by itself or by a role it belongs to; like
 PostgreSQL's it is the role's own attribute, not inherited through
-membership. `CREATEROLE` and `REPLICATION` are recorded for the
+membership. `VIEWCLUSTER` lets the role run `SHOW NODES`, which lists
+every node's address, locality and liveness; it too is the role's own.
+`CREATEROLE` and `REPLICATION` are recorded for the
 catalogs (`pg_roles`, `pg_authid`) and grant nothing. `VALID UNTIL`
 ends a role's password logins at that time — the attempt fails as a
 wrong password does — but not its certificate logins, as PostgreSQL

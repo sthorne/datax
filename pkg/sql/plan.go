@@ -434,6 +434,10 @@ func (s *Session) planBoundColumns(ctx context.Context, stmt parser.Statement) (
 		return showDatabasesColumns(), nil
 	case *parser.ShowPlacement:
 		return showPlacementColumns(), nil
+	case *parser.ShowRanges:
+		return showRangesColumns(), nil
+	case *parser.ShowNodes:
+		return showNodesColumns(), nil
 	case *parser.AlterTable:
 		return alterTableColumns(t), nil
 
