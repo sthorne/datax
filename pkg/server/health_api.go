@@ -359,32 +359,36 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		misplaced, unsatisfiable := 0, 0
 		var misEx, unsatEx base.RangeID
 		var unsatPolicy string
-		nodeLocalities := map[base.NodeID]base.Locality{}
+		// A policy is unsatisfiable when fewer usable nodes match it than
+		// it wants replicas (issue #405), the same test SHOW PLACEMENT
+		// applies: such a range is never brought into line, since the
+		// allocator adds a replica before it removes one.
+		nodeStates := map[base.NodeID]placement.NodeState{}
 		for _, nd := range nodes {
-			nodeLocalities[nd.NodeID] = nd.Locality
+			nodeStates[nd.NodeID] = placement.NodeState{Locality: nd.Locality, Usable: live[nd.NodeID] && !nd.Draining}
 		}
+		nodeLocalities := placement.Localities(nodeStates)
+		eligible := map[string]int{}
 		for _, d := range descs {
 			policy := n.placementOf(d)
 			if len(policy.Constraints) > 0 {
+				key := policy.Normalize().String()
+				e, ok := eligible[key]
+				if !ok {
+					e = placement.Eligible(policy, nodeStates)
+					eligible[key] = e
+				}
 				var ids []base.NodeID
 				for _, rep := range d.Replicas {
 					ids = append(ids, rep.NodeID)
 				}
-				if len(placement.Misplaced(policy, ids, nodeLocalities)) > 0 {
-					anyHome := false
-					for _, nd := range nodes {
-						if live[nd.NodeID] && policy.Satisfies(nd.Locality) {
-							anyHome = true
-							break
-						}
-					}
-					if anyHome {
-						misplaced++
-						misEx = d.RangeID
-					} else {
-						unsatisfiable++
-						unsatEx, unsatPolicy = d.RangeID, policy.String()
-					}
+				switch {
+				case placement.Unsatisfiable(policy, e):
+					unsatisfiable++
+					unsatEx, unsatPolicy = d.RangeID, policy.String()
+				case len(placement.Misplaced(policy, ids, nodeLocalities)) > 0:
+					misplaced++
+					misEx = d.RangeID
 				}
 			}
 			liveReps, unknownReps, seen := 0, 0, map[string]bool{}
@@ -443,7 +447,7 @@ func (n *Node) runHealthChecks(req *http.Request) *HealthStatus {
 		}
 		if unsatisfiable > 0 {
 			add(Problem{Severity: SeverityCritical, Check: "placement-unsatisfiable", Range: int64(unsatEx), Section: "cluster-ranges",
-				Summary: fmt.Sprintf("%d range(s) name a placement no live node satisfies (e.g. %s wants %s): the data stays where it is until such a node joins", unsatisfiable, unsatEx, unsatPolicy)})
+				Summary: fmt.Sprintf("%d range(s) name a placement fewer live nodes satisfy than it wants replicas (e.g. %s wants %s): misplaced replicas stay where they are, and lost ones are not replaced, until enough such nodes join", unsatisfiable, unsatEx, unsatPolicy)})
 		}
 		if misplaced > 0 {
 			add(Problem{Severity: SeverityWarning, Check: "placement-misplaced", Range: int64(misEx), Section: "cluster-ranges",

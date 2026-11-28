@@ -374,6 +374,7 @@ func (s *Session) execShowPlacement(ctx context.Context, txn *kvclient.Txn, t *p
 		types.NewString(constraints),
 		types.NewString(source),
 	})
+	res.Rows[0] = append(res.Rows[0], s.placementComplianceRow(ctx, txn, db)...)
 	res.Tag = "SHOW PLACEMENT 1"
 	return res, nil
 }

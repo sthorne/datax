@@ -286,7 +286,7 @@ func (a *Activity) ByAuth() map[string]map[string]int {
 // statementKind classifies a parsed statement for counting.
 func statementKind(stmt parser.Statement) string {
 	switch stmt.(type) {
-	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases, *parser.ShowSequences, *parser.ShowFunctions, *parser.ShowPlacement:
+	case *parser.Select, *parser.Explain, *parser.ShowTables, *parser.ShowStats, *parser.Show, *parser.ShowDatabases, *parser.ShowSequences, *parser.ShowFunctions, *parser.ShowPlacement, *parser.ShowRanges, *parser.ShowNodes:
 		return "select"
 	case *parser.Insert:
 		return "insert"

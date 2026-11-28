@@ -168,7 +168,7 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 	}
 	s.invalidateRoles()
 	superuser, _ := d.IsMemberOf(catalog.AdminRole)
-	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "bypassrls", d.BypassRLS, "superuser", superuser, "createdb", d.CreateDB,
+	log.Audit("role-ddl", "stmt", tag, "target", name, "login", d.Login, "bypassrls", d.BypassRLS, "superuser", superuser, "createdb", d.CreateDB, "viewcluster", d.ViewCluster,
 		"connlimit", d.ConnectionLimit(), "valid_until", d.ValidUntil, "principal", s.sessionUser, "role", s.user)
 	return &Result{Tag: tag}, nil
 }
@@ -178,7 +178,7 @@ func (s *Session) execCreateRole(ctx context.Context, txn *kvclient.Txn, t *pars
 func roleAttributesSpelled(t *parser.CreateRole) bool {
 	return t.Login != nil || t.Inherit != nil || t.BypassRLS != nil || len(t.InRoles) > 0 ||
 		t.Superuser != nil || t.CreateDB != nil || t.CreateRole != nil || t.Replication != nil ||
-		t.ConnLimit != nil || t.ValidUntil != nil
+		t.ViewCluster != nil || t.ConnLimit != nil || t.ValidUntil != nil
 }
 
 // applyRoleAttributes sets SUPERUSER, CREATEDB, CREATEROLE, REPLICATION,
@@ -207,6 +207,9 @@ func applyRoleAttributes(d *catalog.RoleDescriptor, t *parser.CreateRole) error 
 	}
 	if t.Replication != nil {
 		d.Replication = *t.Replication
+	}
+	if t.ViewCluster != nil {
+		d.ViewCluster = *t.ViewCluster
 	}
 	if t.ConnLimit != nil {
 		n := *t.ConnLimit
@@ -252,7 +255,7 @@ func parseValidUntil(text string) (string, error) {
 // password, written to the old layout so every node can authenticate it.
 func (s *Session) execCreateRoleLegacy(ctx context.Context, txn *kvclient.Txn, t *parser.CreateRole, name, tag string) (*Result, error) {
 	if t.Login != nil && !*t.Login || t.Inherit != nil || t.BypassRLS != nil && *t.BypassRLS || len(t.InRoles) > 0 || !t.IsUser && t.Login == nil || t.Password != nil && *t.Password == "" ||
-		t.Superuser != nil || t.CreateDB != nil || t.CreateRole != nil || t.Replication != nil || t.ConnLimit != nil || t.ValidUntil != nil {
+		t.Superuser != nil || t.CreateDB != nil || t.CreateRole != nil || t.Replication != nil || t.ViewCluster != nil || t.ConnLimit != nil || t.ValidUntil != nil {
 		return nil, s.requireV11("roles (NOLOGIN, INHERIT, IN ROLE, PASSWORD NULL, role attributes)")
 	}
 	key := keys.UserKey(name)

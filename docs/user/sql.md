@@ -2813,7 +2813,14 @@ SHOW GRANTS [ON t | ON DATABASE d] [FOR role];
                                 -- privilege_type, is_grantable
 SHOW GRANTS ON ROLE [r] [FOR member];  -- role_name, member, is_admin
 SHOW DATABASES;                 -- database_name, owner
-SHOW PLACEMENT [FOR DATABASE d]; -- database_name, replicas, constraints, source
+SHOW PLACEMENT [FOR DATABASE d]; -- database_name, replicas, constraints, source, and
+                                -- compliance: satisfied, ranges, misplaced_ranges,
+                                -- unsatisfiable_ranges, unattributed_ranges,
+                                -- unknown_locality_replicas (see Region-restricted replication)
+SHOW RANGES [FROM DATABASE d];  -- range_id, start_key, end_key, table_name, replicas,
+                                -- replica_localities, status
+SHOW NODES;                     -- node_id, address, locality, state, draining,
+                                -- shutting_down, last_heartbeat (admin or VIEWCLUSTER)
 SHOW STATS FOR t;               -- see Table statistics
 SHOW FUNCTIONS;                 -- name, signature, category, volatility, aliases, description
 SHOW ALL;                       -- every session setting
@@ -3123,14 +3130,71 @@ nodes the policy admits over the following passes, one range at a time,
 and `SHOW PLACEMENT` reports the count it will actually use, so a
 database with no policy shows the cluster default and says so.
 
-If **no live node** satisfies a policy, the allocator does nothing — it
-never places a replica outside a region you named, and it never drops
-one to satisfy a policy. The data stays where it is and the health API
-reports `placement-unsatisfiable`; `placement-misplaced` marks the
-window while replicas are still being moved home. Asking for more
-replicas than the admitted nodes can hold (three replicas, two nodes in
-the region) is a legal policy that simply cannot converge until a node
-joins there.
+If **fewer live nodes** satisfy a policy than it wants replicas (none
+at all, or two nodes in the region for three replicas), the allocator
+cannot bring the data into line. It never places a replica outside a
+region you named and never drops one to satisfy a policy, and since it
+adds a replica before removing one, a misplaced replica has nowhere to
+go. The data stays where it is and the policy is reported
+unsatisfiable (`placement-unsatisfiable` in the health API, and in
+`SHOW PLACEMENT`). `placement-misplaced` marks the window while replicas
+are still being moved home. Such a policy is legal; it converges once
+enough nodes join the region.
+
+#### Checking compliance over SQL
+
+A policy says where data may live; `SHOW PLACEMENT` also says whether
+it is there, read from the cluster's range descriptors and node registry
+at the moment you ask. Any role can run it, over pgwire, with the HTTP
+listener off:
+
+```sql
+SHOW PLACEMENT FOR DATABASE eu;
+--  database_name | replicas | constraints      | source          | satisfied | ranges | misplaced_ranges | unsatisfiable_ranges | unattributed_ranges | unknown_locality_replicas
+--  eu            |        3 | region=eu-west-1 | database policy | t         |      4 |                0 |                    0 |                   0 |                         0
+```
+
+- `ranges` — the ranges holding any of the database's table data.
+- `misplaced_ranges` — ranges with a replica on a node outside the policy.
+- `unsatisfiable_ranges` — ranges under a policy that fewer live,
+  non-draining nodes satisfy than it wants replicas (all of the
+  database's ranges, when it is so).
+- `unattributed_ranges` — ranges that hold the database's data **and**
+  another table's or system data. No policy governs such a range — a
+  policy applies only to a range wholly inside one table — so its
+  replicas may be anywhere. A policy splits its tables into their own
+  ranges when it is set; this counts where that has not happened.
+- `unknown_locality_replicas` — replicas on a node missing from the
+  registry (gone, or not yet heard from), whose locality therefore
+  cannot be checked.
+- `satisfied` — true when the database has no constraints, or when every
+  count above is zero and the policy is satisfiable. Being
+  under-replicated alone does not make it false: that is availability,
+  not residency, and is reported by the health API. A start-up check
+  should treat anything but `true` as a failure.
+
+The compliance columns are NULL when they cannot be answered (the range
+listing failed or timed out), never a guess from an older listing.
+
+`SHOW RANGES [FROM DATABASE d]` lists the same ranges, one row each:
+its bounds, the table it belongs to, each replica's node and locality,
+and its status (`ok`, `misplaced`, `unsatisfiable`, `unattributed`,
+`unknown-locality`). It needs `CONNECT` on the database. The table name,
+and boundary keys that would carry a row's primary key, are shown only
+to a role that can see the table; anyone else gets the key's structure
+(`/table/<id>/<index>`).
+
+`SHOW NODES` lists every node in the registry, dead ones included until
+they leave it: node ID, address, locality, `live` / `unresponsive` /
+`dead`, draining and shutting-down flags, and the last heartbeat. It
+shows the whole cluster's layout, so it takes the admin role or the
+`VIEWCLUSTER` role attribute (`ALTER ROLE app VIEWCLUSTER`;
+`NOVIEWCLUSTER` removes it). Like `CREATEDB` the attribute is the
+role's own, not inherited through membership.
+
+Compliance covers **table data only**. Database and table names,
+schema descriptors, roles, jobs and other system data live in system
+ranges that no database's policy governs, and may be on any node.
 
 Placement needs cluster version v16 and the database's ownership (or
 admin). The mechanics — how a range finds its policy, why a policy

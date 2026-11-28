@@ -68,6 +68,7 @@ func (n *Node) startSQL() error {
 		return found, nil
 	}
 	opts.Notify = n.notifyHub()
+	opts.Cluster = sqlCluster{n}
 	opts.Advisory = advisory.NewManager(n.stopper.Ctx(), advisory.Config{DB: n.db, NodeID: int32(n.ident.NodeID), TTL: n.cfg.AdvisoryLockTTL})
 	if ks := n.KeyService(); ks != nil {
 		opts.KeyService = ks

@@ -100,6 +100,9 @@ func TestMergedRaftStateGoesWithTheForcedFlush(t *testing.T) {
 		t.Fatal(kerr)
 	}
 	rhs := resp.Right.RangeID
+	// A write to the new right-hand range waits for it to elect a leader;
+	// the merge refuses a right neighbor this node does not lead yet.
+	env.put(t, keys.Key("n"), "v")
 	if kerr := env.merge(ctx, keys.Key("a")); kerr != nil {
 		t.Fatal(kerr)
 	}

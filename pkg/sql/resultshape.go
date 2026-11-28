@@ -48,6 +48,37 @@ func showPlacementColumns() []ResultColumn {
 		{Name: "replicas", Type: types.Int},
 		{Name: "constraints", Type: types.String},
 		{Name: "source", Type: types.String},
+		// Compliance (issue #405): NULL when it cannot be answered.
+		{Name: "satisfied", Type: types.Bool},
+		{Name: "ranges", Type: types.Int},
+		{Name: "misplaced_ranges", Type: types.Int},
+		{Name: "unsatisfiable_ranges", Type: types.Int},
+		{Name: "unattributed_ranges", Type: types.Int},
+		{Name: "unknown_locality_replicas", Type: types.Int},
+	}
+}
+
+func showRangesColumns() []ResultColumn {
+	return []ResultColumn{
+		{Name: "range_id", Type: types.Int},
+		{Name: "start_key", Type: types.String},
+		{Name: "end_key", Type: types.String},
+		{Name: "table_name", Type: types.String},
+		{Name: "replicas", Type: types.ArrayOf(types.Int)},
+		{Name: "replica_localities", Type: types.ArrayOf(types.String)},
+		{Name: "status", Type: types.String},
+	}
+}
+
+func showNodesColumns() []ResultColumn {
+	return []ResultColumn{
+		{Name: "node_id", Type: types.Int},
+		{Name: "address", Type: types.String},
+		{Name: "locality", Type: types.String},
+		{Name: "state", Type: types.String},
+		{Name: "draining", Type: types.Bool},
+		{Name: "shutting_down", Type: types.Bool},
+		{Name: "last_heartbeat", Type: types.Timestamp},
 	}
 }
 

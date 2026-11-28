@@ -796,24 +796,34 @@ a busy node is merely expensive.
 
 ### When a policy cannot be met
 
-If no live node satisfies the policy, the allocator **does nothing** —
+If fewer live, non-draining nodes satisfy the policy than it wants
+replicas, the allocator **cannot converge** and does not try to —
 it never places a replica outside a region an operator named, and it
 never drops a replica to satisfy one. The data stays where it is and the
 condition is reported instead:
 
-- `placement-unsatisfiable` (critical) — a range names a placement no
-  live node satisfies. Typically a region's nodes are all down, or a
-  constraint names a locality tier no node declares.
+- `placement-unsatisfiable` (critical) — a range names a placement
+  fewer live nodes satisfy than it wants replicas. Typically a region's
+  nodes are down, a region has fewer nodes than the replica count, or a
+  constraint names a locality tier no node declares. A misplaced replica
+  cannot be moved home then, because the enforcement pass adds a replica
+  before it removes one, and a lost one is not replaced.
 - `placement-misplaced` (warning) — replicas are outside the policy but
   a home exists; the enforcement pass is moving them, one per pass.
 
-Both appear in `/api/health` and on the console's health view. The
-counter `datax_placement_replicas_moved_total` tracks the moves.
+Both appear in `/api/health` and on the console's health view, and
+`SHOW PLACEMENT` reports the same per database over SQL, with two more
+counts a residency check needs: ranges shared with another table (no
+policy governs them) and replicas on nodes of unknown locality (see
+[checking compliance over SQL](user/sql.md#checking-compliance-over-sql)).
+The counter `datax_placement_replicas_moved_total` tracks the moves.
 
 A policy asking for more replicas than the admitted set can hold (three
 replicas, two nodes in the region) is a stored, legal policy that simply
 cannot converge: the range keeps its third replica outside the region and
-reports `placement-unsatisfiable` until a node joins there. That is the
+reports `placement-unsatisfiable` until a node joins there. (Before
+0.58.0 the health check called such a range only misplaced, since one
+matching node existed; it now uses the same test as `SHOW PLACEMENT`.) That is the
 deliberate choice — a policy is a restriction on where data may live, and
 the allocator would rather leave a replica in the wrong place, loudly,
 than move data somewhere the operator excluded.

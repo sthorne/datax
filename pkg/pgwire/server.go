@@ -136,6 +136,10 @@ type ServerOptions struct {
 	// temporary tables (gap PG-D-009), the orphan sweep's view of which
 	// are live (nil: a registry of this server's own).
 	TempTables *sql.TempRegistry
+	// Cluster is the node's view of the cluster for SHOW NODES, SHOW
+	// RANGES and SHOW PLACEMENT's compliance columns (issue #405); nil
+	// reports them unavailable.
+	Cluster sql.ClusterInfo
 }
 
 // Server accepts SQL client connections.
@@ -209,6 +213,7 @@ func (s *Server) acceptLoop() {
 		c.session.BackendPID = c.pid
 		c.session.BackendControl = s.backendControl
 		c.session.SessionsHook = s.act.Sessions
+		c.session.Cluster = s.opts.Cluster
 		s.mu.Lock()
 		s.conns[nc] = c
 		s.mu.Unlock()

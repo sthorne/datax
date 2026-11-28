@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ func runDemo(args []string) error {
 	verbose := fs.Bool("v", false, "verbose logging")
 	mergeThr := fs.Int64("merge-size-threshold", 0, "size in bytes below which a range and its right neighbor are merged back together (0 = default 16 MiB, negative = disabled)")
 	gcTTL := fs.Duration("gc-ttl", 0, "how long MVCC history, and the rows of dropped tables, are kept before they are reclaimed (0 = default 25h). A demo is in memory: a test suite that creates and drops databases over and over holds everything it dropped in memory for this long, so give such a cluster a short window, e.g. 5m")
+	locSpec := fs.String("locality", "", "each node's locality, one per node separated by ';' (e.g. 'region=us-east-1;region=us-east-2;region=eu-west-1'), or one for every node; default region=demo,rack=<a…i>")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -40,8 +42,10 @@ func runDemo(args []string) error {
 		return fmt.Errorf("--nodes must be between 1 and 9")
 	}
 	log.SetVerbose(*verbose)
-
-	racks := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}
+	locs, err := demoLocalities(*locSpec, *nodes)
+	if err != nil {
+		return err
+	}
 	var started []*server.Node
 	defer func() {
 		for i := len(started) - 1; i >= 0; i-- {
@@ -51,7 +55,7 @@ func runDemo(args []string) error {
 
 	fmt.Printf("Starting a %d-node in-memory datax cluster across racks...\n", *nodes)
 	for i := 0; i < *nodes; i++ {
-		loc, _ := base.ParseLocality(fmt.Sprintf("region=demo,rack=%s", racks[i]))
+		loc := locs[i]
 		cfg := server.Config{
 			Listen:                fmt.Sprintf("127.0.0.1:%d", *baseRPC+i),
 			PGListen:              fmt.Sprintf("127.0.0.1:%d", *basePG+i),
@@ -73,7 +77,7 @@ func runDemo(args []string) error {
 			return fmt.Errorf("starting node %d: %w", i+1, err)
 		}
 		started = append(started, n)
-		fmt.Printf("  %s  rack=%s  sql=%s  rpc=%s\n", n.NodeID(), racks[i], n.SQLAddr(), n.Addr())
+		fmt.Printf("  %s  %s  sql=%s  rpc=%s\n", n.NodeID(), loc, n.SQLAddr(), n.Addr())
 	}
 
 	if *nodes >= 3 {
@@ -179,6 +183,37 @@ func listRangesFor(ctx context.Context, n *server.Node) ([]kvpb.RangeDescriptor,
 		if err := json.Unmarshal(kv.Value, &d); err == nil {
 			out = append(out, d)
 		}
+	}
+	return out, nil
+}
+
+// demoLocalities resolves --locality for n demo nodes (issue #405):
+// empty gives the simulated racks, region=demo,rack=<a…i>; one locality
+// applies to every node; otherwise there must be exactly one per node,
+// separated by ';'.
+func demoLocalities(spec string, n int) ([]base.Locality, error) {
+	out := make([]base.Locality, n)
+	if strings.TrimSpace(spec) == "" {
+		racks := "abcdefghi"
+		for i := range out {
+			out[i], _ = base.ParseLocality(fmt.Sprintf("region=demo,rack=%c", racks[i]))
+		}
+		return out, nil
+	}
+	parts := strings.Split(spec, ";")
+	if len(parts) != 1 && len(parts) != n {
+		return nil, fmt.Errorf("--locality names %d localities for %d nodes: give one per node, separated by ';', or one for all", len(parts), n)
+	}
+	for i := range out {
+		text := strings.TrimSpace(parts[0])
+		if len(parts) > 1 {
+			text = strings.TrimSpace(parts[i])
+		}
+		l, err := base.ParseLocality(text)
+		if err != nil {
+			return nil, fmt.Errorf("--locality for node %d: %w", i+1, err)
+		}
+		out[i] = l
 	}
 	return out, nil
 }
